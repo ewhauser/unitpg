@@ -52,6 +52,9 @@ option('test_fake_wal', type: 'boolean', value: false,
 option('test_no_bg_jobs', type: 'boolean', value: false,
   description: 'Disable background maintenance jobs except async I/O workers for test-only builds')
 
+option('test_mem_smgr', type: 'boolean', value: false,
+  description: 'Use a memory-backed relation storage manager for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

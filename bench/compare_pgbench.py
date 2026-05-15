@@ -114,6 +114,7 @@ def build_with_meson(
     prefix: Path,
     fake_wal: bool,
     no_bg_jobs: bool,
+    mem_smgr: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -137,6 +138,7 @@ def build_with_meson(
         *MESON_BASE_OPTIONS,
         f"-Dtest_fake_wal={'true' if fake_wal else 'false'}",
         f"-Dtest_no_bg_jobs={'true' if no_bg_jobs else 'false'}",
+        f"-Dtest_mem_smgr={'true' if mem_smgr else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -154,6 +156,7 @@ def build_with_configure(
     prefix: Path,
     fake_wal: bool,
     no_bg_jobs: bool,
+    mem_smgr: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -179,6 +182,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-fake-wal")
     if no_bg_jobs:
         configure_cmd.append("--enable-test-no-bg-jobs")
+    if mem_smgr:
+        configure_cmd.append("--enable-test-mem-smgr")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -197,6 +202,7 @@ def build_variant(
     label: str,
     fake_wal: bool,
     no_bg_jobs: bool,
+    mem_smgr: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -212,6 +218,7 @@ def build_variant(
             prefix=prefix,
             fake_wal=fake_wal,
             no_bg_jobs=no_bg_jobs,
+            mem_smgr=mem_smgr,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -223,6 +230,7 @@ def build_variant(
         prefix=prefix,
         fake_wal=fake_wal,
         no_bg_jobs=no_bg_jobs,
+        mem_smgr=mem_smgr,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -356,6 +364,11 @@ def main() -> int:
         action="store_true",
         help="do not enable the no-background-jobs flag in the fake-WAL build",
     )
+    parser.add_argument(
+        "--disable-mem-smgr",
+        action="store_true",
+        help="do not enable the memory storage manager in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -380,6 +393,7 @@ def main() -> int:
             label="baseline",
             fake_wal=False,
             no_bg_jobs=False,
+            mem_smgr=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -396,6 +410,7 @@ def main() -> int:
             label="fakewal",
             fake_wal=True,
             no_bg_jobs=not args.keep_bg_jobs,
+            mem_smgr=not args.disable_mem_smgr,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -445,6 +460,7 @@ def main() -> int:
             "baseline": {
                 "fake_wal": False,
                 "no_bg_jobs": False,
+                "mem_smgr": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -452,6 +468,7 @@ def main() -> int:
             "fakewal": {
                 "fake_wal": True,
                 "no_bg_jobs": not args.keep_bg_jobs,
+                "mem_smgr": not args.disable_mem_smgr,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

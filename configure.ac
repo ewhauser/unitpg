@@ -260,6 +260,15 @@ PGAC_ARG_BOOL(enable, test-no-bg-jobs, no,
 AC_SUBST(enable_test_no_bg_jobs)
 
 #
+# Test-only in-memory storage manager
+#
+PGAC_ARG_BOOL(enable, test-mem-smgr, no,
+              [use a memory-backed relation storage manager (for testing)],
+              [AC_DEFINE([USE_TEST_MEM_SMGR], 1,
+                         [Define to 1 to use a memory-backed relation storage manager. (--enable-test-mem-smgr)])])
+AC_SUBST(enable_test_mem_smgr)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

@@ -56,6 +56,10 @@
    (--enable-test-no-bg-jobs) */
 #undef USE_TEST_NO_BG_JOBS
 
+/* Define to 1 to use a memory-backed relation storage manager.
+   (--enable-test-mem-smgr) */
+#undef USE_TEST_MEM_SMGR
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

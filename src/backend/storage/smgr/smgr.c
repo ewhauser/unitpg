@@ -70,6 +70,9 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
+#ifdef USE_TEST_MEM_SMGR
+#include "storage/memsmgr.h"
+#endif
 #include "storage/smgr.h"
 #include "utils/hsearch.h"
 #include "utils/inval.h"
@@ -128,6 +131,28 @@ typedef struct f_smgr
 static const f_smgr smgrsw[] = {
 	/* magnetic disk */
 	{
+#ifdef USE_TEST_MEM_SMGR
+		.smgr_init = meminit,
+		.smgr_shutdown = memshutdown,
+		.smgr_open = memopen,
+		.smgr_close = memclose,
+		.smgr_create = memcreate,
+		.smgr_exists = memexists,
+		.smgr_unlink = memunlink,
+		.smgr_extend = memextend,
+		.smgr_zeroextend = memzeroextend,
+		.smgr_prefetch = memprefetch,
+		.smgr_maxcombine = memmaxcombine,
+		.smgr_readv = memreadv,
+		.smgr_startreadv = memstartreadv,
+		.smgr_writev = memwritev,
+		.smgr_writeback = memwriteback,
+		.smgr_nblocks = memnblocks,
+		.smgr_truncate = memtruncate,
+		.smgr_immedsync = memimmedsync,
+		.smgr_registersync = memregistersync,
+		.smgr_fd = memfd,
+#else
 		.smgr_init = mdinit,
 		.smgr_shutdown = NULL,
 		.smgr_open = mdopen,
@@ -148,6 +173,7 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
+#endif
 	}
 };
 
