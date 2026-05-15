@@ -55,6 +55,9 @@ option('test_no_bg_jobs', type: 'boolean', value: false,
 option('test_mem_smgr', type: 'boolean', value: false,
   description: 'Use a memory-backed relation storage manager for test-only builds')
 
+option('test_ephemeral_buffers', type: 'boolean', value: false,
+  description: 'Use direct memory-backed temp buffers for test-only builds')
+
 option('test_mem_slru', type: 'boolean', value: false,
   description: 'Use memory-backed transaction-status SLRUs for test-only builds')
 

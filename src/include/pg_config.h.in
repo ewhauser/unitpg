@@ -60,6 +60,10 @@
    (--enable-test-mem-smgr) */
 #undef USE_TEST_MEM_SMGR
 
+/* Define to 1 to use direct memory-backed temp buffers.
+   (--enable-test-ephemeral-buffers) */
+#undef USE_TEST_EPHEMERAL_BUFFERS
+
 /* Define to 1 to use memory-backed transaction-status SLRUs.
    (--enable-test-mem-slru) */
 #undef USE_TEST_MEM_SLRU

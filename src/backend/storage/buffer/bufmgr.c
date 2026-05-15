@@ -1228,6 +1228,7 @@ PinBufferForBlock(Relation rel,
 				  BufferAccessStrategy strategy,
 				  IOObject io_object,
 				  IOContext io_context,
+				  bool allow_storage_hit,
 				  bool *foundPtr)
 {
 	BufferDesc *bufHdr;
@@ -1246,7 +1247,8 @@ PinBufferForBlock(Relation rel,
 									   smgr->smgr_rlocator.backend);
 
 	if (persistence == RELPERSISTENCE_TEMP)
-		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, foundPtr);
+		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, foundPtr,
+								  allow_storage_hit);
 	else
 		bufHdr = BufferAlloc(smgr, persistence, forkNum, blockNum,
 							 strategy, foundPtr, io_context);
@@ -1340,7 +1342,8 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 
 		buffer = PinBufferForBlock(rel, smgr, persistence,
 								   forkNum, blockNum, strategy,
-								   io_object, io_context, &found);
+								   io_object, io_context,
+								   false, &found);
 		ZeroAndLockBuffer(buffer, mode, found);
 		return buffer;
 	}
@@ -1451,6 +1454,7 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 										   blockNum + i,
 										   operation->strategy,
 										   io_object, io_context,
+										   true,
 										   &found);
 		}
 

@@ -269,6 +269,19 @@ PGAC_ARG_BOOL(enable, test-mem-smgr, no,
 AC_SUBST(enable_test_mem_smgr)
 
 #
+# Test-only ephemeral buffer mode
+#
+PGAC_ARG_BOOL(enable, test-ephemeral-buffers, no,
+              [use direct memory-backed temp buffers (for testing)],
+              [AC_DEFINE([USE_TEST_EPHEMERAL_BUFFERS], 1,
+                         [Define to 1 to use direct memory-backed temp buffers. (--enable-test-ephemeral-buffers)])])
+AC_SUBST(enable_test_ephemeral_buffers)
+if test "$enable_test_ephemeral_buffers" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  AC_MSG_ERROR([--enable-test-ephemeral-buffers requires --enable-test-mem-smgr])
+fi
+
+#
 # Test-only in-memory transaction-status SLRUs
 #
 PGAC_ARG_BOOL(enable, test-mem-slru, no,

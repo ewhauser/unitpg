@@ -53,4 +53,11 @@ extern void memregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	memfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  uint32 *off);
 
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+extern bool mem_buffer_direct_enabled(SMgrRelation reln);
+extern Block mem_buffer_direct_page(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum, bool create,
+									bool *found);
+#endif
+
 #endif							/* MEMSMGR_H */

@@ -775,6 +775,7 @@ enable_injection_points
 enable_test_fake_wal
 enable_test_no_bg_jobs
 enable_test_mem_smgr
+enable_test_ephemeral_buffers
 enable_test_mem_slru
 enable_test_no_wal_assembly
 enable_test_no_observability
@@ -864,6 +865,7 @@ enable_injection_points
 enable_test_fake_wal
 enable_test_no_bg_jobs
 enable_test_mem_smgr
+enable_test_ephemeral_buffers
 enable_test_mem_slru
 enable_test_no_wal_assembly
 enable_test_no_observability
@@ -1579,6 +1581,8 @@ Optional Features:
                           workers (for testing)
   --enable-test-mem-smgr  use a memory-backed relation storage manager (for
                           testing)
+  --enable-test-ephemeral-buffers
+                          use direct memory-backed temp buffers (for testing)
   --enable-test-mem-slru  use memory-backed transaction-status SLRUs (for
                           testing)
   --enable-test-no-wal-assembly
@@ -3812,6 +3816,38 @@ $as_echo "#define USE_TEST_MEM_SMGR 1" >>confdefs.h
 else
   enable_test_mem_smgr=no
 
+fi
+
+
+#
+# Test-only ephemeral buffer mode
+#
+
+
+# Check whether --enable-test-ephemeral-buffers was given.
+if test "${enable_test_ephemeral_buffers+set}" = set; then :
+  enableval=$enable_test_ephemeral_buffers;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_EPHEMERAL_BUFFERS 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-ephemeral-buffers option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_ephemeral_buffers=no
+
+fi
+if test "$enable_test_ephemeral_buffers" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  as_fn_error $? "--enable-test-ephemeral-buffers requires --enable-test-mem-smgr" "$LINENO" 5
 fi
 
 

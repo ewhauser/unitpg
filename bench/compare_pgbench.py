@@ -115,6 +115,7 @@ def build_with_meson(
     fake_wal: bool,
     no_bg_jobs: bool,
     mem_smgr: bool,
+    ephemeral_buffers: bool,
     mem_slru: bool,
     no_wal_assembly: bool,
     no_observability: bool,
@@ -146,6 +147,7 @@ def build_with_meson(
         f"-Dtest_fake_wal={'true' if fake_wal else 'false'}",
         f"-Dtest_no_bg_jobs={'true' if no_bg_jobs else 'false'}",
         f"-Dtest_mem_smgr={'true' if mem_smgr else 'false'}",
+        f"-Dtest_ephemeral_buffers={'true' if ephemeral_buffers else 'false'}",
         f"-Dtest_mem_slru={'true' if mem_slru else 'false'}",
         f"-Dtest_no_wal_assembly={'true' if no_wal_assembly else 'false'}",
         f"-Dtest_no_observability={'true' if no_observability else 'false'}",
@@ -171,6 +173,7 @@ def build_with_configure(
     fake_wal: bool,
     no_bg_jobs: bool,
     mem_smgr: bool,
+    ephemeral_buffers: bool,
     mem_slru: bool,
     no_wal_assembly: bool,
     no_observability: bool,
@@ -205,6 +208,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-no-bg-jobs")
     if mem_smgr:
         configure_cmd.append("--enable-test-mem-smgr")
+    if ephemeral_buffers:
+        configure_cmd.append("--enable-test-ephemeral-buffers")
     if mem_slru:
         configure_cmd.append("--enable-test-mem-slru")
     if no_wal_assembly:
@@ -238,6 +243,7 @@ def build_variant(
     fake_wal: bool,
     no_bg_jobs: bool,
     mem_smgr: bool,
+    ephemeral_buffers: bool,
     mem_slru: bool,
     no_wal_assembly: bool,
     no_observability: bool,
@@ -261,6 +267,7 @@ def build_variant(
             fake_wal=fake_wal,
             no_bg_jobs=no_bg_jobs,
             mem_smgr=mem_smgr,
+            ephemeral_buffers=ephemeral_buffers,
             mem_slru=mem_slru,
             no_wal_assembly=no_wal_assembly,
             no_observability=no_observability,
@@ -280,6 +287,7 @@ def build_variant(
         fake_wal=fake_wal,
         no_bg_jobs=no_bg_jobs,
         mem_smgr=mem_smgr,
+        ephemeral_buffers=ephemeral_buffers,
         mem_slru=mem_slru,
         no_wal_assembly=no_wal_assembly,
         no_observability=no_observability,
@@ -426,6 +434,11 @@ def main() -> int:
         help="do not enable the memory storage manager in the fast-fork build",
     )
     parser.add_argument(
+        "--disable-ephemeral-buffers",
+        action="store_true",
+        help="do not use direct memory-backed temp buffers in the fast-fork build",
+    )
+    parser.add_argument(
         "--disable-mem-slru",
         action="store_true",
         help="do not enable in-memory transaction-status SLRUs in the fast-fork build",
@@ -485,6 +498,7 @@ def main() -> int:
             fake_wal=False,
             no_bg_jobs=False,
             mem_smgr=False,
+            ephemeral_buffers=False,
             mem_slru=False,
             no_wal_assembly=False,
             no_observability=False,
@@ -509,6 +523,7 @@ def main() -> int:
             fake_wal=True,
             no_bg_jobs=not args.keep_bg_jobs,
             mem_smgr=not args.disable_mem_smgr,
+            ephemeral_buffers=not args.disable_ephemeral_buffers,
             mem_slru=not args.disable_mem_slru,
             no_wal_assembly=not args.disable_no_wal_assembly,
             no_observability=not args.disable_no_observability,
@@ -566,6 +581,7 @@ def main() -> int:
                 "fake_wal": False,
                 "no_bg_jobs": False,
                 "mem_smgr": False,
+                "ephemeral_buffers": False,
                 "mem_slru": False,
                 "no_wal_assembly": False,
                 "no_observability": False,
@@ -581,6 +597,7 @@ def main() -> int:
                 "fake_wal": True,
                 "no_bg_jobs": not args.keep_bg_jobs,
                 "mem_smgr": not args.disable_mem_smgr,
+                "ephemeral_buffers": not args.disable_ephemeral_buffers,
                 "mem_slru": not args.disable_mem_slru,
                 "no_wal_assembly": not args.disable_no_wal_assembly,
                 "no_observability": not args.disable_no_observability,

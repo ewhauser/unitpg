@@ -527,6 +527,42 @@ memfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 	return -1;
 }
 
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+bool
+mem_buffer_direct_enabled(SMgrRelation reln)
+{
+	return reln != NULL &&
+		!mem_use_md(reln) &&
+		mem_key_is_temp(&reln->smgr_rlocator);
+}
+
+Block
+mem_buffer_direct_page(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber blocknum, bool create, bool *found)
+{
+	MemSmgrForkEntry *fork;
+	MemSmgrPageEntry *page;
+
+	if (found != NULL)
+		*found = false;
+
+	if (!mem_buffer_direct_enabled(reln))
+		return NULL;
+
+	fork = mem_get_fork_entry(reln, forknum, false);
+	if (fork == NULL || !fork->exists || blocknum >= fork->nblocks)
+		return NULL;
+
+	page = mem_get_page_entry(reln->smgr_rlocator, forknum, blocknum, create);
+	if (page == NULL)
+		return NULL;
+
+	if (found != NULL)
+		*found = true;
+	return (Block) page->data;
+}
+#endif
+
 static bool
 mem_use_md(SMgrRelation reln)
 {

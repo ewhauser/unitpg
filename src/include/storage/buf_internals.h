@@ -601,7 +601,8 @@ extern PrefetchBufferResult PrefetchLocalBuffer(SMgrRelation smgr,
 												ForkNumber forkNum,
 												BlockNumber blockNum);
 extern BufferDesc *LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum,
-									BlockNumber blockNum, bool *foundPtr);
+									BlockNumber blockNum, bool *foundPtr,
+									bool allow_storage_hit);
 extern BlockNumber ExtendBufferedRelLocal(BufferManagerRelation bmr,
 										  ForkNumber fork,
 										  uint32 flags,
