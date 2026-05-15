@@ -61,6 +61,9 @@ option('test_mem_slru', type: 'boolean', value: false,
 option('test_no_wal_assembly', type: 'boolean', value: false,
   description: 'Skip ordinary WAL record assembly for test-only builds')
 
+option('test_no_observability', type: 'boolean', value: false,
+  description: 'Compile out hot-path statistics and wait reporting for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

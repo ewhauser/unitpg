@@ -812,7 +812,9 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 	if (fdata)
 	{
 		CheckpointStats.ckpt_slru_written++;
+#ifndef USE_TEST_NO_OBSERVABILITY
 		PendingCheckpointerStats.slru_written++;
+#endif
 	}
 }
 

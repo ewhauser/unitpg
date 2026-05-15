@@ -30,6 +30,9 @@ PgStat_CheckpointerStats PendingCheckpointerStats = {0};
 void
 pgstat_report_checkpointer(void)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	MemSet(&PendingCheckpointerStats, 0, sizeof(PendingCheckpointerStats));
+#else
 	PgStatShared_Checkpointer *stats_shmem = &pgStatLocal.shmem->checkpointer;
 
 	Assert(!pgStatLocal.shmem->is_shutdown);
@@ -69,6 +72,7 @@ pgstat_report_checkpointer(void)
 	 * Report IO statistics
 	 */
 	pgstat_flush_io(false);
+#endif
 }
 
 /*

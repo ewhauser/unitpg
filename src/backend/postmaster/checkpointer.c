@@ -451,19 +451,23 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 			if (chkpt_or_rstpt_timed)
 			{
 				chkpt_or_rstpt_timed = false;
+#ifndef USE_TEST_NO_OBSERVABILITY
 				if (do_restartpoint)
 					PendingCheckpointerStats.restartpoints_timed++;
 				else
 					PendingCheckpointerStats.num_timed++;
+#endif
 			}
 
 			if (chkpt_or_rstpt_requested)
 			{
 				chkpt_or_rstpt_requested = false;
+#ifndef USE_TEST_NO_OBSERVABILITY
 				if (do_restartpoint)
 					PendingCheckpointerStats.restartpoints_requested++;
 				else
 					PendingCheckpointerStats.num_requested++;
+#endif
 			}
 
 			/*
@@ -529,8 +533,10 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 				 */
 				last_checkpoint_time = now;
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 				if (ckpt_performed)
 					PendingCheckpointerStats.num_performed++;
+#endif
 			}
 			else
 			{
@@ -542,7 +548,9 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 					 */
 					last_checkpoint_time = now;
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 					PendingCheckpointerStats.restartpoints_performed++;
+#endif
 				}
 				else
 				{
@@ -623,11 +631,13 @@ CheckpointerMain(const void *startup_data, size_t startup_data_len)
 		 * Close down the database.
 		 *
 		 * Since ShutdownXLOG() creates restartpoint or checkpoint, and
-		 * updates the statistics, increment the checkpoint request and flush
-		 * out pending statistic.
-		 */
-		PendingCheckpointerStats.num_requested++;
-		ShutdownXLOG(0, 0);
+	 * updates the statistics, increment the checkpoint request and flush
+	 * out pending statistic.
+	 */
+#ifndef USE_TEST_NO_OBSERVABILITY
+	PendingCheckpointerStats.num_requested++;
+#endif
+	ShutdownXLOG(0, 0);
 		pgstat_report_checkpointer();
 		pgstat_report_wal(true);
 

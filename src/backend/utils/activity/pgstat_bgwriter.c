@@ -30,6 +30,9 @@ PgStat_BgWriterStats PendingBgWriterStats = {0};
 void
 pgstat_report_bgwriter(void)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	MemSet(&PendingBgWriterStats, 0, sizeof(PendingBgWriterStats));
+#else
 	PgStatShared_BgWriter *stats_shmem = &pgStatLocal.shmem->bgwriter;
 
 	Assert(!pgStatLocal.shmem->is_shutdown);
@@ -62,6 +65,7 @@ pgstat_report_bgwriter(void)
 	 * Report IO statistics
 	 */
 	pgstat_flush_io(false);
+#endif
 }
 
 /*

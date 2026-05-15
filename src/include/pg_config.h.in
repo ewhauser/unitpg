@@ -68,6 +68,10 @@
    (--enable-test-no-wal-assembly) */
 #undef USE_TEST_NO_WAL_ASSEMBLY
 
+/* Define to 1 to compile out hot-path statistics and wait reporting.
+   (--enable-test-no-observability) */
+#undef USE_TEST_NO_OBSERVABILITY
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

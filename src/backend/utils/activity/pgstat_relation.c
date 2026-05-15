@@ -373,6 +373,12 @@ pgstat_report_analyze(Relation rel,
 void
 pgstat_count_heap_insert(Relation rel, PgStat_Counter n)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) rel;
+	(void) n;
+	return;
+#endif
+
 	if (pgstat_should_count_relation(rel))
 	{
 		PgStat_TableStatus *pgstat_info = rel->pgstat_info;
@@ -388,6 +394,13 @@ pgstat_count_heap_insert(Relation rel, PgStat_Counter n)
 void
 pgstat_count_heap_update(Relation rel, bool hot, bool newpage)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) rel;
+	(void) hot;
+	(void) newpage;
+	return;
+#endif
+
 	Assert(!(hot && newpage));
 
 	if (pgstat_should_count_relation(rel))
@@ -414,6 +427,11 @@ pgstat_count_heap_update(Relation rel, bool hot, bool newpage)
 void
 pgstat_count_heap_delete(Relation rel)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) rel;
+	return;
+#endif
+
 	if (pgstat_should_count_relation(rel))
 	{
 		PgStat_TableStatus *pgstat_info = rel->pgstat_info;
@@ -429,6 +447,11 @@ pgstat_count_heap_delete(Relation rel)
 void
 pgstat_count_truncate(Relation rel)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) rel;
+	return;
+#endif
+
 	if (pgstat_should_count_relation(rel))
 	{
 		PgStat_TableStatus *pgstat_info = rel->pgstat_info;
@@ -452,6 +475,12 @@ pgstat_count_truncate(Relation rel)
 void
 pgstat_update_heap_dead_tuples(Relation rel, int delta)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) rel;
+	(void) delta;
+	return;
+#endif
+
 	if (pgstat_should_count_relation(rel))
 	{
 		PgStat_TableStatus *pgstat_info = rel->pgstat_info;

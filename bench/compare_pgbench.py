@@ -117,6 +117,7 @@ def build_with_meson(
     mem_smgr: bool,
     mem_slru: bool,
     no_wal_assembly: bool,
+    no_observability: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -143,6 +144,7 @@ def build_with_meson(
         f"-Dtest_mem_smgr={'true' if mem_smgr else 'false'}",
         f"-Dtest_mem_slru={'true' if mem_slru else 'false'}",
         f"-Dtest_no_wal_assembly={'true' if no_wal_assembly else 'false'}",
+        f"-Dtest_no_observability={'true' if no_observability else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -163,6 +165,7 @@ def build_with_configure(
     mem_smgr: bool,
     mem_slru: bool,
     no_wal_assembly: bool,
+    no_observability: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -194,6 +197,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-mem-slru")
     if no_wal_assembly:
         configure_cmd.append("--enable-test-no-wal-assembly")
+    if no_observability:
+        configure_cmd.append("--enable-test-no-observability")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -215,6 +220,7 @@ def build_variant(
     mem_smgr: bool,
     mem_slru: bool,
     no_wal_assembly: bool,
+    no_observability: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -233,6 +239,7 @@ def build_variant(
             mem_smgr=mem_smgr,
             mem_slru=mem_slru,
             no_wal_assembly=no_wal_assembly,
+            no_observability=no_observability,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -247,6 +254,7 @@ def build_variant(
         mem_smgr=mem_smgr,
         mem_slru=mem_slru,
         no_wal_assembly=no_wal_assembly,
+        no_observability=no_observability,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -395,6 +403,11 @@ def main() -> int:
         action="store_true",
         help="do not skip ordinary WAL record assembly in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-observability",
+        action="store_true",
+        help="do not compile out hot-path statistics and wait reporting in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -422,6 +435,7 @@ def main() -> int:
             mem_smgr=False,
             mem_slru=False,
             no_wal_assembly=False,
+            no_observability=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -441,6 +455,7 @@ def main() -> int:
             mem_smgr=not args.disable_mem_smgr,
             mem_slru=not args.disable_mem_slru,
             no_wal_assembly=not args.disable_no_wal_assembly,
+            no_observability=not args.disable_no_observability,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -493,6 +508,7 @@ def main() -> int:
                 "mem_smgr": False,
                 "mem_slru": False,
                 "no_wal_assembly": False,
+                "no_observability": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -503,6 +519,7 @@ def main() -> int:
                 "mem_smgr": not args.disable_mem_smgr,
                 "mem_slru": not args.disable_mem_slru,
                 "no_wal_assembly": not args.disable_no_wal_assembly,
+                "no_observability": not args.disable_no_observability,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

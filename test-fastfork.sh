@@ -21,6 +21,7 @@ Usage: ./test-fastfork.sh [quick|core|full] [options] [-- extra meson test args]
 Build and validate the fast-fork Postgres configuration:
   -Dtest_fake_wal=true -Dtest_no_bg_jobs=true -Dtest_mem_smgr=true
   -Dtest_mem_slru=true -Dtest_no_wal_assembly=true
+  -Dtest_no_observability=true
 
 Modes:
   quick       Fast compatible smoke tests plus async I/O tests when the local
@@ -160,6 +161,7 @@ SETUP_ARGS=(
 	"-Dtest_mem_smgr=true"
 	"-Dtest_mem_slru=true"
 	"-Dtest_no_wal_assembly=true"
+	"-Dtest_no_observability=true"
 	"-Dtap_tests=auto"
 	"-Dauto_features=disabled"
 	"-Dicu=disabled"
@@ -188,7 +190,6 @@ SETUP_TESTS=(
 
 CORE_EXTRA_TESTS=(
 	"postgresql:brin/isolation"
-	"postgresql:index/isolation"
 	"postgresql:spgist_name_ops/regress"
 	"postgresql:test_binaryheap/regress"
 	"postgresql:test_bitmapset/regress"
@@ -213,7 +214,9 @@ CORE_EXTRA_TESTS=(
 # test_no_bg_jobs keeps async I/O workers but disables generic, parallel, and
 # extension-launched background workers, so skip suites that intentionally
 # exercise those code paths.
-UNSUPPORTED_RE='^postgresql:(regress/regress|isolation/isolation|recovery/|subscription/|pg_upgrade/|pg_basebackup/|pg_combinebackup/|pg_rewind/|pg_verifybackup/|pg_archivecleanup/|pg_resetwal/|pg_walinspect/|pg_waldump/|pg_walsummary/|pg_logicalinspect/|test_decoding/|test_checksums/|test_autovacuum/|test_custom_rmgrs/|test_shm_mq/|worker_spi/|basic_archive/|brin/02_wal_consistency|pg_ctl/003_promote)'
+# The index isolation suite checks pg_statio_* heap access counters.  Those are
+# intentionally disabled by test_no_observability.
+UNSUPPORTED_RE='^postgresql:(regress/regress|isolation/isolation|recovery/|subscription/|pg_upgrade/|pg_basebackup/|pg_combinebackup/|pg_rewind/|pg_verifybackup/|pg_archivecleanup/|pg_resetwal/|pg_walinspect/|pg_waldump/|pg_walsummary/|pg_logicalinspect/|test_decoding/|test_checksums/|test_autovacuum/|test_custom_rmgrs/|test_shm_mq/|worker_spi/|basic_archive/|brin/02_wal_consistency|index/isolation|pg_ctl/003_promote)'
 
 if [[ "$WIPE" -eq 1 ]]; then
 	rm -rf "$BUILD_DIR"

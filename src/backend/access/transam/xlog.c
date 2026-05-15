@@ -7233,8 +7233,10 @@ LogCheckpointEnd(bool restartpoint, int flags)
 												 CheckpointStats.ckpt_sync_end_t);
 
 	/* Accumulate checkpoint timing summary data, in milliseconds. */
+#ifndef USE_TEST_NO_OBSERVABILITY
 	PendingCheckpointerStats.write_time += write_msecs;
 	PendingCheckpointerStats.sync_time += sync_msecs;
+#endif
 
 	/*
 	 * All of the published timing statistics are accounted for.  Only

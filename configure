@@ -777,6 +777,7 @@ enable_test_no_bg_jobs
 enable_test_mem_smgr
 enable_test_mem_slru
 enable_test_no_wal_assembly
+enable_test_no_observability
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -862,6 +863,7 @@ enable_test_no_bg_jobs
 enable_test_mem_smgr
 enable_test_mem_slru
 enable_test_no_wal_assembly
+enable_test_no_observability
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1575,6 +1577,9 @@ Optional Features:
                           testing)
   --enable-test-no-wal-assembly
                           skip ordinary WAL record assembly (for testing)
+  --enable-test-no-observability
+                          compile out hot-path statistics and wait reporting
+                          (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -3854,6 +3859,34 @@ fi
 if test "$enable_test_no_wal_assembly" = yes &&
    test "$enable_test_fake_wal" != yes; then
   as_fn_error $? "--enable-test-no-wal-assembly requires --enable-test-fake-wal" "$LINENO" 5
+fi
+
+
+#
+# Test-only no observability
+#
+
+
+# Check whether --enable-test-no-observability was given.
+if test "${enable_test_no_observability+set}" = set; then :
+  enableval=$enable_test_no_observability;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_OBSERVABILITY 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-observability option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_observability=no
+
 fi
 
 

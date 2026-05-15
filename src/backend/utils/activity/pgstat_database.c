@@ -22,7 +22,9 @@
 #include "utils/timestamp.h"
 
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 static bool pgstat_should_report_connstat(void);
+#endif
 
 
 PgStat_Counter pgStatBlockReadTime = 0;
@@ -32,9 +34,11 @@ PgStat_Counter pgStatTransactionIdleTime = 0;
 SessionEndType pgStatSessionEndCause = DISCONNECT_NORMAL;
 
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 static int	pgStatXactCommit = 0;
 static int	pgStatXactRollback = 0;
 static PgStat_Counter pgLastSessionReportTime = 0;
+#endif
 
 
 /*
@@ -43,7 +47,11 @@ static PgStat_Counter pgLastSessionReportTime = 0;
 void
 pgstat_drop_database(Oid databaseid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) databaseid;
+#else
 	pgstat_drop_transactional(PGSTAT_KIND_DATABASE, databaseid, InvalidOid);
+#endif
 }
 
 /*
@@ -54,6 +62,9 @@ pgstat_drop_database(Oid databaseid)
 void
 pgstat_report_autovac(Oid dboid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) dboid;
+#else
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Database *dbentry;
 
@@ -72,6 +83,7 @@ pgstat_report_autovac(Oid dboid)
 	dbentry->stats.last_autovac_time = GetCurrentTimestamp();
 
 	pgstat_unlock_entry(entry_ref);
+#endif
 }
 
 /*
@@ -80,6 +92,9 @@ pgstat_report_autovac(Oid dboid)
 void
 pgstat_report_recovery_conflict(int reason)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) reason;
+#else
 	PgStat_StatDBEntry *dbentry;
 
 	Assert(IsUnderPostmaster);
@@ -126,6 +141,7 @@ pgstat_report_recovery_conflict(int reason)
 			dbentry->conflict_startup_deadlock++;
 			break;
 	}
+#endif
 }
 
 /*
@@ -134,6 +150,7 @@ pgstat_report_recovery_conflict(int reason)
 void
 pgstat_report_deadlock(void)
 {
+#ifndef USE_TEST_NO_OBSERVABILITY
 	PgStat_StatDBEntry *dbent;
 
 	if (!pgstat_track_counts)
@@ -141,6 +158,7 @@ pgstat_report_deadlock(void)
 
 	dbent = pgstat_prep_database_pending(MyDatabaseId);
 	dbent->deadlocks++;
+#endif
 }
 
 /*
@@ -154,6 +172,9 @@ pgstat_report_deadlock(void)
 void
 pgstat_prepare_report_checksum_failure(Oid dboid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) dboid;
+#else
 	Assert(!CritSectionCount);
 
 	/*
@@ -163,6 +184,7 @@ pgstat_prepare_report_checksum_failure(Oid dboid)
 	 */
 	pgstat_get_entry_ref(PGSTAT_KIND_DATABASE, dboid, InvalidOid,
 						 true, NULL);
+#endif
 }
 
 /*
@@ -175,6 +197,10 @@ pgstat_prepare_report_checksum_failure(Oid dboid)
 void
 pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) dboid;
+	(void) failurecount;
+#else
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Database *sharedent;
 
@@ -212,6 +238,7 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
 	sharedent->stats.last_checksum_failure = GetCurrentTimestamp();
 
 	pgstat_unlock_entry(entry_ref);
+#endif
 }
 
 /*
@@ -220,6 +247,9 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
 void
 pgstat_report_tempfile(size_t filesize)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) filesize;
+#else
 	PgStat_StatDBEntry *dbent;
 
 	if (!pgstat_track_counts)
@@ -228,6 +258,7 @@ pgstat_report_tempfile(size_t filesize)
 	dbent = pgstat_prep_database_pending(MyDatabaseId);
 	dbent->temp_bytes += filesize;
 	dbent->temp_files++;
+#endif
 }
 
 /*
@@ -236,6 +267,9 @@ pgstat_report_tempfile(size_t filesize)
 void
 pgstat_report_connect(Oid dboid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) dboid;
+#else
 	PgStat_StatDBEntry *dbentry;
 
 	if (!pgstat_should_report_connstat())
@@ -245,6 +279,7 @@ pgstat_report_connect(Oid dboid)
 
 	dbentry = pgstat_prep_database_pending(dboid);
 	dbentry->sessions++;
+#endif
 }
 
 /*
@@ -253,6 +288,9 @@ pgstat_report_connect(Oid dboid)
 void
 pgstat_report_disconnect(Oid dboid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) dboid;
+#else
 	PgStat_StatDBEntry *dbentry;
 
 	if (!pgstat_should_report_connstat())
@@ -276,6 +314,7 @@ pgstat_report_disconnect(Oid dboid)
 			dbentry->sessions_killed++;
 			break;
 	}
+#endif
 }
 
 /*
@@ -294,6 +333,10 @@ pgstat_fetch_stat_dbentry(Oid dboid)
 void
 AtEOXact_PgStat_Database(bool isCommit, bool parallel)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) isCommit;
+	(void) parallel;
+#else
 	/* Don't count parallel worker transaction stats */
 	if (!parallel)
 	{
@@ -306,6 +349,7 @@ AtEOXact_PgStat_Database(bool isCommit, bool parallel)
 		else
 			pgStatXactRollback++;
 	}
+#endif
 }
 
 /*
@@ -315,6 +359,10 @@ void
 pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 									 PgStat_Counter workers_launched)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) workers_to_launch;
+	(void) workers_launched;
+#else
 	PgStat_StatDBEntry *dbentry;
 
 	if (!OidIsValid(MyDatabaseId))
@@ -323,6 +371,7 @@ pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 	dbentry = pgstat_prep_database_pending(MyDatabaseId);
 	dbentry->parallel_workers_to_launch += workers_to_launch;
 	dbentry->parallel_workers_launched += workers_launched;
+#endif
 }
 
 /*
@@ -332,6 +381,9 @@ pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 void
 pgstat_update_dbstats(TimestampTz ts)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) ts;
+#else
 	PgStat_StatDBEntry *dbentry;
 
 	/*
@@ -374,6 +426,7 @@ pgstat_update_dbstats(TimestampTz ts)
 	pgStatBlockWriteTime = 0;
 	pgStatActiveTime = 0;
 	pgStatTransactionIdleTime = 0;
+#endif
 }
 
 /*
@@ -383,11 +436,13 @@ pgstat_update_dbstats(TimestampTz ts)
  * but they have different session characteristics from normal backends (for
  * example, they are always "active"), so they would skew session statistics.
  */
+#ifndef USE_TEST_NO_OBSERVABILITY
 static bool
 pgstat_should_report_connstat(void)
 {
 	return MyBackendType == B_BACKEND;
 }
+#endif
 
 /*
  * Find or create a local PgStat_StatDBEntry entry for dboid.

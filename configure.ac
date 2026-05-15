@@ -291,6 +291,15 @@ if test "$enable_test_no_wal_assembly" = yes &&
 fi
 
 #
+# Test-only no observability
+#
+PGAC_ARG_BOOL(enable, test-no-observability, no,
+              [compile out hot-path statistics and wait reporting (for testing)],
+              [AC_DEFINE([USE_TEST_NO_OBSERVABILITY], 1,
+                         [Define to 1 to compile out hot-path statistics and wait reporting. (--enable-test-no-observability)])])
+AC_SUBST(enable_test_no_observability)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])
