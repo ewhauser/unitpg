@@ -64,6 +64,9 @@ option('test_no_wal_assembly', type: 'boolean', value: false,
 option('test_no_observability', type: 'boolean', value: false,
   description: 'Compile out hot-path statistics and wait reporting for test-only builds')
 
+option('test_fast_memory_contexts', type: 'boolean', value: false,
+  description: 'Use faster memory context choices for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

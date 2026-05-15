@@ -72,6 +72,10 @@
    (--enable-test-no-observability) */
 #undef USE_TEST_NO_OBSERVABILITY
 
+/* Define to 1 to use faster memory context choices.
+   (--enable-test-fast-memory-contexts) */
+#undef USE_TEST_FAST_MEMORY_CONTEXTS
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

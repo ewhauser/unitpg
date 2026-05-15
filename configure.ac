@@ -300,6 +300,15 @@ PGAC_ARG_BOOL(enable, test-no-observability, no,
 AC_SUBST(enable_test_no_observability)
 
 #
+# Test-only fast memory contexts
+#
+PGAC_ARG_BOOL(enable, test-fast-memory-contexts, no,
+              [use faster memory context choices (for testing)],
+              [AC_DEFINE([USE_TEST_FAST_MEMORY_CONTEXTS], 1,
+                         [Define to 1 to use faster memory context choices. (--enable-test-fast-memory-contexts)])])
+AC_SUBST(enable_test_fast_memory_contexts)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

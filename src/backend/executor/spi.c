@@ -159,12 +159,12 @@ SPI_connect_ext(int options)
 	 * it doesn't matter because we clean up explicitly in AtEOSubXact_SPI();
 	 * but see also AtEOXact_SPI().
 	 */
-	_SPI_current->procCxt = AllocSetContextCreate(_SPI_current->atomic ? TopTransactionContext : PortalContext,
-												  "SPI Proc",
-												  ALLOCSET_DEFAULT_SIZES);
-	_SPI_current->execCxt = AllocSetContextCreate(_SPI_current->atomic ? TopTransactionContext : _SPI_current->procCxt,
-												  "SPI Exec",
-												  ALLOCSET_DEFAULT_SIZES);
+	_SPI_current->procCxt = FastMaybeFreeableContextCreate(_SPI_current->atomic ? TopTransactionContext : PortalContext,
+														   "SPI Proc",
+														   ALLOCSET_DEFAULT_SIZES);
+	_SPI_current->execCxt = FastQueryContextCreate(_SPI_current->atomic ? TopTransactionContext : _SPI_current->procCxt,
+												   "SPI Exec",
+												   ALLOCSET_DEFAULT_SIZES);
 	/* ... and switch to procedure's context */
 	_SPI_current->savedcxt = MemoryContextSwitchTo(_SPI_current->procCxt);
 
@@ -2137,9 +2137,9 @@ spi_dest_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
 
 	oldcxt = _SPI_procmem();	/* switch to procedure memory context */
 
-	tuptabcxt = AllocSetContextCreate(CurrentMemoryContext,
-									  "SPI TupTable",
-									  ALLOCSET_DEFAULT_SIZES);
+	tuptabcxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+											   "SPI TupTable",
+											   ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(tuptabcxt);
 
 	_SPI_current->tuptable = tuptable = palloc0_object(SPITupleTable);
@@ -3156,9 +3156,9 @@ _SPI_make_plan_non_temp(SPIPlanPtr plan)
 	 * Create a memory context for the plan, underneath the procedure context.
 	 * We don't expect the plan to be very large.
 	 */
-	plancxt = AllocSetContextCreate(parentcxt,
-									"SPI Plan",
-									ALLOCSET_SMALL_SIZES);
+	plancxt = FastMaybeFreeableContextCreate(parentcxt,
+											 "SPI Plan",
+											 ALLOCSET_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(plancxt);
 
 	/* Copy the _SPI_plan struct and subsidiary data into the new context */
@@ -3221,9 +3221,9 @@ _SPI_save_plan(SPIPlanPtr plan)
 	 * very large, so use smaller-than-default alloc parameters.  It's a
 	 * transient context until we finish copying everything.
 	 */
-	plancxt = AllocSetContextCreate(CurrentMemoryContext,
-									"SPI Plan",
-									ALLOCSET_SMALL_SIZES);
+	plancxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+											 "SPI Plan",
+											 ALLOCSET_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(plancxt);
 
 	/* Copy the SPI plan into its own context */

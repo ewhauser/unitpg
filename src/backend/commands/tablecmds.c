@@ -14012,9 +14012,9 @@ validateForeignKeyConstraint(char *conname,
 	slot = table_slot_create(rel, NULL);
 	scan = table_beginscan(rel, snapshot, 0, NULL,
 						   SO_NONE);
-	perTupCxt = AllocSetContextCreate(CurrentMemoryContext,
-									  "validateForeignKeyConstraint",
-									  ALLOCSET_SMALL_SIZES);
+	perTupCxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+											   "validateForeignKeyConstraint",
+											   ALLOCSET_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(perTupCxt);
 
 	while (table_scan_getnextslot(scan, ForwardScanDirection, slot))
@@ -20910,9 +20910,9 @@ AttachPartitionEnsureIndexes(List **wqueue, Relation rel, Relation attachrel)
 	MemoryContext cxt;
 	MemoryContext oldcxt;
 
-	cxt = AllocSetContextCreate(CurrentMemoryContext,
-								"AttachPartitionEnsureIndexes",
-								ALLOCSET_DEFAULT_SIZES);
+	cxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+										 "AttachPartitionEnsureIndexes",
+										 ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(cxt);
 
 	idxes = RelationGetIndexList(rel);
@@ -21097,8 +21097,8 @@ CloneRowTriggersToPartition(Relation parent, Relation partition)
 	scan = systable_beginscan(pg_trigger, TriggerRelidNameIndexId,
 							  true, NULL, 1, &key);
 
-	perTupCxt = AllocSetContextCreate(CurrentMemoryContext,
-									  "clone trig", ALLOCSET_SMALL_SIZES);
+	perTupCxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+											   "clone trig", ALLOCSET_SMALL_SIZES);
 
 	while (HeapTupleIsValid(tuple = systable_getnext(scan)))
 	{

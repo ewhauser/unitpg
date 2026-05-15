@@ -6457,9 +6457,9 @@ strlist_to_textarray(List *list)
 	int			lb[1];
 
 	/* Work in a temp context; easier than individually pfree'ing the Datums */
-	memcxt = AllocSetContextCreate(CurrentMemoryContext,
-								   "strlist to array",
-								   ALLOCSET_DEFAULT_SIZES);
+	memcxt = FastScratchContextCreate(CurrentMemoryContext,
+									  "strlist to array",
+									  ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(memcxt);
 
 	datums = palloc_array(Datum, list_length(list));
