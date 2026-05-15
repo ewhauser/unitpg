@@ -50,6 +50,24 @@ Specs live in [spec/](spec/). The current work is organized around:
 
 The agent workflow and validation loop are documented in [AGENTS.md](AGENTS.md).
 
+## Current Performance Snapshot
+
+These are local benchmark snapshots from the current fast-fork prototype, not
+portable performance guarantees. Keep this section updated when committing new
+performance work.
+
+| Area | Baseline | Fast fork | Result | Notes |
+| --- | ---: | ---: | ---: | --- |
+| Runtime fixture restore | 233.971 TPS | 588.741 TPS | 2.516x TPS | `bench/results/snapshot-compare-current`, 3 rounds, 200 transactions, 200 rows |
+| Runtime fixture restore latency | 4.274 ms | 1.699 ms | 0.398x latency | Same run as above |
+| Startup, postmaster ready | 0.117264 s | 0.113301 s | 1.035x | `bench/results/startup-compare-smoke`, 2-round smoke |
+| Startup, first query | 0.011634 s | 0.006105 s | 1.906x | Same smoke run as above |
+
+The runtime fixture-restore comparison measured stock PostgreSQL replaying the
+rollback-heavy setup workload against the fast fork restoring a captured
+fixture snapshot before each test body. The startup comparison is a tiny smoke
+sample; use more rounds before making decisions from startup numbers.
+
 ## Build And Validate
 
 The main fast-fork validation entrypoint is:
@@ -132,6 +150,8 @@ python3 bench/compare_startup.py \
 - Validate correctness before trusting benchmark numbers.
 - Do not commit generated benchmark results from `bench/results/` or build
   artifacts from `bench/.build/`.
+- When a change is meant to improve performance, update the performance table
+  above with the benchmark command/result or explain why the table is unchanged.
 - If `git status` reports an fsmonitor IPC warning in this worktree, use:
 
 ```sh

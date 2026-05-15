@@ -251,6 +251,11 @@ When adding a new spec, use the next `NNN-name.md` prefix.
 
 ## Reporting Results
 
+Always update `README.md` when committing a performance change. For each
+performance change, either update the `Current Performance Snapshot` table with
+the latest benchmark result or explicitly note in the commit/PR summary why the
+README performance table was not changed.
+
 When reporting a performance change, include:
 
 - commit or working-tree state
