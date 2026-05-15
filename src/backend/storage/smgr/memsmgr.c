@@ -32,11 +32,14 @@
 
 /*
  * Shared non-temp storage is fixed-size by design: this is a disposable
- * unit-test build, and exhausting the memory budget should fail loudly.
- * Temp storage is backend-local and grows with the backend memory context.
+ * unit-test build, and exhausting the memory budget should fail loudly.  The
+ * shared hash is allocated up front, so keep this large enough for long
+ * rollback-heavy test runs without making every test cluster reserve an
+ * unbounded amount of memory.  Temp storage is backend-local and grows with
+ * the backend memory context.
  */
 #define MEMSMGR_SHARED_MAX_FORKS	8192
-#define MEMSMGR_SHARED_MAX_PAGES	65536
+#define MEMSMGR_SHARED_MAX_PAGES	262144
 #define MEMSMGR_MAX_COMBINE			32
 
 typedef struct MemSmgrForkKey
