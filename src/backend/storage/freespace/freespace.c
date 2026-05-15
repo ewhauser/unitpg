@@ -136,9 +136,13 @@ static bool fsm_does_block_exist(Relation rel, BlockNumber blknumber);
 BlockNumber
 GetPageWithFreeSpace(Relation rel, Size spaceNeeded)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return InvalidBlockNumber;
+#else
 	uint8		min_cat = fsm_space_needed_to_cat(spaceNeeded);
 
 	return fsm_search(rel, min_cat);
+#endif
 }
 
 /*
@@ -154,6 +158,9 @@ BlockNumber
 RecordAndGetPageWithFreeSpace(Relation rel, BlockNumber oldPage,
 							  Size oldSpaceAvail, Size spaceNeeded)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return InvalidBlockNumber;
+#else
 	int			old_cat = fsm_space_avail_to_cat(oldSpaceAvail);
 	int			search_cat = fsm_space_needed_to_cat(spaceNeeded);
 	FSMAddress	addr;
@@ -181,6 +188,7 @@ RecordAndGetPageWithFreeSpace(Relation rel, BlockNumber oldPage,
 			return blknum;
 	}
 	return fsm_search(rel, search_cat);
+#endif
 }
 
 /*
@@ -193,6 +201,9 @@ RecordAndGetPageWithFreeSpace(Relation rel, BlockNumber oldPage,
 void
 RecordPageWithFreeSpace(Relation rel, BlockNumber heapBlk, Size spaceAvail)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	int			new_cat = fsm_space_avail_to_cat(spaceAvail);
 	FSMAddress	addr;
 	uint16		slot;
@@ -201,6 +212,7 @@ RecordPageWithFreeSpace(Relation rel, BlockNumber heapBlk, Size spaceAvail)
 	addr = fsm_get_location(heapBlk, &slot);
 
 	fsm_set_and_search(rel, addr, slot, new_cat, 0);
+#endif
 }
 
 /*
@@ -211,6 +223,9 @@ void
 XLogRecordPageWithFreeSpace(RelFileLocator rlocator, BlockNumber heapBlk,
 							Size spaceAvail)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	int			new_cat = fsm_space_avail_to_cat(spaceAvail);
 	FSMAddress	addr;
 	uint16		slot;
@@ -244,6 +259,7 @@ XLogRecordPageWithFreeSpace(RelFileLocator rlocator, BlockNumber heapBlk,
 	if (fsm_set_avail(page, slot, new_cat))
 		MarkBufferDirty(buf);
 	UnlockReleaseBuffer(buf);
+#endif
 }
 
 /*
@@ -253,6 +269,9 @@ XLogRecordPageWithFreeSpace(RelFileLocator rlocator, BlockNumber heapBlk,
 Size
 GetRecordedFreeSpace(Relation rel, BlockNumber heapBlk)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return 0;
+#else
 	FSMAddress	addr;
 	uint16		slot;
 	Buffer		buf;
@@ -268,6 +287,7 @@ GetRecordedFreeSpace(Relation rel, BlockNumber heapBlk)
 	ReleaseBuffer(buf);
 
 	return fsm_space_cat_to_avail(cat);
+#endif
 }
 
 /*
@@ -284,6 +304,9 @@ GetRecordedFreeSpace(Relation rel, BlockNumber heapBlk)
 BlockNumber
 FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return InvalidBlockNumber;
+#else
 	BlockNumber new_nfsmblocks;
 	FSMAddress	first_removed_address;
 	uint16		first_removed_slot;
@@ -356,6 +379,7 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 	}
 
 	return new_nfsmblocks;
+#endif
 }
 
 /*
@@ -367,12 +391,16 @@ FreeSpaceMapPrepareTruncateRel(Relation rel, BlockNumber nblocks)
 void
 FreeSpaceMapVacuum(Relation rel)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	bool		dummy;
 
 	/* Recursively scan the tree, starting at the root */
 	(void) fsm_vacuum_page(rel, FSM_ROOT_ADDRESS,
 						   (BlockNumber) 0, InvalidBlockNumber,
 						   &dummy);
+#endif
 }
 
 /*
@@ -386,11 +414,15 @@ FreeSpaceMapVacuum(Relation rel)
 void
 FreeSpaceMapVacuumRange(Relation rel, BlockNumber start, BlockNumber end)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	bool		dummy;
 
 	/* Recursively scan the tree, starting at the root */
 	if (end > start)
 		(void) fsm_vacuum_page(rel, FSM_ROOT_ADDRESS, start, end, &dummy);
+#endif
 }
 
 /******** Internal routines ********/

@@ -655,6 +655,16 @@ extern void pgstat_report_connect(Oid dboid);
 extern void pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 												 PgStat_Counter workers_launched);
 
+#ifdef USE_TEST_NO_OBSERVABILITY
+#define pgstat_count_buffer_read_time(n)							\
+	((void) 0)
+#define pgstat_count_buffer_write_time(n)							\
+	((void) 0)
+#define pgstat_count_conn_active_time(n)							\
+	((void) 0)
+#define pgstat_count_conn_txn_idle_time(n)							\
+	((void) 0)
+#else
 #define pgstat_count_buffer_read_time(n)							\
 	(pgStatBlockReadTime += (n))
 #define pgstat_count_buffer_write_time(n)							\
@@ -663,6 +673,7 @@ extern void pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launc
 	(pgStatActiveTime += (n))
 #define pgstat_count_conn_txn_idle_time(n)							\
 	(pgStatTransactionIdleTime += (n))
+#endif
 
 extern PgStat_StatDBEntry *pgstat_fetch_stat_dbentry(Oid dboid);
 
@@ -708,12 +719,33 @@ extern void pgstat_report_analyze(Relation rel,
  * pgstat_assoc_relation() to do so. See its comment for why this is done
  * separately from pgstat_init_relation().
  */
+#ifdef USE_TEST_NO_OBSERVABILITY
+#define pgstat_should_count_relation(rel)							\
+	(false)
+#else
 #define pgstat_should_count_relation(rel)                           \
 	(likely((rel)->pgstat_info != NULL) ? true :                    \
 	 ((rel)->pgstat_enabled ? pgstat_assoc_relation(rel), true : false))
+#endif
 
 /* nontransactional event counts are simple enough to inline */
 
+#ifdef USE_TEST_NO_OBSERVABILITY
+#define pgstat_count_heap_scan(rel)									\
+	((void) 0)
+#define pgstat_count_heap_getnext(rel)								\
+	((void) 0)
+#define pgstat_count_heap_fetch(rel)								\
+	((void) 0)
+#define pgstat_count_index_scan(rel)								\
+	((void) 0)
+#define pgstat_count_index_tuples(rel, n)							\
+	((void) 0)
+#define pgstat_count_buffer_read(rel)								\
+	((void) 0)
+#define pgstat_count_buffer_hit(rel)								\
+	((void) 0)
+#else
 #define pgstat_count_heap_scan(rel)									\
 	do {															\
 		if (pgstat_should_count_relation(rel))						\
@@ -749,6 +781,7 @@ extern void pgstat_report_analyze(Relation rel,
 		if (pgstat_should_count_relation(rel))						\
 			(rel)->pgstat_info->counts.blocks_hit++;				\
 	} while (0)
+#endif
 
 extern void pgstat_count_heap_insert(Relation rel, PgStat_Counter n);
 extern void pgstat_count_heap_update(Relation rel, bool hot, bool newpage);

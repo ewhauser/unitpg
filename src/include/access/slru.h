@@ -145,6 +145,15 @@ typedef struct SlruOpts
 	 */
 	const char *Dir;
 
+#ifdef USE_TEST_MEM_SLRU
+	/*
+	 * Keep this SLRU authoritative in shared memory and never read, write,
+	 * fsync, or unlink segment files.  Only target transaction-status SLRUs
+	 * should set this in test-only builds.
+	 */
+	bool		in_memory;
+#endif
+
 	/*
 	 * If true, use long segment file names.  Otherwise, use short file names.
 	 *
@@ -219,6 +228,9 @@ extern void SimpleLruRequestWithOpts(const SlruOpts *options);
 	SimpleLruRequestWithOpts(&(SlruOpts){__VA_ARGS__})
 
 extern int	SimpleLruAutotuneBuffers(int divisor, int max);
+#ifdef USE_TEST_MEM_SLRU
+extern int	SimpleLruTestInMemoryBuffers(int nslots, int max);
+#endif
 extern int	SimpleLruZeroPage(SlruDesc *ctl, int64 pageno);
 extern void SimpleLruZeroAndWritePage(SlruDesc *ctl, int64 pageno);
 extern int	SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,

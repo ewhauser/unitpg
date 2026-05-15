@@ -37,6 +37,15 @@ typedef uint64 XLogRecPtr;
 #define FirstNormalUnloggedLSN	((XLogRecPtr) 1000)
 
 /*
+ * Test-only fake WAL LSNs live in a range that no practical real WAL stream
+ * should reach.  This lets flush/wait paths recognize them without confusing
+ * them with startup/checkpoint WAL that still needs to be written.
+ */
+#define FirstTestFakeWalLSN		((XLogRecPtr) UINT64CONST(0x8000000000000000))
+#define XLogRecPtrIsTestFakeWal(r) \
+	(((r) & FirstTestFakeWalLSN) != 0)
+
+/*
  * Handy macro for printing XLogRecPtr in conventional format, e.g.,
  *
  * printf("%X/%08X", LSN_FORMAT_ARGS(lsn));

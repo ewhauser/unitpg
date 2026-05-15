@@ -3192,6 +3192,11 @@ relation_needs_vacanalyze(Oid relid,
 	}
 	*wraparound = force_vacuum;
 
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	force_vacuum = false;
+	*wraparound = false;
+#endif
+
 	/*
 	 * To calculate the (M)XID age portion of the score, divide the age by its
 	 * respective *_freeze_max_age parameter.

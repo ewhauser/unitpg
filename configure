@@ -772,6 +772,16 @@ LDFLAGS
 CFLAGS
 CC
 enable_injection_points
+enable_test_fake_wal
+enable_test_no_bg_jobs
+enable_test_mem_smgr
+enable_test_ephemeral_buffers
+enable_test_mem_slru
+enable_test_no_wal_assembly
+enable_test_no_observability
+enable_test_fast_memory_contexts
+enable_test_ephemeral_catalog
+enable_test_no_durable_maintenance
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -852,6 +862,16 @@ enable_coverage
 enable_dtrace
 enable_tap_tests
 enable_injection_points
+enable_test_fake_wal
+enable_test_no_bg_jobs
+enable_test_mem_smgr
+enable_test_ephemeral_buffers
+enable_test_mem_slru
+enable_test_no_wal_assembly
+enable_test_no_observability
+enable_test_fast_memory_contexts
+enable_test_ephemeral_catalog
+enable_test_no_durable_maintenance
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1554,6 +1574,30 @@ Optional Features:
   --enable-tap-tests      enable TAP tests (requires Perl and IPC::Run)
   --enable-injection-points
                           enable injection points (for testing)
+  --enable-test-fake-wal  replace ordinary WAL records with fake LSNs (for
+                          testing)
+  --enable-test-no-bg-jobs
+                          disable background maintenance jobs except async I/O
+                          workers (for testing)
+  --enable-test-mem-smgr  use a memory-backed relation storage manager (for
+                          testing)
+  --enable-test-ephemeral-buffers
+                          use direct memory-backed temp buffers (for testing)
+  --enable-test-mem-slru  use memory-backed transaction-status SLRUs (for
+                          testing)
+  --enable-test-no-wal-assembly
+                          skip ordinary WAL record assembly (for testing)
+  --enable-test-no-observability
+                          compile out hot-path statistics and wait reporting
+                          (for testing)
+  --enable-test-fast-memory-contexts
+                          use faster memory context choices (for testing)
+  --enable-test-ephemeral-catalog
+                          enable ephemeral catalog fast paths (for testing)
+  --enable-test-no-durable-maintenance
+                          disable durable maintenance work (for testing)
+  --enable-test-fast-analyze
+                          use a no-sample ANALYZE fast path (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -3686,6 +3730,324 @@ $as_echo "#define USE_INJECTION_POINTS 1" >>confdefs.h
 
 else
   enable_injection_points=no
+
+fi
+
+
+
+#
+# Test-only fake WAL
+#
+
+
+# Check whether --enable-test-fake-wal was given.
+if test "${enable_test_fake_wal+set}" = set; then :
+  enableval=$enable_test_fake_wal;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_FAKE_WAL 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-fake-wal option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_fake_wal=no
+
+fi
+
+
+#
+# Test-only no background jobs
+#
+
+
+# Check whether --enable-test-no-bg-jobs was given.
+if test "${enable_test_no_bg_jobs+set}" = set; then :
+  enableval=$enable_test_no_bg_jobs;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_BG_JOBS 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-bg-jobs option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_bg_jobs=no
+
+fi
+
+
+#
+# Test-only in-memory storage manager
+#
+
+
+# Check whether --enable-test-mem-smgr was given.
+if test "${enable_test_mem_smgr+set}" = set; then :
+  enableval=$enable_test_mem_smgr;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_MEM_SMGR 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-mem-smgr option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_mem_smgr=no
+
+fi
+
+
+#
+# Test-only ephemeral buffer mode
+#
+
+
+# Check whether --enable-test-ephemeral-buffers was given.
+if test "${enable_test_ephemeral_buffers+set}" = set; then :
+  enableval=$enable_test_ephemeral_buffers;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_EPHEMERAL_BUFFERS 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-ephemeral-buffers option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_ephemeral_buffers=no
+
+fi
+if test "$enable_test_ephemeral_buffers" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  as_fn_error $? "--enable-test-ephemeral-buffers requires --enable-test-mem-smgr" "$LINENO" 5
+fi
+
+
+#
+# Test-only in-memory transaction-status SLRUs
+#
+
+
+# Check whether --enable-test-mem-slru was given.
+if test "${enable_test_mem_slru+set}" = set; then :
+  enableval=$enable_test_mem_slru;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_MEM_SLRU 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-mem-slru option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_mem_slru=no
+
+fi
+
+
+#
+# Test-only no WAL assembly
+#
+
+
+# Check whether --enable-test-no-wal-assembly was given.
+if test "${enable_test_no_wal_assembly+set}" = set; then :
+  enableval=$enable_test_no_wal_assembly;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_WAL_ASSEMBLY 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-wal-assembly option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_wal_assembly=no
+
+fi
+
+if test "$enable_test_no_wal_assembly" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  as_fn_error $? "--enable-test-no-wal-assembly requires --enable-test-fake-wal" "$LINENO" 5
+fi
+
+
+#
+# Test-only no observability
+#
+
+
+# Check whether --enable-test-no-observability was given.
+if test "${enable_test_no_observability+set}" = set; then :
+  enableval=$enable_test_no_observability;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_OBSERVABILITY 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-observability option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_observability=no
+
+fi
+
+
+#
+# Test-only fast memory contexts
+#
+
+
+# Check whether --enable-test-fast-memory-contexts was given.
+if test "${enable_test_fast_memory_contexts+set}" = set; then :
+  enableval=$enable_test_fast_memory_contexts;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_FAST_MEMORY_CONTEXTS 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-fast-memory-contexts option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_fast_memory_contexts=no
+
+fi
+
+
+#
+# Test-only ephemeral catalog fast paths
+#
+
+
+# Check whether --enable-test-ephemeral-catalog was given.
+if test "${enable_test_ephemeral_catalog+set}" = set; then :
+  enableval=$enable_test_ephemeral_catalog;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_EPHEMERAL_CATALOG 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-ephemeral-catalog option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_ephemeral_catalog=no
+
+fi
+
+
+#
+# Test-only no durable maintenance
+#
+
+
+# Check whether --enable-test-no-durable-maintenance was given.
+if test "${enable_test_no_durable_maintenance+set}" = set; then :
+  enableval=$enable_test_no_durable_maintenance;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_DURABLE_MAINTENANCE 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-durable-maintenance option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_durable_maintenance=no
+
+fi
+
+
+#
+# Test-only fast ANALYZE
+#
+
+
+# Check whether --enable-test-fast-analyze was given.
+if test "${enable_test_fast_analyze+set}" = set; then :
+  enableval=$enable_test_fast_analyze;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_FAST_ANALYZE 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-fast-analyze option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_fast_analyze=no
 
 fi
 

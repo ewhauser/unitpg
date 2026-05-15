@@ -127,6 +127,11 @@ pgstat_lock_snapshot_cb(void)
 void
 pgstat_count_lock_fastpath_exceeded(uint8 locktag_type)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) locktag_type;
+	return;
+#endif
+
 	Assert(locktag_type <= LOCKTAG_LAST_TYPE);
 	PendingLockStats.stats[locktag_type].fastpath_exceeded++;
 	have_lockstats = true;
@@ -142,6 +147,12 @@ pgstat_count_lock_fastpath_exceeded(uint8 locktag_type)
 void
 pgstat_count_lock_waits(uint8 locktag_type, long msecs)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) locktag_type;
+	(void) msecs;
+	return;
+#endif
+
 	Assert(locktag_type <= LOCKTAG_LAST_TYPE);
 	PendingLockStats.stats[locktag_type].waits++;
 	PendingLockStats.stats[locktag_type].wait_time += (PgStat_Counter) msecs;

@@ -26,6 +26,7 @@
 #include "access/tupconvert.h"
 #include "access/visibilitymap.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "catalog/pg_inherits.h"
@@ -38,6 +39,7 @@
 #include "foreign/fdwapi.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "optimizer/plancat.h"
 #include "parser/parse_oper.h"
 #include "parser/parse_relation.h"
 #include "pgstat.h"
@@ -97,6 +99,13 @@ static void update_attstats(Oid relid, bool inh,
 							int natts, VacAttrStats **vacattrstats);
 static Datum std_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
 static Datum ind_fetch_func(VacAttrStatsP stats, int rownum, bool *isNull);
+
+#ifdef USE_TEST_FAST_ANALYZE
+static bool test_fast_analyze_relation(Relation onerel,
+									   const VacuumParams *params,
+									   bool in_outer_xact,
+									   int elevel);
+#endif
 
 
 /*
@@ -189,6 +198,14 @@ analyze_rel(Oid relid, RangeVar *relation,
 	 */
 	if (va_cols != NIL)
 		validate_va_cols_list(onerel, va_cols);
+
+#ifdef USE_TEST_FAST_ANALYZE
+	if (test_fast_analyze_relation(onerel, params, in_outer_xact, elevel))
+	{
+		relation_close(onerel, ShareUpdateExclusiveLock);
+		return;
+	}
+#endif
 
 	/*
 	 * Initialize progress reporting before setup for regular/foreign tables.
@@ -294,6 +311,107 @@ analyze_rel(Oid relid, RangeVar *relation,
 out:
 	pgstat_progress_end_command();
 }
+
+#ifdef USE_TEST_FAST_ANALYZE
+/*
+ * Test-only ANALYZE fast path.
+ *
+ * In unit-test clusters, explicit ANALYZE commands are usually cargo-culted
+ * from production setup scripts and run on tiny or empty relations.  Preserve
+ * relation lookup, permissions, column-list validation, and catalog/index
+ * visibility, but skip sample acquisition, pg_statistic writes, and index
+ * cleanup callbacks.
+ */
+static bool
+test_fast_analyze_relation(Relation onerel, const VacuumParams *params,
+						   bool in_outer_xact, int elevel)
+{
+	char		relkind = onerel->rd_rel->relkind;
+	BlockNumber relpages;
+	double		reltuples;
+	double		allvisfrac;
+	bool		hasindex;
+	int			nindexes = 0;
+	Relation   *Irel = NULL;
+	int			ind;
+
+	if (IsSystemRelation(onerel))
+		return false;
+
+	if (relkind != RELKIND_RELATION &&
+		relkind != RELKIND_MATVIEW &&
+		relkind != RELKIND_PARTITIONED_TABLE)
+		return false;
+
+	if (relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		List	   *idxs = RelationGetIndexList(onerel);
+
+		hasindex = idxs != NIL;
+		list_free(idxs);
+		CommandCounterIncrement();
+		vac_update_relstats(onerel, -1, 0,
+							0, 0, hasindex,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							NULL, NULL,
+							in_outer_xact);
+		goto done;
+	}
+
+	estimate_rel_size(onerel, NULL, &relpages, &reltuples, &allvisfrac);
+	vac_open_indexes(onerel, AccessShareLock, &nindexes, &Irel);
+	hasindex = nindexes > 0;
+
+	/*
+	 * Keep relation-level stats fresh enough for the planner to cost indexes.
+	 * Treat pages as all-visible in this test-only mode: correctness is still
+	 * enforced by the executor/visibility map, but index-only paths stay cheap
+	 * enough for regression tests and tiny unit-test fixtures.
+	 */
+	CommandCounterIncrement();
+	vac_update_relstats(onerel,
+						relpages,
+						reltuples,
+						relpages,
+						0,
+						hasindex,
+						InvalidTransactionId,
+						InvalidMultiXactId,
+						NULL, NULL,
+						in_outer_xact);
+
+	for (ind = 0; ind < nindexes; ind++)
+	{
+		BlockNumber indexpages;
+		double		indextuples;
+		double		indexallvisfrac;
+
+		estimate_rel_size(Irel[ind], NULL, &indexpages, &indextuples,
+						  &indexallvisfrac);
+		vac_update_relstats(Irel[ind],
+							indexpages,
+							indextuples,
+							0, 0,
+							false,
+							InvalidTransactionId,
+							InvalidMultiXactId,
+							NULL, NULL,
+							in_outer_xact);
+	}
+
+	vac_close_indexes(nindexes, Irel, NoLock);
+
+done:
+	if (params->options & VACOPT_VERBOSE)
+		ereport(elevel,
+				(errmsg("fast analyze refreshed relation stats for \"%s.%s\"",
+						get_namespace_name(RelationGetNamespace(onerel)),
+						RelationGetRelationName(onerel))));
+
+	return true;
+}
+#endif
 
 /*
  *	do_analyze_rel() -- analyze one relation, recursively or not

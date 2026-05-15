@@ -56,6 +56,14 @@ void
 pgstat_count_backend_io_op_time(IOObject io_object, IOContext io_context,
 								IOOp io_op, instr_time io_time)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) io_object;
+	(void) io_context;
+	(void) io_op;
+	(void) io_time;
+	return;
+#endif
+
 	Assert(track_io_timing || track_wal_io_timing);
 
 	if (!pgstat_tracks_backend_bktype(MyBackendType))
@@ -74,6 +82,15 @@ void
 pgstat_count_backend_io_op(IOObject io_object, IOContext io_context,
 						   IOOp io_op, uint32 cnt, uint64 bytes)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) io_object;
+	(void) io_context;
+	(void) io_op;
+	(void) cnt;
+	(void) bytes;
+	return;
+#endif
+
 	if (!pgstat_tracks_backend_bktype(MyBackendType))
 		return;
 

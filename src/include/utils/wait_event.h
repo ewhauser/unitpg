@@ -66,11 +66,15 @@ extern char **GetWaitEventCustomNames(uint32 classId, int *nwaitevents);
 static inline void
 pgstat_report_wait_start(uint32 wait_event_info)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) wait_event_info;
+#else
 	/*
 	 * Since this is a four-byte field which is always read and written as
 	 * four-bytes, updates are atomic.
 	 */
 	*(volatile uint32 *) my_wait_event_info = wait_event_info;
+#endif
 }
 
 /* ----------
@@ -82,8 +86,10 @@ pgstat_report_wait_start(uint32 wait_event_info)
 static inline void
 pgstat_report_wait_end(void)
 {
+#ifndef USE_TEST_NO_OBSERVABILITY
 	/* see pgstat_report_wait_start() */
 	*(volatile uint32 *) my_wait_event_info = 0;
+#endif
 }
 
 

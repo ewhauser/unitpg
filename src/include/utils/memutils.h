@@ -150,6 +150,48 @@ extern MemoryContext BumpContextCreate(MemoryContext parent,
 									   Size initBlockSize,
 									   Size maxBlockSize);
 
+static inline MemoryContext
+FastQueryContextCreate(MemoryContext parent, const char *name,
+					   Size minContextSize, Size initBlockSize,
+					   Size maxBlockSize)
+{
+#ifdef USE_TEST_FAST_MEMORY_CONTEXTS
+	return GenerationContextCreate(parent, name, minContextSize,
+								   initBlockSize, maxBlockSize);
+#else
+	return AllocSetContextCreateInternal(parent, name, minContextSize,
+										 initBlockSize, maxBlockSize);
+#endif
+}
+
+static inline MemoryContext
+FastScratchContextCreate(MemoryContext parent, const char *name,
+						 Size minContextSize, Size initBlockSize,
+						 Size maxBlockSize)
+{
+#ifdef USE_TEST_FAST_MEMORY_CONTEXTS
+	return BumpContextCreate(parent, name, minContextSize,
+							 initBlockSize, maxBlockSize);
+#else
+	return AllocSetContextCreateInternal(parent, name, minContextSize,
+										 initBlockSize, maxBlockSize);
+#endif
+}
+
+static inline MemoryContext
+FastMaybeFreeableContextCreate(MemoryContext parent, const char *name,
+							   Size minContextSize, Size initBlockSize,
+							   Size maxBlockSize)
+{
+#ifdef USE_TEST_FAST_MEMORY_CONTEXTS
+	return GenerationContextCreate(parent, name, minContextSize,
+								   initBlockSize, maxBlockSize);
+#else
+	return AllocSetContextCreateInternal(parent, name, minContextSize,
+										 initBlockSize, maxBlockSize);
+#endif
+}
+
 /*
  * Recommended default alloc parameters, suitable for "ordinary" contexts
  * that might hold quite a lot of data.

@@ -46,6 +46,39 @@ option('tap_tests', type: 'feature', value: 'auto',
 option('injection_points', type: 'boolean', value: false,
   description: 'Enable injection points')
 
+option('test_fake_wal', type: 'boolean', value: false,
+  description: 'Replace ordinary WAL records with fake LSNs for test-only builds')
+
+option('test_no_bg_jobs', type: 'boolean', value: false,
+  description: 'Disable background maintenance jobs except async I/O workers for test-only builds')
+
+option('test_mem_smgr', type: 'boolean', value: false,
+  description: 'Use a memory-backed relation storage manager for test-only builds')
+
+option('test_ephemeral_buffers', type: 'boolean', value: false,
+  description: 'Use direct memory-backed temp buffers for test-only builds')
+
+option('test_mem_slru', type: 'boolean', value: false,
+  description: 'Use memory-backed transaction-status SLRUs for test-only builds')
+
+option('test_no_wal_assembly', type: 'boolean', value: false,
+  description: 'Skip ordinary WAL record assembly for test-only builds')
+
+option('test_no_observability', type: 'boolean', value: false,
+  description: 'Compile out hot-path statistics and wait reporting for test-only builds')
+
+option('test_fast_memory_contexts', type: 'boolean', value: false,
+  description: 'Use faster memory context choices for test-only builds')
+
+option('test_ephemeral_catalog', type: 'boolean', value: false,
+  description: 'Enable ephemeral catalog fast paths for test-only builds')
+
+option('test_no_durable_maintenance', type: 'boolean', value: false,
+  description: 'Disable durable maintenance work for test-only builds')
+
+option('test_fast_analyze', type: 'boolean', value: false,
+  description: 'Use a no-sample ANALYZE fast path for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

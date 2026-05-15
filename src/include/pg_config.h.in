@@ -48,6 +48,50 @@
 /* Define to 1 if you want National Language Support. (--enable-nls) */
 #undef ENABLE_NLS
 
+/* Define to 1 to replace ordinary WAL records with fake LSNs.
+   (--enable-test-fake-wal) */
+#undef USE_TEST_FAKE_WAL
+
+/* Define to 1 to disable background maintenance jobs except async I/O workers.
+   (--enable-test-no-bg-jobs) */
+#undef USE_TEST_NO_BG_JOBS
+
+/* Define to 1 to use a memory-backed relation storage manager.
+   (--enable-test-mem-smgr) */
+#undef USE_TEST_MEM_SMGR
+
+/* Define to 1 to use direct memory-backed temp buffers.
+   (--enable-test-ephemeral-buffers) */
+#undef USE_TEST_EPHEMERAL_BUFFERS
+
+/* Define to 1 to use memory-backed transaction-status SLRUs.
+   (--enable-test-mem-slru) */
+#undef USE_TEST_MEM_SLRU
+
+/* Define to 1 to skip ordinary WAL record assembly.
+   (--enable-test-no-wal-assembly) */
+#undef USE_TEST_NO_WAL_ASSEMBLY
+
+/* Define to 1 to compile out hot-path statistics and wait reporting.
+   (--enable-test-no-observability) */
+#undef USE_TEST_NO_OBSERVABILITY
+
+/* Define to 1 to use faster memory context choices.
+   (--enable-test-fast-memory-contexts) */
+#undef USE_TEST_FAST_MEMORY_CONTEXTS
+
+/* Define to 1 to enable ephemeral catalog fast paths.
+   (--enable-test-ephemeral-catalog) */
+#undef USE_TEST_EPHEMERAL_CATALOG
+
+/* Define to 1 to disable durable maintenance work.
+   (--enable-test-no-durable-maintenance) */
+#undef USE_TEST_NO_DURABLE_MAINTENANCE
+
+/* Define to 1 to use a no-sample ANALYZE fast path.
+   (--enable-test-fast-analyze) */
+#undef USE_TEST_FAST_ANALYZE
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

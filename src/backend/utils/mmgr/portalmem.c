@@ -199,9 +199,9 @@ CreatePortal(const char *name, bool allowDup, bool dupSilent)
 	portal = (Portal) MemoryContextAllocZero(TopPortalContext, sizeof *portal);
 
 	/* initialize portal context; typically it won't store much */
-	portal->portalContext = AllocSetContextCreate(TopPortalContext,
-												  "PortalContext",
-												  ALLOCSET_SMALL_SIZES);
+	portal->portalContext = FastMaybeFreeableContextCreate(TopPortalContext,
+														   "PortalContext",
+														   ALLOCSET_SMALL_SIZES);
 
 	/* create a resource owner for the portal */
 	portal->resowner = ResourceOwnerCreate(CurTransactionResourceOwner,
@@ -342,9 +342,9 @@ PortalCreateHoldStore(Portal portal)
 	 * Note this is NOT a child of the portal's portalContext.
 	 */
 	portal->holdContext =
-		AllocSetContextCreate(TopPortalContext,
-							  "PortalHoldContext",
-							  ALLOCSET_DEFAULT_SIZES);
+		FastMaybeFreeableContextCreate(TopPortalContext,
+									   "PortalHoldContext",
+									   ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Create the tuple store, selecting cross-transaction temp files, and

@@ -21,7 +21,9 @@
 #include "utils/timestamp.h"
 
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 static inline PgStat_SLRUStats *get_slru_entry(int slru_idx);
+#endif
 static void pgstat_reset_slru_counter_internal(int index, TimestampTz ts);
 
 
@@ -55,12 +57,21 @@ pgstat_reset_slru(const char *name)
  * SLRU statistics count accumulation functions --- called from slru.c
  */
 
+#ifdef USE_TEST_NO_OBSERVABILITY
+#define PGSTAT_COUNT_SLRU(stat)						\
+void												\
+CppConcat(pgstat_count_slru_,stat)(int slru_idx)	\
+{													\
+	(void) slru_idx;								\
+}
+#else
 #define PGSTAT_COUNT_SLRU(stat)						\
 void												\
 CppConcat(pgstat_count_slru_,stat)(int slru_idx)	\
 {													\
 	get_slru_entry(slru_idx)->stat += 1;			\
 }
+#endif
 
 /* pgstat_count_slru_blocks_zeroed */
 PGSTAT_COUNT_SLRU(blocks_zeroed)
@@ -211,6 +222,7 @@ pgstat_slru_snapshot_cb(void)
  * Returns pointer to entry with counters for given SLRU (based on the name
  * stored in SlruCtl as lwlock tranche name).
  */
+#ifndef USE_TEST_NO_OBSERVABILITY
 static inline PgStat_SLRUStats *
 get_slru_entry(int slru_idx)
 {
@@ -229,6 +241,7 @@ get_slru_entry(int slru_idx)
 
 	return &pending_SLRUStats[slru_idx];
 }
+#endif
 
 static void
 pgstat_reset_slru_counter_internal(int index, TimestampTz ts)

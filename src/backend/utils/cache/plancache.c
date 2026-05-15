@@ -199,9 +199,9 @@ CreateCachedPlan(const RawStmt *raw_parse_tree,
 	 * caller's context (which we assume to be transient), so that it will be
 	 * cleaned up on error.
 	 */
-	source_context = AllocSetContextCreate(CurrentMemoryContext,
-										   "CachedPlanSource",
-										   ALLOCSET_START_SMALL_SIZES);
+	source_context = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+													"CachedPlanSource",
+													ALLOCSET_START_SMALL_SIZES);
 
 	/*
 	 * Create and fill the CachedPlanSource struct within the new context.
@@ -426,9 +426,9 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 	else
 	{
 		/* Again, it's a good bet the querytree_context can be small */
-		querytree_context = AllocSetContextCreate(source_context,
-												  "CachedPlanQuery",
-												  ALLOCSET_START_SMALL_SIZES);
+		querytree_context = FastMaybeFreeableContextCreate(source_context,
+														   "CachedPlanQuery",
+														   ALLOCSET_START_SMALL_SIZES);
 		MemoryContextSwitchTo(querytree_context);
 		querytree_list = copyObject(querytree_list);
 	}
@@ -888,9 +888,9 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	 * Allocate new query_context and copy the completed querytree into it.
 	 * It's transient until we complete the copying and dependency extraction.
 	 */
-	querytree_context = AllocSetContextCreate(CurrentMemoryContext,
-											  "CachedPlanQuery",
-											  ALLOCSET_START_SMALL_SIZES);
+	querytree_context = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+													   "CachedPlanQuery",
+													   ALLOCSET_START_SMALL_SIZES);
 	oldcxt = MemoryContextSwitchTo(querytree_context);
 
 	qlist = copyObject(tlist);
@@ -1103,9 +1103,9 @@ BuildCachedPlan(CachedPlanSource *plansource, List *qlist,
 	 */
 	if (!plansource->is_oneshot)
 	{
-		plan_context = AllocSetContextCreate(CurrentMemoryContext,
-											 "CachedPlan",
-											 ALLOCSET_START_SMALL_SIZES);
+		plan_context = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+													  "CachedPlan",
+													  ALLOCSET_START_SMALL_SIZES);
 		MemoryContextCopyAndSetIdentifier(plan_context, plansource->query_string);
 
 		/*
@@ -1687,9 +1687,9 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	if (plansource->is_oneshot)
 		elog(ERROR, "cannot copy a one-shot cached plan");
 
-	source_context = AllocSetContextCreate(CurrentMemoryContext,
-										   "CachedPlanSource",
-										   ALLOCSET_START_SMALL_SIZES);
+	source_context = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+													"CachedPlanSource",
+													ALLOCSET_START_SMALL_SIZES);
 
 	oldcxt = MemoryContextSwitchTo(source_context);
 
@@ -1721,9 +1721,9 @@ CopyCachedPlan(CachedPlanSource *plansource)
 		newsource->resultDesc = NULL;
 	newsource->context = source_context;
 
-	querytree_context = AllocSetContextCreate(source_context,
-											  "CachedPlanQuery",
-											  ALLOCSET_START_SMALL_SIZES);
+	querytree_context = FastMaybeFreeableContextCreate(source_context,
+													   "CachedPlanQuery",
+													   ALLOCSET_START_SMALL_SIZES);
 	MemoryContextSwitchTo(querytree_context);
 	newsource->query_list = copyObject(plansource->query_list);
 	newsource->relationOids = copyObject(plansource->relationOids);
@@ -1835,9 +1835,9 @@ GetCachedExpression(Node *expr)
 	 * avoid leaking a long-lived context if we fail while copying data, we
 	 * initially make the context under the caller's context.
 	 */
-	cexpr_context = AllocSetContextCreate(CurrentMemoryContext,
-										  "CachedExpression",
-										  ALLOCSET_SMALL_SIZES);
+	cexpr_context = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+												   "CachedExpression",
+												   ALLOCSET_SMALL_SIZES);
 
 	oldcxt = MemoryContextSwitchTo(cexpr_context);
 

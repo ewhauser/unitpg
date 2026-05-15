@@ -785,11 +785,18 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 	 * the status flags in one XLogRecData, then all the xids in another one?
 	 * Not clear that it's worth the trouble though.
 	 */
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID))
+		(void) XLogSkipInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+	else
+#endif
+	{
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfMultiXactCreate);
 	XLogRegisterData(members, nmembers * sizeof(MultiXactMember));
 
 	(void) XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+	}
 
 	/* Now enter the information into the OFFSETs and MEMBERs logs */
 	RecordNewMultiXact(multi, offset, nmembers, members);
@@ -1006,6 +1013,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	 * Note these are pretty much the same protections in GetNewTransactionId.
 	 *----------
 	 */
+#ifndef USE_TEST_NO_DURABLE_MAINTENANCE
 	if (!MultiXactIdPrecedes(result, MultiXactState->multiVacLimit))
 	{
 		/*
@@ -1091,6 +1099,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 		LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
 		result = MultiXactState->nextMXact;
 	}
+#endif
 
 	/*
 	 * Make sure there is room for the next MXID in the file.  Assigning this
@@ -1766,6 +1775,15 @@ static void
 MultiXactShmemRequest(void *arg)
 {
 	Size		size;
+	int			offset_nslots = multixact_offset_buffers;
+	int			member_nslots = multixact_member_buffers;
+
+#ifdef USE_TEST_MEM_SLRU
+	offset_nslots = SimpleLruTestInMemoryBuffers(offset_nslots,
+												 SLRU_MAX_ALLOWED_BUFFERS);
+	member_nslots = SimpleLruTestInMemoryBuffers(member_nslots,
+												 SLRU_MAX_ALLOWED_BUFFERS);
+#endif
 
 	/*
 	 * Calculate the size of the MultiXactState struct, and the two
@@ -1787,7 +1805,7 @@ MultiXactShmemRequest(void *arg)
 					 .Dir = "pg_multixact/offsets",
 					 .long_segment_names = false,
 
-					 .nslots = multixact_offset_buffers,
+					 .nslots = offset_nslots,
 
 					 .sync_handler = SYNC_HANDLER_MULTIXACT_OFFSET,
 					 .PagePrecedes = MultiXactOffsetPagePrecedes,
@@ -1795,6 +1813,9 @@ MultiXactShmemRequest(void *arg)
 
 					 .buffer_tranche_id = LWTRANCHE_MULTIXACTOFFSET_BUFFER,
 					 .bank_tranche_id = LWTRANCHE_MULTIXACTOFFSET_SLRU,
+#ifdef USE_TEST_MEM_SLRU
+					 .in_memory = true,
+#endif
 		);
 
 	SimpleLruRequest(.desc = &MultiXactMemberSlruDesc,
@@ -1802,7 +1823,7 @@ MultiXactShmemRequest(void *arg)
 					 .Dir = "pg_multixact/members",
 					 .long_segment_names = true,
 
-					 .nslots = multixact_member_buffers,
+					 .nslots = member_nslots,
 
 					 .sync_handler = SYNC_HANDLER_MULTIXACT_MEMBER,
 					 .PagePrecedes = MultiXactMemberPagePrecedes,
@@ -1810,6 +1831,9 @@ MultiXactShmemRequest(void *arg)
 
 					 .buffer_tranche_id = LWTRANCHE_MULTIXACTMEMBER_BUFFER,
 					 .bank_tranche_id = LWTRANCHE_MULTIXACTMEMBER_SLRU,
+#ifdef USE_TEST_MEM_SLRU
+					 .in_memory = true,
+#endif
 		);
 }
 
@@ -2901,6 +2925,15 @@ WriteMTruncateXlogRec(Oid oldestMultiDB,
 	xlrec.oldestMultiDB = oldestMultiDB;
 	xlrec.oldestMulti = oldestMulti;
 	xlrec.oldestOffset = oldestOffset;
+
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID))
+	{
+		recptr = XLogSkipInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID);
+		XLogFlush(recptr);
+		return;
+	}
+#endif
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfMultiXactTruncate);

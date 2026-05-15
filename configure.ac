@@ -242,6 +242,113 @@ PGAC_ARG_BOOL(enable, injection-points, no, [enable injection points (for testin
 AC_SUBST(enable_injection_points)
 
 #
+# Test-only fake WAL
+#
+PGAC_ARG_BOOL(enable, test-fake-wal, no,
+              [replace ordinary WAL records with fake LSNs (for testing)],
+              [AC_DEFINE([USE_TEST_FAKE_WAL], 1,
+                         [Define to 1 to replace ordinary WAL records with fake LSNs. (--enable-test-fake-wal)])])
+AC_SUBST(enable_test_fake_wal)
+
+#
+# Test-only no background jobs
+#
+PGAC_ARG_BOOL(enable, test-no-bg-jobs, no,
+              [disable background maintenance jobs except async I/O workers (for testing)],
+              [AC_DEFINE([USE_TEST_NO_BG_JOBS], 1,
+                         [Define to 1 to disable background maintenance jobs except async I/O workers. (--enable-test-no-bg-jobs)])])
+AC_SUBST(enable_test_no_bg_jobs)
+
+#
+# Test-only in-memory storage manager
+#
+PGAC_ARG_BOOL(enable, test-mem-smgr, no,
+              [use a memory-backed relation storage manager (for testing)],
+              [AC_DEFINE([USE_TEST_MEM_SMGR], 1,
+                         [Define to 1 to use a memory-backed relation storage manager. (--enable-test-mem-smgr)])])
+AC_SUBST(enable_test_mem_smgr)
+
+#
+# Test-only ephemeral buffer mode
+#
+PGAC_ARG_BOOL(enable, test-ephemeral-buffers, no,
+              [use direct memory-backed temp buffers (for testing)],
+              [AC_DEFINE([USE_TEST_EPHEMERAL_BUFFERS], 1,
+                         [Define to 1 to use direct memory-backed temp buffers. (--enable-test-ephemeral-buffers)])])
+AC_SUBST(enable_test_ephemeral_buffers)
+if test "$enable_test_ephemeral_buffers" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  AC_MSG_ERROR([--enable-test-ephemeral-buffers requires --enable-test-mem-smgr])
+fi
+
+#
+# Test-only in-memory transaction-status SLRUs
+#
+PGAC_ARG_BOOL(enable, test-mem-slru, no,
+              [use memory-backed transaction-status SLRUs (for testing)],
+              [AC_DEFINE([USE_TEST_MEM_SLRU], 1,
+                         [Define to 1 to use memory-backed transaction-status SLRUs. (--enable-test-mem-slru)])])
+AC_SUBST(enable_test_mem_slru)
+
+#
+# Test-only no WAL assembly
+#
+PGAC_ARG_BOOL(enable, test-no-wal-assembly, no,
+              [skip ordinary WAL record assembly (for testing)],
+              [AC_DEFINE([USE_TEST_NO_WAL_ASSEMBLY], 1,
+                         [Define to 1 to skip ordinary WAL record assembly. (--enable-test-no-wal-assembly)])])
+AC_SUBST(enable_test_no_wal_assembly)
+if test "$enable_test_no_wal_assembly" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  AC_MSG_ERROR([--enable-test-no-wal-assembly requires --enable-test-fake-wal])
+fi
+
+#
+# Test-only no observability
+#
+PGAC_ARG_BOOL(enable, test-no-observability, no,
+              [compile out hot-path statistics and wait reporting (for testing)],
+              [AC_DEFINE([USE_TEST_NO_OBSERVABILITY], 1,
+                         [Define to 1 to compile out hot-path statistics and wait reporting. (--enable-test-no-observability)])])
+AC_SUBST(enable_test_no_observability)
+
+#
+# Test-only fast memory contexts
+#
+PGAC_ARG_BOOL(enable, test-fast-memory-contexts, no,
+              [use faster memory context choices (for testing)],
+              [AC_DEFINE([USE_TEST_FAST_MEMORY_CONTEXTS], 1,
+                         [Define to 1 to use faster memory context choices. (--enable-test-fast-memory-contexts)])])
+AC_SUBST(enable_test_fast_memory_contexts)
+
+#
+# Test-only ephemeral catalog fast paths
+#
+PGAC_ARG_BOOL(enable, test-ephemeral-catalog, no,
+              [enable ephemeral catalog fast paths (for testing)],
+              [AC_DEFINE([USE_TEST_EPHEMERAL_CATALOG], 1,
+                         [Define to 1 to enable ephemeral catalog fast paths. (--enable-test-ephemeral-catalog)])])
+AC_SUBST(enable_test_ephemeral_catalog)
+
+#
+# Test-only no durable maintenance
+#
+PGAC_ARG_BOOL(enable, test-no-durable-maintenance, no,
+              [disable durable maintenance work (for testing)],
+              [AC_DEFINE([USE_TEST_NO_DURABLE_MAINTENANCE], 1,
+                         [Define to 1 to disable durable maintenance work. (--enable-test-no-durable-maintenance)])])
+AC_SUBST(enable_test_no_durable_maintenance)
+
+#
+# Test-only fast ANALYZE
+#
+PGAC_ARG_BOOL(enable, test-fast-analyze, no,
+              [use a no-sample ANALYZE fast path (for testing)],
+              [AC_DEFINE([USE_TEST_FAST_ANALYZE], 1,
+                         [Define to 1 to use a no-sample ANALYZE fast path. (--enable-test-fast-analyze)])])
+AC_SUBST(enable_test_fast_analyze)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

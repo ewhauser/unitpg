@@ -454,8 +454,10 @@ static TimestampTz maybe_start_io_workers_scheduled_at(void);
 static bool CreateOptsFile(int argc, char *argv[], char *fullprogname);
 static PMChild *StartChildProcess(BackendType type);
 static void StartSysLogger(void);
+#ifndef USE_TEST_NO_BG_JOBS
 static void StartAutovacuumWorker(void);
 static bool StartBackgroundWorker(RegisteredBgWorker *rw);
+#endif
 static void InitPostmasterDeathWatchHandle(void);
 
 #ifdef WIN32
@@ -923,7 +925,9 @@ PostmasterMain(int argc, char *argv[])
 	 * Register the apply launcher.  It's probably a good idea to call this
 	 * before any modules had a chance to take the background worker slots.
 	 */
+#ifndef USE_TEST_NO_BG_JOBS
 	ApplyLauncherRegister();
+#endif
 
 	/*
 	 * Register the shared memory needs of all core subsystems.
@@ -1396,11 +1400,13 @@ PostmasterMain(int argc, char *argv[])
 	/* Make sure we can perform I/O while starting up. */
 	maybe_start_io_workers();
 
+#ifndef USE_TEST_NO_BG_JOBS
 	/* Start bgwriter and checkpointer so they can help with recovery */
 	if (CheckpointerPMChild == NULL)
 		CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
 	if (BgWriterPMChild == NULL)
 		BgWriterPMChild = StartChildProcess(B_BG_WRITER);
+#endif
 
 	/*
 	 * We're ready to rock and roll...
@@ -1409,8 +1415,10 @@ PostmasterMain(int argc, char *argv[])
 	Assert(StartupPMChild != NULL);
 	StartupStatus = STARTUP_RUNNING;
 
+#ifndef USE_TEST_NO_BG_JOBS
 	/* Some workers may be scheduled to start now */
 	maybe_start_bgworkers();
+#endif
 
 	status = ServerLoop();
 
@@ -3062,6 +3070,17 @@ PostmasterStateMachine(void)
 				 * checkpointer to do a shutdown checkpoint.
 				 */
 				Assert(Shutdown > NoShutdown);
+#ifdef USE_TEST_NO_BG_JOBS
+				/*
+				 * Test-only no-job builds intentionally skip shutdown
+				 * checkpoints.  The disposable cluster may require recovery if
+				 * it is reused, which is acceptable for this mode.
+				 */
+				UpdatePMState(PM_WAIT_DEAD_END);
+				ConfigurePostmasterWaitSet(false);
+				SignalChildren(SIGUSR2, btmask(B_IO_WORKER));
+				SignalChildren(SIGTERM, btmask(B_DEAD_END_BACKEND));
+#else
 				/* Start the checkpointer if not running */
 				if (CheckpointerPMChild == NULL)
 					CheckpointerPMChild = StartChildProcess(B_CHECKPOINTER);
@@ -3092,6 +3111,7 @@ PostmasterStateMachine(void)
 					 */
 					HandleFatalError(PMQUIT_FOR_CRASH, false);
 				}
+#endif
 			}
 		}
 	}
@@ -3337,6 +3357,19 @@ LaunchMissingBackgroundProcesses(void)
 	 * we always will process the config change in a timely manner.
 	 */
 	maybe_start_io_workers();
+
+#ifdef USE_TEST_NO_BG_JOBS
+	/*
+	 * Test-only no-job builds still accept foreground connections and async
+	 * I/O workers, but never launch background maintenance children or
+	 * registered background workers.
+	 */
+	StartWorkerNeeded = false;
+	HaveCrashedWorker = false;
+	start_autovac_launcher = false;
+	WalReceiverRequested = false;
+	return;
+#endif
 
 	/*
 	 * The checkpointer and the background writer are active from the start,
@@ -3810,9 +3843,15 @@ process_pm_pmsignal(void)
 	/* Process background worker state changes. */
 	if (CheckPostmasterSignal(PMSIGNAL_BACKGROUND_WORKER_CHANGE))
 	{
+#ifdef USE_TEST_NO_BG_JOBS
+		BackgroundWorkerStateChange(false);
+		ForgetUnstartedBackgroundWorkers();
+		StartWorkerNeeded = false;
+#else
 		/* Accept new worker requests only if not stopping. */
 		BackgroundWorkerStateChange(pmState < PM_STOP_BACKENDS);
 		StartWorkerNeeded = true;
+#endif
 	}
 
 	/* Tell syslogger to rotate logfile if requested */
@@ -3832,6 +3871,7 @@ process_pm_pmsignal(void)
 	if (CheckPostmasterSignal(PMSIGNAL_START_AUTOVAC_LAUNCHER) &&
 		Shutdown <= SmartShutdown && pmState < PM_STOP_BACKENDS)
 	{
+#ifndef USE_TEST_NO_BG_JOBS
 		/*
 		 * Start one iteration of the autovacuum daemon, even if autovacuuming
 		 * is nominally not enabled.  This is so we can have an active defense
@@ -3842,19 +3882,24 @@ process_pm_pmsignal(void)
 		 * completes.
 		 */
 		start_autovac_launcher = true;
+#endif
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_START_AUTOVAC_WORKER) &&
 		Shutdown <= SmartShutdown && pmState < PM_STOP_BACKENDS)
 	{
+#ifndef USE_TEST_NO_BG_JOBS
 		/* The autovacuum launcher wants us to start a worker process. */
 		StartAutovacuumWorker();
+#endif
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_START_WALRECEIVER))
 	{
+#ifndef USE_TEST_NO_BG_JOBS
 		/* Startup Process wants us to start the walreceiver process. */
 		WalReceiverRequested = true;
+#endif
 	}
 
 	if (CheckPostmasterSignal(PMSIGNAL_XLOG_IS_SHUTDOWN))
@@ -4077,6 +4122,7 @@ StartSysLogger(void)
  *
  * NB -- this code very roughly matches BackendStartup.
  */
+#ifndef USE_TEST_NO_BG_JOBS
 static void
 StartAutovacuumWorker(void)
 {
@@ -4122,6 +4168,7 @@ StartAutovacuumWorker(void)
 		avlauncher_needs_signal = true;
 	}
 }
+#endif
 
 
 /*
@@ -4169,6 +4216,7 @@ CreateOptsFile(int argc, char *argv[], char *fullprogname)
  *
  * NB -- this code very roughly matches BackendStartup.
  */
+#ifndef USE_TEST_NO_BG_JOBS
 static bool
 StartBackgroundWorker(RegisteredBgWorker *rw)
 {
@@ -4264,6 +4312,7 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 
 	return false;
 }
+#endif
 
 /*
  * If the time is right, start background worker(s).
@@ -4279,6 +4328,11 @@ bgworker_should_start_now(BgWorkerStartTime start_time)
 static void
 maybe_start_bgworkers(void)
 {
+#ifdef USE_TEST_NO_BG_JOBS
+	StartWorkerNeeded = false;
+	HaveCrashedWorker = false;
+	return;
+#else
 #define MAX_BGWORKERS_TO_LAUNCH 100
 	int			num_launched = 0;
 	TimestampTz now = 0;
@@ -4388,6 +4442,7 @@ maybe_start_bgworkers(void)
 			}
 		}
 	}
+#endif
 }
 
 static bool

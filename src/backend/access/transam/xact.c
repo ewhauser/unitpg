@@ -5878,7 +5878,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 {
 	xl_xact_commit xlrec;
 	xl_xact_xinfo xl_xinfo;
-	xl_xact_dbinfo xl_dbinfo;
+	xl_xact_dbinfo xl_dbinfo = {0};
 	xl_xact_subxacts xl_subxacts;
 	xl_xact_relfilelocators xl_relfilelocators;
 	xl_xact_stats_items xl_dropped_stats;
@@ -5973,6 +5973,11 @@ XactLogCommitRecord(TimestampTz commit_time,
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_XACT_ID, info))
+		return XLogSkipInsert(RM_XACT_ID, info);
+#endif
+
 	/* Then include all the collected data into the commit record. */
 
 	XLogBeginInsert();
@@ -6052,7 +6057,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	xl_xact_relfilelocators xl_relfilelocators;
 	xl_xact_stats_items xl_dropped_stats;
 	xl_xact_twophase xl_twophase;
-	xl_xact_dbinfo xl_dbinfo;
+	xl_xact_dbinfo xl_dbinfo = {0};
 	xl_xact_origin xl_origin;
 
 	uint8		info;
@@ -6125,6 +6130,11 @@ XactLogAbortRecord(TimestampTz abort_time,
 
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
+
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_XACT_ID, info))
+		return XLogSkipInsert(RM_XACT_ID, info);
+#endif
 
 	/* Then include all the collected data into the abort record. */
 

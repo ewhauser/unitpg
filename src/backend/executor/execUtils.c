@@ -96,9 +96,9 @@ CreateExecutorState(void)
 	/*
 	 * Create the per-query context for this Executor run.
 	 */
-	qcontext = AllocSetContextCreate(CurrentMemoryContext,
-									 "ExecutorState",
-									 ALLOCSET_DEFAULT_SIZES);
+	qcontext = FastQueryContextCreate(CurrentMemoryContext,
+									  "ExecutorState",
+									  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Make the EState node within the per-query context.  This way, we don't
@@ -261,11 +261,11 @@ CreateExprContextInternal(EState *estate, Size minContextSize,
 	 * Create working memory for expression evaluation in this context.
 	 */
 	econtext->ecxt_per_tuple_memory =
-		AllocSetContextCreate(estate->es_query_cxt,
-							  "ExprContext",
-							  minContextSize,
-							  initBlockSize,
-							  maxBlockSize);
+		FastMaybeFreeableContextCreate(estate->es_query_cxt,
+									   "ExprContext",
+									   minContextSize,
+									   initBlockSize,
+									   maxBlockSize);
 
 	econtext->ecxt_param_exec_vals = estate->es_param_exec_vals;
 	econtext->ecxt_param_list_info = estate->es_param_list_info;
@@ -377,9 +377,9 @@ CreateStandaloneExprContext(void)
 	 * Create working memory for expression evaluation in this context.
 	 */
 	econtext->ecxt_per_tuple_memory =
-		AllocSetContextCreate(CurrentMemoryContext,
-							  "ExprContext",
-							  ALLOCSET_DEFAULT_SIZES);
+		FastMaybeFreeableContextCreate(CurrentMemoryContext,
+									   "ExprContext",
+									   ALLOCSET_DEFAULT_SIZES);
 
 	econtext->ecxt_param_exec_vals = NULL;
 	econtext->ecxt_param_list_info = NULL;

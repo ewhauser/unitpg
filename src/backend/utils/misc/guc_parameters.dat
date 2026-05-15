@@ -3204,7 +3204,7 @@
 { name => 'track_counts', type => 'bool', context => 'PGC_SUSET', group => 'STATS_CUMULATIVE',
   short_desc => 'Collects statistics on database activity.',
   variable => 'pgstat_track_counts',
-  boot_val => 'true',
+  boot_val => 'TEST_NO_OBSERVABILITY_TRACK_COUNTS_BOOT_VAL',
 },
 
 { name => 'track_functions', type => 'enum', context => 'PGC_SUSET', group => 'STATS_CUMULATIVE',

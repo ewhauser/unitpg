@@ -45,6 +45,9 @@ static WalUsage prevWalUsage;
 void
 pgstat_report_wal(bool force)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) force;
+#else
 	bool		nowait;
 
 	/* like in pgstat.c, don't wait for lock acquisition when !force */
@@ -57,6 +60,7 @@ pgstat_report_wal(bool force)
 	/* flush IO stats */
 	pgstat_flush_io(nowait);
 	(void) pgstat_flush_backend(nowait, PGSTAT_BACKEND_FLUSH_IO);
+#endif
 }
 
 /*

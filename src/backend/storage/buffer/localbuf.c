@@ -22,6 +22,9 @@
 #include "storage/buf_internals.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+#include "storage/memsmgr.h"
+#endif
 #include "utils/guc_hooks.h"
 #include "utils/memdebug.h"
 #include "utils/memutils.h"
@@ -47,6 +50,10 @@ int			NLocBuffer = 0;		/* until buffers are initialized */
 BufferDesc *LocalBufferDescriptors = NULL;
 Block	   *LocalBufferBlockPointers = NULL;
 int32	   *LocalRefCount = NULL;
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+static Block *LocalBufferOwnedBlockPointers = NULL;
+static bool *LocalBufferDirectBacked = NULL;
+#endif
 
 static int	nextFreeLocalBufId = 0;
 
@@ -59,6 +66,57 @@ static int	NLocalPinnedBuffers = 0;
 static void InitLocalBuffers(void);
 static Block GetLocalBufferStorage(void);
 static Buffer GetLocalVictimBuffer(void);
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+static bool TestEphemeralLocalBufferAttach(SMgrRelation smgr,
+										   ForkNumber forkNum,
+										   BlockNumber blockNum,
+										   BufferDesc *bufHdr, bool create);
+static bool TestEphemeralLocalBufferIsDirect(BufferDesc *bufHdr);
+static void TestEphemeralLocalBufferDetach(BufferDesc *bufHdr);
+#endif
+
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+static bool
+TestEphemeralLocalBufferAttach(SMgrRelation smgr, ForkNumber forkNum,
+							   BlockNumber blockNum, BufferDesc *bufHdr,
+							   bool create)
+{
+	bool		found;
+	Block		page;
+	int			bufid = -BufferDescriptorGetBuffer(bufHdr) - 1;
+
+	if (LocalBufferDirectBacked == NULL || !mem_buffer_direct_enabled(smgr))
+		return false;
+
+	page = mem_buffer_direct_page(smgr, forkNum, blockNum, create, &found);
+	if (page == NULL || !found)
+		return false;
+
+	LocalBufHdrGetBlock(bufHdr) = page;
+	LocalBufferDirectBacked[bufid] = true;
+	return true;
+}
+
+static bool
+TestEphemeralLocalBufferIsDirect(BufferDesc *bufHdr)
+{
+	int			bufid = -BufferDescriptorGetBuffer(bufHdr) - 1;
+
+	return LocalBufferDirectBacked != NULL && LocalBufferDirectBacked[bufid];
+}
+
+static void
+TestEphemeralLocalBufferDetach(BufferDesc *bufHdr)
+{
+	int			bufid = -BufferDescriptorGetBuffer(bufHdr) - 1;
+
+	if (LocalBufferDirectBacked != NULL && LocalBufferDirectBacked[bufid])
+	{
+		LocalBufferDirectBacked[bufid] = false;
+		LocalBufHdrGetBlock(bufHdr) = LocalBufferOwnedBlockPointers[bufid];
+	}
+}
+#endif
 
 
 /*
@@ -117,7 +175,7 @@ PrefetchLocalBuffer(SMgrRelation smgr, ForkNumber forkNum,
  */
 BufferDesc *
 LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
-				 bool *foundPtr)
+				 bool *foundPtr, bool allow_storage_hit)
 {
 	BufferTag	newTag;			/* identity of requested block */
 	LocalBufferLookupEnt *hresult;
@@ -170,6 +228,22 @@ LocalBufferAlloc(SMgrRelation smgr, ForkNumber forkNum, BlockNumber blockNum,
 		buf_state |= BM_TAG_VALID | BUF_USAGECOUNT_ONE;
 		pg_atomic_unlocked_write_u64(&bufHdr->state, buf_state);
 
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+		if (TestEphemeralLocalBufferAttach(smgr, forkNum, blockNum, bufHdr,
+										   true))
+		{
+			if (allow_storage_hit)
+			{
+				buf_state = pg_atomic_read_u64(&bufHdr->state);
+				buf_state |= BM_VALID;
+				pg_atomic_unlocked_write_u64(&bufHdr->state, buf_state);
+				*foundPtr = true;
+			}
+			else
+				*foundPtr = false;
+		}
+		else
+#endif
 		*foundPtr = false;
 	}
 
@@ -186,6 +260,17 @@ FlushLocalBuffer(BufferDesc *bufHdr, SMgrRelation reln)
 	Page		localpage = (char *) LocalBufHdrGetBlock(bufHdr);
 
 	Assert(LocalRefCount[-BufferDescriptorGetBuffer(bufHdr) - 1] > 0);
+
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+	if (TestEphemeralLocalBufferIsDirect(bufHdr))
+	{
+		if (StartLocalBufferIO(bufHdr, false, true, NULL) != BUFFER_IO_READY_FOR_IO)
+			elog(ERROR, "failed to start write IO on direct local buffer");
+
+		TerminateLocalBufferIO(bufHdr, true, 0, false);
+		return;
+	}
+#endif
 
 	/*
 	 * Try to start an I/O operation.  There currently are no reasons for
@@ -281,6 +366,9 @@ GetLocalVictimBuffer(void)
 	{
 		/* Set pointer for use by BufferGetBlock() macro */
 		LocalBufHdrGetBlock(bufHdr) = GetLocalBufferStorage();
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+		LocalBufferOwnedBlockPointers[victim_bufid] = LocalBufHdrGetBlock(bufHdr);
+#endif
 	}
 
 	/*
@@ -468,6 +556,17 @@ ExtendBufferedRelLocal(BufferManagerRelation bmr,
 
 	/* actually extend relation */
 	smgrzeroextend(BMR_GET_SMGR(bmr), fork, first_block, extend_by, false);
+
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+	for (uint32 i = 0; i < extend_by; i++)
+	{
+		BufferDesc *buf_hdr = GetLocalBufferDescriptor(-buffers[i] - 1);
+
+		(void) TestEphemeralLocalBufferAttach(BMR_GET_SMGR(bmr), fork,
+											  first_block + i, buf_hdr,
+											  true);
+	}
+#endif
 
 	pgstat_count_io_op_time(IOOBJECT_TEMP_RELATION, IOCONTEXT_NORMAL, IOOP_EXTEND,
 							io_start, 1, extend_by * BLCKSZ);
@@ -667,6 +766,11 @@ InvalidateLocalBuffer(BufferDesc *bufHdr, bool check_unreferenced)
 		hash_search(LocalBufHash, &bufHdr->tag, HASH_REMOVE, NULL);
 	if (!hresult)				/* shouldn't happen */
 		elog(ERROR, "local buffer hash table corrupted");
+
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+	TestEphemeralLocalBufferDetach(bufHdr);
+#endif
+
 	/* Mark buffer invalid */
 	ClearBufferTag(&bufHdr->tag);
 	buf_state &= ~BUF_FLAG_MASK;
@@ -772,7 +876,16 @@ InitLocalBuffers(void)
 	LocalBufferDescriptors = (BufferDesc *) calloc(nbufs, sizeof(BufferDesc));
 	LocalBufferBlockPointers = (Block *) calloc(nbufs, sizeof(Block));
 	LocalRefCount = (int32 *) calloc(nbufs, sizeof(int32));
-	if (!LocalBufferDescriptors || !LocalBufferBlockPointers || !LocalRefCount)
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+	LocalBufferOwnedBlockPointers = (Block *) calloc(nbufs, sizeof(Block));
+	LocalBufferDirectBacked = (bool *) calloc(nbufs, sizeof(bool));
+#endif
+	if (!LocalBufferDescriptors || !LocalBufferBlockPointers || !LocalRefCount
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+		|| !LocalBufferOwnedBlockPointers
+		|| !LocalBufferDirectBacked
+#endif
+		)
 		ereport(FATAL,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("out of memory")));
@@ -890,6 +1003,9 @@ UnpinLocalBufferNoOwner(Buffer buffer)
 		pg_atomic_unlocked_write_u64(&buf_hdr->state, buf_state);
 
 		/* see comment in UnpinBufferNoOwner */
+#if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
+		if (!TestEphemeralLocalBufferIsDirect(buf_hdr))
+#endif
 		VALGRIND_MAKE_MEM_NOACCESS(LocalBufHdrGetBlock(buf_hdr), BLCKSZ);
 	}
 }

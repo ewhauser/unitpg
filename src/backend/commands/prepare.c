@@ -591,10 +591,12 @@ ExplainExecuteQuery(ExecuteStmt *execstmt, IntoClause *into, ExplainState *es,
 	if (es->memory)
 	{
 		/* See ExplainOneQuery about this */
+#ifndef USE_TEST_FAST_MEMORY_CONTEXTS
 		Assert(IsA(CurrentMemoryContext, AllocSetContext));
-		planner_ctx = AllocSetContextCreate(CurrentMemoryContext,
-											"explain analyze planner context",
-											ALLOCSET_DEFAULT_SIZES);
+#endif
+		planner_ctx = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+													 "explain analyze planner context",
+													 ALLOCSET_DEFAULT_SIZES);
 		saved_ctx = MemoryContextSwitchTo(planner_ctx);
 	}
 

@@ -205,6 +205,11 @@ SyncPostCheckpoint(void)
 	int			absorb_counter;
 	ListCell   *lc;
 
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster)
+		return;
+#endif
+
 	absorb_counter = UNLINKS_PER_ABSORB;
 	foreach(lc, pendingUnlinks)
 	{
@@ -300,6 +305,11 @@ ProcessSyncRequests(void)
 	uint64		elapsed;
 	uint64		longest = 0;
 	uint64		total_elapsed = 0;
+
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster)
+		return;
+#endif
 
 	/*
 	 * This is only called during checkpoints, and checkpoints should only

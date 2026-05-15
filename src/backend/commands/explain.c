@@ -345,9 +345,9 @@ standard_ExplainOneQuery(Query *query, int cursorOptions,
 		 * to create a context of the same type as another, so we pray and
 		 * hope that this is OK.
 		 */
-		planner_ctx = AllocSetContextCreate(CurrentMemoryContext,
-											"explain analyze planner context",
-											ALLOCSET_DEFAULT_SIZES);
+		planner_ctx = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+													 "explain analyze planner context",
+													 ALLOCSET_DEFAULT_SIZES);
 		saved_ctx = MemoryContextSwitchTo(planner_ctx);
 	}
 

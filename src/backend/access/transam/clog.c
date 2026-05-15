@@ -789,6 +789,8 @@ CLOGShmemBuffers(void)
 static void
 CLOGShmemRequest(void *arg)
 {
+	int			nslots;
+
 	/* If auto-tuning is requested, now is the time to do it */
 	if (transaction_buffers == 0)
 	{
@@ -809,12 +811,18 @@ CLOGShmemRequest(void *arg)
 							PGC_S_OVERRIDE);
 	}
 	Assert(transaction_buffers != 0);
+
+	nslots = CLOGShmemBuffers();
+#ifdef USE_TEST_MEM_SLRU
+	nslots = SimpleLruTestInMemoryBuffers(nslots, CLOG_MAX_ALLOWED_BUFFERS);
+#endif
+
 	SimpleLruRequest(.desc = &XactSlruDesc,
 					 .name = "transaction",
 					 .Dir = "pg_xact",
 					 .long_segment_names = false,
 
-					 .nslots = CLOGShmemBuffers(),
+					 .nslots = nslots,
 					 .nlsns = CLOG_LSNS_PER_PAGE,
 
 					 .sync_handler = SYNC_HANDLER_CLOG,
@@ -823,6 +831,9 @@ CLOGShmemRequest(void *arg)
 
 					 .buffer_tranche_id = LWTRANCHE_XACT_BUFFER,
 					 .bank_tranche_id = LWTRANCHE_XACT_SLRU,
+#ifdef USE_TEST_MEM_SLRU
+					 .in_memory = true,
+#endif
 		);
 }
 
@@ -1076,6 +1087,15 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact, Oid oldestXactDb)
 	xlrec.pageno = pageno;
 	xlrec.oldestXact = oldestXact;
 	xlrec.oldestXactDb = oldestXactDb;
+
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_CLOG_ID, CLOG_TRUNCATE))
+	{
+		recptr = XLogSkipInsert(RM_CLOG_ID, CLOG_TRUNCATE);
+		XLogFlush(recptr);
+		return;
+	}
+#endif
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xl_clog_truncate));

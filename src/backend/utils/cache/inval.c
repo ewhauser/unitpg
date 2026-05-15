@@ -1956,6 +1956,12 @@ LogLogicalInvalidations(void)
 		xlrec.nmsgs = nmsgs;
 
 		/* perform insertion */
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_XACT_ID, XLOG_XACT_INVALIDATIONS))
+			(void) XLogSkipInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, MinSizeOfXactInvals);
 		ProcessMessageSubGroupMulti(group, CatCacheMsgs,
@@ -1965,5 +1971,6 @@ LogLogicalInvalidations(void)
 									XLogRegisterData(msgs,
 													 n * sizeof(SharedInvalidationMessage)));
 		XLogInsert(RM_XACT_ID, XLOG_XACT_INVALIDATIONS);
+		}
 	}
 }

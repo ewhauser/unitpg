@@ -26,9 +26,11 @@ typedef struct PgStat_PendingDroppedStatsItem
 } PgStat_PendingDroppedStatsItem;
 
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 static void AtEOXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state, bool isCommit);
 static void AtEOSubXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state,
 											bool isCommit, int nestDepth);
+#endif
 
 static PgStat_SubXactStatus *pgStatXactStack = NULL;
 
@@ -39,6 +41,13 @@ static PgStat_SubXactStatus *pgStatXactStack = NULL;
 void
 AtEOXact_PgStat(bool isCommit, bool parallel)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) isCommit;
+	(void) parallel;
+	pgStatXactStack = NULL;
+	pgstat_clear_snapshot();
+	return;
+#else
 	PgStat_SubXactStatus *xact_state;
 
 	AtEOXact_PgStat_Database(isCommit, parallel);
@@ -57,12 +66,14 @@ AtEOXact_PgStat(bool isCommit, bool parallel)
 
 	/* Make sure any stats snapshot is thrown away */
 	pgstat_clear_snapshot();
+#endif
 }
 
 /*
  * When committing, drop stats for objects dropped in the transaction. When
  * aborting, drop stats for objects created in the transaction.
  */
+#ifndef USE_TEST_NO_OBSERVABILITY
 static void
 AtEOXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state, bool isCommit)
 {
@@ -105,6 +116,7 @@ AtEOXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state, bool isCommit)
 	if (not_freed_count > 0)
 		pgstat_request_entry_refs_gc();
 }
+#endif
 
 /*
  * Called from access/transam/xact.c at subtransaction commit/abort.
@@ -112,6 +124,11 @@ AtEOXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state, bool isCommit)
 void
 AtEOSubXact_PgStat(bool isCommit, int nestDepth)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) isCommit;
+	(void) nestDepth;
+	return;
+#else
 	PgStat_SubXactStatus *xact_state;
 
 	/* merge the sub-transaction's transactional stats into the parent */
@@ -127,11 +144,13 @@ AtEOSubXact_PgStat(bool isCommit, int nestDepth)
 
 		pfree(xact_state);
 	}
+#endif
 }
 
 /*
  * Like AtEOXact_PgStat_DroppedStats(), but for subtransactions.
  */
+#ifndef USE_TEST_NO_OBSERVABILITY
 static void
 AtEOSubXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state,
 								bool isCommit, int nestDepth)
@@ -183,6 +202,7 @@ AtEOSubXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state,
 	if (not_freed_count > 0)
 		pgstat_request_entry_refs_gc();
 }
+#endif
 
 /*
  * Save the transactional stats state at 2PC transaction prepare.
@@ -190,6 +210,10 @@ AtEOSubXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state,
 void
 AtPrepare_PgStat(void)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	pgStatXactStack = NULL;
+	pgstat_clear_snapshot();
+#else
 	PgStat_SubXactStatus *xact_state;
 
 	xact_state = pgStatXactStack;
@@ -200,6 +224,7 @@ AtPrepare_PgStat(void)
 
 		AtPrepare_PgStat_Relations(xact_state);
 	}
+#endif
 }
 
 /*
@@ -210,6 +235,10 @@ AtPrepare_PgStat(void)
 void
 PostPrepare_PgStat(void)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	pgStatXactStack = NULL;
+	pgstat_clear_snapshot();
+#else
 	PgStat_SubXactStatus *xact_state;
 
 	/*
@@ -228,6 +257,7 @@ PostPrepare_PgStat(void)
 
 	/* Make sure any stats snapshot is thrown away */
 	pgstat_clear_snapshot();
+#endif
 }
 
 /*
@@ -271,6 +301,11 @@ pgstat_get_xact_stack_level(int nest_level)
 int
 pgstat_get_transactional_drops(bool isCommit, xl_xact_stats_item **items)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) isCommit;
+	*items = NULL;
+	return 0;
+#else
 	PgStat_SubXactStatus *xact_state = pgStatXactStack;
 	int			nitems = 0;
 	dlist_iter	iter;
@@ -303,6 +338,7 @@ pgstat_get_transactional_drops(bool isCommit, xl_xact_stats_item **items)
 	}
 
 	return nitems;
+#endif
 }
 
 /*
@@ -313,6 +349,11 @@ pgstat_get_transactional_drops(bool isCommit, xl_xact_stats_item **items)
 void
 pgstat_execute_transactional_drops(int ndrops, struct xl_xact_stats_item *items, bool is_redo)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) ndrops;
+	(void) items;
+	(void) is_redo;
+#else
 	int			not_freed_count = 0;
 
 	if (ndrops == 0)
@@ -329,8 +370,10 @@ pgstat_execute_transactional_drops(int ndrops, struct xl_xact_stats_item *items,
 
 	if (not_freed_count > 0)
 		pgstat_request_entry_refs_gc();
+#endif
 }
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 static void
 create_drop_transactional_internal(PgStat_Kind kind, Oid dboid, uint64 objid, bool is_create)
 {
@@ -349,6 +392,7 @@ create_drop_transactional_internal(PgStat_Kind kind, Oid dboid, uint64 objid, bo
 
 	dclist_push_tail(&xact_state->pending_drops, &drop->node);
 }
+#endif
 
 /*
  * Create a stats entry for a newly created database object in a transactional
@@ -360,6 +404,11 @@ create_drop_transactional_internal(PgStat_Kind kind, Oid dboid, uint64 objid, bo
 void
 pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) kind;
+	(void) dboid;
+	(void) objid;
+#else
 	if (pgstat_get_entry_ref(kind, dboid, objid, false, NULL))
 	{
 		ereport(WARNING,
@@ -371,6 +420,7 @@ pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 	}
 
 	create_drop_transactional_internal(kind, dboid, objid, /* create */ true);
+#endif
 }
 
 /*
@@ -383,5 +433,11 @@ pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 void
 pgstat_drop_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) kind;
+	(void) dboid;
+	(void) objid;
+#else
 	create_drop_transactional_internal(kind, dboid, objid, /* create */ false);
+#endif
 }

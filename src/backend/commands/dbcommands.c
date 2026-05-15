@@ -526,17 +526,25 @@ CreateDirAndVersionFile(char *dbpath, Oid dbid, Oid tsid, bool isRedo)
 	if (!isRedo)
 	{
 		xl_dbase_create_wal_log_rec xlrec;
+		const uint8	info = XLOG_DBASE_CREATE_WAL_LOG;
 
 		START_CRIT_SECTION();
 
 		xlrec.db_id = dbid;
 		xlrec.tablespace_id = tsid;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_DBASE_ID, info))
+			(void) XLogSkipInsert(RM_DBASE_ID, info);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec,
 						 sizeof(xl_dbase_create_wal_log_rec));
 
-		(void) XLogInsert(RM_DBASE_ID, XLOG_DBASE_CREATE_WAL_LOG);
+		(void) XLogInsert(RM_DBASE_ID, info);
+		}
 
 		END_CRIT_SECTION();
 	}
@@ -622,18 +630,25 @@ CreateDatabaseUsingFileCopy(Oid src_dboid, Oid dst_dboid, Oid src_tsid,
 		/* Record the filesystem change in XLOG */
 		{
 			xl_dbase_create_file_copy_rec xlrec;
+			const uint8	info = XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE;
 
 			xlrec.db_id = dst_dboid;
 			xlrec.tablespace_id = dsttablespace;
 			xlrec.src_db_id = src_dboid;
 			xlrec.src_tablespace_id = srctablespace;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+			if (!XLogRecordAssemblyRequired(RM_DBASE_ID, info))
+				(void) XLogSkipInsert(RM_DBASE_ID, info);
+			else
+#endif
+			{
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec,
 							 sizeof(xl_dbase_create_file_copy_rec));
 
-			(void) XLogInsert(RM_DBASE_ID,
-							  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+			(void) XLogInsert(RM_DBASE_ID, info);
+			}
 		}
 		pfree(srcpath);
 		pfree(dstpath);
@@ -2224,18 +2239,25 @@ movedb(const char *dbname, const char *tblspcname)
 		 */
 		{
 			xl_dbase_create_file_copy_rec xlrec;
+			const uint8	info = XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE;
 
 			xlrec.db_id = db_id;
 			xlrec.tablespace_id = dst_tblspcoid;
 			xlrec.src_db_id = db_id;
 			xlrec.src_tablespace_id = src_tblspcoid;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+			if (!XLogRecordAssemblyRequired(RM_DBASE_ID, info))
+				(void) XLogSkipInsert(RM_DBASE_ID, info);
+			else
+#endif
+			{
 			XLogBeginInsert();
 			XLogRegisterData(&xlrec,
 							 sizeof(xl_dbase_create_file_copy_rec));
 
-			(void) XLogInsert(RM_DBASE_ID,
-							  XLOG_DBASE_CREATE_FILE_COPY | XLR_SPECIAL_REL_UPDATE);
+			(void) XLogInsert(RM_DBASE_ID, info);
+			}
 		}
 
 		/*
@@ -2322,16 +2344,23 @@ movedb(const char *dbname, const char *tblspcname)
 	 */
 	{
 		xl_dbase_drop_rec xlrec;
+		const uint8	info = XLOG_DBASE_DROP | XLR_SPECIAL_REL_UPDATE;
 
 		xlrec.db_id = db_id;
 		xlrec.ntablespaces = 1;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_DBASE_ID, info))
+			(void) XLogSkipInsert(RM_DBASE_ID, info);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, sizeof(xl_dbase_drop_rec));
 		XLogRegisterData(&src_tblspcoid, sizeof(Oid));
 
-		(void) XLogInsert(RM_DBASE_ID,
-						  XLOG_DBASE_DROP | XLR_SPECIAL_REL_UPDATE);
+		(void) XLogInsert(RM_DBASE_ID, info);
+		}
 	}
 
 	/* Now it's safe to release the database lock */
@@ -3081,16 +3110,23 @@ remove_dbtablespaces(Oid db_id)
 	/* Record the filesystem change in XLOG */
 	{
 		xl_dbase_drop_rec xlrec;
+		const uint8	info = XLOG_DBASE_DROP | XLR_SPECIAL_REL_UPDATE;
 
 		xlrec.db_id = db_id;
 		xlrec.ntablespaces = ntblspc;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_DBASE_ID, info))
+			(void) XLogSkipInsert(RM_DBASE_ID, info);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, MinSizeOfDbaseDropRec);
 		XLogRegisterData(tablespace_ids, ntblspc * sizeof(Oid));
 
-		(void) XLogInsert(RM_DBASE_ID,
-						  XLOG_DBASE_DROP | XLR_SPECIAL_REL_UPDATE);
+		(void) XLogInsert(RM_DBASE_ID, info);
+		}
 	}
 
 	list_free(ltblspc);

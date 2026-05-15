@@ -68,6 +68,15 @@ void
 pgstat_count_io_op(IOObject io_object, IOContext io_context, IOOp io_op,
 				   uint32 cnt, uint64 bytes)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) io_object;
+	(void) io_context;
+	(void) io_op;
+	(void) cnt;
+	(void) bytes;
+	return;
+#endif
+
 	Assert((unsigned int) io_object < IOOBJECT_NUM_TYPES);
 	Assert((unsigned int) io_context < IOCONTEXT_NUM_TYPES);
 	Assert(pgstat_is_ioop_tracked_in_bytes(io_op) || bytes == 0);
@@ -91,6 +100,12 @@ instr_time
 pgstat_prepare_io_time(bool track_io_guc)
 {
 	instr_time	io_start;
+
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) track_io_guc;
+	INSTR_TIME_SET_ZERO(io_start);
+	return io_start;
+#endif
 
 	if (track_io_guc)
 		INSTR_TIME_SET_CURRENT(io_start);
@@ -122,6 +137,16 @@ void
 pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 						instr_time start_time, uint32 cnt, uint64 bytes)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) io_object;
+	(void) io_context;
+	(void) io_op;
+	(void) start_time;
+	(void) cnt;
+	(void) bytes;
+	return;
+#endif
+
 	if (!INSTR_TIME_IS_ZERO(start_time))
 	{
 		instr_time	io_time;

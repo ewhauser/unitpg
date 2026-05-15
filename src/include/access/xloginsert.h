@@ -44,6 +44,10 @@
 extern void XLogBeginInsert(void);
 extern void XLogSetRecordFlags(uint8 flags);
 extern XLogRecPtr XLogInsert(RmgrId rmid, uint8 info);
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+extern bool XLogRecordAssemblyRequired(RmgrId rmid, uint8 info);
+extern XLogRecPtr XLogSkipInsert(RmgrId rmid, uint8 info);
+#endif
 extern XLogRecPtr XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value);
 extern void XLogEnsureRecordSpace(int max_block_id, int ndatas);
 extern void XLogRegisterData(const void *data, uint32 len);

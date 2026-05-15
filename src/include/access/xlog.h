@@ -98,6 +98,22 @@ typedef enum RecoveryState
 extern PGDLLIMPORT int wal_level;
 extern PGDLLIMPORT bool XLogLogicalInfo;
 
+#ifdef USE_TEST_FAKE_WAL
+
+/*
+ * Test-only builds can opt into fake WAL for ordinary records.  Keep the
+ * public macros conservative and cheap so call sites naturally avoid
+ * standby/logical/full-page-write work without touching each access method.
+ */
+#define XLogArchivingActive()	(false)
+#define XLogArchivingAlways()	(false)
+#define XLogIsNeeded()			(false)
+#define XLogHintBitIsNeeded()	(false)
+#define XLogStandbyInfoActive() (false)
+#define XLogLogicalInfoActive() (false)
+
+#else
+
 /* Is WAL archiving enabled (always or only while server is running normally)? */
 #define XLogArchivingActive() \
 	(AssertMacro(XLogArchiveMode == ARCHIVE_MODE_OFF || wal_level >= WAL_LEVEL_REPLICA), XLogArchiveMode > ARCHIVE_MODE_OFF)
@@ -136,6 +152,8 @@ extern PGDLLIMPORT bool XLogLogicalInfo;
  */
 #define XLogLogicalInfoActive() \
 	 (wal_level >= WAL_LEVEL_LOGICAL || XLogLogicalInfo)
+
+#endif							/* USE_TEST_FAKE_WAL */
 
 #ifdef WAL_DEBUG
 extern PGDLLIMPORT bool XLOG_DEBUG;

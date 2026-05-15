@@ -806,5 +806,10 @@ const char *const config_type_names[] =
 StaticAssertDecl(lengthof(config_type_names) == (PGC_ENUM + 1),
 				 "array length mismatch");
 
+#ifdef USE_TEST_NO_OBSERVABILITY
+#define TEST_NO_OBSERVABILITY_TRACK_COUNTS_BOOT_VAL false
+#else
+#define TEST_NO_OBSERVABILITY_TRACK_COUNTS_BOOT_VAL true
+#endif
 
 #include "utils/guc_tables.inc.c"

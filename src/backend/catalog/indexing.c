@@ -19,10 +19,37 @@
 #include "access/heapam.h"
 #include "access/htup_details.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
+#include "miscadmin.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/resowner.h"
+
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+typedef struct TestCatalogIndexCacheEntry
+{
+	Oid			relid;
+	CatalogIndexState indstate;
+	struct TestCatalogIndexCacheEntry *next;
+} TestCatalogIndexCacheEntry;
+
+static TestCatalogIndexCacheEntry *TestCatalogIndexCache = NULL;
+static bool TestCatalogIndexCacheRegistered = false;
+
+static CatalogIndexState CatalogOpenIndexesInternal(Relation heapRel);
+static CatalogIndexState TestEphemeralCatalogOpenIndexes(Relation heapRel);
+static void TestEphemeralCatalogResetIndexes(bool close_indexes);
+static void TestEphemeralCatalogXactCallback(XactEvent event, void *arg);
+static void TestEphemeralCatalogSubXactCallback(SubXactEvent event,
+												SubTransactionId mySubid,
+												SubTransactionId parentSubid,
+												void *arg);
+#else
+static CatalogIndexState CatalogOpenIndexesInternal(Relation heapRel);
+#endif
 
 
 /*
@@ -42,6 +69,12 @@
 CatalogIndexState
 CatalogOpenIndexes(Relation heapRel)
 {
+	return CatalogOpenIndexesInternal(heapRel);
+}
+
+static CatalogIndexState
+CatalogOpenIndexesInternal(Relation heapRel)
+{
 	ResultRelInfo *resultRelInfo;
 
 	resultRelInfo = makeNode(ResultRelInfo);
@@ -53,6 +86,95 @@ CatalogOpenIndexes(Relation heapRel)
 
 	return resultRelInfo;
 }
+
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+static CatalogIndexState
+TestEphemeralCatalogOpenIndexes(Relation heapRel)
+{
+	TestCatalogIndexCacheEntry *entry;
+	MemoryContext oldcontext;
+	ResourceOwner oldowner;
+	Oid			relid = RelationGetRelid(heapRel);
+
+	for (entry = TestCatalogIndexCache; entry != NULL; entry = entry->next)
+	{
+		if (entry->relid == relid)
+			return entry->indstate;
+	}
+
+	if (!TestCatalogIndexCacheRegistered)
+	{
+		RegisterXactCallback(TestEphemeralCatalogXactCallback, NULL);
+		RegisterSubXactCallback(TestEphemeralCatalogSubXactCallback, NULL);
+		TestCatalogIndexCacheRegistered = true;
+	}
+
+	oldcontext = MemoryContextSwitchTo(TopTransactionContext);
+	oldowner = CurrentResourceOwner;
+	CurrentResourceOwner = TopTransactionResourceOwner;
+	entry = palloc0_object(TestCatalogIndexCacheEntry);
+	entry->relid = relid;
+	entry->indstate = CatalogOpenIndexesInternal(heapRel);
+	entry->next = TestCatalogIndexCache;
+	TestCatalogIndexCache = entry;
+	CurrentResourceOwner = oldowner;
+	MemoryContextSwitchTo(oldcontext);
+
+	return entry->indstate;
+}
+
+static void
+TestEphemeralCatalogResetIndexes(bool close_indexes)
+{
+	TestCatalogIndexCacheEntry *entry = TestCatalogIndexCache;
+	ResourceOwner oldowner = CurrentResourceOwner;
+
+	if (close_indexes)
+		CurrentResourceOwner = TopTransactionResourceOwner;
+
+	while (entry != NULL)
+	{
+		TestCatalogIndexCacheEntry *next = entry->next;
+
+		if (close_indexes)
+			CatalogCloseIndexes(entry->indstate);
+
+		entry = next;
+	}
+
+	if (close_indexes)
+		CurrentResourceOwner = oldowner;
+
+	TestCatalogIndexCache = NULL;
+}
+
+static void
+TestEphemeralCatalogXactCallback(XactEvent event, void *arg)
+{
+	(void) arg;
+
+	if (event == XACT_EVENT_PRE_COMMIT ||
+		event == XACT_EVENT_PARALLEL_PRE_COMMIT ||
+		event == XACT_EVENT_PRE_PREPARE)
+		TestEphemeralCatalogResetIndexes(true);
+	else
+		TestEphemeralCatalogResetIndexes(false);
+}
+
+static void
+TestEphemeralCatalogSubXactCallback(SubXactEvent event,
+									SubTransactionId mySubid,
+									SubTransactionId parentSubid,
+									void *arg)
+{
+	(void) mySubid;
+	(void) parentSubid;
+	(void) arg;
+
+	if (event == SUBXACT_EVENT_ABORT_SUB)
+		TestEphemeralCatalogResetIndexes(false);
+}
+#endif
 
 /*
  * CatalogCloseIndexes - clean up resources allocated by CatalogOpenIndexes
@@ -233,15 +355,30 @@ void
 CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 {
 	CatalogIndexState indstate;
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+	bool		use_cached_indexes = IsUnderPostmaster &&
+		IsTransactionState() && IsCatalogRelation(heapRel);
+#endif
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+	indstate = use_cached_indexes ?
+		TestEphemeralCatalogOpenIndexes(heapRel) :
+		CatalogOpenIndexes(heapRel);
+#else
 	indstate = CatalogOpenIndexes(heapRel);
+#endif
 
 	simple_heap_insert(heapRel, tup);
 
 	CatalogIndexInsert(indstate, tup, TU_All);
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+	if (!use_cached_indexes)
+		CatalogCloseIndexes(indstate);
+#else
 	CatalogCloseIndexes(indstate);
+#endif
 }
 
 /*
@@ -314,15 +451,30 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 {
 	CatalogIndexState indstate;
 	TU_UpdateIndexes updateIndexes = TU_All;
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+	bool		use_cached_indexes = IsUnderPostmaster &&
+		IsTransactionState() && IsCatalogRelation(heapRel);
+#endif
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+	indstate = use_cached_indexes ?
+		TestEphemeralCatalogOpenIndexes(heapRel) :
+		CatalogOpenIndexes(heapRel);
+#else
 	indstate = CatalogOpenIndexes(heapRel);
+#endif
 
 	simple_heap_update(heapRel, otid, tup, &updateIndexes);
 
 	CatalogIndexInsert(indstate, tup, updateIndexes);
+#ifdef USE_TEST_EPHEMERAL_CATALOG
+	if (!use_cached_indexes)
+		CatalogCloseIndexes(indstate);
+#else
 	CatalogCloseIndexes(indstate);
+#endif
 }
 
 /*

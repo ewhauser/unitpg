@@ -194,6 +194,16 @@ log_smgrcreate(const RelFileLocator *rlocator, ForkNumber forkNum)
 	xlrec.rlocator = *rlocator;
 	xlrec.forkNum = forkNum;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_SMGR_ID,
+									XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE))
+	{
+		(void) XLogSkipInsert(RM_SMGR_ID,
+							  XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);
+		return;
+	}
+#endif
+
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xlrec));
 	XLogInsert(RM_SMGR_ID, XLOG_SMGR_CREATE | XLR_SPECIAL_REL_UPDATE);

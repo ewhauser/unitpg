@@ -1228,6 +1228,7 @@ PinBufferForBlock(Relation rel,
 				  BufferAccessStrategy strategy,
 				  IOObject io_object,
 				  IOContext io_context,
+				  bool allow_storage_hit,
 				  bool *foundPtr)
 {
 	BufferDesc *bufHdr;
@@ -1246,7 +1247,8 @@ PinBufferForBlock(Relation rel,
 									   smgr->smgr_rlocator.backend);
 
 	if (persistence == RELPERSISTENCE_TEMP)
-		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, foundPtr);
+		bufHdr = LocalBufferAlloc(smgr, forkNum, blockNum, foundPtr,
+								  allow_storage_hit);
 	else
 		bufHdr = BufferAlloc(smgr, persistence, forkNum, blockNum,
 							 strategy, foundPtr, io_context);
@@ -1340,7 +1342,8 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 
 		buffer = PinBufferForBlock(rel, smgr, persistence,
 								   forkNum, blockNum, strategy,
-								   io_object, io_context, &found);
+								   io_object, io_context,
+								   false, &found);
 		ZeroAndLockBuffer(buffer, mode, found);
 		return buffer;
 	}
@@ -1451,6 +1454,7 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 										   blockNum + i,
 										   operation->strategy,
 										   io_object, io_context,
+										   true,
 										   &found);
 		}
 
@@ -3774,7 +3778,9 @@ BufferSync(int flags)
 			if (SyncOneBuffer(buf_id, false, &wb_context) & BUF_WRITTEN)
 			{
 				TRACE_POSTGRESQL_BUFFER_SYNC_WRITTEN(buf_id);
+#ifndef USE_TEST_NO_OBSERVABILITY
 				PendingCheckpointerStats.buffers_written++;
+#endif
 				num_written++;
 			}
 		}
@@ -3887,7 +3893,9 @@ BgBufferSync(WritebackContext *wb_context)
 	strategy_buf_id = StrategySyncStart(&strategy_passes, &recent_alloc);
 
 	/* Report buffer alloc counts to pgstat */
+#ifndef USE_TEST_NO_OBSERVABILITY
 	PendingBgWriterStats.buf_alloc += recent_alloc;
+#endif
 
 	/*
 	 * If we're not running the LRU scan, just stop after doing the stats
@@ -4074,7 +4082,9 @@ BgBufferSync(WritebackContext *wb_context)
 			reusable_buffers++;
 			if (++num_written >= bgwriter_lru_maxpages)
 			{
+#ifndef USE_TEST_NO_OBSERVABILITY
 				PendingBgWriterStats.maxwritten_clean++;
+#endif
 				break;
 			}
 		}
@@ -4082,7 +4092,9 @@ BgBufferSync(WritebackContext *wb_context)
 			reusable_buffers++;
 	}
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 	PendingBgWriterStats.buf_written_clean += num_written;
+#endif
 
 #ifdef BGW_DEBUG
 	elog(DEBUG1, "bgwriter: recent_alloc=%u smoothed=%.2f delta=%ld ahead=%d density=%.2f reusable_est=%d upcoming_est=%d scanned=%d wrote=%d reusable=%d",
@@ -4440,6 +4452,11 @@ DebugPrintBufferRefcount(Buffer buffer)
 void
 CheckPointBuffers(int flags)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster)
+		return;
+#endif
+
 	BufferSync(flags);
 }
 

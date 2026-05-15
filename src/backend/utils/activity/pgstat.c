@@ -188,7 +188,9 @@ static void pgstat_init_snapshot_fixed(void);
 
 static void pgstat_reset_after_failure(void);
 
+#ifndef USE_TEST_NO_OBSERVABILITY
 static bool pgstat_flush_pending_entries(bool nowait);
+#endif
 
 static void pgstat_prep_snapshot(void);
 static void pgstat_build_snapshot(void);
@@ -722,6 +724,10 @@ pgstat_initialize(void)
 long
 pgstat_report_stat(bool force)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) force;
+	return 0;
+#else
 	static TimestampTz pending_since = 0;
 	static TimestampTz last_flush = 0;
 	bool		partial_flush;
@@ -833,6 +839,7 @@ pgstat_report_stat(bool force)
 	pgstat_report_fixed = false;
 
 	return 0;
+#endif
 }
 
 /*
@@ -1380,6 +1387,7 @@ pgstat_delete_pending_entry(PgStat_EntryRef *entry_ref)
 /*
  * Flush out pending variable-numbered stats.
  */
+#ifndef USE_TEST_NO_OBSERVABILITY
 static bool
 pgstat_flush_pending_entries(bool nowait)
 {
@@ -1435,6 +1443,7 @@ pgstat_flush_pending_entries(bool nowait)
 
 	return have_pending;
 }
+#endif
 
 
 /* ------------------------------------------------------------

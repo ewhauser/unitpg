@@ -1195,9 +1195,9 @@ exec_simple_query(const char *query_string)
 		if (lnext(parsetree_list, parsetree_item) != NULL)
 		{
 			per_parsetree_context =
-				AllocSetContextCreate(MessageContext,
-									  "per-parsetree message context",
-									  ALLOCSET_DEFAULT_SIZES);
+				FastMaybeFreeableContextCreate(MessageContext,
+											   "per-parsetree message context",
+											   ALLOCSET_DEFAULT_SIZES);
 			oldcontext = MemoryContextSwitchTo(per_parsetree_context);
 		}
 		else
@@ -1468,9 +1468,9 @@ exec_parse_message(const char *query_string,	/* string to execute */
 		drop_unnamed_stmt();
 		/* Create context for parsing */
 		unnamed_stmt_context =
-			AllocSetContextCreate(MessageContext,
-								  "unnamed prepared statement",
-								  ALLOCSET_DEFAULT_SIZES);
+			FastMaybeFreeableContextCreate(MessageContext,
+										   "unnamed prepared statement",
+										   ALLOCSET_DEFAULT_SIZES);
 		oldcontext = MemoryContextSwitchTo(unnamed_stmt_context);
 	}
 
@@ -4438,9 +4438,9 @@ PostgresMain(const char *dbname, const char *username)
 	 * MessageContext is reset once per iteration of the main loop, ie, upon
 	 * completion of processing of each command message from the client.
 	 */
-	MessageContext = AllocSetContextCreate(TopMemoryContext,
-										   "MessageContext",
-										   ALLOCSET_DEFAULT_SIZES);
+	MessageContext = FastMaybeFreeableContextCreate(TopMemoryContext,
+												   "MessageContext",
+												   ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * Create memory context and buffer used for RowDescription messages. As
@@ -4448,9 +4448,9 @@ PostgresMain(const char *dbname, const char *username)
 	 * frequently executed for every single statement, we don't want to
 	 * allocate a separate buffer every time.
 	 */
-	row_description_context = AllocSetContextCreate(TopMemoryContext,
-													"RowDescriptionContext",
-													ALLOCSET_DEFAULT_SIZES);
+	row_description_context = FastMaybeFreeableContextCreate(TopMemoryContext,
+															 "RowDescriptionContext",
+															 ALLOCSET_DEFAULT_SIZES);
 	MemoryContextSwitchTo(row_description_context);
 	initStringInfo(&row_description_buf);
 	MemoryContextSwitchTo(TopMemoryContext);

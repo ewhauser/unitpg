@@ -76,6 +76,12 @@ pgstat_init_function_usage(FunctionCallInfo fcinfo,
 	PgStat_FunctionCounts *pending;
 	bool		created_entry;
 
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) fcinfo;
+	fcu->fs = NULL;
+	return;
+#endif
+
 	if (pgstat_track_functions <= fcinfo->flinfo->fn_stats)
 	{
 		/* stats not wanted */
@@ -149,6 +155,12 @@ pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
 	instr_time	total;
 	instr_time	others;
 	instr_time	self;
+
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) fcu;
+	(void) finalize;
+	return;
+#endif
 
 	/* stats not wanted? */
 	if (fs == NULL)

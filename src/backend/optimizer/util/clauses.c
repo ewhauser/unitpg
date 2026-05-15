@@ -5355,9 +5355,9 @@ inline_function(Oid funcid, Oid result_type, Oid result_collid,
 	 * Make a temporary memory context, so that we don't leak all the stuff
 	 * that parsing might create.
 	 */
-	mycxt = AllocSetContextCreate(CurrentMemoryContext,
-								  "inline_function",
-								  ALLOCSET_DEFAULT_SIZES);
+	mycxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+										   "inline_function",
+										   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(mycxt);
 
 	/*
@@ -5895,9 +5895,9 @@ inline_function_in_from(PlannerInfo *root, RangeTblEntry *rte)
 	 * that parsing and rewriting might create.  If we succeed, we'll copy
 	 * just the finished query tree back up to the caller's context.
 	 */
-	mycxt = AllocSetContextCreate(CurrentMemoryContext,
-								  "inline_function_in_from",
-								  ALLOCSET_DEFAULT_SIZES);
+	mycxt = FastMaybeFreeableContextCreate(CurrentMemoryContext,
+										   "inline_function_in_from",
+										   ALLOCSET_DEFAULT_SIZES);
 	oldcxt = MemoryContextSwitchTo(mycxt);
 
 	/* Fetch the function body */

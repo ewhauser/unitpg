@@ -188,10 +188,21 @@ static void SlruReportIOError(SlruDesc *ctl, int64 pageno,
 							  const void *opaque_data);
 static int	SlruSelectLRUPage(SlruDesc *ctl, int64 pageno);
 
+#ifdef USE_TEST_MEM_SLRU
+static bool SlruIsInMemory(SlruDesc *ctl);
+#endif
 static bool SlruScanDirCbDeleteCutoff(SlruDesc *ctl, char *filename,
 									  int64 segpage, void *data);
 static void SlruInternalDeleteSegment(SlruDesc *ctl, int64 segno);
 static inline void SlruRecentlyUsed(SlruShared shared, int slotno);
+
+#ifdef USE_TEST_MEM_SLRU
+static bool
+SlruIsInMemory(SlruDesc *ctl)
+{
+	return ctl->options.in_memory;
+}
+#endif
 
 
 /*
@@ -238,6 +249,22 @@ SimpleLruAutotuneBuffers(int divisor, int max)
 			   Max(SLRU_BANK_SIZE,
 				   NBuffers / divisor - (NBuffers / divisor) % SLRU_BANK_SIZE));
 }
+
+#ifdef USE_TEST_MEM_SLRU
+/*
+ * In-memory SLRUs are authoritative stores, not caches, so they must keep a
+ * much wider page window resident.  The generic layer fails loudly before
+ * evicting a live in-memory page if a test workload exceeds this capacity.
+ */
+int
+SimpleLruTestInMemoryBuffers(int nslots, int max)
+{
+	const int	min_in_memory_slots = 4096;
+	int			rounded_max = max - (max % SLRU_BANK_SIZE);
+
+	return Min(rounded_max, Max(min_in_memory_slots, nslots));
+}
+#endif
 
 /*
  * Register a simple LRU cache in shared memory.
@@ -606,7 +633,15 @@ SimpleLruReadPage(SlruDesc *ctl, int64 pageno, bool write_ok,
 		LWLockRelease(banklock);
 
 		/* Do the read */
-		ok = SlruPhysicalReadPage(ctl, pageno, slotno);
+#ifdef USE_TEST_MEM_SLRU
+		if (SlruIsInMemory(ctl))
+		{
+			MemSet(shared->page_buffer[slotno], 0, BLCKSZ);
+			ok = true;
+		}
+		else
+#endif
+			ok = SlruPhysicalReadPage(ctl, pageno, slotno);
 
 		/* Set the LSNs for this newly read-in page to zero */
 		SimpleLruZeroLSNs(ctl, slotno);
@@ -724,6 +759,14 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 		shared->page_number[slotno] != pageno)
 		return;
 
+#ifdef USE_TEST_MEM_SLRU
+	if (SlruIsInMemory(ctl))
+	{
+		shared->page_dirty[slotno] = false;
+		return;
+	}
+#endif
+
 	/*
 	 * Mark the slot write-busy, and clear the dirtybit.  After this point, a
 	 * transaction status update on this page will mark it dirty again.
@@ -769,7 +812,9 @@ SlruInternalWritePage(SlruDesc *ctl, int slotno, SlruWriteAll fdata)
 	if (fdata)
 	{
 		CheckpointStats.ckpt_slru_written++;
+#ifndef USE_TEST_NO_OBSERVABILITY
 		PendingCheckpointerStats.slru_written++;
+#endif
 	}
 }
 
@@ -794,6 +839,34 @@ SimpleLruWritePage(SlruDesc *ctl, int slotno)
 bool
 SimpleLruDoesPhysicalPageExist(SlruDesc *ctl, int64 pageno)
 {
+#ifdef USE_TEST_MEM_SLRU
+	if (SlruIsInMemory(ctl))
+	{
+		SlruShared	shared = ctl->shared;
+		LWLock	   *banklock = SimpleLruGetBankLock(ctl, pageno);
+		int			bankno = pageno % ctl->nbanks;
+		int			bankstart = bankno * SLRU_BANK_SIZE;
+		int			bankend = bankstart + SLRU_BANK_SIZE;
+		bool		found = false;
+
+		pgstat_count_slru_blocks_exists(shared->slru_stats_idx);
+
+		LWLockAcquire(banklock, LW_SHARED);
+		for (int slotno = bankstart; slotno < bankend; slotno++)
+		{
+			if (shared->page_status[slotno] != SLRU_PAGE_EMPTY &&
+				shared->page_number[slotno] == pageno)
+			{
+				found = true;
+				break;
+			}
+		}
+		LWLockRelease(banklock);
+
+		return found;
+	}
+#endif
+
 	int64		segno = pageno / SLRU_PAGES_PER_SEGMENT;
 	int			rpageno = pageno % SLRU_PAGES_PER_SEGMENT;
 	int			offset = rpageno * BLCKSZ;
@@ -1343,6 +1416,25 @@ SlruSelectLRUPage(SlruDesc *ctl, int64 pageno)
 			continue;
 		}
 
+#ifdef USE_TEST_MEM_SLRU
+		if (SlruIsInMemory(ctl))
+		{
+			if (best_invalid_delta >= 0)
+			{
+				SimpleLruWaitIO(ctl, bestinvalidslot);
+				continue;
+			}
+
+			ereport(ERROR,
+					(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
+					 errmsg("in-memory SLRU \"%s\" exhausted",
+							ctl->options.name),
+					 errdetail("No free shared-memory slot is available for page %lld.",
+							   (long long) pageno),
+					 errhint("Increase the test-only in-memory SLRU buffer count for this workload.")));
+		}
+#endif
+
 		/*
 		 * If the selected page is clean, we're set.
 		 */
@@ -1437,6 +1529,11 @@ SimpleLruWriteAll(SlruDesc *ctl, bool allow_redirtied)
 	}
 	if (!ok)
 		SlruReportIOError(ctl, pageno, NULL);
+
+#ifdef USE_TEST_MEM_SLRU
+	if (SlruIsInMemory(ctl))
+		return;
+#endif
 
 	/* Ensure that directory entries for new files are on disk. */
 	if (ctl->options.sync_handler != SYNC_HANDLER_NONE)
@@ -1553,6 +1650,11 @@ static void
 SlruInternalDeleteSegment(SlruDesc *ctl, int64 segno)
 {
 	char		path[MAXPGPATH];
+
+#ifdef USE_TEST_MEM_SLRU
+	if (SlruIsInMemory(ctl))
+		return;
+#endif
 
 	/* Forget any fsync requests queued for this segment. */
 	if (ctl->options.sync_handler != SYNC_HANDLER_NONE)
@@ -1843,6 +1945,11 @@ SlruCorrectSegmentFilenameLength(SlruDesc *ctl, size_t len)
 bool
 SlruScanDirectory(SlruDesc *ctl, SlruScanCallback callback, void *data)
 {
+#ifdef USE_TEST_MEM_SLRU
+	if (SlruIsInMemory(ctl))
+		return false;
+#endif
+
 	bool		retval = false;
 	DIR		   *cldir;
 	struct dirent *clde;
@@ -1883,6 +1990,14 @@ SlruScanDirectory(SlruDesc *ctl, SlruScanCallback callback, void *data)
 int
 SlruSyncFileTag(SlruDesc *ctl, const FileTag *ftag, char *path)
 {
+#ifdef USE_TEST_MEM_SLRU
+	if (SlruIsInMemory(ctl))
+	{
+		SlruFileName(ctl, path, ftag->segno);
+		return 0;
+	}
+#endif
+
 	int			fd;
 	int			save_errno;
 	int			result;

@@ -751,6 +751,20 @@ static void WALInsertLockUpdateInsertingAt(XLogRecPtr insertingAt);
 
 static void XLogChecksums(uint32 new_type);
 
+#ifdef USE_TEST_FAKE_WAL
+static inline bool
+XLogRecPtrIsTestFake(XLogRecPtr record)
+{
+	/*
+	 * Bootstrap starts real WAL at the first segment boundary, so values
+	 * below wal_segment_size belong to the fake-LSN space already used for
+	 * unlogged relations.
+	 */
+	return XLogRecPtrIsTestFakeWal(record) ||
+		(XLogRecPtrIsValid(record) && record < (XLogRecPtr) wal_segment_size);
+}
+#endif
+
 /*
  * Insert an XLOG record represented by an already-constructed chain of data
  * chunks.  This is a low-level routine; to construct the WAL record header
@@ -2634,6 +2648,11 @@ XLogSetAsyncXactLSN(XLogRecPtr asyncXactLSN)
 	bool		wakeup = false;
 	XLogRecPtr	prevAsyncXactLSN;
 
+#ifdef USE_TEST_FAKE_WAL
+	if (XLogRecPtrIsTestFake(asyncXactLSN))
+		return;
+#endif
+
 	SpinLockAcquire(&XLogCtl->info_lck);
 	sleeping = XLogCtl->WalWriterSleeping;
 	prevAsyncXactLSN = XLogCtl->asyncXactLSN;
@@ -2802,7 +2821,14 @@ XLogFlush(XLogRecPtr record)
 {
 	XLogRecPtr	WriteRqstPtr;
 	XLogwrtRqst WriteRqst;
-	TimeLineID	insertTLI = XLogCtl->InsertTimeLineID;
+	TimeLineID	insertTLI;
+
+#ifdef USE_TEST_FAKE_WAL
+	if (XLogRecPtrIsTestFake(record))
+		return;
+#endif
+
+	insertTLI = XLogCtl->InsertTimeLineID;
 
 	/*
 	 * During REDO, we are reading not writing WAL.  Therefore, instead of
@@ -3158,6 +3184,11 @@ XLogBackgroundFlush(void)
 bool
 XLogNeedsFlush(XLogRecPtr record)
 {
+#ifdef USE_TEST_FAKE_WAL
+	if (XLogRecPtrIsTestFake(record))
+		return false;
+#endif
+
 	/*
 	 * During recovery, we don't flush WAL but update minRecoveryPoint
 	 * instead. So "needs flush" is taken to mean whether minRecoveryPoint
@@ -7202,8 +7233,10 @@ LogCheckpointEnd(bool restartpoint, int flags)
 												 CheckpointStats.ckpt_sync_end_t);
 
 	/* Accumulate checkpoint timing summary data, in milliseconds. */
+#ifndef USE_TEST_NO_OBSERVABILITY
 	PendingCheckpointerStats.write_time += write_msecs;
 	PendingCheckpointerStats.sync_time += sync_msecs;
+#endif
 
 	/*
 	 * All of the published timing statistics are accounted for.  Only
@@ -7416,6 +7449,11 @@ CreateCheckPoint(int flags)
 		shutdown = true;
 	else
 		shutdown = false;
+
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster && !shutdown)
+		return false;
+#endif
 
 	/* sanity check */
 	if (RecoveryInProgress() && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
@@ -8045,6 +8083,11 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
 static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster)
+		return;
+#endif
+
 	CheckPointRelationMap();
 	CheckPointReplicationSlots(flags & CHECKPOINT_IS_SHUTDOWN);
 	CheckPointSnapBuild();

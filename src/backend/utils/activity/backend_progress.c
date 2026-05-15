@@ -27,6 +27,10 @@
 void
 pgstat_progress_start_command(ProgressCommandType cmdtype, Oid relid)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) cmdtype;
+	(void) relid;
+#else
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	if (!beentry || !pgstat_track_activities)
@@ -37,6 +41,7 @@ pgstat_progress_start_command(ProgressCommandType cmdtype, Oid relid)
 	beentry->st_progress_command_target = relid;
 	MemSet(&beentry->st_progress_param, 0, sizeof(beentry->st_progress_param));
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
+#endif
 }
 
 /*-----------
@@ -48,6 +53,10 @@ pgstat_progress_start_command(ProgressCommandType cmdtype, Oid relid)
 void
 pgstat_progress_update_param(int index, int64 val)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) index;
+	(void) val;
+#else
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
@@ -58,6 +67,7 @@ pgstat_progress_update_param(int index, int64 val)
 	PGSTAT_BEGIN_WRITE_ACTIVITY(beentry);
 	beentry->st_progress_param[index] = val;
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
+#endif
 }
 
 /*-----------
@@ -69,6 +79,10 @@ pgstat_progress_update_param(int index, int64 val)
 void
 pgstat_progress_incr_param(int index, int64 incr)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) index;
+	(void) incr;
+#else
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
@@ -79,6 +93,7 @@ pgstat_progress_incr_param(int index, int64 incr)
 	PGSTAT_BEGIN_WRITE_ACTIVITY(beentry);
 	beentry->st_progress_param[index] += incr;
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
+#endif
 }
 
 /*-----------
@@ -91,6 +106,10 @@ pgstat_progress_incr_param(int index, int64 incr)
 void
 pgstat_progress_parallel_incr_param(int index, int64 incr)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) index;
+	(void) incr;
+#else
 	/*
 	 * Parallel workers notify a leader through a PqMsg_Progress message to
 	 * update progress, passing the progress index and incremented value.
@@ -109,6 +128,7 @@ pgstat_progress_parallel_incr_param(int index, int64 incr)
 	}
 	else
 		pgstat_progress_incr_param(index, incr);
+#endif
 }
 
 /*-----------
@@ -122,6 +142,11 @@ void
 pgstat_progress_update_multi_param(int nparam, const int *index,
 								   const int64 *val)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+	(void) nparam;
+	(void) index;
+	(void) val;
+#else
 	volatile PgBackendStatus *beentry = MyBEEntry;
 	int			i;
 
@@ -138,6 +163,7 @@ pgstat_progress_update_multi_param(int nparam, const int *index,
 	}
 
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
+#endif
 }
 
 /*-----------
@@ -150,6 +176,8 @@ pgstat_progress_update_multi_param(int nparam, const int *index,
 void
 pgstat_progress_end_command(void)
 {
+#ifdef USE_TEST_NO_OBSERVABILITY
+#else
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	if (!beentry || !pgstat_track_activities)
@@ -162,4 +190,5 @@ pgstat_progress_end_command(void)
 	beentry->st_progress_command = PROGRESS_COMMAND_INVALID;
 	beentry->st_progress_command_target = InvalidOid;
 	PGSTAT_END_WRITE_ACTIVITY(beentry);
+#endif
 }

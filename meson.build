@@ -505,6 +505,25 @@ meson_bin = find_program(meson_binpath, native: true)
 
 cdata.set('USE_ASSERT_CHECKING', get_option('cassert') ? 1 : false)
 cdata.set('USE_INJECTION_POINTS', get_option('injection_points') ? 1 : false)
+cdata.set('USE_TEST_FAKE_WAL', get_option('test_fake_wal') ? 1 : false)
+cdata.set('USE_TEST_NO_BG_JOBS', get_option('test_no_bg_jobs') ? 1 : false)
+cdata.set('USE_TEST_MEM_SMGR', get_option('test_mem_smgr') ? 1 : false)
+cdata.set('USE_TEST_EPHEMERAL_BUFFERS', get_option('test_ephemeral_buffers') ? 1 : false)
+cdata.set('USE_TEST_MEM_SLRU', get_option('test_mem_slru') ? 1 : false)
+cdata.set('USE_TEST_NO_WAL_ASSEMBLY', get_option('test_no_wal_assembly') ? 1 : false)
+cdata.set('USE_TEST_NO_OBSERVABILITY', get_option('test_no_observability') ? 1 : false)
+cdata.set('USE_TEST_FAST_MEMORY_CONTEXTS', get_option('test_fast_memory_contexts') ? 1 : false)
+cdata.set('USE_TEST_EPHEMERAL_CATALOG', get_option('test_ephemeral_catalog') ? 1 : false)
+cdata.set('USE_TEST_NO_DURABLE_MAINTENANCE', get_option('test_no_durable_maintenance') ? 1 : false)
+cdata.set('USE_TEST_FAST_ANALYZE', get_option('test_fast_analyze') ? 1 : false)
+
+if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
+  error('test_no_wal_assembly requires test_fake_wal')
+endif
+
+if get_option('test_ephemeral_buffers') and not get_option('test_mem_smgr')
+  error('test_ephemeral_buffers requires test_mem_smgr')
+endif
 
 blocksize = get_option('blocksize').to_int() * 1024
 
