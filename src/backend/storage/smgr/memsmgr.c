@@ -17,7 +17,11 @@
  */
 #include "postgres.h"
 
+#include "access/transam.h"
+#include "access/xact.h"
 #include "access/xlogutils.h"
+#include "commands/sequence.h"
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
@@ -25,9 +29,12 @@
 #include "storage/lwlock.h"
 #include "storage/md.h"
 #include "storage/memsmgr.h"
+#include "storage/procarray.h"
 #include "storage/relfilelocator.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
+#include "utils/builtins.h"
+#include "utils/inval.h"
 #include "utils/memutils.h"
 
 /*
@@ -75,6 +82,21 @@ typedef struct MemSmgrSharedState
 	bool		initialized;
 } MemSmgrSharedState;
 
+#ifdef USE_TEST_MEM_SMGR
+typedef struct MemSmgrSnapshot
+{
+	char	   *name;
+	int			nforks;
+	MemSmgrForkEntry *forks;
+	int			npages;
+	MemSmgrPageEntry *pages;
+	Oid			next_oid;
+	uint32		oid_count;
+	MemoryContext context;
+	struct MemSmgrSnapshot *next;
+} MemSmgrSnapshot;
+#endif
+
 static MemSmgrSharedState *MemSmgrState;
 static HTAB *MemSmgrForkHash;
 static HTAB *MemSmgrPageHash;
@@ -82,6 +104,11 @@ static HTAB *MemSmgrPageHash;
 static MemoryContext MemSmgrLocalCxt;
 static HTAB *LocalForkHash;
 static HTAB *LocalPageHash;
+
+#ifdef USE_TEST_MEM_SMGR
+static MemoryContext MemSmgrSnapshotCxt;
+static MemSmgrSnapshot *MemSmgrSnapshots;
+#endif
 
 static void MemSmgrShmemRequest(void *arg);
 static void MemSmgrShmemInit(void *arg);
@@ -130,6 +157,16 @@ static BlockNumber mem_nblocks_locked(SMgrRelation reln, ForkNumber forknum);
 static void mem_complete_aio_read(PgAioHandle *ioh, SMgrRelation reln,
 								  ForkNumber forknum, BlockNumber blocknum,
 								  void **buffers, BlockNumber nblocks);
+#ifdef USE_TEST_MEM_SMGR
+static void mem_require_snapshot_allowed(const char *function_name);
+static bool mem_snapshot_key_matches(const RelFileLocatorBackend *rlocator);
+static MemSmgrSnapshot *mem_find_snapshot(const char *name);
+static void mem_delete_snapshot(MemSmgrSnapshot *snapshot);
+static MemSmgrSnapshot *mem_create_snapshot(const char *name);
+static void mem_capture_snapshot(MemSmgrSnapshot *snapshot);
+static void mem_restore_snapshot(MemSmgrSnapshot *snapshot);
+static void mem_restore_reset_caches(void);
+#endif
 
 static void
 MemSmgrShmemRequest(void *arg)
@@ -527,6 +564,94 @@ memfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off)
 	return -1;
 }
 
+Datum
+pg_fastfork_snapshot(PG_FUNCTION_ARGS)
+{
+#ifndef USE_TEST_MEM_SMGR
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_fastfork_snapshot() requires --enable-test-mem-smgr")));
+	PG_RETURN_VOID();
+#else
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	MemSmgrSnapshot *snapshot;
+	MemSmgrSnapshot *existing;
+
+	mem_require_snapshot_allowed("pg_fastfork_snapshot");
+
+	if (name[0] == '\0')
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("fast-fork snapshot name must not be empty")));
+
+	existing = mem_find_snapshot(name);
+	if (existing != NULL)
+		mem_delete_snapshot(existing);
+
+	FlushDatabaseBuffers(InvalidOid);
+	FlushDatabaseBuffers(MyDatabaseId);
+
+	snapshot = mem_create_snapshot(name);
+	mem_capture_snapshot(snapshot);
+
+	pfree(name);
+	PG_RETURN_VOID();
+#endif
+}
+
+Datum
+pg_fastfork_restore(PG_FUNCTION_ARGS)
+{
+#ifndef USE_TEST_MEM_SMGR
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_fastfork_restore() requires --enable-test-mem-smgr")));
+	PG_RETURN_VOID();
+#else
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	MemSmgrSnapshot *snapshot;
+
+	mem_require_snapshot_allowed("pg_fastfork_restore");
+
+	snapshot = mem_find_snapshot(name);
+	if (snapshot == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_OBJECT),
+				 errmsg("fast-fork snapshot \"%s\" does not exist", name)));
+
+	DropDatabaseBuffers(InvalidOid);
+	DropDatabaseBuffers(MyDatabaseId);
+	mem_restore_snapshot(snapshot);
+	mem_restore_reset_caches();
+
+	pfree(name);
+	PG_RETURN_VOID();
+#endif
+}
+
+Datum
+pg_fastfork_drop_snapshot(PG_FUNCTION_ARGS)
+{
+#ifndef USE_TEST_MEM_SMGR
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_fastfork_drop_snapshot() requires --enable-test-mem-smgr")));
+	PG_RETURN_VOID();
+#else
+	char	   *name = text_to_cstring(PG_GETARG_TEXT_PP(0));
+	MemSmgrSnapshot *snapshot;
+
+	mem_require_snapshot_allowed("pg_fastfork_drop_snapshot");
+
+	snapshot = mem_find_snapshot(name);
+	if (snapshot != NULL)
+		mem_delete_snapshot(snapshot);
+
+	pfree(name);
+	PG_RETURN_VOID();
+#endif
+}
+
 #if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
 bool
 mem_buffer_direct_enabled(SMgrRelation reln)
@@ -560,6 +685,250 @@ mem_buffer_direct_page(SMgrRelation reln, ForkNumber forknum,
 	if (found != NULL)
 		*found = true;
 	return (Block) page->data;
+}
+#endif
+
+#ifdef USE_TEST_MEM_SMGR
+static void
+mem_require_snapshot_allowed(const char *function_name)
+{
+	int			notherbackends;
+	int			npreparedxacts;
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to call %s()", function_name)));
+
+	if (!IsUnderPostmaster || MemSmgrState == NULL ||
+		MemSmgrForkHash == NULL || MemSmgrPageHash == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s() requires the in-memory storage manager",
+						function_name)));
+
+	if (!OidIsValid(MyDatabaseId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("%s() requires a database connection", function_name)));
+
+	if (IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("%s() cannot run inside a transaction block",
+						function_name)));
+
+	if (CountOtherDBBackends(MyDatabaseId, &notherbackends, &npreparedxacts))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("database is being accessed by other users"),
+				 errdetail("%d other session(s) and %d prepared transaction(s) are using the database.",
+						   notherbackends, npreparedxacts)));
+}
+
+static bool
+mem_snapshot_key_matches(const RelFileLocatorBackend *rlocator)
+{
+	if (mem_key_is_temp(rlocator))
+		return false;
+
+	return rlocator->locator.dbOid == MyDatabaseId ||
+		rlocator->locator.dbOid == InvalidOid;
+}
+
+static MemSmgrSnapshot *
+mem_find_snapshot(const char *name)
+{
+	MemSmgrSnapshot *snapshot;
+
+	for (snapshot = MemSmgrSnapshots; snapshot != NULL; snapshot = snapshot->next)
+	{
+		if (strcmp(snapshot->name, name) == 0)
+			return snapshot;
+	}
+
+	return NULL;
+}
+
+static void
+mem_delete_snapshot(MemSmgrSnapshot *snapshot)
+{
+	MemSmgrSnapshot **link;
+
+	for (link = &MemSmgrSnapshots; *link != NULL; link = &(*link)->next)
+	{
+		if (*link == snapshot)
+		{
+			*link = snapshot->next;
+			MemoryContextDelete(snapshot->context);
+			return;
+		}
+	}
+}
+
+static MemSmgrSnapshot *
+mem_create_snapshot(const char *name)
+{
+	MemoryContext context;
+	MemoryContext oldcontext;
+	MemSmgrSnapshot *snapshot;
+
+	if (MemSmgrSnapshotCxt == NULL)
+		MemSmgrSnapshotCxt = AllocSetContextCreate(TopMemoryContext,
+												   "MemSmgr snapshots",
+												   ALLOCSET_DEFAULT_SIZES);
+
+	context = AllocSetContextCreate(MemSmgrSnapshotCxt,
+									"MemSmgr snapshot",
+									ALLOCSET_DEFAULT_SIZES);
+	oldcontext = MemoryContextSwitchTo(context);
+
+	snapshot = palloc0(sizeof(MemSmgrSnapshot));
+	snapshot->context = context;
+	snapshot->name = pstrdup(name);
+
+#ifdef USE_TEST_MEM_SMGR
+	TestFastForkGetOidState(&snapshot->next_oid, &snapshot->oid_count);
+#endif
+
+	MemoryContextSwitchTo(oldcontext);
+
+	snapshot->next = MemSmgrSnapshots;
+	MemSmgrSnapshots = snapshot;
+	return snapshot;
+}
+
+static void
+mem_capture_snapshot(MemSmgrSnapshot *snapshot)
+{
+	HASH_SEQ_STATUS status;
+	MemSmgrForkEntry *fork;
+	MemSmgrPageEntry *page;
+	MemoryContext oldcontext;
+	int			nforks = 0;
+	int			npages = 0;
+	int			i;
+
+	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&status, MemSmgrForkHash);
+	while ((fork = hash_seq_search(&status)) != NULL)
+	{
+		if (mem_snapshot_key_matches(&fork->key.rlocator))
+			nforks++;
+	}
+
+	hash_seq_init(&status, MemSmgrPageHash);
+	while ((page = hash_seq_search(&status)) != NULL)
+	{
+		if (mem_snapshot_key_matches(&page->key.rlocator))
+			npages++;
+	}
+
+	LWLockRelease(&MemSmgrState->lock);
+
+	oldcontext = MemoryContextSwitchTo(snapshot->context);
+	snapshot->nforks = nforks;
+	snapshot->npages = npages;
+	if (nforks > 0)
+		snapshot->forks = palloc(sizeof(MemSmgrForkEntry) * nforks);
+	if (npages > 0)
+		snapshot->pages = palloc(sizeof(MemSmgrPageEntry) * npages);
+	MemoryContextSwitchTo(oldcontext);
+
+	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	i = 0;
+	hash_seq_init(&status, MemSmgrForkHash);
+	while ((fork = hash_seq_search(&status)) != NULL)
+	{
+		if (mem_snapshot_key_matches(&fork->key.rlocator))
+		{
+			if (i < nforks)
+				snapshot->forks[i++] = *fork;
+		}
+	}
+	snapshot->nforks = i;
+
+	i = 0;
+	hash_seq_init(&status, MemSmgrPageHash);
+	while ((page = hash_seq_search(&status)) != NULL)
+	{
+		if (mem_snapshot_key_matches(&page->key.rlocator))
+		{
+			if (i < npages)
+				snapshot->pages[i++] = *page;
+		}
+	}
+	snapshot->npages = i;
+
+	LWLockRelease(&MemSmgrState->lock);
+}
+
+static void
+mem_restore_snapshot(MemSmgrSnapshot *snapshot)
+{
+	HASH_SEQ_STATUS status;
+	MemSmgrForkEntry *fork;
+	MemSmgrPageEntry *page;
+
+	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&status, MemSmgrForkHash);
+	while ((fork = hash_seq_search(&status)) != NULL)
+	{
+		if (mem_snapshot_key_matches(&fork->key.rlocator))
+			hash_search(MemSmgrForkHash, &fork->key, HASH_REMOVE, NULL);
+	}
+
+	hash_seq_init(&status, MemSmgrPageHash);
+	while ((page = hash_seq_search(&status)) != NULL)
+	{
+		if (mem_snapshot_key_matches(&page->key.rlocator))
+			hash_search(MemSmgrPageHash, &page->key, HASH_REMOVE, NULL);
+	}
+
+	for (int i = 0; i < snapshot->nforks; i++)
+	{
+		bool		found;
+		MemSmgrForkEntry *target;
+
+		target = hash_search(MemSmgrForkHash, &snapshot->forks[i].key,
+							 HASH_ENTER_NULL, &found);
+		if (target == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("memory storage manager fork table is full")));
+		*target = snapshot->forks[i];
+	}
+
+	for (int i = 0; i < snapshot->npages; i++)
+	{
+		bool		found;
+		MemSmgrPageEntry *target;
+
+		target = hash_search(MemSmgrPageHash, &snapshot->pages[i].key,
+							 HASH_ENTER_NULL, &found);
+		if (target == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("memory storage manager page table is full")));
+		*target = snapshot->pages[i];
+	}
+
+	LWLockRelease(&MemSmgrState->lock);
+
+#ifdef USE_TEST_MEM_SMGR
+	TestFastForkSetOidState(snapshot->next_oid, snapshot->oid_count);
+#endif
+}
+
+static void
+mem_restore_reset_caches(void)
+{
+	smgrreleaseall();
+	InvalidateSystemCaches();
+	ResetSequenceCaches();
 }
 #endif
 

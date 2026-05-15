@@ -1,24 +1,56 @@
-# Ephemeral Catalog Fast Path
+# DDL Snapshot and Ephemeral Catalog Fast Path
 
 ## Summary
 
-Add a test-only fast path for DDL-heavy unit-test workloads by moving newly
-created and modified catalog state into an ephemeral in-memory catalog overlay.
+Add test-only fast paths for DDL-heavy unit-test workloads. The most common
+unit-test pattern is:
+
+1. run schema DDL, indexes, constraints, and fixture/sample data setup
+2. run each test inside a transaction
+3. roll the test transaction back
+
 PostgreSQL DDL is expensive because it writes many catalog heap tuples, updates
 catalog indexes, records dependencies, sends invalidations, advances command
 counters, rebuilds relcache/syscache state, and then often rolls all of it back
-at the end of a test.
+or recreates it for the next test.
 
 The fast fork should keep SQL semantics for DDL, name lookup, relcache,
-syscache, MVCC visibility, and rollback inside the running cluster, but avoid
-durable catalog heap/index churn for objects created by disposable tests.
+syscache, MVCC visibility, and rollback inside the running cluster. It should
+avoid repeatedly paying full catalog/storage setup cost when the test workload
+is disposable.
+
+The recommended first implementation is a DDL fixture snapshot/restore path:
+create the schema and fixture data once, capture an in-memory snapshot, then
+restore that snapshot before each test. A full in-memory catalog overlay remains
+the follow-on design for tests that create unique schema objects dynamically
+inside each test.
+
+## Recommended Strategy
+
+Use a two-tier design:
+
+1. **Fixture snapshot/restore first.**
+   Optimize the common setup-once/run-many-tests path by restoring a captured
+   in-memory database state rather than replaying DDL or rolling catalog changes
+   through normal MVCC cleanup for every test.
+2. **Catalog overlay second.**
+   Optimize tests that generate fresh DDL inside each test transaction by moving
+   supported catalog writes into an in-memory overlay.
+
+Snapshot/restore should be the default recommendation because it preserves
+ordinary PostgreSQL DDL behavior during setup. It avoids needing to model every
+catalog edge case in the first fast path, and it handles tables, indexes,
+constraints, sequences, defaults, and seed data together.
 
 ## Goals
 
-- Speed up common unit-test DDL: `CREATE TABLE`, `CREATE INDEX`, `ALTER TABLE`,
-  `DROP TABLE`, constraints, defaults, sequences, and temporary schemas.
+- Speed up common unit-test setup: `CREATE TABLE`, `CREATE INDEX`,
+  `ALTER TABLE`, constraints, defaults, sequences, and fixture/sample data.
+- Restore the post-setup database state quickly before each test.
+- Preserve ordinary query behavior against objects restored from a snapshot.
+- Preserve ordinary PostgreSQL DDL behavior while creating the snapshot.
 - Preserve ordinary query behavior against objects created through the fast
-  path.
+  overlay path.
 - Preserve transaction visibility: uncommitted DDL is visible to its transaction
   and not to unrelated transactions.
 - Preserve rollback: aborting the test transaction discards catalog changes and
@@ -37,12 +69,15 @@ durable catalog heap/index churn for objects created by disposable tests.
 - Perfect support for every PostgreSQL extension object type in the first
   version.
 - Replacing long-lived bootstrap system catalogs.
+- Automatically rewriting ordinary user DDL into temporary tables.
+- Allowing snapshot restore while other backends are actively using the
+  database in the first version.
 - Weakening parser, planner, executor, relcache, syscache, MVCC, or lock
   correctness for the supported DDL subset.
 
 ## Build Flag
 
-Add a new build option:
+Use the existing fast-fork catalog build option:
 
 - Meson: `-Dtest_ephemeral_catalog=true`
 - Autoconf: `--enable-test-ephemeral-catalog`
@@ -60,15 +95,115 @@ meson setup build-fastfork \
   -Dtest_ephemeral_catalog=true
 ```
 
-This mode composes naturally with later in-memory storage and in-memory SLRU
-work:
+This mode composes naturally with in-memory storage and in-memory SLRU work:
 
 ```sh
   -Dtest_mem_smgr=true \
   -Dtest_mem_slru=true
 ```
 
-## Primary Targets
+## Phase 1: Fixture Snapshot/Restore
+
+### User Model
+
+The intended unit-test workflow is:
+
+```sql
+-- Once per test process or suite:
+CREATE TABLE ...;
+CREATE INDEX ...;
+INSERT INTO ...; -- fixture/sample data
+SELECT pg_fastfork_snapshot('fixture');
+
+-- Before each test:
+SELECT pg_fastfork_restore('fixture');
+BEGIN;
+-- run test
+ROLLBACK;
+```
+
+The exact SQL API can change, but the behavior should remain:
+
+- snapshot captures a named in-memory database state
+- restore makes the current database match that snapshot
+- restore is much faster than dropping/recreating schema or replaying DDL
+- normal SQL semantics remain unchanged after restore
+
+### Snapshot Contents
+
+A fixture snapshot must capture enough state to make restored tests behave as
+if setup had just completed:
+
+- `memsmgr` relation fork metadata and page contents
+- catalog heap/index relation contents for objects created during setup
+- relation mapper and relfilenode identity needed to open restored relations
+- sequence state for fixture-created sequences
+- OID and relfilenode counters, so restored tests produce repeatable object IDs
+  where PostgreSQL semantics allow it
+- transaction status horizon required for snapshot visibility
+- relcache/syscache invalidation generation, so stale descriptors are not reused
+
+When `test_mem_smgr` is enabled, relation data should be captured as in-memory
+pages. The preferred implementation is copy-on-write page snapshots rather than
+full page copies:
+
+- snapshot records the current fork/page map generation
+- later page writes clone pages when they would modify a snapshotted page
+- restore drops pages and fork metadata newer than the snapshot generation
+- restore reinstates the saved fork map, relation sizes, and sequence state
+
+This makes fixture data cheap to keep while allowing tests to mutate it freely.
+
+### Restore Semantics
+
+The first version should keep restore deliberately narrow and safe:
+
+- restore is only allowed outside an active transaction block
+- restore requires no other active backend in the target database, except the
+  caller
+- restore invalidates all local relcache/syscache entries
+- restore sends coarse shared invalidations if other idle backends are allowed
+  in a later version
+- restore discards uncommitted relation storage and catalog state newer than the
+  snapshot
+- restore resets transaction-local state only through ordinary transaction-end
+  cleanup; it must not leave resource owners, locks, portals, or snapshots
+  dangling
+
+If the first implementation only supports a single backend, it should fail
+clearly when another backend is connected. Multi-connection restore can come
+later with a coordinated quiesce/invalidation protocol.
+
+### Storage Boundary
+
+The snapshot boundary should sit below SQL but above physical durability:
+
+- `memsmgr` owns relation page snapshot/restore
+- transaction-status SLRUs own any required transaction horizon reset
+- relcache/syscache receive coarse invalidation hooks
+- sequence state is restored through sequence/catalog state rather than by
+  replaying SQL
+
+Avoid replaying SQL during restore. Replay would preserve behavior, but it would
+miss the main performance goal.
+
+### Why This Comes Before a Catalog Overlay
+
+DDL setup can use stock PostgreSQL catalog behavior once. That means the first
+fast path does not need to emulate every catalog write, dependency edge, or
+relcache/syscache interaction. Snapshot/restore also handles fixture data, which
+a catalog-only overlay does not.
+
+The catalog overlay is still valuable, but it should target the narrower case
+where tests create new schema objects inside the per-test transaction after the
+fixture snapshot has already been restored.
+
+## Phase 2: Catalog Overlay
+
+Phase 2 implements an in-memory catalog overlay for per-test dynamic DDL. It is
+not the preferred first step for the common setup-once workflow.
+
+## Primary Overlay Targets
 
 ### DDL Entry Points
 
@@ -312,7 +447,8 @@ The spec is satisfied when both validation paths pass on the current fork.
 
 ### Correctness Gate
 
-Run the fast-fork validation script with ephemeral catalog mode enabled:
+Run the fast-fork validation script with snapshot/restore and ephemeral catalog
+mode enabled:
 
 ```sh
 ./test-fastfork.sh --wipe
@@ -329,19 +465,32 @@ Passing means:
 
 - The script exits successfully.
 - All selected compatible tests pass.
+- Snapshot create/restore succeeds after schema and fixture setup.
+- A restored test can query fixture tables, use indexes, enforce constraints,
+  and mutate fixture data.
+- Rolling back a test transaction returns to the restored state.
+- Restoring the named fixture again discards all changes from the previous test.
 - DDL, name lookup, relcache, syscache, indexes, constraints, dependency-backed
   drops, MVCC, savepoints, rollback, and relation cleanup remain correct for
-  supported objects.
+  supported snapshot and overlay objects.
 - Any skipped tests are explicitly incompatible with the fast-fork feature set
   or missing local test dependencies.
 
 Additional high-value checks:
 
+- Create table, index, constraint, default, sequence, and seed rows; snapshot;
+  mutate rows and sequences; restore; verify all state matches the snapshot.
+- Restore twice in a row and verify OID, relfilenode, sequence, and row state
+  remain stable.
+- Attempt restore while another backend is connected and verify the first
+  version fails clearly, or verify coordinated restore if multi-backend support
+  has been implemented.
 - Create table, index, constraint, default, sequence; query it; roll back; then
-  verify the objects are gone.
+  verify the overlay-created objects are gone.
 - Create DDL in one transaction and verify another backend cannot see it before
-  commit.
-- Commit supported ephemeral DDL and verify another backend can see it.
+  commit, if the overlay phase supports multiple backends.
+- Commit supported ephemeral DDL and verify another backend can see it, if the
+  overlay phase supports committed overlay rows.
 - Abort a subtransaction that created a table and verify outer transaction
   catalog state remains valid.
 
@@ -368,11 +517,31 @@ Passing means:
 - Baseline and fork runs complete successfully.
 - Results are written under `bench/results/`.
 - The summary records the fork speed relative to the cached baseline build.
+- Snapshot/restore benchmark mode records the cost of restore separately from
+  test execution.
+- Per-test restore plus rollback is faster than replaying schema DDL and
+  fixture inserts for each test.
 
 ## Implementation Checklist
 
-- Add Meson and autoconf build options for `test_ephemeral_catalog`.
-- Add `USE_TEST_EPHEMERAL_CATALOG` to generated config headers.
+### Phase 1: Snapshot/Restore
+
+- Add a test-only SQL/API surface for creating, restoring, listing, and dropping
+  named fast-fork snapshots.
+- Add `memsmgr` snapshot support for fork metadata, relation sizes, and page
+  contents.
+- Implement copy-on-write page handling for pages retained by a snapshot.
+- Restore sequence state and any counters required for repeatable test setup.
+- Restore or validate transaction-status state needed for MVCC visibility.
+- Add a database quiescence check; initially require a single active backend.
+- Invalidate relcache/syscache state after restore.
+- Add clear errors when restore is attempted inside a transaction block or while
+  unsupported backends are active.
+- Teach the benchmark harness to measure setup replay versus snapshot restore.
+- Add validation tests for table/index/constraint/sequence/fixture restore.
+
+### Phase 2: Catalog Overlay
+
 - Add shared-memory overlay storage for supported catalog rows.
 - Add in-memory indexes for supported syscache/relcache lookup keys.
 - Intercept supported catalog writes in `CatalogTupleInsert`,
@@ -387,15 +556,18 @@ Passing means:
 - Ensure relation storage is unlinked when overlay-created relations abort or
   are dropped.
 - Add clear unsupported-DDL errors for object types outside the first pass.
-- Teach `test-fastfork.sh` to configure `-Dtest_ephemeral_catalog=true`.
-- Teach `bench/compare_pgbench.py` to configure the fork build with
-  `-Dtest_ephemeral_catalog=true`.
 - Run the validation and benchmark gates above.
 
 ## Risks
 
-- Catalog semantics are broad; too-large a first pass can become unmergeable.
-  Start with ordinary table/index/constraint/sequence DDL.
+- Snapshot restore must not leave backend-local state dangling. The first
+  version should require restore outside a transaction and with no active
+  competing backends.
+- Copy-on-write bugs can make fixture data leak between tests. Add targeted
+  tests that mutate heap, index, toast, and sequence state after restore.
+- Catalog semantics are broad; too-large an overlay first pass can become
+  unmergeable. Start overlay work with ordinary table/index/constraint/sequence
+  DDL after snapshot/restore is working.
 - Syscache and relcache must agree. If one sees overlay rows and the other does
   not, planner/executor behavior will become inconsistent.
 - Transaction visibility bugs in catalog state can make tests pass in a single

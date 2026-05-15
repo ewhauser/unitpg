@@ -355,6 +355,11 @@ extern bool ForceTransactionIdLimitUpdate(void);
 extern Oid	GetNewObjectId(void);
 extern void StopGeneratingPinnedObjectIds(void);
 
+#ifdef USE_TEST_MEM_SMGR
+extern void TestFastForkGetOidState(Oid *nextOid, uint32 *oidCount);
+extern void TestFastForkSetOidState(Oid nextOid, uint32 oidCount);
+#endif
+
 #ifdef USE_ASSERT_CHECKING
 extern void AssertTransactionIdInAllowableRange(TransactionId xid);
 #else

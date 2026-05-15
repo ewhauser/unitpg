@@ -19,7 +19,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKLOAD = ROOT / "bench" / "unit-test-rollback.pgbench"
+WORKLOADS = {
+    "rollback": ROOT / "bench" / "unit-test-rollback.pgbench",
+    "snapshot": ROOT / "bench" / "unit-test-snapshot.pgbench",
+}
 
 
 FAST_SETTINGS = {
@@ -121,12 +124,21 @@ def main() -> int:
     parser.add_argument("--warmup-transactions", type=int, default=10)
     parser.add_argument("--random-seed", default="1")
     parser.add_argument(
+        "--workload",
+        choices=sorted(WORKLOADS),
+        default="rollback",
+        help="pgbench workload to run",
+    )
+    parser.add_argument(
         "--config",
         action="append",
         default=[],
         help="extra postgresql.conf line, for example --config shared_buffers=256MB",
     )
     args = parser.parse_args()
+
+    if args.workload == "snapshot" and args.clients != 1:
+        raise SystemExit("the snapshot workload currently requires --clients 1")
 
     bin_dir = args.bin.resolve()
     initdb = bin_path(bin_dir, "initdb")
@@ -156,6 +168,8 @@ def main() -> int:
 
     started_at = dt.datetime.now(dt.UTC).isoformat()
     t0 = time.perf_counter()
+    workload = WORKLOADS[args.workload]
+    warmup_transactions = 0 if args.workload == "snapshot" else args.warmup_transactions
 
     try:
         run([initdb, "-D", str(data_dir), "--no-sync", "-A", "trust", "-U", "postgres"], env=base_env)
@@ -181,13 +195,15 @@ def main() -> int:
             "-j",
             str(args.jobs),
             "-f",
-            str(WORKLOAD),
+            str(workload),
         ]
+        if args.workload == "snapshot":
+            common_pgbench.extend(["-D", "setup_done=0"])
 
         warmup = None
-        if args.warmup_transactions > 0:
+        if warmup_transactions > 0:
             warmup_proc = run(
-                [*common_pgbench, "-t", str(args.warmup_transactions)],
+                [*common_pgbench, "-t", str(warmup_transactions)],
                 env=base_env,
             )
             warmup = parse_pgbench_output(warmup_proc.stdout)
@@ -203,15 +219,17 @@ def main() -> int:
             "workdir": str(workdir),
             "postgres_version": run([postgres, "--version"], env=base_env).stdout.strip(),
             "pgbench_version": run([pgbench, "--version"], env=base_env).stdout.strip(),
-            "workload": str(WORKLOAD),
-            "workload_sha256": sha256(WORKLOAD),
+            "workload": str(workload),
+            "workload_name": args.workload,
+            "workload_sha256": sha256(workload),
             "settings": settings,
             "parameters": {
                 "clients": args.clients,
                 "jobs": args.jobs,
                 "transactions": args.transactions,
                 "rows": args.rows,
-                "warmup_transactions": args.warmup_transactions,
+                "warmup_transactions": warmup_transactions,
+                "requested_warmup_transactions": args.warmup_transactions,
                 "random_seed": args.random_seed,
             },
             "warmup": warmup,

@@ -7,6 +7,15 @@ The workload in `unit-test-rollback.pgbench` is shaped like an application unit
 test: create schema objects, insert data, create indexes, run indexed joins and
 mutations, use a savepoint, and roll the whole transaction back.
 
+The optional `unit-test-snapshot.pgbench` workload uses the fast-fork fixture
+snapshot API. Its first warmup transaction creates the schema/data fixture and
+captures `pg_fastfork_snapshot('bench_fixture')`; later transactions restore
+that fixture before running the same query/mutation body. This workload is for
+the fast-fork build and currently expects `--clients 1`. Because the first
+snapshot implementation stores snapshots in the backend session, the runner
+does not run a separate warmup pgbench process for this workload; use enough
+transactions that the one-time fixture setup is amortized.
+
 ## Baseline
 
 Build and install PostgreSQL, then point the runner at that install's `bin`
@@ -28,6 +37,16 @@ python3 bench/run_pgbench.py \
   --output bench/results/fork.json
 ```
 
+To measure the fixture snapshot path against a fast-fork build:
+
+```sh
+python3 bench/run_pgbench.py \
+  --bin /path/to/fork/install/bin \
+  --label fork-snapshot \
+  --workload snapshot \
+  --output bench/results/fork-snapshot.json
+```
+
 The runner initializes a disposable cluster and applies these fast test
 settings: `fsync=off`, `synchronous_commit=off`, `full_page_writes=off`,
 `wal_level=minimal`, `archive_mode=off`, `max_wal_senders=0`,
@@ -43,6 +62,17 @@ same workload against both, and write a comparison under `bench/results/`:
 
 ```sh
 python3 bench/compare_pgbench.py \
+  --rounds 5 \
+  --transactions 200 \
+  --rows 200
+```
+
+To compare stock Postgres doing DDL/data setup in every transaction against the
+fast-fork snapshot/restore path, use:
+
+```sh
+python3 bench/compare_pgbench.py \
+  --fakewal-workload snapshot \
   --rounds 5 \
   --transactions 200 \
   --rows 200

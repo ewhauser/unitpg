@@ -302,7 +302,13 @@ def build_variant(
     )
 
 
-def pgbench_cmd(args: argparse.Namespace, bin_dir: Path, label: str, output: Path) -> list[str]:
+def pgbench_cmd(
+    args: argparse.Namespace,
+    bin_dir: Path,
+    label: str,
+    output: Path,
+    workload: str,
+) -> list[str]:
     cmd = [
         sys.executable,
         "-B",
@@ -325,6 +331,8 @@ def pgbench_cmd(args: argparse.Namespace, bin_dir: Path, label: str, output: Pat
         str(args.warmup_transactions),
         "--random-seed",
         str(args.random_seed),
+        "--workload",
+        workload,
     ]
     for config in args.config:
         cmd.extend(["--config", config])
@@ -360,14 +368,16 @@ def write_summary_markdown(payload: dict[str, object], path: Path) -> None:
         f"Generated: `{payload['generated_at']}`",
         f"Build system: `{payload['build_system']}`",
         "",
-        "| Variant | Rounds | Median TPS | Mean TPS | Median latency (ms) |",
-        "| --- | ---: | ---: | ---: | ---: |",
+        "| Variant | Workload | Rounds | Median TPS | Mean TPS | Median latency (ms) |",
+        "| --- | --- | ---: | ---: | ---: | ---: |",
     ]
     for name in ("baseline", "fakewal"):
+        variant = variants[name]
         summary = variants[name]["summary"]
         lines.append(
-            "| {name} | {rounds} | {median_tps:.3f} | {mean_tps:.3f} | {median_latency:.3f} |".format(
+            "| {name} | {workload} | {rounds} | {median_tps:.3f} | {mean_tps:.3f} | {median_latency:.3f} |".format(
                 name=name,
+                workload=variant["workload"],
                 rounds=summary["rounds"],
                 median_tps=summary["tps"]["median"],
                 mean_tps=summary["tps"]["mean"],
@@ -415,6 +425,18 @@ def main() -> int:
     parser.add_argument("--warmup-transactions", type=int, default=10)
     parser.add_argument("--rows", type=int, default=200)
     parser.add_argument("--random-seed", default="1")
+    parser.add_argument(
+        "--baseline-workload",
+        choices=["rollback", "snapshot"],
+        default="rollback",
+        help="workload to run against the baseline build",
+    )
+    parser.add_argument(
+        "--fakewal-workload",
+        choices=["rollback", "snapshot"],
+        default="rollback",
+        help="workload to run against the fast-fork build",
+    )
     parser.add_argument(
         "--config",
         action="append",
@@ -477,6 +499,11 @@ def main() -> int:
 
     if args.rounds < 1:
         raise SystemExit("--rounds must be at least 1")
+    if (
+        (args.baseline_workload == "snapshot" or args.fakewal_workload == "snapshot")
+        and args.clients != 1
+    ):
+        raise SystemExit("the snapshot workload currently requires --clients 1")
 
     source = args.source.resolve()
     build_root = args.build_root.resolve()
@@ -541,7 +568,8 @@ def main() -> int:
         for name in ("baseline", "fakewal"):
             run_path = output_dir / "runs" / f"{round_index:02d}-{name}.json"
             label = f"{name}-round-{round_index:02d}"
-            cmd = pgbench_cmd(args, bins[name], label, run_path)
+            workload = args.baseline_workload if name == "baseline" else args.fakewal_workload
+            cmd = pgbench_cmd(args, bins[name], label, run_path, workload)
             result = run_json(cmd, log=output_dir / "logs" / f"{round_index:02d}-{name}-pgbench.log")
             result["round"] = round_index
             result["result_path"] = str(run_path)
@@ -575,9 +603,12 @@ def main() -> int:
             "rows": args.rows,
             "random_seed": args.random_seed,
             "config": args.config,
+            "baseline_workload": args.baseline_workload,
+            "fakewal_workload": args.fakewal_workload,
         },
         "variants": {
             "baseline": {
+                "workload": args.baseline_workload,
                 "fake_wal": False,
                 "no_bg_jobs": False,
                 "mem_smgr": False,
@@ -594,6 +625,7 @@ def main() -> int:
                 "runs": runs["baseline"],
             },
             "fakewal": {
+                "workload": args.fakewal_workload,
                 "fake_wal": True,
                 "no_bg_jobs": not args.keep_bg_jobs,
                 "mem_smgr": not args.disable_mem_smgr,

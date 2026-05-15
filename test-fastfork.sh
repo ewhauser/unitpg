@@ -316,6 +316,8 @@ done
 
 "$MESON" test "${SETUP_ARGS_FOR_TEST[@]}"
 fix_darwin_tmp_install_names
+"${PYTHON:-python3}" "$ROOT/bench/test_fastfork_snapshot.py" \
+	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 
 TEST_ARGS=(
 	"-C" "$BUILD_DIR"
