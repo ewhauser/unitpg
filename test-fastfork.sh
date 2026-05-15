@@ -22,6 +22,7 @@ Build and validate the fast-fork Postgres configuration:
   -Dtest_fake_wal=true -Dtest_no_bg_jobs=true -Dtest_mem_smgr=true
   -Dtest_mem_slru=true -Dtest_no_wal_assembly=true
   -Dtest_no_observability=true -Dtest_fast_memory_contexts=true
+  -Dtest_ephemeral_catalog=true
 
 Modes:
   quick       Fast compatible smoke tests plus async I/O tests when the local
@@ -163,6 +164,7 @@ SETUP_ARGS=(
 	"-Dtest_no_wal_assembly=true"
 	"-Dtest_no_observability=true"
 	"-Dtest_fast_memory_contexts=true"
+	"-Dtest_ephemeral_catalog=true"
 	"-Dtap_tests=auto"
 	"-Dauto_features=disabled"
 	"-Dicu=disabled"

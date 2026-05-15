@@ -76,6 +76,10 @@
    (--enable-test-fast-memory-contexts) */
 #undef USE_TEST_FAST_MEMORY_CONTEXTS
 
+/* Define to 1 to enable ephemeral catalog fast paths.
+   (--enable-test-ephemeral-catalog) */
+#undef USE_TEST_EPHEMERAL_CATALOG
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

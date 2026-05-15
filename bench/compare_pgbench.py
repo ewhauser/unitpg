@@ -119,6 +119,7 @@ def build_with_meson(
     no_wal_assembly: bool,
     no_observability: bool,
     fast_memory_contexts: bool,
+    ephemeral_catalog: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -147,6 +148,7 @@ def build_with_meson(
         f"-Dtest_no_wal_assembly={'true' if no_wal_assembly else 'false'}",
         f"-Dtest_no_observability={'true' if no_observability else 'false'}",
         f"-Dtest_fast_memory_contexts={'true' if fast_memory_contexts else 'false'}",
+        f"-Dtest_ephemeral_catalog={'true' if ephemeral_catalog else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -169,6 +171,7 @@ def build_with_configure(
     no_wal_assembly: bool,
     no_observability: bool,
     fast_memory_contexts: bool,
+    ephemeral_catalog: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -204,6 +207,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-no-observability")
     if fast_memory_contexts:
         configure_cmd.append("--enable-test-fast-memory-contexts")
+    if ephemeral_catalog:
+        configure_cmd.append("--enable-test-ephemeral-catalog")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -227,6 +232,7 @@ def build_variant(
     no_wal_assembly: bool,
     no_observability: bool,
     fast_memory_contexts: bool,
+    ephemeral_catalog: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -247,6 +253,7 @@ def build_variant(
             no_wal_assembly=no_wal_assembly,
             no_observability=no_observability,
             fast_memory_contexts=fast_memory_contexts,
+            ephemeral_catalog=ephemeral_catalog,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -263,6 +270,7 @@ def build_variant(
         no_wal_assembly=no_wal_assembly,
         no_observability=no_observability,
         fast_memory_contexts=fast_memory_contexts,
+        ephemeral_catalog=ephemeral_catalog,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -421,6 +429,11 @@ def main() -> int:
         action="store_true",
         help="do not use faster memory context choices in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-ephemeral-catalog",
+        action="store_true",
+        help="do not enable ephemeral catalog fast paths in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -450,6 +463,7 @@ def main() -> int:
             no_wal_assembly=False,
             no_observability=False,
             fast_memory_contexts=False,
+            ephemeral_catalog=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -471,6 +485,7 @@ def main() -> int:
             no_wal_assembly=not args.disable_no_wal_assembly,
             no_observability=not args.disable_no_observability,
             fast_memory_contexts=not args.disable_fast_memory_contexts,
+            ephemeral_catalog=not args.disable_ephemeral_catalog,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -525,6 +540,7 @@ def main() -> int:
                 "no_wal_assembly": False,
                 "no_observability": False,
                 "fast_memory_contexts": False,
+                "ephemeral_catalog": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -537,6 +553,7 @@ def main() -> int:
                 "no_wal_assembly": not args.disable_no_wal_assembly,
                 "no_observability": not args.disable_no_observability,
                 "fast_memory_contexts": not args.disable_fast_memory_contexts,
+                "ephemeral_catalog": not args.disable_ephemeral_catalog,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

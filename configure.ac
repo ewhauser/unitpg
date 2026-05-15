@@ -309,6 +309,15 @@ PGAC_ARG_BOOL(enable, test-fast-memory-contexts, no,
 AC_SUBST(enable_test_fast_memory_contexts)
 
 #
+# Test-only ephemeral catalog fast paths
+#
+PGAC_ARG_BOOL(enable, test-ephemeral-catalog, no,
+              [enable ephemeral catalog fast paths (for testing)],
+              [AC_DEFINE([USE_TEST_EPHEMERAL_CATALOG], 1,
+                         [Define to 1 to enable ephemeral catalog fast paths. (--enable-test-ephemeral-catalog)])])
+AC_SUBST(enable_test_ephemeral_catalog)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])
