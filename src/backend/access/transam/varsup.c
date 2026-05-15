@@ -111,6 +111,7 @@ GetNewTransactionId(bool isSubXact)
 	 * Note that this coding also appears in GetNewMultiXactId.
 	 *----------
 	 */
+#ifndef USE_TEST_NO_DURABLE_MAINTENANCE
 	if (TransactionIdFollowsOrEquals(xid, TransamVariables->xidVacLimit))
 	{
 		/*
@@ -186,6 +187,7 @@ GetNewTransactionId(bool isSubXact)
 		full_xid = TransamVariables->nextXid;
 		xid = XidFromFullTransactionId(full_xid);
 	}
+#endif
 
 	/*
 	 * If we are allocating the first XID of a new page of the commit log,

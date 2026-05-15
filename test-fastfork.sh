@@ -22,7 +22,7 @@ Build and validate the fast-fork Postgres configuration:
   -Dtest_fake_wal=true -Dtest_no_bg_jobs=true -Dtest_mem_smgr=true
   -Dtest_mem_slru=true -Dtest_no_wal_assembly=true
   -Dtest_no_observability=true -Dtest_fast_memory_contexts=true
-  -Dtest_ephemeral_catalog=true
+  -Dtest_ephemeral_catalog=true -Dtest_no_durable_maintenance=true
 
 Modes:
   quick       Fast compatible smoke tests plus async I/O tests when the local
@@ -165,6 +165,7 @@ SETUP_ARGS=(
 	"-Dtest_no_observability=true"
 	"-Dtest_fast_memory_contexts=true"
 	"-Dtest_ephemeral_catalog=true"
+	"-Dtest_no_durable_maintenance=true"
 	"-Dtap_tests=auto"
 	"-Dauto_features=disabled"
 	"-Dicu=disabled"
@@ -219,7 +220,9 @@ CORE_EXTRA_TESTS=(
 # exercise those code paths.
 # The index isolation suite checks pg_statio_* heap access counters.  Those are
 # intentionally disabled by test_no_observability.
-UNSUPPORTED_RE='^postgresql:(regress/regress|isolation/isolation|recovery/|subscription/|pg_upgrade/|pg_basebackup/|pg_combinebackup/|pg_rewind/|pg_verifybackup/|pg_archivecleanup/|pg_resetwal/|pg_walinspect/|pg_waldump/|pg_walsummary/|pg_logicalinspect/|test_decoding/|test_checksums/|test_autovacuum/|test_custom_rmgrs/|test_shm_mq/|worker_spi/|basic_archive/|brin/02_wal_consistency|index/isolation|pg_ctl/003_promote)'
+# The BRIN isolation suite asserts VACUUM-driven summarization; in
+# test_no_durable_maintenance, VACUUM is intentionally a no-op.
+UNSUPPORTED_RE='^postgresql:(regress/regress|isolation/isolation|recovery/|subscription/|pg_upgrade/|pg_basebackup/|pg_combinebackup/|pg_rewind/|pg_verifybackup/|pg_archivecleanup/|pg_resetwal/|pg_walinspect/|pg_waldump/|pg_walsummary/|pg_logicalinspect/|test_decoding/|test_checksums/|test_autovacuum/|test_custom_rmgrs/|test_shm_mq/|worker_spi/|basic_archive/|brin/isolation|brin/02_wal_consistency|index/isolation|pg_ctl/003_promote)'
 
 if [[ "$WIPE" -eq 1 ]]; then
 	rm -rf "$BUILD_DIR"
@@ -277,6 +280,8 @@ else
 fi
 
 sort -u "$SELECTED_TESTS" -o "$SELECTED_TESTS"
+grep -Ev "$UNSUPPORTED_RE" "$SELECTED_TESTS" > "$SELECTED_TESTS.filtered"
+mv "$SELECTED_TESTS.filtered" "$SELECTED_TESTS"
 
 if [[ ! -s "$SELECTED_TESTS" ]]; then
 	printf 'no tests selected\n' >&2

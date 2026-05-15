@@ -150,6 +150,9 @@ static Buffer vm_extend(Relation rel, BlockNumber vm_nblocks);
 bool
 visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return false;
+#else
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	int			mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	int			mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
@@ -182,6 +185,7 @@ visibilitymap_clear(Relation rel, BlockNumber heapBlk, Buffer vmbuf, uint8 flags
 	LockBuffer(vmbuf, BUFFER_LOCK_UNLOCK);
 
 	return cleared;
+#endif
 }
 
 /*
@@ -256,6 +260,9 @@ visibilitymap_set(BlockNumber heapBlk,
 				  Buffer vmBuf, uint8 flags,
 				  const RelFileLocator rlocator)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
@@ -294,6 +301,7 @@ visibilitymap_set(BlockNumber heapBlk,
 		map[mapByte] |= (flags << mapOffset);
 		MarkBufferDirty(vmBuf);
 	}
+#endif
 }
 
 /*
@@ -318,6 +326,9 @@ visibilitymap_set(BlockNumber heapBlk,
 uint8
 visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return (uint8) 0;
+#else
 	BlockNumber mapBlock = HEAPBLK_TO_MAPBLOCK(heapBlk);
 	uint32		mapByte = HEAPBLK_TO_MAPBYTE(heapBlk);
 	uint8		mapOffset = HEAPBLK_TO_OFFSET(heapBlk);
@@ -354,6 +365,7 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 	 */
 	result = ((map[mapByte] >> mapOffset) & VISIBILITYMAP_VALID_BITS);
 	return result;
+#endif
 }
 
 /*
@@ -366,6 +378,15 @@ visibilitymap_get_status(Relation rel, BlockNumber heapBlk, Buffer *vmbuf)
 void
 visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_frozen)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	/* all_visible must be specified */
+	Assert(all_visible);
+
+	*all_visible = 0;
+	if (all_frozen)
+		*all_frozen = 0;
+	return;
+#else
 	BlockNumber mapBlock;
 	BlockNumber nvisible = 0;
 	BlockNumber nfrozen = 0;
@@ -404,6 +425,7 @@ visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_fro
 	*all_visible = nvisible;
 	if (all_frozen)
 		*all_frozen = nfrozen;
+#endif
 }
 
 /*
@@ -420,6 +442,9 @@ visibilitymap_count(Relation rel, BlockNumber *all_visible, BlockNumber *all_fro
 BlockNumber
 visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return InvalidBlockNumber;
+#else
 	BlockNumber newnblocks;
 
 	/* last remaining block, byte, and bit */
@@ -509,6 +534,7 @@ visibilitymap_prepare_truncate(Relation rel, BlockNumber nheapblocks)
 	}
 
 	return newnblocks;
+#endif
 }
 
 /*

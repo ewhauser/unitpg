@@ -80,6 +80,10 @@
    (--enable-test-ephemeral-catalog) */
 #undef USE_TEST_EPHEMERAL_CATALOG
 
+/* Define to 1 to disable durable maintenance work.
+   (--enable-test-no-durable-maintenance) */
+#undef USE_TEST_NO_DURABLE_MAINTENANCE
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

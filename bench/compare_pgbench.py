@@ -120,6 +120,7 @@ def build_with_meson(
     no_observability: bool,
     fast_memory_contexts: bool,
     ephemeral_catalog: bool,
+    no_durable_maintenance: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -149,6 +150,7 @@ def build_with_meson(
         f"-Dtest_no_observability={'true' if no_observability else 'false'}",
         f"-Dtest_fast_memory_contexts={'true' if fast_memory_contexts else 'false'}",
         f"-Dtest_ephemeral_catalog={'true' if ephemeral_catalog else 'false'}",
+        f"-Dtest_no_durable_maintenance={'true' if no_durable_maintenance else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -172,6 +174,7 @@ def build_with_configure(
     no_observability: bool,
     fast_memory_contexts: bool,
     ephemeral_catalog: bool,
+    no_durable_maintenance: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -209,6 +212,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-fast-memory-contexts")
     if ephemeral_catalog:
         configure_cmd.append("--enable-test-ephemeral-catalog")
+    if no_durable_maintenance:
+        configure_cmd.append("--enable-test-no-durable-maintenance")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -233,6 +238,7 @@ def build_variant(
     no_observability: bool,
     fast_memory_contexts: bool,
     ephemeral_catalog: bool,
+    no_durable_maintenance: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -254,6 +260,7 @@ def build_variant(
             no_observability=no_observability,
             fast_memory_contexts=fast_memory_contexts,
             ephemeral_catalog=ephemeral_catalog,
+            no_durable_maintenance=no_durable_maintenance,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -271,6 +278,7 @@ def build_variant(
         no_observability=no_observability,
         fast_memory_contexts=fast_memory_contexts,
         ephemeral_catalog=ephemeral_catalog,
+        no_durable_maintenance=no_durable_maintenance,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -434,6 +442,11 @@ def main() -> int:
         action="store_true",
         help="do not enable ephemeral catalog fast paths in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-durable-maintenance",
+        action="store_true",
+        help="do not disable durable maintenance work in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -464,6 +477,7 @@ def main() -> int:
             no_observability=False,
             fast_memory_contexts=False,
             ephemeral_catalog=False,
+            no_durable_maintenance=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -486,6 +500,7 @@ def main() -> int:
             no_observability=not args.disable_no_observability,
             fast_memory_contexts=not args.disable_fast_memory_contexts,
             ephemeral_catalog=not args.disable_ephemeral_catalog,
+            no_durable_maintenance=not args.disable_no_durable_maintenance,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -541,6 +556,7 @@ def main() -> int:
                 "no_observability": False,
                 "fast_memory_contexts": False,
                 "ephemeral_catalog": False,
+                "no_durable_maintenance": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -554,6 +570,7 @@ def main() -> int:
                 "no_observability": not args.disable_no_observability,
                 "fast_memory_contexts": not args.disable_fast_memory_contexts,
                 "ephemeral_catalog": not args.disable_ephemeral_catalog,
+                "no_durable_maintenance": not args.disable_no_durable_maintenance,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

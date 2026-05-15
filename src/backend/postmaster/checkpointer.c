@@ -1099,6 +1099,15 @@ RequestCheckpoint(int flags)
 		return;
 	}
 
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	/*
+	 * Short-lived test clusters do not need durable checkpoints.  Standalone
+	 * bootstrap/initdb keeps the normal path above so template clusters are
+	 * still materialized correctly.
+	 */
+	return;
+#endif
+
 #ifdef USE_TEST_NO_BG_JOBS
 	/*
 	 * Test-only no-job builds never launch a checkpointer.  Treat checkpoint

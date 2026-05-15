@@ -1013,6 +1013,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 	 * Note these are pretty much the same protections in GetNewTransactionId.
 	 *----------
 	 */
+#ifndef USE_TEST_NO_DURABLE_MAINTENANCE
 	if (!MultiXactIdPrecedes(result, MultiXactState->multiVacLimit))
 	{
 		/*
@@ -1098,6 +1099,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 		LWLockAcquire(MultiXactGenLock, LW_EXCLUSIVE);
 		result = MultiXactState->nextMXact;
 	}
+#endif
 
 	/*
 	 * Make sure there is room for the next MXID in the file.  Assigning this

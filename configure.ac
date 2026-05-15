@@ -318,6 +318,15 @@ PGAC_ARG_BOOL(enable, test-ephemeral-catalog, no,
 AC_SUBST(enable_test_ephemeral_catalog)
 
 #
+# Test-only no durable maintenance
+#
+PGAC_ARG_BOOL(enable, test-no-durable-maintenance, no,
+              [disable durable maintenance work (for testing)],
+              [AC_DEFINE([USE_TEST_NO_DURABLE_MAINTENANCE], 1,
+                         [Define to 1 to disable durable maintenance work. (--enable-test-no-durable-maintenance)])])
+AC_SUBST(enable_test_no_durable_maintenance)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

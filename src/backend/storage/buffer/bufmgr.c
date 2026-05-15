@@ -4448,6 +4448,11 @@ DebugPrintBufferRefcount(Buffer buffer)
 void
 CheckPointBuffers(int flags)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster)
+		return;
+#endif
+
 	BufferSync(flags);
 }
 

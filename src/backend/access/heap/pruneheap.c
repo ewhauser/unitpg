@@ -271,6 +271,9 @@ void
 heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 					bool rel_read_only)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	Page		page = BufferGetPage(buffer);
 	TransactionId prune_xid;
 	GlobalVisState *vistest;
@@ -387,6 +390,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer, Buffer *vmbuffer,
 		 * free space should be reused by UPDATEs to *this* page.
 		 */
 	}
+#endif
 }
 
 /*

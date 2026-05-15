@@ -122,10 +122,12 @@ int			VacuumCostBalanceLocal = 0;
 static List *expand_vacuum_rel(VacuumRelation *vrel,
 							   MemoryContext vac_context, int options);
 static List *get_all_vacuum_rels(MemoryContext vac_context, int options);
+#ifndef USE_TEST_NO_DURABLE_MAINTENANCE
 static void vac_truncate_clog(TransactionId frozenXID,
 							  MultiXactId minMulti,
 							  TransactionId lastSaneFrozenXid,
 							  MultiXactId lastSaneMinMulti);
+#endif
 static bool vacuum_rel(Oid relid, RangeVar *relation, VacuumParams params,
 					   BufferAccessStrategy bstrategy, bool isTopLevel);
 static double compute_parallel_delay(void);
@@ -409,6 +411,30 @@ ExecVacuum(ParseState *pstate, VacuumStmt *vacstmt, bool isTopLevel)
 	/* user-invoked vacuum is never "for wraparound" */
 	params.is_wraparound = false;
 
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (params.options & VACOPT_VACUUM)
+	{
+		PreventInTransactionBlock(isTopLevel, "VACUUM");
+
+		if (params.options & VACOPT_FULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("VACUUM FULL is disabled by test_no_durable_maintenance")));
+		if (params.nworkers > 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("parallel VACUUM is disabled by test_no_durable_maintenance")));
+
+		if (!(params.options & VACOPT_ANALYZE))
+			return;
+
+		params.options &= ~(VACOPT_VACUUM |
+							VACOPT_PROCESS_TOAST |
+							VACOPT_SKIP_DATABASE_STATS |
+							VACOPT_ONLY_DATABASE_STATS);
+	}
+#endif
+
 	/*
 	 * user-invoked vacuum uses VACOPT_VERBOSE instead of
 	 * log_vacuum_min_duration and log_analyze_min_duration
@@ -501,6 +527,11 @@ vacuum(List *relations, const VacuumParams *params, BufferAccessStrategy bstrate
 				use_own_xacts;
 
 	stmttype = (params->options & VACOPT_VACUUM) ? "VACUUM" : "ANALYZE";
+
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (params->options & VACOPT_VACUUM)
+		return;
+#endif
 
 	/*
 	 * We cannot run VACUUM inside a user transaction block; if we were inside
@@ -1273,6 +1304,9 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 bool
 vacuum_xid_failsafe_check(const struct VacuumCutoffs *cutoffs)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return false;
+#else
 	TransactionId relfrozenxid = cutoffs->relfrozenxid;
 	MultiXactId relminmxid = cutoffs->relminmxid;
 	TransactionId xid_skip_limit;
@@ -1317,6 +1351,7 @@ vacuum_xid_failsafe_check(const struct VacuumCutoffs *cutoffs)
 	}
 
 	return false;
+#endif
 }
 
 /*
@@ -1613,6 +1648,9 @@ vac_update_relstats(Relation relation,
 void
 vac_update_datfrozenxid(void)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	return;
+#else
 	HeapTuple	tuple;
 	Form_pg_database dbform;
 	Relation	relation;
@@ -1811,6 +1849,7 @@ vac_update_datfrozenxid(void)
 	if (dirty || ForceTransactionIdLimitUpdate())
 		vac_truncate_clog(newFrozenXid, newMinMulti,
 						  lastSaneFrozenXid, lastSaneMinMulti);
+#endif
 }
 
 
@@ -1831,6 +1870,7 @@ vac_update_datfrozenxid(void)
  *		DB's datfrozenxid/datminmxid values, or we found that the shared
  *		XID-wrap-limit info is stale.
  */
+#ifndef USE_TEST_NO_DURABLE_MAINTENANCE
 static void
 vac_truncate_clog(TransactionId frozenXID,
 				  MultiXactId minMulti,
@@ -1987,6 +2027,7 @@ vac_truncate_clog(TransactionId frozenXID,
 
 	LWLockRelease(WrapLimitsVacuumLock);
 }
+#endif
 
 
 /*

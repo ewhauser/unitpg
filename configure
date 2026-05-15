@@ -780,6 +780,7 @@ enable_test_no_wal_assembly
 enable_test_no_observability
 enable_test_fast_memory_contexts
 enable_test_ephemeral_catalog
+enable_test_no_durable_maintenance
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -868,6 +869,7 @@ enable_test_no_wal_assembly
 enable_test_no_observability
 enable_test_fast_memory_contexts
 enable_test_ephemeral_catalog
+enable_test_no_durable_maintenance
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1588,6 +1590,8 @@ Optional Features:
                           use faster memory context choices (for testing)
   --enable-test-ephemeral-catalog
                           enable ephemeral catalog fast paths (for testing)
+  --enable-test-no-durable-maintenance
+                          disable durable maintenance work (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -3950,6 +3954,34 @@ $as_echo "#define USE_TEST_EPHEMERAL_CATALOG 1" >>confdefs.h
 
 else
   enable_test_ephemeral_catalog=no
+
+fi
+
+
+#
+# Test-only no durable maintenance
+#
+
+
+# Check whether --enable-test-no-durable-maintenance was given.
+if test "${enable_test_no_durable_maintenance+set}" = set; then :
+  enableval=$enable_test_no_durable_maintenance;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_DURABLE_MAINTENANCE 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-durable-maintenance option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_durable_maintenance=no
 
 fi
 

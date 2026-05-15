@@ -7450,6 +7450,11 @@ CreateCheckPoint(int flags)
 	else
 		shutdown = false;
 
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster && !shutdown)
+		return false;
+#endif
+
 	/* sanity check */
 	if (RecoveryInProgress() && (flags & CHECKPOINT_END_OF_RECOVERY) == 0)
 		elog(ERROR, "can't create a checkpoint during recovery");
@@ -8078,6 +8083,11 @@ CreateOverwriteContrecordRecord(XLogRecPtr aborted_lsn, XLogRecPtr pagePtr,
 static void
 CheckPointGuts(XLogRecPtr checkPointRedo, int flags)
 {
+#ifdef USE_TEST_NO_DURABLE_MAINTENANCE
+	if (IsUnderPostmaster)
+		return;
+#endif
+
 	CheckPointRelationMap();
 	CheckPointReplicationSlots(flags & CHECKPOINT_IS_SHUTDOWN);
 	CheckPointSnapBuild();
