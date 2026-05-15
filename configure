@@ -774,6 +774,8 @@ CC
 enable_injection_points
 enable_test_fake_wal
 enable_test_no_bg_jobs
+enable_test_mem_smgr
+enable_test_mem_slru
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -856,6 +858,8 @@ enable_tap_tests
 enable_injection_points
 enable_test_fake_wal
 enable_test_no_bg_jobs
+enable_test_mem_smgr
+enable_test_mem_slru
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1563,6 +1567,10 @@ Optional Features:
   --enable-test-no-bg-jobs
                           disable background maintenance jobs except async I/O
                           workers (for testing)
+  --enable-test-mem-smgr  use a memory-backed relation storage manager (for
+                          testing)
+  --enable-test-mem-slru  use memory-backed transaction-status SLRUs (for
+                          testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -3752,6 +3760,62 @@ $as_echo "#define USE_TEST_NO_BG_JOBS 1" >>confdefs.h
 
 else
   enable_test_no_bg_jobs=no
+
+fi
+
+
+#
+# Test-only in-memory storage manager
+#
+
+
+# Check whether --enable-test-mem-smgr was given.
+if test "${enable_test_mem_smgr+set}" = set; then :
+  enableval=$enable_test_mem_smgr;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_MEM_SMGR 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-mem-smgr option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_mem_smgr=no
+
+fi
+
+
+#
+# Test-only in-memory transaction-status SLRUs
+#
+
+
+# Check whether --enable-test-mem-slru was given.
+if test "${enable_test_mem_slru+set}" = set; then :
+  enableval=$enable_test_mem_slru;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_MEM_SLRU 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-mem-slru option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_mem_slru=no
 
 fi
 

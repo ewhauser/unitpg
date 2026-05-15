@@ -269,6 +269,15 @@ PGAC_ARG_BOOL(enable, test-mem-smgr, no,
 AC_SUBST(enable_test_mem_smgr)
 
 #
+# Test-only in-memory transaction-status SLRUs
+#
+PGAC_ARG_BOOL(enable, test-mem-slru, no,
+              [use memory-backed transaction-status SLRUs (for testing)],
+              [AC_DEFINE([USE_TEST_MEM_SLRU], 1,
+                         [Define to 1 to use memory-backed transaction-status SLRUs. (--enable-test-mem-slru)])])
+AC_SUBST(enable_test_mem_slru)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

@@ -222,6 +222,8 @@ SUBTRANSShmemBuffers(void)
 static void
 SUBTRANSShmemRequest(void *arg)
 {
+	int			nslots;
+
 	/* If auto-tuning is requested, now is the time to do it */
 	if (subtransaction_buffers == 0)
 	{
@@ -243,12 +245,17 @@ SUBTRANSShmemRequest(void *arg)
 	}
 	Assert(subtransaction_buffers != 0);
 
+	nslots = SUBTRANSShmemBuffers();
+#ifdef USE_TEST_MEM_SLRU
+	nslots = SimpleLruTestInMemoryBuffers(nslots, SLRU_MAX_ALLOWED_BUFFERS);
+#endif
+
 	SimpleLruRequest(.desc = &SubTransSlruDesc,
 					 .name = "subtransaction",
 					 .Dir = "pg_subtrans",
 					 .long_segment_names = false,
 
-					 .nslots = SUBTRANSShmemBuffers(),
+					 .nslots = nslots,
 
 					 .sync_handler = SYNC_HANDLER_NONE,
 					 .PagePrecedes = SubTransPagePrecedes,
@@ -256,6 +263,9 @@ SUBTRANSShmemRequest(void *arg)
 
 					 .buffer_tranche_id = LWTRANCHE_SUBTRANS_BUFFER,
 					 .bank_tranche_id = LWTRANCHE_SUBTRANS_SLRU,
+#ifdef USE_TEST_MEM_SLRU
+					 .in_memory = true,
+#endif
 		);
 }
 

@@ -528,6 +528,8 @@ CommitTsShmemBuffers(void)
 static void
 CommitTsShmemRequest(void *arg)
 {
+	int			nslots;
+
 	/* If auto-tuning is requested, now is the time to do it */
 	if (commit_timestamp_buffers == 0)
 	{
@@ -548,12 +550,18 @@ CommitTsShmemRequest(void *arg)
 							PGC_S_OVERRIDE);
 	}
 	Assert(commit_timestamp_buffers != 0);
+
+	nslots = CommitTsShmemBuffers();
+#ifdef USE_TEST_MEM_SLRU
+	nslots = SimpleLruTestInMemoryBuffers(nslots, SLRU_MAX_ALLOWED_BUFFERS);
+#endif
+
 	SimpleLruRequest(.desc = &CommitTsSlruDesc,
 					 .name = "commit_timestamp",
 					 .Dir = "pg_commit_ts",
 					 .long_segment_names = false,
 
-					 .nslots = CommitTsShmemBuffers(),
+					 .nslots = nslots,
 
 					 .PagePrecedes = CommitTsPagePrecedes,
 					 .errdetail_for_io_error = commit_ts_errdetail_for_io_error,
@@ -561,6 +569,9 @@ CommitTsShmemRequest(void *arg)
 					 .sync_handler = SYNC_HANDLER_COMMIT_TS,
 					 .buffer_tranche_id = LWTRANCHE_COMMITTS_BUFFER,
 					 .bank_tranche_id = LWTRANCHE_COMMITTS_SLRU,
+#ifdef USE_TEST_MEM_SLRU
+					 .in_memory = true,
+#endif
 		);
 
 	ShmemRequestStruct(.name = "CommitTs shared",

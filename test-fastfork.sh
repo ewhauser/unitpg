@@ -20,6 +20,7 @@ Usage: ./test-fastfork.sh [quick|core|full] [options] [-- extra meson test args]
 
 Build and validate the fast-fork Postgres configuration:
   -Dtest_fake_wal=true -Dtest_no_bg_jobs=true -Dtest_mem_smgr=true
+  -Dtest_mem_slru=true
 
 Modes:
   quick       Fast compatible smoke tests plus async I/O tests when the local
@@ -157,6 +158,7 @@ SETUP_ARGS=(
 	"-Dtest_fake_wal=true"
 	"-Dtest_no_bg_jobs=true"
 	"-Dtest_mem_smgr=true"
+	"-Dtest_mem_slru=true"
 	"-Dtap_tests=auto"
 	"-Dauto_features=disabled"
 	"-Dicu=disabled"

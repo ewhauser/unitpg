@@ -60,6 +60,10 @@
    (--enable-test-mem-smgr) */
 #undef USE_TEST_MEM_SMGR
 
+/* Define to 1 to use memory-backed transaction-status SLRUs.
+   (--enable-test-mem-slru) */
+#undef USE_TEST_MEM_SLRU
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 
