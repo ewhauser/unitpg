@@ -367,15 +367,23 @@ CreateTableSpace(CreateTableSpaceStmt *stmt)
 	/* Record the filesystem change in XLOG */
 	{
 		xl_tblspc_create_rec xlrec;
+		const uint8	info = XLOG_TBLSPC_CREATE;
 
 		xlrec.ts_id = tablespaceoid;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_TBLSPC_ID, info))
+			(void) XLogSkipInsert(RM_TBLSPC_ID, info);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec,
 						 offsetof(xl_tblspc_create_rec, ts_path));
 		XLogRegisterData(location, strlen(location) + 1);
 
-		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_CREATE);
+		(void) XLogInsert(RM_TBLSPC_ID, info);
+		}
 	}
 
 	/*
@@ -537,13 +545,21 @@ DropTableSpace(DropTableSpaceStmt *stmt)
 	/* Record the filesystem change in XLOG */
 	{
 		xl_tblspc_drop_rec xlrec;
+		const uint8	info = XLOG_TBLSPC_DROP;
 
 		xlrec.ts_id = tablespaceoid;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_TBLSPC_ID, info))
+			(void) XLogSkipInsert(RM_TBLSPC_ID, info);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, sizeof(xl_tblspc_drop_rec));
 
-		(void) XLogInsert(RM_TBLSPC_ID, XLOG_TBLSPC_DROP);
+		(void) XLogInsert(RM_TBLSPC_ID, info);
+		}
 	}
 
 	/*

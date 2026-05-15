@@ -402,6 +402,12 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		xl_seq_rec	xlrec;
 		XLogRecPtr	recptr;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_SEQ_ID, XLOG_SEQ_LOG))
+			recptr = XLogSkipInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
@@ -411,6 +417,7 @@ fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum)
 		XLogRegisterData(tuple->t_data, tuple->t_len);
 
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		}
 
 		PageSetLSN(page, recptr);
 	}
@@ -831,6 +838,12 @@ nextval_internal(Oid relid, bool check_permissions)
 		 * that many future WAL records, at the cost that we lose those
 		 * sequence values if we crash.
 		 */
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_SEQ_ID, XLOG_SEQ_LOG))
+			recptr = XLogSkipInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
@@ -845,6 +858,7 @@ nextval_internal(Oid relid, bool check_permissions)
 		XLogRegisterData(seqdatatuple.t_data, seqdatatuple.t_len);
 
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		}
 
 		PageSetLSN(page, recptr);
 	}
@@ -1023,6 +1037,12 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 		XLogRecPtr	recptr;
 		Page		page = BufferGetPage(buf);
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_SEQ_ID, XLOG_SEQ_LOG))
+			recptr = XLogSkipInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterBuffer(0, buf, REGBUF_WILL_INIT);
 
@@ -1031,6 +1051,7 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 		XLogRegisterData(seqdatatuple.t_data, seqdatatuple.t_len);
 
 		recptr = XLogInsert(RM_SEQ_ID, XLOG_SEQ_LOG);
+		}
 
 		PageSetLSN(page, recptr);
 	}

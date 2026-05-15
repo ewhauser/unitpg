@@ -5973,6 +5973,11 @@ XactLogCommitRecord(TimestampTz commit_time,
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_XACT_ID, info))
+		return XLogSkipInsert(RM_XACT_ID, info);
+#endif
+
 	/* Then include all the collected data into the commit record. */
 
 	XLogBeginInsert();
@@ -6125,6 +6130,11 @@ XactLogAbortRecord(TimestampTz abort_time,
 
 	if (xl_xinfo.xinfo != 0)
 		info |= XLOG_XACT_HAS_INFO;
+
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_XACT_ID, info))
+		return XLogSkipInsert(RM_XACT_ID, info);
+#endif
 
 	/* Then include all the collected data into the abort record. */
 

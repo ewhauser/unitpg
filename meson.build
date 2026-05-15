@@ -509,6 +509,11 @@ cdata.set('USE_TEST_FAKE_WAL', get_option('test_fake_wal') ? 1 : false)
 cdata.set('USE_TEST_NO_BG_JOBS', get_option('test_no_bg_jobs') ? 1 : false)
 cdata.set('USE_TEST_MEM_SMGR', get_option('test_mem_smgr') ? 1 : false)
 cdata.set('USE_TEST_MEM_SLRU', get_option('test_mem_slru') ? 1 : false)
+cdata.set('USE_TEST_NO_WAL_ASSEMBLY', get_option('test_no_wal_assembly') ? 1 : false)
+
+if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
+  error('test_no_wal_assembly requires test_fake_wal')
+endif
 
 blocksize = get_option('blocksize').to_int() * 1024
 

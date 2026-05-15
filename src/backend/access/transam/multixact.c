@@ -785,11 +785,18 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 	 * the status flags in one XLogRecData, then all the xids in another one?
 	 * Not clear that it's worth the trouble though.
 	 */
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID))
+		(void) XLogSkipInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+	else
+#endif
+	{
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfMultiXactCreate);
 	XLogRegisterData(members, nmembers * sizeof(MultiXactMember));
 
 	(void) XLogInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_CREATE_ID);
+	}
 
 	/* Now enter the information into the OFFSETs and MEMBERs logs */
 	RecordNewMultiXact(multi, offset, nmembers, members);
@@ -2916,6 +2923,15 @@ WriteMTruncateXlogRec(Oid oldestMultiDB,
 	xlrec.oldestMultiDB = oldestMultiDB;
 	xlrec.oldestMulti = oldestMulti;
 	xlrec.oldestOffset = oldestOffset;
+
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID))
+	{
+		recptr = XLogSkipInsert(RM_MULTIXACT_ID, XLOG_MULTIXACT_TRUNCATE_ID);
+		XLogFlush(recptr);
+		return;
+	}
+#endif
 
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfMultiXactTruncate);

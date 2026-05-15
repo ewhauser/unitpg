@@ -1088,6 +1088,15 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXact, Oid oldestXactDb)
 	xlrec.oldestXact = oldestXact;
 	xlrec.oldestXactDb = oldestXactDb;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_CLOG_ID, CLOG_TRUNCATE))
+	{
+		recptr = XLogSkipInsert(RM_CLOG_ID, CLOG_TRUNCATE);
+		XLogFlush(recptr);
+		return;
+	}
+#endif
+
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, sizeof(xl_clog_truncate));
 	recptr = XLogInsert(RM_CLOG_ID, CLOG_TRUNCATE);

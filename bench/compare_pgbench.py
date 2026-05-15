@@ -116,6 +116,7 @@ def build_with_meson(
     no_bg_jobs: bool,
     mem_smgr: bool,
     mem_slru: bool,
+    no_wal_assembly: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -141,6 +142,7 @@ def build_with_meson(
         f"-Dtest_no_bg_jobs={'true' if no_bg_jobs else 'false'}",
         f"-Dtest_mem_smgr={'true' if mem_smgr else 'false'}",
         f"-Dtest_mem_slru={'true' if mem_slru else 'false'}",
+        f"-Dtest_no_wal_assembly={'true' if no_wal_assembly else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -160,6 +162,7 @@ def build_with_configure(
     no_bg_jobs: bool,
     mem_smgr: bool,
     mem_slru: bool,
+    no_wal_assembly: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -189,6 +192,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-mem-smgr")
     if mem_slru:
         configure_cmd.append("--enable-test-mem-slru")
+    if no_wal_assembly:
+        configure_cmd.append("--enable-test-no-wal-assembly")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -209,6 +214,7 @@ def build_variant(
     no_bg_jobs: bool,
     mem_smgr: bool,
     mem_slru: bool,
+    no_wal_assembly: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -226,6 +232,7 @@ def build_variant(
             no_bg_jobs=no_bg_jobs,
             mem_smgr=mem_smgr,
             mem_slru=mem_slru,
+            no_wal_assembly=no_wal_assembly,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -239,6 +246,7 @@ def build_variant(
         no_bg_jobs=no_bg_jobs,
         mem_smgr=mem_smgr,
         mem_slru=mem_slru,
+        no_wal_assembly=no_wal_assembly,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -382,6 +390,11 @@ def main() -> int:
         action="store_true",
         help="do not enable in-memory transaction-status SLRUs in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-wal-assembly",
+        action="store_true",
+        help="do not skip ordinary WAL record assembly in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -408,6 +421,7 @@ def main() -> int:
             no_bg_jobs=False,
             mem_smgr=False,
             mem_slru=False,
+            no_wal_assembly=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -426,6 +440,7 @@ def main() -> int:
             no_bg_jobs=not args.keep_bg_jobs,
             mem_smgr=not args.disable_mem_smgr,
             mem_slru=not args.disable_mem_slru,
+            no_wal_assembly=not args.disable_no_wal_assembly,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -477,6 +492,7 @@ def main() -> int:
                 "no_bg_jobs": False,
                 "mem_smgr": False,
                 "mem_slru": False,
+                "no_wal_assembly": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -486,6 +502,7 @@ def main() -> int:
                 "no_bg_jobs": not args.keep_bg_jobs,
                 "mem_smgr": not args.disable_mem_smgr,
                 "mem_slru": not args.disable_mem_slru,
+                "no_wal_assembly": not args.disable_no_wal_assembly,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

@@ -278,6 +278,19 @@ PGAC_ARG_BOOL(enable, test-mem-slru, no,
 AC_SUBST(enable_test_mem_slru)
 
 #
+# Test-only no WAL assembly
+#
+PGAC_ARG_BOOL(enable, test-no-wal-assembly, no,
+              [skip ordinary WAL record assembly (for testing)],
+              [AC_DEFINE([USE_TEST_NO_WAL_ASSEMBLY], 1,
+                         [Define to 1 to skip ordinary WAL record assembly. (--enable-test-no-wal-assembly)])])
+AC_SUBST(enable_test_no_wal_assembly)
+if test "$enable_test_no_wal_assembly" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  AC_MSG_ERROR([--enable-test-no-wal-assembly requires --enable-test-fake-wal])
+fi
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

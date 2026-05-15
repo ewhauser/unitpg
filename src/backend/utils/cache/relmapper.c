@@ -969,11 +969,18 @@ write_relmap_file(RelMapFile *newmap, bool write_wal, bool send_sinval,
 		xlrec.tsid = tsid;
 		xlrec.nbytes = sizeof(RelMapFile);
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+		if (!XLogRecordAssemblyRequired(RM_RELMAP_ID, XLOG_RELMAP_UPDATE))
+			lsn = XLogSkipInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
+		else
+#endif
+		{
 		XLogBeginInsert();
 		XLogRegisterData(&xlrec, MinSizeOfRelmapUpdate);
 		XLogRegisterData(newmap, sizeof(RelMapFile));
 
 		lsn = XLogInsert(RM_RELMAP_ID, XLOG_RELMAP_UPDATE);
+		}
 
 		/* As always, WAL must hit the disk before the data update does */
 		XLogFlush(lsn);

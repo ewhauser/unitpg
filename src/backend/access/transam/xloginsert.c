@@ -144,6 +144,9 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   bool *topxid_included);
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
+#ifdef USE_TEST_FAKE_WAL
+static XLogRecPtr XLogTestFakeInsert(bool reset_insertion);
+#endif
 
 /*
  * Begin constructing a WAL record. This must be called before the
@@ -237,6 +240,56 @@ XLogResetInsertion(void)
 	curinsert_flags = 0;
 	begininsert_called = false;
 }
+
+#ifdef USE_TEST_FAKE_WAL
+static XLogRecPtr
+XLogTestFakeInsert(bool reset_insertion)
+{
+	XLogRecPtr	EndPos;
+
+	EndPos = FirstTestFakeWalLSN | GetFakeLSNForUnloggedRel();
+
+	if (reset_insertion)
+		XLogResetInsertion();
+	MarkCurrentTransactionIdLoggedIfAny();
+	if (IsSubxactTopXidLogPending())
+		MarkSubxactTopXidLogged();
+
+	ProcLastRecPtr = EndPos;
+	XactLastRecEnd = EndPos;
+
+	return EndPos;
+}
+#endif
+
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+bool
+XLogRecordAssemblyRequired(RmgrId rmid, uint8 info)
+{
+	return rmid == RM_XLOG_ID;
+}
+
+XLogRecPtr
+XLogSkipInsert(RmgrId rmid, uint8 info)
+{
+	if (XLogRecordAssemblyRequired(rmid, info))
+		elog(ERROR, "WAL record assembly is required for resource manager %u", rmid);
+
+	if ((info & ~(XLR_RMGR_INFO_MASK |
+				  XLR_SPECIAL_REL_UPDATE |
+				  XLR_CHECK_CONSISTENCY)) != 0)
+		elog(PANIC, "invalid xlog info mask %02X", info);
+
+	if (!XLogInsertAllowed())
+		elog(ERROR, "cannot make new WAL entries during recovery");
+
+	if (IsBootstrapProcessingMode() && rmid != RM_XLOG_ID)
+		return SizeOfXLogLongPHD;
+
+	TRACE_POSTGRESQL_WAL_INSERT(rmid, info);
+	return XLogTestFakeInsert(false);
+}
+#endif
 
 /*
  * Register a reference to a buffer with the WAL record being constructed.
@@ -518,16 +571,7 @@ XLogInsert(RmgrId rmid, uint8 info)
 	 */
 	if (rmid != RM_XLOG_ID)
 	{
-		EndPos = FirstTestFakeWalLSN | GetFakeLSNForUnloggedRel();
-
-		XLogResetInsertion();
-		MarkCurrentTransactionIdLoggedIfAny();
-		if (IsSubxactTopXidLogPending())
-			MarkSubxactTopXidLogged();
-
-		ProcLastRecPtr = EndPos;
-		XactLastRecEnd = EndPos;
-
+		EndPos = XLogTestFakeInsert(true);
 		return EndPos;
 	}
 #endif
@@ -569,6 +613,11 @@ XLogInsert(RmgrId rmid, uint8 info)
 XLogRecPtr
 XLogSimpleInsertInt64(RmgrId rmid, uint8 info, int64 value)
 {
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(rmid, info))
+		return XLogSkipInsert(rmid, info);
+#endif
+
 	XLogBeginInsert();
 	XLogRegisterData(&value, sizeof(value));
 	return XLogInsert(rmid, info);

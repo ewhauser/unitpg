@@ -64,6 +64,10 @@
    (--enable-test-mem-slru) */
 #undef USE_TEST_MEM_SLRU
 
+/* Define to 1 to skip ordinary WAL record assembly.
+   (--enable-test-no-wal-assembly) */
+#undef USE_TEST_NO_WAL_ASSEMBLY
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

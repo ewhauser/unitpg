@@ -58,6 +58,9 @@ option('test_mem_smgr', type: 'boolean', value: false,
 option('test_mem_slru', type: 'boolean', value: false,
   description: 'Use memory-backed transaction-status SLRUs for test-only builds')
 
+option('test_no_wal_assembly', type: 'boolean', value: false,
+  description: 'Skip ordinary WAL record assembly for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

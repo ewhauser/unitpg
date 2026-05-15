@@ -994,6 +994,14 @@ WriteTruncateXlogRec(int64 pageno, TransactionId oldestXid)
 	xlrec.pageno = pageno;
 	xlrec.oldestXid = oldestXid;
 
+#ifdef USE_TEST_NO_WAL_ASSEMBLY
+	if (!XLogRecordAssemblyRequired(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE))
+	{
+		(void) XLogSkipInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
+		return;
+	}
+#endif
+
 	XLogBeginInsert();
 	XLogRegisterData(&xlrec, SizeOfCommitTsTruncate);
 	(void) XLogInsert(RM_COMMIT_TS_ID, COMMIT_TS_TRUNCATE);
