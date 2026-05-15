@@ -73,6 +73,9 @@ option('test_ephemeral_catalog', type: 'boolean', value: false,
 option('test_no_durable_maintenance', type: 'boolean', value: false,
   description: 'Disable durable maintenance work for test-only builds')
 
+option('test_fast_analyze', type: 'boolean', value: false,
+  description: 'Use a no-sample ANALYZE fast path for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

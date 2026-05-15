@@ -1592,6 +1592,8 @@ Optional Features:
                           enable ephemeral catalog fast paths (for testing)
   --enable-test-no-durable-maintenance
                           disable durable maintenance work (for testing)
+  --enable-test-fast-analyze
+                          use a no-sample ANALYZE fast path (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -3982,6 +3984,34 @@ $as_echo "#define USE_TEST_NO_DURABLE_MAINTENANCE 1" >>confdefs.h
 
 else
   enable_test_no_durable_maintenance=no
+
+fi
+
+
+#
+# Test-only fast ANALYZE
+#
+
+
+# Check whether --enable-test-fast-analyze was given.
+if test "${enable_test_fast_analyze+set}" = set; then :
+  enableval=$enable_test_fast_analyze;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_FAST_ANALYZE 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-fast-analyze option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_fast_analyze=no
 
 fi
 

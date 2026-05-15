@@ -327,6 +327,15 @@ PGAC_ARG_BOOL(enable, test-no-durable-maintenance, no,
 AC_SUBST(enable_test_no_durable_maintenance)
 
 #
+# Test-only fast ANALYZE
+#
+PGAC_ARG_BOOL(enable, test-fast-analyze, no,
+              [use a no-sample ANALYZE fast path (for testing)],
+              [AC_DEFINE([USE_TEST_FAST_ANALYZE], 1,
+                         [Define to 1 to use a no-sample ANALYZE fast path. (--enable-test-fast-analyze)])])
+AC_SUBST(enable_test_fast_analyze)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])
