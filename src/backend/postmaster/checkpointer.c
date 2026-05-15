@@ -1089,6 +1089,14 @@ RequestCheckpoint(int flags)
 		return;
 	}
 
+#ifdef USE_TEST_NO_BG_JOBS
+	/*
+	 * Test-only no-job builds never launch a checkpointer.  Treat checkpoint
+	 * requests as already satisfied; durability is explicitly out of scope.
+	 */
+	return;
+#endif
+
 	/*
 	 * Atomically set the request flags, and take a snapshot of the counters.
 	 * When we see ckpt_started > old_started, we know the flags we set here
@@ -1224,6 +1232,10 @@ ForwardSyncRequest(const FileTag *ftag, SyncRequestType type)
 
 	if (!IsUnderPostmaster)
 		return false;			/* probably shouldn't even get here */
+
+#ifdef USE_TEST_NO_BG_JOBS
+	return true;
+#endif
 
 	if (AmCheckpointerProcess())
 		elog(ERROR, "ForwardSyncRequest must not be called in checkpointer");

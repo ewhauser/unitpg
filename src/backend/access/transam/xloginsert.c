@@ -509,6 +509,29 @@ XLogInsert(RmgrId rmid, uint8 info)
 		return EndPos;
 	}
 
+#ifdef USE_TEST_FAKE_WAL
+	/*
+	 * Test-only builds still emit core XLOG records, such as checkpoints, so
+	 * initdb and normal startup keep their expected control-file/WAL shape.
+	 * Ordinary records get an increasing fake LSN instead of being assembled
+	 * and copied into WAL buffers.
+	 */
+	if (rmid != RM_XLOG_ID)
+	{
+		EndPos = FirstTestFakeWalLSN | GetFakeLSNForUnloggedRel();
+
+		XLogResetInsertion();
+		MarkCurrentTransactionIdLoggedIfAny();
+		if (IsSubxactTopXidLogPending())
+			MarkSubxactTopXidLogged();
+
+		ProcLastRecPtr = EndPos;
+		XactLastRecEnd = EndPos;
+
+		return EndPos;
+	}
+#endif
+
 	do
 	{
 		XLogRecPtr	RedoRecPtr;

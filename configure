@@ -772,6 +772,8 @@ LDFLAGS
 CFLAGS
 CC
 enable_injection_points
+enable_test_fake_wal
+enable_test_no_bg_jobs
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -852,6 +854,8 @@ enable_coverage
 enable_dtrace
 enable_tap_tests
 enable_injection_points
+enable_test_fake_wal
+enable_test_no_bg_jobs
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1554,6 +1558,11 @@ Optional Features:
   --enable-tap-tests      enable TAP tests (requires Perl and IPC::Run)
   --enable-injection-points
                           enable injection points (for testing)
+  --enable-test-fake-wal  replace ordinary WAL records with fake LSNs (for
+                          testing)
+  --enable-test-no-bg-jobs
+                          disable background maintenance jobs except async I/O
+                          workers (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -3686,6 +3695,63 @@ $as_echo "#define USE_INJECTION_POINTS 1" >>confdefs.h
 
 else
   enable_injection_points=no
+
+fi
+
+
+
+#
+# Test-only fake WAL
+#
+
+
+# Check whether --enable-test-fake-wal was given.
+if test "${enable_test_fake_wal+set}" = set; then :
+  enableval=$enable_test_fake_wal;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_FAKE_WAL 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-fake-wal option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_fake_wal=no
+
+fi
+
+
+#
+# Test-only no background jobs
+#
+
+
+# Check whether --enable-test-no-bg-jobs was given.
+if test "${enable_test_no_bg_jobs+set}" = set; then :
+  enableval=$enable_test_no_bg_jobs;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_BG_JOBS 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-bg-jobs option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_bg_jobs=no
 
 fi
 

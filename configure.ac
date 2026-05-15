@@ -242,6 +242,24 @@ PGAC_ARG_BOOL(enable, injection-points, no, [enable injection points (for testin
 AC_SUBST(enable_injection_points)
 
 #
+# Test-only fake WAL
+#
+PGAC_ARG_BOOL(enable, test-fake-wal, no,
+              [replace ordinary WAL records with fake LSNs (for testing)],
+              [AC_DEFINE([USE_TEST_FAKE_WAL], 1,
+                         [Define to 1 to replace ordinary WAL records with fake LSNs. (--enable-test-fake-wal)])])
+AC_SUBST(enable_test_fake_wal)
+
+#
+# Test-only no background jobs
+#
+PGAC_ARG_BOOL(enable, test-no-bg-jobs, no,
+              [disable background maintenance jobs except async I/O workers (for testing)],
+              [AC_DEFINE([USE_TEST_NO_BG_JOBS], 1,
+                         [Define to 1 to disable background maintenance jobs except async I/O workers. (--enable-test-no-bg-jobs)])])
+AC_SUBST(enable_test_no_bg_jobs)
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

@@ -46,6 +46,12 @@ option('tap_tests', type: 'feature', value: 'auto',
 option('injection_points', type: 'boolean', value: false,
   description: 'Enable injection points')
 
+option('test_fake_wal', type: 'boolean', value: false,
+  description: 'Replace ordinary WAL records with fake LSNs for test-only builds')
+
+option('test_no_bg_jobs', type: 'boolean', value: false,
+  description: 'Disable background maintenance jobs except async I/O workers for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

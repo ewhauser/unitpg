@@ -5878,7 +5878,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 {
 	xl_xact_commit xlrec;
 	xl_xact_xinfo xl_xinfo;
-	xl_xact_dbinfo xl_dbinfo;
+	xl_xact_dbinfo xl_dbinfo = {0};
 	xl_xact_subxacts xl_subxacts;
 	xl_xact_relfilelocators xl_relfilelocators;
 	xl_xact_stats_items xl_dropped_stats;
@@ -6052,7 +6052,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	xl_xact_relfilelocators xl_relfilelocators;
 	xl_xact_stats_items xl_dropped_stats;
 	xl_xact_twophase xl_twophase;
-	xl_xact_dbinfo xl_dbinfo;
+	xl_xact_dbinfo xl_dbinfo = {0};
 	xl_xact_origin xl_origin;
 
 	uint8		info;
