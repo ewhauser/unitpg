@@ -1,18 +1,18 @@
 \set probe_id random(1, :bench_rows)
 \set delta random(1, 50)
 BEGIN;
-CREATE TEMP TABLE bench_parent (
+CREATE TABLE bench_parent (
     id integer PRIMARY KEY,
     payload text NOT NULL,
     bucket integer NOT NULL,
     created_at timestamptz NOT NULL DEFAULT now()
-) ON COMMIT DROP;
-CREATE TEMP TABLE bench_child (
+);
+CREATE TABLE bench_child (
     id integer PRIMARY KEY,
     parent_id integer NOT NULL REFERENCES bench_parent(id),
     amount integer NOT NULL,
     payload text NOT NULL
-) ON COMMIT DROP;
+);
 INSERT INTO bench_parent (id, payload, bucket)
 SELECT g, md5(g::text), g % 16
 FROM generate_series(1, :bench_rows) AS g;

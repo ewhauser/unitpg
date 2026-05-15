@@ -6,6 +6,9 @@ PostgreSQL against a test-only fork.
 The workload in `unit-test-rollback.pgbench` is shaped like an application unit
 test: create schema objects, insert data, create indexes, run indexed joins and
 mutations, use a savepoint, and roll the whole transaction back.
+It deliberately uses ordinary permanent tables inside the transaction rather
+than temp tables, because the target application test pattern does not rely on
+PostgreSQL temp-table storage.
 
 The optional `unit-test-snapshot.pgbench` workload uses the fast-fork fixture
 snapshot API. Its first warmup transaction creates the schema/data fixture and
@@ -81,6 +84,41 @@ python3 bench/compare_pgbench.py \
 The comparison runner uses Meson by default and installs both builds under
 `bench/.build/`. It writes `summary.md`, `summary.json`, per-run JSON files,
 and build logs into a timestamped result directory.
+
+## Startup Benchmark
+
+To measure startup cost for one installed PostgreSQL build:
+
+```sh
+python3 bench/run_startup.py \
+  --bin /path/to/postgres/install/bin \
+  --label baseline-startup \
+  --rounds 10 \
+  --output bench/results/baseline-startup.json
+```
+
+The startup runner records `initdb` separately from repeated
+start/first-query/stop cycles. By default it reuses the same initialized data
+directory for each round. To model harnesses that copy a fresh seed cluster per
+worker, use `--mode copy`.
+
+To compare the cached baseline install against the fast-fork install:
+
+```sh
+python3 bench/compare_startup.py \
+  --rounds 10 \
+  --output-dir bench/results/startup-compare
+```
+
+Like the pgbench comparison, the startup comparison can reuse existing installs:
+
+```sh
+python3 bench/compare_startup.py \
+  --baseline-bin bench/.build/installs/baseline-meson/bin \
+  --fakewal-bin bench/.build/fastfork-validation/tmp_install/usr/local/pgsql/bin \
+  --rounds 10 \
+  --output-dir bench/results/startup-compare
+```
 
 The baseline install is cached by default. If `bench/.build/installs/baseline-*`
 already has the needed PostgreSQL binaries, later runs reuse it without
