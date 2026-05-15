@@ -17,12 +17,15 @@
  */
 #include "postgres.h"
 
+#include <sys/mman.h>
+
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
 #include "commands/sequence.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "portability/mem.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
@@ -73,13 +76,21 @@ typedef struct MemSmgrForkEntry
 typedef struct MemSmgrPageEntry
 {
 	MemSmgrPageKey key;
-	char		data[BLCKSZ];
+	uint32		page_index;
 } MemSmgrPageEntry;
+
+typedef struct MemSmgrSnapshotPageEntry
+{
+	MemSmgrPageKey key;
+	char		data[BLCKSZ];
+} MemSmgrSnapshotPageEntry;
 
 typedef struct MemSmgrSharedState
 {
 	LWLock		lock;
 	bool		initialized;
+	uint32		next_page;
+	char	   *page_data;
 } MemSmgrSharedState;
 
 #ifdef USE_TEST_MEM_SMGR
@@ -89,7 +100,7 @@ typedef struct MemSmgrSnapshot
 	int			nforks;
 	MemSmgrForkEntry *forks;
 	int			npages;
-	MemSmgrPageEntry *pages;
+	MemSmgrSnapshotPageEntry *pages;
 	Oid			next_oid;
 	uint32		oid_count;
 	MemoryContext context;
@@ -142,8 +153,13 @@ static MemSmgrPageEntry *mem_get_page_entry(RelFileLocatorBackend rlocator,
 											ForkNumber forknum,
 											BlockNumber blocknum,
 											bool create);
+static char *mem_page_data(const MemSmgrPageEntry *entry);
+static uint32 mem_alloc_page_index(void);
 static void mem_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							 BlockNumber first_block);
+static bool mem_relation_is_memory_only(RelFileLocatorBackend rlocator);
+static void mem_remove_memory_only_fork(RelFileLocatorBackend rlocator,
+										ForkNumber forknum);
 static void mem_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum);
 static void mem_readv_locked(SMgrRelation reln, ForkNumber forknum,
 							 BlockNumber blocknum, void **buffers,
@@ -195,7 +211,26 @@ MemSmgrShmemInit(void *arg)
 {
 	if (!MemSmgrState->initialized)
 	{
+		Size		map_size;
+		void	   *map;
+
 		LWLockInitialize(&MemSmgrState->lock, LWTRANCHE_BUFFER_MAPPING);
+		MemSmgrState->next_page = 0;
+
+		/*
+		 * Keep page contents out of PostgreSQL's fixed-size shared hash.
+		 * Reserving the address space here is cheap on overcommitting
+		 * platforms; physical pages are only faulted in as tests write data.
+		 */
+		map_size = mul_size(MEMSMGR_SHARED_MAX_PAGES, BLCKSZ);
+		map = mmap(NULL, map_size, PROT_READ | PROT_WRITE,
+				   MAP_SHARED | MAP_ANONYMOUS | MAP_HASSEMAPHORE, -1, 0);
+		if (map == MAP_FAILED)
+			ereport(FATAL,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("could not allocate memory storage manager page arena: %m")));
+
+		MemSmgrState->page_data = (char *) map;
 		MemSmgrState->initialized = true;
 	}
 }
@@ -320,8 +355,16 @@ memunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 
 	if (forknum == InvalidForkNumber)
 	{
-		for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
-			mem_remove_fork(rlocator, fork);
+		if (mem_relation_is_memory_only(rlocator))
+		{
+			for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+				mem_remove_memory_only_fork(rlocator, fork);
+		}
+		else
+		{
+			for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+				mem_remove_fork(rlocator, fork);
+		}
 	}
 	else
 		mem_remove_fork(rlocator, forknum);
@@ -684,7 +727,7 @@ mem_buffer_direct_page(SMgrRelation reln, ForkNumber forknum,
 
 	if (found != NULL)
 		*found = true;
-	return (Block) page->data;
+	return (Block) mem_page_data(page);
 }
 #endif
 
@@ -833,7 +876,7 @@ mem_capture_snapshot(MemSmgrSnapshot *snapshot)
 	if (nforks > 0)
 		snapshot->forks = palloc(sizeof(MemSmgrForkEntry) * nforks);
 	if (npages > 0)
-		snapshot->pages = palloc(sizeof(MemSmgrPageEntry) * npages);
+		snapshot->pages = palloc(sizeof(MemSmgrSnapshotPageEntry) * npages);
 	MemoryContextSwitchTo(oldcontext);
 
 	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
@@ -857,7 +900,11 @@ mem_capture_snapshot(MemSmgrSnapshot *snapshot)
 		if (mem_snapshot_key_matches(&page->key.rlocator))
 		{
 			if (i < npages)
-				snapshot->pages[i++] = *page;
+			{
+				snapshot->pages[i].key = page->key;
+				memcpy(snapshot->pages[i].data, mem_page_data(page), BLCKSZ);
+				i++;
+			}
 		}
 	}
 	snapshot->npages = i;
@@ -913,7 +960,9 @@ mem_restore_snapshot(MemSmgrSnapshot *snapshot)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("memory storage manager page table is full")));
-		*target = snapshot->pages[i];
+		if (!found)
+			target->page_index = mem_alloc_page_index();
+		memcpy(mem_page_data(target), snapshot->pages[i].data, BLCKSZ);
 	}
 
 	LWLockRelease(&MemSmgrState->lock);
@@ -1102,9 +1151,35 @@ mem_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 				 errmsg("memory storage manager page table is full")));
 
 	if (entry != NULL && create && !found)
-		memset(entry->data, 0, BLCKSZ);
+	{
+		entry->page_index = mem_alloc_page_index();
+		memset(mem_page_data(entry), 0, BLCKSZ);
+	}
 
 	return entry;
+}
+
+static char *
+mem_page_data(const MemSmgrPageEntry *entry)
+{
+	return MemSmgrState->page_data + ((Size) entry->page_index * BLCKSZ);
+}
+
+static uint32
+mem_alloc_page_index(void)
+{
+	uint32		page_index;
+
+	if (MemSmgrState == NULL || MemSmgrState->page_data == NULL)
+		elog(ERROR, "memory storage manager page arena is not initialized");
+
+	page_index = MemSmgrState->next_page++;
+	if (page_index >= MEMSMGR_SHARED_MAX_PAGES)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("memory storage manager page arena is full")));
+
+	return page_index;
 }
 
 static void
@@ -1129,15 +1204,74 @@ mem_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 	}
 }
 
+static bool
+mem_relation_is_memory_only(RelFileLocatorBackend rlocator)
+{
+	bool		saw_entry = false;
+
+	for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+	{
+		MemSmgrForkEntry *entry;
+
+		entry = mem_lookup_fork_entry(rlocator, fork);
+		if (entry == NULL)
+			continue;
+
+		saw_entry = true;
+		if (entry->on_disk)
+			return false;
+	}
+
+	return saw_entry;
+}
+
+static void
+mem_remove_memory_only_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	MemSmgrForkKey key;
+	HTAB	   *fork_hash;
+	MemSmgrForkEntry *entry;
+
+	mem_build_fork_key(&key, rlocator, forknum);
+	fork_hash = mem_fork_hash_for(&rlocator);
+	entry = hash_search(fork_hash, &key, HASH_FIND, NULL);
+
+	if (entry != NULL && !entry->on_disk)
+		hash_search(fork_hash, &key, HASH_REMOVE, NULL);
+
+	mem_remove_pages(rlocator, forknum, 0);
+}
+
 static void
 mem_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
 {
+	MemSmgrForkKey key;
+	HTAB	   *fork_hash;
 	MemSmgrForkEntry *entry;
 
-	entry = mem_create_fork_entry(rlocator, forknum);
-	entry->exists = false;
-	entry->on_disk = false;
-	entry->nblocks = 0;
+	mem_build_fork_key(&key, rlocator, forknum);
+	fork_hash = mem_fork_hash_for(&rlocator);
+	entry = hash_search(fork_hash, &key, HASH_FIND, NULL);
+
+	if (entry != NULL && !entry->on_disk)
+		hash_search(fork_hash, &key, HASH_REMOVE, NULL);
+	else
+	{
+		if (entry == NULL)
+		{
+			bool		found;
+
+			entry = hash_search(fork_hash, &key, HASH_ENTER_NULL, &found);
+		}
+		if (entry == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("memory storage manager fork table is full")));
+
+		entry->exists = false;
+		entry->on_disk = true;
+		entry->nblocks = 0;
+	}
 
 	mem_remove_pages(rlocator, forknum, 0);
 }
@@ -1163,7 +1297,7 @@ mem_readv_locked(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 		page = mem_get_page_entry(reln->smgr_rlocator, forknum, curblock,
 								  false);
 		if (page != NULL)
-			memcpy(buffers[i], page->data, BLCKSZ);
+			memcpy(buffers[i], mem_page_data(page), BLCKSZ);
 		else if (fork->on_disk)
 			mdreadv(reln, forknum, curblock, &buffers[i], 1);
 		else
@@ -1190,7 +1324,7 @@ mem_writev_locked(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 
 		page = mem_get_page_entry(reln->smgr_rlocator, forknum, blocknum + i,
 								  true);
-		memcpy(page->data, buffers[i], BLCKSZ);
+		memcpy(mem_page_data(page), buffers[i], BLCKSZ);
 	}
 
 	if (blocknum + nblocks > fork->nblocks)
@@ -1212,7 +1346,7 @@ mem_zeroextend_locked(SMgrRelation reln, ForkNumber forknum,
 
 		page = mem_get_page_entry(reln->smgr_rlocator, forknum,
 								  blocknum + i, true);
-		memset(page->data, 0, BLCKSZ);
+		memset(mem_page_data(page), 0, BLCKSZ);
 	}
 
 	if (blocknum + nblocks > fork->nblocks)

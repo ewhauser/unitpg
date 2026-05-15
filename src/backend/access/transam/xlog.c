@@ -711,17 +711,26 @@ static bool InstallXLogFileSegment(XLogSegNo *segno, char *tmppath,
 								   TimeLineID tli);
 static void XLogFileClose(void);
 static void PreallocXlogFiles(XLogRecPtr endptr, TimeLineID tli);
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 static void RemoveTempXlogFiles(void);
+#endif
 static void RemoveOldXlogFiles(XLogSegNo segno, XLogRecPtr lastredoptr,
 							   XLogRecPtr endptr, TimeLineID insertTLI);
 static void RemoveXlogFile(const struct dirent *segment_de,
 						   XLogSegNo recycleSegNo, XLogSegNo *endlogSegNo,
 						   TimeLineID insertTLI);
 static void UpdateLastRemovedPtr(char *filename);
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 static void ValidateXLOGDirectoryStructure(void);
+#endif
 static void CleanupBackupHistory(void);
 static void UpdateMinRecoveryPoint(XLogRecPtr lsn, bool force);
 static bool PerformRecoveryXLogAction(void);
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+static void TestNoRecoveryStartupRejectRecoveryInputs(void);
+static bool TestNoRecoveryStartupFileExists(const char *path);
+static EndOfWalRecoveryInfo *TestNoRecoveryStartupFinishFromControlFile(const CheckPoint *checkPoint);
+#endif
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
@@ -3904,6 +3913,7 @@ UpdateLastRemovedPtr(char *filename)
 	SpinLockRelease(&XLogCtl->info_lck);
 }
 
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 /*
  * Remove all temporary log files in pg_wal
  *
@@ -3932,6 +3942,7 @@ RemoveTempXlogFiles(void)
 	}
 	FreeDir(xldir);
 }
+#endif
 
 /*
  * Recycle or remove all log files older or equal to passed segno.
@@ -4177,6 +4188,7 @@ RemoveXlogFile(const struct dirent *segment_de,
  * a symlink, and if that was the DBA's intent then automatically making a
  * plain directory would result in degraded performance with no notice.
  */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 static void
 ValidateXLOGDirectoryStructure(void)
 {
@@ -4233,6 +4245,7 @@ ValidateXLOGDirectoryStructure(void)
 							path)));
 	}
 }
+#endif
 
 /*
  * Remove previous backup history files.  This also retries creation of
@@ -5880,7 +5893,9 @@ StartupXLOG(void)
 	XLogCtlInsert *Insert;
 	CheckPoint	checkPoint;
 	bool		wasShutdown;
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	bool		didCrash;
+#endif
 	bool		haveTblspcMap;
 	bool		haveBackupLabel;
 	XLogRecPtr	EndOfLog;
@@ -5902,6 +5917,10 @@ StartupXLOG(void)
 	Assert(CurrentResourceOwner == NULL ||
 		   CurrentResourceOwner == AuxProcessResourceOwner);
 	CurrentResourceOwner = AuxProcessResourceOwner;
+
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+	TestNoRecoveryStartupRejectRecoveryInputs();
+#endif
 
 	/*
 	 * Check that contents look valid.
@@ -5981,7 +6000,9 @@ StartupXLOG(void)
 	 * In cases where someone has performed a copy for PITR, these directories
 	 * may have been excluded and need to be re-created.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	ValidateXLOGDirectoryStructure();
+#endif
 
 	/* Set up timeout handler needed to report startup progress. */
 	if (!IsBootstrapProcessingMode())
@@ -6002,6 +6023,15 @@ StartupXLOG(void)
 	 *   though more recent data written to disk from here on would be
 	 *   persisted.  To avoid that, fsync the entire data directory.
 	 */
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+	if (ControlFile->state != DB_SHUTDOWNED &&
+		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
+	{
+		ereport(LOG,
+				(errmsg("fast-fork startup is ignoring previous unclean shutdown state")));
+		ControlFile->state = DB_SHUTDOWNED;
+	}
+#else
 	if (ControlFile->state != DB_SHUTDOWNED &&
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
 	{
@@ -6011,6 +6041,7 @@ StartupXLOG(void)
 	}
 	else
 		didCrash = false;
+#endif
 
 	/*
 	 * Prepare for WAL recovery if needed.
@@ -6020,8 +6051,19 @@ StartupXLOG(void)
 	 * starting checkpoint, and sets InRecovery and ArchiveRecoveryRequested.
 	 * It also applies the tablespace map file, if any.
 	 */
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+	wasShutdown = true;
+	haveBackupLabel = false;
+	haveTblspcMap = false;
+	InRecovery = false;
+	InArchiveRecovery = false;
+	ArchiveRecoveryRequested = false;
+	ereport(DEBUG1,
+			(errmsg_internal("fast-fork startup bypassing WAL recovery initialization")));
+#else
 	InitWalRecovery(ControlFile, &wasShutdown,
 					&haveBackupLabel, &haveTblspcMap);
+#endif
 	checkPoint = ControlFile->checkPointCopy;
 
 	/* initialize shared memory variables from the checkpoint record */
@@ -6053,6 +6095,7 @@ StartupXLOG(void)
 	 * Initialize replication slots, before there's a chance to remove
 	 * required resources.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	StartupReplicationSlots();
 
 	/*
@@ -6066,6 +6109,10 @@ StartupXLOG(void)
 	 * during crash recovery.
 	 */
 	StartupReorderBuffer();
+#else
+	if (wal_level != WAL_LEVEL_MINIMAL)
+		StartupLogicalDecodingStatus(false);
+#endif
 
 	/*
 	 * Startup CLOG. This must be done after TransamVariables->nextXid has
@@ -6091,7 +6138,9 @@ StartupXLOG(void)
 	/*
 	 * Recover knowledge about replay progress of known replication partners.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	StartupReplicationOrigin();
+#endif
 
 	/*
 	 * Initialize unlogged LSN. On a clean shutdown, it's restored from the
@@ -6117,7 +6166,9 @@ StartupXLOG(void)
 	 * are small, so it's better to copy them unnecessarily than not copy them
 	 * and regret later.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	restoreTimeLineHistoryFiles(checkPoint.ThisTimeLineID, recoveryTargetTLI);
+#endif
 
 	/*
 	 * Before running in recovery, scan pg_twophase and fill in its status to
@@ -6127,7 +6178,9 @@ StartupXLOG(void)
 	 * replay.  This avoids as well any subsequent scans when doing recovery
 	 * of the on-disk two-phase data.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	restoreTwoPhaseData();
+#endif
 
 	/*
 	 * When starting with crash recovery, reset pgstat data - it might not be
@@ -6140,10 +6193,12 @@ StartupXLOG(void)
 	 * TODO: With a bit of extra work we could just start with a pgstat file
 	 * associated with the checkpoint redo location we're starting from.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	if (didCrash)
 		pgstat_discard_stats();
 	else
 		pgstat_restore_stats();
+#endif
 
 	lastFullPageWrites = checkPoint.fullPageWrites;
 
@@ -6315,7 +6370,11 @@ StartupXLOG(void)
 	/*
 	 * Finish WAL recovery.
 	 */
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+	endOfRecoveryInfo = TestNoRecoveryStartupFinishFromControlFile(&checkPoint);
+#else
 	endOfRecoveryInfo = FinishWalRecovery();
+#endif
 	EndOfLog = endOfRecoveryInfo->endOfLog;
 	EndOfLogTLI = endOfRecoveryInfo->endOfLogTLI;
 	abortedRecPtr = endOfRecoveryInfo->abortedRecPtr;
@@ -6384,7 +6443,11 @@ StartupXLOG(void)
 	 * This information is not quite needed yet, but it is positioned here so
 	 * as potential problems are detected before any on-disk change is done.
 	 */
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+	oldestActiveXID = XidFromFullTransactionId(TransamVariables->nextXid);
+#else
 	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+#endif
 
 	/*
 	 * Allow ordinary WAL segment creation before possibly switching to a new
@@ -6529,7 +6592,9 @@ StartupXLOG(void)
 	/*
 	 * Preallocate additional log files, if wanted.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	PreallocXlogFiles(EndOfLog, newTLI);
+#endif
 
 	/*
 	 * Okay, we're officially UP.
@@ -6564,10 +6629,14 @@ StartupXLOG(void)
 	 * happen before renaming the last partial segment of the old timeline as
 	 * it may be possible that we have to recover some transactions from it.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	RecoverPreparedTransactions();
+#endif
 
 	/* Shut down xlogreader */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	ShutdownWalRecovery();
+#endif
 
 	/* Enable WAL writes for this backend only. */
 	LocalSetXLogInsertAllowed();
@@ -6613,7 +6682,9 @@ StartupXLOG(void)
 	 * Update logical decoding status in shared memory and write an
 	 * XLOG_LOGICAL_DECODING_STATUS_CHANGE, if necessary.
 	 */
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	UpdateLogicalDecodingStatusEndOfRecovery();
+#endif
 
 	/* Clean up EndOfWalRecoveryInfo data to appease Valgrind leak checking */
 	if (endOfRecoveryInfo->lastPage)
@@ -6685,7 +6756,9 @@ StartupXLOG(void)
 	XLogCtl->SharedRecoveryState = RECOVERY_STATE_DONE;
 	SpinLockRelease(&XLogCtl->info_lck);
 
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 	UpdateControlFile();
+#endif
 	LWLockRelease(ControlFileLock);
 
 	/*
@@ -8760,7 +8833,9 @@ XLogReportParameters(void)
 		ControlFile->wal_level = wal_level;
 		ControlFile->wal_log_hints = wal_log_hints;
 		ControlFile->track_commit_timestamp = track_commit_timestamp;
+#ifndef USE_TEST_NO_RECOVERY_STARTUP
 		UpdateControlFile();
+#endif
 
 		LWLockRelease(ControlFileLock);
 	}
@@ -9351,6 +9426,83 @@ get_sync_bit(int method)
 			return 0;			/* silence warning */
 	}
 }
+
+#ifdef USE_TEST_NO_RECOVERY_STARTUP
+static bool
+TestNoRecoveryStartupFileExists(const char *path)
+{
+	struct stat stat_buf;
+
+	return stat(path, &stat_buf) == 0;
+}
+
+static void
+TestNoRecoveryStartupRejectRecoveryInputs(void)
+{
+	if (TestNoRecoveryStartupFileExists(STANDBY_SIGNAL_FILE) ||
+		TestNoRecoveryStartupFileExists(RECOVERY_SIGNAL_FILE) ||
+		TestNoRecoveryStartupFileExists(BACKUP_LABEL_FILE))
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("recovery startup is disabled by test_no_recovery_startup"),
+				 errdetail("Fast-fork startup treats the data directory as disposable test state and does not run standby, archive recovery, or backup recovery.")));
+
+	if (recoveryRestoreCommand != NULL && recoveryRestoreCommand[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("restore_command is not supported by test_no_recovery_startup")));
+
+	if (recoveryEndCommand != NULL && recoveryEndCommand[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("recovery_end_command is not supported by test_no_recovery_startup")));
+
+	if (archiveCleanupCommand != NULL && archiveCleanupCommand[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("archive_cleanup_command is not supported by test_no_recovery_startup")));
+
+	if (PrimaryConnInfo != NULL && PrimaryConnInfo[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("primary_conninfo is not supported by test_no_recovery_startup")));
+
+	if (PrimarySlotName != NULL && PrimarySlotName[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("primary_slot_name is not supported by test_no_recovery_startup")));
+
+	if (recoveryTarget != RECOVERY_TARGET_UNSET ||
+		recoveryTargetAction != RECOVERY_TARGET_ACTION_PAUSE)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("recovery targets are not supported by test_no_recovery_startup")));
+}
+
+static EndOfWalRecoveryInfo *
+TestNoRecoveryStartupFinishFromControlFile(const CheckPoint *checkPoint)
+{
+	EndOfWalRecoveryInfo *result = palloc0_object(EndOfWalRecoveryInfo);
+	XLogRecPtr	endOfLog = ControlFile->checkPoint;
+
+	if (endOfLog % XLOG_BLCKSZ != 0)
+		endOfLog += XLOG_BLCKSZ - (endOfLog % XLOG_BLCKSZ);
+
+	result->lastRec = ControlFile->checkPoint;
+	result->lastRecTLI = checkPoint->ThisTimeLineID;
+	result->endOfLog = endOfLog;
+	result->endOfLogTLI = checkPoint->ThisTimeLineID;
+	result->lastPageBeginPtr = endOfLog;
+	result->lastPage = NULL;
+	result->abortedRecPtr = InvalidXLogRecPtr;
+	result->missingContrecPtr = InvalidXLogRecPtr;
+	result->recoveryStopReason = pstrdup("fast-fork no recovery startup");
+	result->standby_signal_file_found = false;
+	result->recovery_signal_file_found = false;
+
+	return result;
+}
+#endif
 
 /*
  * GUC support

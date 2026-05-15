@@ -92,6 +92,10 @@
    (--enable-test-fast-analyze) */
 #undef USE_TEST_FAST_ANALYZE
 
+/* Define to 1 to skip crash recovery and WAL redo during startup.
+   (--enable-test-no-recovery-startup) */
+#undef USE_TEST_NO_RECOVERY_STARTUP
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

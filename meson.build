@@ -516,6 +516,7 @@ cdata.set('USE_TEST_FAST_MEMORY_CONTEXTS', get_option('test_fast_memory_contexts
 cdata.set('USE_TEST_EPHEMERAL_CATALOG', get_option('test_ephemeral_catalog') ? 1 : false)
 cdata.set('USE_TEST_NO_DURABLE_MAINTENANCE', get_option('test_no_durable_maintenance') ? 1 : false)
 cdata.set('USE_TEST_FAST_ANALYZE', get_option('test_fast_analyze') ? 1 : false)
+cdata.set('USE_TEST_NO_RECOVERY_STARTUP', get_option('test_no_recovery_startup') ? 1 : false)
 
 if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
   error('test_no_wal_assembly requires test_fake_wal')
@@ -523,6 +524,15 @@ endif
 
 if get_option('test_ephemeral_buffers') and not get_option('test_mem_smgr')
   error('test_ephemeral_buffers requires test_mem_smgr')
+endif
+
+if get_option('test_no_recovery_startup')
+  if not get_option('test_fake_wal')
+    error('test_no_recovery_startup requires test_fake_wal')
+  endif
+  if not get_option('test_mem_smgr')
+    error('test_no_recovery_startup requires test_mem_smgr')
+  endif
 endif
 
 blocksize = get_option('blocksize').to_int() * 1024

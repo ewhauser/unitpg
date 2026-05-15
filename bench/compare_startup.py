@@ -32,6 +32,8 @@ def startup_cmd(args: argparse.Namespace, bin_dir: Path, label: str, output: Pat
         str(args.rounds),
         "--mode",
         args.mode,
+        "--stop-mode",
+        args.stop_mode,
     ]
     for config in args.config:
         cmd.extend(["--config", config])
@@ -58,21 +60,24 @@ def write_summary_markdown(payload: dict[str, object], path: Path) -> None:
         f"Generated: `{payload['generated_at']}`",
         f"Build system: `{payload['build_system']}`",
         f"Mode: `{payload['mode']}`",
+        f"Stop mode: `{payload['parameters']['stop_mode']}`",
         "",
-        "| Variant | Rounds | Initdb (s) | Median start (s) | Mean start (s) | Median first query (s) | Median stop (s) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Variant | Rounds | Initdb (s) | Median launch (s) | Median start (s) | Mean start (s) | Median first query (s) | Median attempts | Median stop (s) |",
+        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name in ("baseline", "fakewal"):
         run = variants[name]["run"]
         summary = run["summary"]
         lines.append(
-            "| {name} | {rounds} | {initdb:.6f} | {median_start:.6f} | {mean_start:.6f} | {median_query:.6f} | {median_stop:.6f} |".format(
+            "| {name} | {rounds} | {initdb:.6f} | {median_launch:.6f} | {median_start:.6f} | {mean_start:.6f} | {median_query:.6f} | {median_attempts:.1f} | {median_stop:.6f} |".format(
                 name=name,
                 rounds=run["rounds"],
                 initdb=run["initdb_seconds"],
+                median_launch=summary["pg_ctl_launch_seconds"]["median"],
                 median_start=summary["pg_ctl_start_seconds"]["median"],
                 mean_start=summary["pg_ctl_start_seconds"]["mean"],
                 median_query=summary["first_query_seconds"]["median"],
+                median_attempts=summary["query_attempts"]["median"],
                 median_stop=summary["pg_ctl_stop_seconds"]["median"],
             )
         )
@@ -130,6 +135,12 @@ def main() -> int:
         default=[],
         help="extra postgresql.conf line forwarded to bench/run_startup.py",
     )
+    parser.add_argument(
+        "--stop-mode",
+        choices=["fast", "immediate"],
+        default="fast",
+        help="shutdown mode forwarded to bench/run_startup.py",
+    )
     parser.add_argument("--baseline-bin", type=Path, help="use an existing baseline install bin directory")
     parser.add_argument("--fakewal-bin", type=Path, help="use an existing fake-WAL install bin directory")
     parser.add_argument(
@@ -182,6 +193,11 @@ def main() -> int:
         action="store_true",
         help="do not use the no-sample ANALYZE fast path in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-recovery-startup",
+        action="store_true",
+        help="do not skip crash recovery and WAL redo during startup in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -215,6 +231,7 @@ def main() -> int:
             ephemeral_catalog=False,
             no_durable_maintenance=False,
             fast_analyze=False,
+            no_recovery_startup=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -240,6 +257,7 @@ def main() -> int:
             ephemeral_catalog=not args.disable_ephemeral_catalog,
             no_durable_maintenance=not args.disable_no_durable_maintenance,
             fast_analyze=not args.disable_fast_analyze,
+            no_recovery_startup=not args.disable_no_recovery_startup,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -280,6 +298,7 @@ def main() -> int:
         "parameters": {
             "rounds": args.rounds,
             "mode": args.mode,
+            "stop_mode": args.stop_mode,
             "config": args.config,
         },
         "variants": {
@@ -299,6 +318,7 @@ def main() -> int:
                 "ephemeral_catalog": not args.disable_ephemeral_catalog,
                 "no_durable_maintenance": not args.disable_no_durable_maintenance,
                 "fast_analyze": not args.disable_fast_analyze,
+                "no_recovery_startup": not args.disable_no_recovery_startup,
                 "bin_dir": str(bins["fakewal"]),
                 "run": runs["fakewal"],
             },

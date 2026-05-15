@@ -349,6 +349,23 @@ PGAC_ARG_BOOL(enable, test-fast-analyze, no,
 AC_SUBST(enable_test_fast_analyze)
 
 #
+# Test-only no recovery startup
+#
+PGAC_ARG_BOOL(enable, test-no-recovery-startup, no,
+              [skip crash recovery and WAL redo during startup (for testing)],
+              [AC_DEFINE([USE_TEST_NO_RECOVERY_STARTUP], 1,
+                         [Define to 1 to skip crash recovery and WAL redo during startup. (--enable-test-no-recovery-startup)])])
+AC_SUBST(enable_test_no_recovery_startup)
+if test "$enable_test_no_recovery_startup" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  AC_MSG_ERROR([--enable-test-no-recovery-startup requires --enable-test-fake-wal])
+fi
+if test "$enable_test_no_recovery_startup" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  AC_MSG_ERROR([--enable-test-no-recovery-startup requires --enable-test-mem-smgr])
+fi
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

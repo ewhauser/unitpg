@@ -1598,6 +1598,9 @@ Optional Features:
                           disable durable maintenance work (for testing)
   --enable-test-fast-analyze
                           use a no-sample ANALYZE fast path (for testing)
+  --enable-test-no-recovery-startup
+                          skip crash recovery and WAL redo during startup (for
+                          testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -4049,6 +4052,43 @@ $as_echo "#define USE_TEST_FAST_ANALYZE 1" >>confdefs.h
 else
   enable_test_fast_analyze=no
 
+fi
+
+
+#
+# Test-only no recovery startup
+#
+
+
+# Check whether --enable-test-no-recovery-startup was given.
+if test "${enable_test_no_recovery_startup+set}" = set; then :
+  enableval=$enable_test_no_recovery_startup;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_RECOVERY_STARTUP 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-recovery-startup option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_recovery_startup=no
+
+fi
+
+if test "$enable_test_no_recovery_startup" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  as_fn_error $? "--enable-test-no-recovery-startup requires --enable-test-fake-wal" "$LINENO" 5
+fi
+if test "$enable_test_no_recovery_startup" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  as_fn_error $? "--enable-test-no-recovery-startup requires --enable-test-mem-smgr" "$LINENO" 5
 fi
 
 

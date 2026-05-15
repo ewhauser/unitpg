@@ -123,6 +123,7 @@ def build_with_meson(
     ephemeral_catalog: bool,
     no_durable_maintenance: bool,
     fast_analyze: bool,
+    no_recovery_startup: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -155,6 +156,7 @@ def build_with_meson(
         f"-Dtest_ephemeral_catalog={'true' if ephemeral_catalog else 'false'}",
         f"-Dtest_no_durable_maintenance={'true' if no_durable_maintenance else 'false'}",
         f"-Dtest_fast_analyze={'true' if fast_analyze else 'false'}",
+        f"-Dtest_no_recovery_startup={'true' if no_recovery_startup else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -181,6 +183,7 @@ def build_with_configure(
     ephemeral_catalog: bool,
     no_durable_maintenance: bool,
     fast_analyze: bool,
+    no_recovery_startup: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -224,6 +227,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-no-durable-maintenance")
     if fast_analyze:
         configure_cmd.append("--enable-test-fast-analyze")
+    if no_recovery_startup:
+        configure_cmd.append("--enable-test-no-recovery-startup")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -251,6 +256,7 @@ def build_variant(
     ephemeral_catalog: bool,
     no_durable_maintenance: bool,
     fast_analyze: bool,
+    no_recovery_startup: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -275,6 +281,7 @@ def build_variant(
             ephemeral_catalog=ephemeral_catalog,
             no_durable_maintenance=no_durable_maintenance,
             fast_analyze=fast_analyze,
+            no_recovery_startup=no_recovery_startup,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -295,6 +302,7 @@ def build_variant(
         ephemeral_catalog=ephemeral_catalog,
         no_durable_maintenance=no_durable_maintenance,
         fast_analyze=fast_analyze,
+        no_recovery_startup=no_recovery_startup,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -495,6 +503,11 @@ def main() -> int:
         action="store_true",
         help="do not use the no-sample ANALYZE fast path in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-recovery-startup",
+        action="store_true",
+        help="do not skip crash recovery and WAL redo during startup in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -533,6 +546,7 @@ def main() -> int:
             ephemeral_catalog=False,
             no_durable_maintenance=False,
             fast_analyze=False,
+            no_recovery_startup=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -558,6 +572,7 @@ def main() -> int:
             ephemeral_catalog=not args.disable_ephemeral_catalog,
             no_durable_maintenance=not args.disable_no_durable_maintenance,
             fast_analyze=not args.disable_fast_analyze,
+            no_recovery_startup=not args.disable_no_recovery_startup,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -620,6 +635,7 @@ def main() -> int:
                 "ephemeral_catalog": False,
                 "no_durable_maintenance": False,
                 "fast_analyze": False,
+                "no_recovery_startup": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -637,6 +653,7 @@ def main() -> int:
                 "ephemeral_catalog": not args.disable_ephemeral_catalog,
                 "no_durable_maintenance": not args.disable_no_durable_maintenance,
                 "fast_analyze": not args.disable_fast_analyze,
+                "no_recovery_startup": not args.disable_no_recovery_startup,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

@@ -58,15 +58,19 @@ performance work.
 
 | Area | Baseline | Fast fork | Result | Notes |
 | --- | ---: | ---: | ---: | --- |
-| Runtime fixture restore | 233.971 TPS | 588.741 TPS | 2.516x TPS | `bench/results/snapshot-compare-current`, 3 rounds, 200 transactions, 200 rows |
-| Runtime fixture restore latency | 4.274 ms | 1.699 ms | 0.398x latency | Same run as above |
-| Startup, postmaster ready | 0.117264 s | 0.113301 s | 1.035x | `bench/results/startup-compare-smoke`, 2-round smoke |
-| Startup, first query | 0.011634 s | 0.006105 s | 1.906x | Same smoke run as above |
+| Runtime fixture restore | 256.435 TPS | 614.132 TPS | 2.395x TPS | `bench/results/conservative-fast-startup-snapshot-final`, 3 rounds, 200 transactions, 200 rows |
+| Runtime fixture restore latency | 3.900 ms | 1.628 ms | 0.417x latency | Same run as above |
+| Runtime plain rollback | 245.491 TPS | 129.768 TPS | 0.529x TPS | `bench/results/conservative-fast-startup-rollback-final`, 3 rounds, permanent-table rollback workload |
+| Startup, initdb | 0.302902 s | 0.276885 s | 1.094x | `bench/results/conservative-fast-startup-final`, 10 rounds, direct first-query polling |
+| Startup, postmaster ready | 0.040151 s | 0.030156 s | 1.331x | Same run as above |
+| Startup, first query | 0.006660 s | 0.006601 s | 1.009x | Same run as above |
 
 The runtime fixture-restore comparison measured stock PostgreSQL replaying the
 rollback-heavy setup workload against the fast fork restoring a captured
-fixture snapshot before each test body. The startup comparison is a tiny smoke
-sample; use more rounds before making decisions from startup numbers.
+fixture snapshot before each test body. Plain rollback remains slower in the
+current prototype; use fixture snapshots for the intended fast path. Startup is
+now measured by direct polling for the first successful query, so the
+postmaster-ready row includes client retry timing.
 
 ## Build And Validate
 

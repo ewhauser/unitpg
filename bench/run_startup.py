@@ -112,42 +112,81 @@ def start_query_stop_round(
     pg_ctl: str,
     psql: str,
     port: int,
+    stop_mode: str,
     env: dict[str, str],
 ) -> tuple[dict[str, object], bool]:
     started = False
     round_result: dict[str, object] = {"postgres_log_path": str(log_file)}
+    query_cmd = [
+        psql,
+        "-h",
+        str(socket_dir),
+        "-p",
+        str(port),
+        "-U",
+        "postgres",
+        "-d",
+        "postgres",
+        "-Atq",
+        "-c",
+        "SELECT 1",
+    ]
 
     try:
-        _, start_seconds = timed_run(
-            [pg_ctl, "-D", str(data_dir), "-l", str(log_file), "-w", "start"],
+        start_time = time.perf_counter()
+        launch_start = time.perf_counter()
+        run(
+            [pg_ctl, "-D", str(data_dir), "-l", str(log_file), "-W", "start"],
             env=env,
         )
+        round_result["pg_ctl_launch_seconds"] = round(time.perf_counter() - launch_start, 6)
         started = True
-        round_result["pg_ctl_start_seconds"] = start_seconds
+        deadline = start_time + 10
+        query_attempts = 0
+        first_query_failure = None
+        last_query_failure = None
 
-        _, first_query_seconds = timed_run(
-            [
-                psql,
-                "-h",
-                str(socket_dir),
-                "-p",
-                str(port),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-Atq",
-                "-c",
-                "SELECT 1",
-            ],
-            env=env,
-        )
-        round_result["first_query_seconds"] = first_query_seconds
+        while True:
+            query_start = time.perf_counter()
+            proc = subprocess.run(
+                query_cmd,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+            query_attempts += 1
+            query_seconds = round(time.perf_counter() - query_start, 6)
+            if proc.returncode == 0:
+                round_result["pg_ctl_start_seconds"] = round(time.perf_counter() - start_time, 6)
+                round_result["first_query_seconds"] = query_seconds
+                round_result["query_attempts"] = query_attempts
+                if first_query_failure is not None:
+                    round_result["first_query_failure"] = first_query_failure
+                    round_result["last_query_failure"] = last_query_failure
+                break
+
+            failure = (proc.stderr or proc.stdout).strip()
+            if failure:
+                if first_query_failure is None:
+                    first_query_failure = failure
+                last_query_failure = failure
+
+            if time.perf_counter() >= deadline:
+                raise subprocess.CalledProcessError(
+                    proc.returncode,
+                    query_cmd,
+                    output=proc.stdout,
+                    stderr=proc.stderr,
+                )
+
+            time.sleep(0.005)
     finally:
         if started:
             stop_start = time.perf_counter()
             subprocess.run(
-                [pg_ctl, "-D", str(data_dir), "-m", "fast", "-w", "stop"],
+                [pg_ctl, "-D", str(data_dir), "-m", stop_mode, "-w", "stop"],
                 env=env,
                 text=True,
                 stdout=subprocess.DEVNULL,
@@ -168,6 +207,12 @@ def main() -> int:
     parser.add_argument("--keep-workdir", action="store_true", help="do not delete the disposable cluster")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument("--mode", choices=["reuse", "copy"], default="reuse")
+    parser.add_argument(
+        "--stop-mode",
+        choices=["fast", "immediate"],
+        default="fast",
+        help="shutdown mode to use between startup rounds",
+    )
     parser.add_argument(
         "--config",
         action="append",
@@ -231,6 +276,7 @@ def main() -> int:
                 pg_ctl=pg_ctl,
                 psql=psql,
                 port=port,
+                stop_mode=args.stop_mode,
                 env=env,
             )
             round_result["round"] = round_number
@@ -242,8 +288,10 @@ def main() -> int:
                 shutil.rmtree(data_dir, ignore_errors=True)
 
         start_times = [float(round_data["pg_ctl_start_seconds"]) for round_data in rounds]
+        launch_times = [float(round_data["pg_ctl_launch_seconds"]) for round_data in rounds]
         first_query_times = [float(round_data["first_query_seconds"]) for round_data in rounds]
         stop_times = [float(round_data["pg_ctl_stop_seconds"]) for round_data in rounds]
+        query_attempts = [float(round_data["query_attempts"]) for round_data in rounds]
         copy_times = [
             float(round_data["copy_seconds"])
             for round_data in rounds
@@ -259,13 +307,16 @@ def main() -> int:
             "postgres_version": run([postgres, "--version"], env=env).stdout.strip(),
             "settings": settings,
             "mode": args.mode,
+            "stop_mode": args.stop_mode,
             "rounds": args.rounds,
             "initdb_seconds": initdb_seconds,
             "round_results": rounds,
             "summary": {
                 "copy_seconds": summarize(copy_times),
+                "pg_ctl_launch_seconds": summarize(launch_times),
                 "pg_ctl_start_seconds": summarize(start_times),
                 "first_query_seconds": summarize(first_query_times),
+                "query_attempts": summarize(query_attempts),
                 "pg_ctl_stop_seconds": summarize(stop_times),
             },
         }
