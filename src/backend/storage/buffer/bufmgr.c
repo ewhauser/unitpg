@@ -5249,6 +5249,38 @@ FastForkEpochDropBuffers(uint64 epoch_id)
 			UnlockBufHdr(bufHdr);
 	}
 }
+
+void
+FastForkEpochCountBuffers(uint64 epoch_id, int64 *buffers,
+						  int64 *dirty_buffers)
+{
+	int			i;
+
+	*buffers = 0;
+	*dirty_buffers = 0;
+
+	if (epoch_id == 0)
+		return;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *bufHdr = GetBufferDescriptor(i);
+		uint64		buf_state;
+
+		if (bufHdr->tag.fastfork_epoch_id != epoch_id)
+			continue;
+
+		buf_state = LockBufHdr(bufHdr);
+		if (bufHdr->tag.fastfork_epoch_id == epoch_id &&
+			(buf_state & BM_VALID) != 0)
+		{
+			(*buffers)++;
+			if ((buf_state & BM_DIRTY) != 0)
+				(*dirty_buffers)++;
+		}
+		UnlockBufHdr(bufHdr);
+	}
+}
 #endif
 
 /* ---------------------------------------------------------------------

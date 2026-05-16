@@ -142,10 +142,47 @@ BEGIN;
 UPDATE epoch_parent SET val = 'named-changed' WHERE id = 1;
 INSERT INTO epoch_child VALUES (1600, 2, 46);
 COMMIT;
+SELECT 1 / CASE WHEN EXISTS (
+           SELECT 1
+           FROM pg_fastfork_epoch_stats()
+           WHERE scope = 'epoch'
+             AND name = 'named-test'
+             AND participants = 1
+             AND joined
+             AND arena_scope = 'postmaster'
+             AND arena_pages_limit > 0
+             AND overlay_pages + overlay_buffers > 0
+       )
+       THEN 1 ELSE 0 END;
 SELECT 1 / CASE WHEN (SELECT val FROM epoch_parent WHERE id = 1) = 'named-changed'
            THEN 1 ELSE 0 END;
 SELECT pg_fastfork_epoch_leave();
+SELECT 1 / CASE WHEN EXISTS (
+           SELECT 1
+           FROM pg_fastfork_epoch_stats()
+           WHERE scope = 'epoch'
+             AND name = 'named-test'
+             AND participants = 0
+             AND NOT joined
+             AND overlay_pages > 0
+       )
+       THEN 1 ELSE 0 END;
 SELECT pg_fastfork_epoch_finish('named-test');
+SELECT 1 / CASE WHEN NOT EXISTS (
+           SELECT 1
+           FROM pg_fastfork_epoch_stats()
+           WHERE scope = 'epoch'
+             AND name = 'named-test'
+       )
+       THEN 1 ELSE 0 END;
+SELECT 1 / CASE WHEN EXISTS (
+           SELECT 1
+           FROM pg_fastfork_epoch_stats()
+           WHERE scope = 'arena'
+             AND overlay_pages = 0
+             AND overlay_buffers = 0
+       )
+       THEN 1 ELSE 0 END;
 DO $$
 BEGIN
   IF (SELECT val FROM epoch_parent WHERE id = 1) <> 'base-1' THEN
