@@ -6618,6 +6618,11 @@ write_relcache_init_file(bool shared)
 	RelIdCacheEnt *idhentry;
 	int			i;
 
+#ifdef USE_TEST_SEED_ONLY_STARTUP
+	if (IsUnderPostmaster)
+		return;
+#endif
+
 	/*
 	 * If we have already received any relcache inval events, there's no
 	 * chance of succeeding so we may as well skip the whole thing.

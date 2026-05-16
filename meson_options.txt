@@ -82,6 +82,9 @@ option('test_fast_analyze', type: 'boolean', value: false,
 option('test_no_recovery_startup', type: 'boolean', value: false,
   description: 'Skip crash recovery and WAL redo during startup for test-only builds')
 
+option('test_seed_only_startup', type: 'boolean', value: false,
+  description: 'Treat the data directory as an immutable seed image during startup for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

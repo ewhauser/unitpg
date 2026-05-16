@@ -16,6 +16,8 @@ explicitly says otherwise.
 - Do preserve parser/planner/executor behavior, MVCC visibility, rollback,
   relcache/syscache correctness, ordinary DDL/query behavior, and constraints
   for supported app-test workloads.
+- Update the performance snapshot in `README.md` whenever committing a
+  performance change, or state there why the table is unchanged.
 - Do not commit generated benchmark results under `bench/results/`, build
   outputs under `bench/.build/`, or Python `__pycache__` directories.
 - Use `git -c core.fsmonitor=false status --short` if normal `git status`
@@ -80,6 +82,7 @@ The validation script already:
 - creates the temporary install
 - fixes macOS temporary-install library names
 - runs the fast-fork fixture snapshot smoke test
+- runs the seed-only dirty-restart smoke test
 - skips known incompatible recovery/durability/replication/background-worker
   suites
 

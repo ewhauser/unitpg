@@ -517,6 +517,7 @@ cdata.set('USE_TEST_EPHEMERAL_CATALOG', get_option('test_ephemeral_catalog') ? 1
 cdata.set('USE_TEST_NO_DURABLE_MAINTENANCE', get_option('test_no_durable_maintenance') ? 1 : false)
 cdata.set('USE_TEST_FAST_ANALYZE', get_option('test_fast_analyze') ? 1 : false)
 cdata.set('USE_TEST_NO_RECOVERY_STARTUP', get_option('test_no_recovery_startup') ? 1 : false)
+cdata.set('USE_TEST_SEED_ONLY_STARTUP', get_option('test_seed_only_startup') ? 1 : false)
 
 if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
   error('test_no_wal_assembly requires test_fake_wal')
@@ -532,6 +533,18 @@ if get_option('test_no_recovery_startup')
   endif
   if not get_option('test_mem_smgr')
     error('test_no_recovery_startup requires test_mem_smgr')
+  endif
+endif
+
+if get_option('test_seed_only_startup')
+  if not get_option('test_no_recovery_startup')
+    error('test_seed_only_startup requires test_no_recovery_startup')
+  endif
+  if not get_option('test_mem_smgr')
+    error('test_seed_only_startup requires test_mem_smgr')
+  endif
+  if not get_option('test_mem_slru')
+    error('test_seed_only_startup requires test_mem_slru')
   endif
 endif
 

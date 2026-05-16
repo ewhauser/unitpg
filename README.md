@@ -46,7 +46,7 @@ Specs live in [spec/](spec/). The current work is organized around:
 - no durable maintenance
 - direct buffer access for ephemeral storage
 - trusted DDL shortcuts
-- startup/recovery benchmarks and startup fast paths
+- startup/recovery benchmarks, startup fast paths, and seed-only restarts
 
 The agent workflow and validation loop are documented in [AGENTS.md](AGENTS.md).
 
@@ -58,19 +58,22 @@ performance work.
 
 | Area | Baseline | Fast fork | Result | Notes |
 | --- | ---: | ---: | ---: | --- |
-| Runtime fixture restore | 256.435 TPS | 614.132 TPS | 2.395x TPS | `bench/results/conservative-fast-startup-snapshot-final`, 3 rounds, 200 transactions, 200 rows |
-| Runtime fixture restore latency | 3.900 ms | 1.628 ms | 0.417x latency | Same run as above |
+| Runtime fixture restore | 244.532 TPS | 588.734 TPS | 2.408x TPS | `bench/results/seed-only-startup-pgbench-final`, 3 rounds, 200 transactions, 200 rows |
+| Runtime fixture restore latency | 4.089 ms | 1.699 ms | 0.416x latency | Same run as above |
 | Runtime plain rollback | 245.491 TPS | 129.768 TPS | 0.529x TPS | `bench/results/conservative-fast-startup-rollback-final`, 3 rounds, permanent-table rollback workload |
-| Startup, initdb | 0.302902 s | 0.276885 s | 1.094x | `bench/results/conservative-fast-startup-final`, 10 rounds, direct first-query polling |
-| Startup, postmaster ready | 0.040151 s | 0.030156 s | 1.331x | Same run as above |
-| Startup, first query | 0.006660 s | 0.006601 s | 1.009x | Same run as above |
+| Startup reuse, postmaster ready | 0.036009 s | 0.031566 s | 1.141x | `bench/results/seed-only-startup-final2`, 10 rounds, direct first-query polling |
+| Startup reuse, first query | 0.008751 s | 0.006006 s | 1.457x | Same run as above |
+| Startup copy, postmaster ready | 0.026903 s | 0.025781 s | 1.044x | `bench/results/seed-only-startup-copy-final2`, 10 rounds |
+| Startup copy, first query | 0.006554 s | 0.005596 s | 1.171x | Same run as above |
 
 The runtime fixture-restore comparison measured stock PostgreSQL replaying the
 rollback-heavy setup workload against the fast fork restoring a captured
 fixture snapshot before each test body. Plain rollback remains slower in the
 current prototype; use fixture snapshots for the intended fast path. Startup is
 now measured by direct polling for the first successful query, so the
-postmaster-ready row includes client retry timing.
+postmaster-ready rows include client retry timing. Seed-only startup treats the
+data directory as an immutable seed image and proves that clean or immediate
+restarts discard runtime-created tables while resetting OID state.
 
 ## Build And Validate
 

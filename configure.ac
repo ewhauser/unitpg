@@ -366,6 +366,27 @@ if test "$enable_test_no_recovery_startup" = yes &&
 fi
 
 #
+# Test-only seed-only startup
+#
+PGAC_ARG_BOOL(enable, test-seed-only-startup, no,
+              [treat the data directory as an immutable seed image during startup (for testing)],
+              [AC_DEFINE([USE_TEST_SEED_ONLY_STARTUP], 1,
+                         [Define to 1 to treat the data directory as an immutable seed image during startup. (--enable-test-seed-only-startup)])])
+AC_SUBST(enable_test_seed_only_startup)
+if test "$enable_test_seed_only_startup" = yes &&
+   test "$enable_test_no_recovery_startup" != yes; then
+  AC_MSG_ERROR([--enable-test-seed-only-startup requires --enable-test-no-recovery-startup])
+fi
+if test "$enable_test_seed_only_startup" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  AC_MSG_ERROR([--enable-test-seed-only-startup requires --enable-test-mem-smgr])
+fi
+if test "$enable_test_seed_only_startup" = yes &&
+   test "$enable_test_mem_slru" != yes; then
+  AC_MSG_ERROR([--enable-test-seed-only-startup requires --enable-test-mem-slru])
+fi
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

@@ -731,6 +731,10 @@ static void TestNoRecoveryStartupRejectRecoveryInputs(void);
 static bool TestNoRecoveryStartupFileExists(const char *path);
 static EndOfWalRecoveryInfo *TestNoRecoveryStartupFinishFromControlFile(const CheckPoint *checkPoint);
 #endif
+#ifdef USE_TEST_SEED_ONLY_STARTUP
+static void TestSeedOnlyStartupApplyManifest(void);
+static void TestSeedOnlyStartupWriteManifest(bool replace);
+#endif
 static void InitControlFile(uint64 sysidentifier, uint32 data_checksum_version);
 static void WriteControlFile(void);
 static void ReadControlFile(void);
@@ -6043,6 +6047,11 @@ StartupXLOG(void)
 		didCrash = false;
 #endif
 
+#ifdef USE_TEST_SEED_ONLY_STARTUP
+	if (IsUnderPostmaster)
+		TestSeedOnlyStartupApplyManifest();
+#endif
+
 	/*
 	 * Prepare for WAL recovery if needed.
 	 *
@@ -7227,6 +7236,15 @@ ShutdownXLOG(int code, Datum arg)
 	 */
 	WalSndWaitStopping();
 
+#ifdef USE_TEST_SEED_ONLY_STARTUP
+	if (IsUnderPostmaster)
+	{
+		ereport(LOG,
+				(errmsg("fast-fork seed-only shutdown is skipping the shutdown checkpoint")));
+		return;
+	}
+#endif
+
 	if (RecoveryInProgress())
 		CreateRestartPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_FAST);
 	else
@@ -7242,6 +7260,14 @@ ShutdownXLOG(int code, Datum arg)
 
 		CreateCheckPoint(CHECKPOINT_IS_SHUTDOWN | CHECKPOINT_FAST);
 	}
+
+#ifdef USE_TEST_SEED_ONLY_STARTUP
+	if (!IsUnderPostmaster)
+	{
+		RelationCacheInitFileRemove();
+		TestSeedOnlyStartupWriteManifest(true);
+	}
+#endif
 }
 
 /*
@@ -9426,6 +9452,178 @@ get_sync_bit(int method)
 			return 0;			/* silence warning */
 	}
 }
+
+#ifdef USE_TEST_SEED_ONLY_STARTUP
+#define TEST_SEED_ONLY_STARTUP_FILE		"global/pg_fastfork_seed"
+#define TEST_SEED_ONLY_STARTUP_MAGIC	UINT64CONST(0x5047464653454544)
+#define TEST_SEED_ONLY_STARTUP_VERSION	1
+
+typedef struct TestSeedOnlyStartupManifest
+{
+	uint64		magic;
+	uint32		version;
+	uint32		catalog_version_no;
+	uint64		system_identifier;
+	pg_time_t	time;
+	XLogRecPtr	checkPoint;
+	CheckPoint	checkPointCopy;
+	XLogRecPtr	unloggedLSN;
+	pg_crc32c	crc;
+} TestSeedOnlyStartupManifest;
+
+static void
+TestSeedOnlyStartupInitManifest(TestSeedOnlyStartupManifest *manifest)
+{
+	memset(manifest, 0, sizeof(*manifest));
+	manifest->magic = TEST_SEED_ONLY_STARTUP_MAGIC;
+	manifest->version = TEST_SEED_ONLY_STARTUP_VERSION;
+	manifest->catalog_version_no = ControlFile->catalog_version_no;
+	manifest->system_identifier = ControlFile->system_identifier;
+	manifest->time = ControlFile->time;
+	manifest->checkPoint = ControlFile->checkPoint;
+	manifest->checkPointCopy = ControlFile->checkPointCopy;
+	manifest->unloggedLSN = ControlFile->unloggedLSN;
+
+	INIT_CRC32C(manifest->crc);
+	COMP_CRC32C(manifest->crc, manifest,
+				offsetof(TestSeedOnlyStartupManifest, crc));
+	FIN_CRC32C(manifest->crc);
+}
+
+static bool
+TestSeedOnlyStartupReadManifest(TestSeedOnlyStartupManifest *manifest)
+{
+	pg_crc32c	crc;
+	int			fd;
+	int			r;
+
+	fd = BasicOpenFile(TEST_SEED_ONLY_STARTUP_FILE,
+					   O_RDONLY | PG_BINARY | O_CLOEXEC);
+	if (fd < 0)
+	{
+		if (errno == ENOENT)
+			return false;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not open fast-fork seed manifest \"%s\": %m",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+	}
+
+	r = read(fd, manifest, sizeof(*manifest));
+	if (r != sizeof(*manifest))
+	{
+		if (r < 0)
+			ereport(FATAL,
+					(errcode_for_file_access(),
+					 errmsg("could not read fast-fork seed manifest \"%s\": %m",
+							TEST_SEED_ONLY_STARTUP_FILE)));
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not read fast-fork seed manifest \"%s\": read %d of %zu",
+						TEST_SEED_ONLY_STARTUP_FILE, r, sizeof(*manifest))));
+	}
+
+	if (close(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not close fast-fork seed manifest \"%s\": %m",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+
+	INIT_CRC32C(crc);
+	COMP_CRC32C(crc, manifest,
+				offsetof(TestSeedOnlyStartupManifest, crc));
+	FIN_CRC32C(crc);
+	if (!EQ_CRC32C(crc, manifest->crc))
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("incorrect checksum in fast-fork seed manifest \"%s\"",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+
+	if (manifest->magic != TEST_SEED_ONLY_STARTUP_MAGIC ||
+		manifest->version != TEST_SEED_ONLY_STARTUP_VERSION)
+		ereport(FATAL,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("unsupported fast-fork seed manifest \"%s\"",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+
+	if (manifest->catalog_version_no != ControlFile->catalog_version_no ||
+		manifest->system_identifier != ControlFile->system_identifier)
+		ereport(FATAL,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fast-fork seed manifest does not match this data directory")));
+
+	return true;
+}
+
+static void
+TestSeedOnlyStartupWriteManifest(bool replace)
+{
+	TestSeedOnlyStartupManifest manifest;
+	int			fd;
+	int			flags;
+
+	TestSeedOnlyStartupInitManifest(&manifest);
+
+	flags = O_WRONLY | O_CREAT | PG_BINARY | O_CLOEXEC;
+	if (replace)
+		flags |= O_TRUNC;
+	else
+		flags |= O_EXCL;
+
+	fd = BasicOpenFile(TEST_SEED_ONLY_STARTUP_FILE,
+					   flags);
+	if (fd < 0)
+	{
+		if (!replace && errno == EEXIST)
+			return;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not create fast-fork seed manifest \"%s\": %m",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+	}
+
+	errno = 0;
+	if (write(fd, &manifest, sizeof(manifest)) != sizeof(manifest))
+	{
+		if (errno == 0)
+			errno = ENOSPC;
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not write fast-fork seed manifest \"%s\": %m",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+	}
+
+	if (close(fd) != 0)
+		ereport(FATAL,
+				(errcode_for_file_access(),
+				 errmsg("could not close fast-fork seed manifest \"%s\": %m",
+						TEST_SEED_ONLY_STARTUP_FILE)));
+}
+
+static void
+TestSeedOnlyStartupApplyManifest(void)
+{
+	TestSeedOnlyStartupManifest manifest;
+
+	if (!TestSeedOnlyStartupReadManifest(&manifest))
+	{
+		RelationCacheInitFileRemove();
+		TestSeedOnlyStartupWriteManifest(false);
+		return;
+	}
+
+	ControlFile->time = manifest.time;
+	ControlFile->checkPoint = manifest.checkPoint;
+	ControlFile->checkPointCopy = manifest.checkPointCopy;
+	ControlFile->unloggedLSN = manifest.unloggedLSN;
+	ControlFile->minRecoveryPoint = InvalidXLogRecPtr;
+	ControlFile->minRecoveryPointTLI = 0;
+	ControlFile->backupStartPoint = InvalidXLogRecPtr;
+	ControlFile->backupEndPoint = InvalidXLogRecPtr;
+	ControlFile->backupEndRequired = false;
+	ControlFile->state = DB_SHUTDOWNED;
+}
+#endif
 
 #ifdef USE_TEST_NO_RECOVERY_STARTUP
 static bool

@@ -198,6 +198,11 @@ def main() -> int:
         action="store_true",
         help="do not skip crash recovery and WAL redo during startup in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-seed-only-startup",
+        action="store_true",
+        help="do not treat the data directory as an immutable seed image in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -232,6 +237,7 @@ def main() -> int:
             no_durable_maintenance=False,
             fast_analyze=False,
             no_recovery_startup=False,
+            seed_only_startup=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -258,6 +264,7 @@ def main() -> int:
             no_durable_maintenance=not args.disable_no_durable_maintenance,
             fast_analyze=not args.disable_fast_analyze,
             no_recovery_startup=not args.disable_no_recovery_startup,
+            seed_only_startup=not args.disable_seed_only_startup,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -319,6 +326,7 @@ def main() -> int:
                 "no_durable_maintenance": not args.disable_no_durable_maintenance,
                 "fast_analyze": not args.disable_fast_analyze,
                 "no_recovery_startup": not args.disable_no_recovery_startup,
+                "seed_only_startup": not args.disable_seed_only_startup,
                 "bin_dir": str(bins["fakewal"]),
                 "run": runs["fakewal"],
             },

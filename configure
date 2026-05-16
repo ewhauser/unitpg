@@ -1601,6 +1601,9 @@ Optional Features:
   --enable-test-no-recovery-startup
                           skip crash recovery and WAL redo during startup (for
                           testing)
+  --enable-test-seed-only-startup
+                          treat the data directory as an immutable seed image
+                          during startup (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -4089,6 +4092,47 @@ fi
 if test "$enable_test_no_recovery_startup" = yes &&
    test "$enable_test_mem_smgr" != yes; then
   as_fn_error $? "--enable-test-no-recovery-startup requires --enable-test-mem-smgr" "$LINENO" 5
+fi
+
+
+#
+# Test-only seed-only startup
+#
+
+
+# Check whether --enable-test-seed-only-startup was given.
+if test "${enable_test_seed_only_startup+set}" = set; then :
+  enableval=$enable_test_seed_only_startup;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_SEED_ONLY_STARTUP 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-seed-only-startup option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_seed_only_startup=no
+
+fi
+
+if test "$enable_test_seed_only_startup" = yes &&
+   test "$enable_test_no_recovery_startup" != yes; then
+  as_fn_error $? "--enable-test-seed-only-startup requires --enable-test-no-recovery-startup" "$LINENO" 5
+fi
+if test "$enable_test_seed_only_startup" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  as_fn_error $? "--enable-test-seed-only-startup requires --enable-test-mem-smgr" "$LINENO" 5
+fi
+if test "$enable_test_seed_only_startup" = yes &&
+   test "$enable_test_mem_slru" != yes; then
+  as_fn_error $? "--enable-test-seed-only-startup requires --enable-test-mem-slru" "$LINENO" 5
 fi
 
 
