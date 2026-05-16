@@ -99,7 +99,8 @@ jobs:
             -A trust \
             -U postgres \
             -c shared_memory_type=mmap
-          "$dist/bin/pg_ctl" -D "$workdir/data" -l "$workdir/postgres.log" -w start
+          "$dist/bin/pg_ctl" -D "$workdir/data" -l "$workdir/postgres.log" -o "-k $workdir" -w start
+          "$dist/bin/psql" -h "$workdir" -d postgres -U postgres -Atqc "select 1" | grep -Fx 1
           "$dist/bin/pg_ctl" -D "$workdir/data" -m fast -w stop
 
       - name: Upload binary archive
