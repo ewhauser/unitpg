@@ -25,6 +25,7 @@ Build and validate the fast-fork Postgres configuration:
   -Dtest_fast_memory_contexts=true -Dtest_ephemeral_catalog=true
   -Dtest_no_durable_maintenance=true -Dtest_fast_analyze=true
   -Dtest_no_recovery_startup=true -Dtest_seed_only_startup=true
+  -Dtest_no_data_directory_startup=true
 
 Modes:
   quick       Fast compatible smoke tests plus async I/O tests when the local
@@ -172,6 +173,7 @@ SETUP_ARGS=(
 	"-Dtest_fast_analyze=true"
 	"-Dtest_no_recovery_startup=true"
 	"-Dtest_seed_only_startup=true"
+	"-Dtest_no_data_directory_startup=true"
 	"-Dtap_tests=auto"
 	"-Dauto_features=disabled"
 	"-Dicu=disabled"
@@ -322,6 +324,8 @@ fix_darwin_tmp_install_names
 "${PYTHON:-python3}" "$ROOT/bench/test_fastfork_snapshot.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 "${PYTHON:-python3}" "$ROOT/bench/test_seed_only_startup.py" \
+	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
+"${PYTHON:-python3}" "$ROOT/bench/test_no_data_directory_startup.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 
 TEST_ARGS=(

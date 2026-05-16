@@ -125,6 +125,7 @@ def build_with_meson(
     fast_analyze: bool,
     no_recovery_startup: bool,
     seed_only_startup: bool,
+    no_data_directory_startup: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -159,6 +160,7 @@ def build_with_meson(
         f"-Dtest_fast_analyze={'true' if fast_analyze else 'false'}",
         f"-Dtest_no_recovery_startup={'true' if no_recovery_startup else 'false'}",
         f"-Dtest_seed_only_startup={'true' if seed_only_startup else 'false'}",
+        f"-Dtest_no_data_directory_startup={'true' if no_data_directory_startup else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -187,6 +189,7 @@ def build_with_configure(
     fast_analyze: bool,
     no_recovery_startup: bool,
     seed_only_startup: bool,
+    no_data_directory_startup: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -234,6 +237,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-no-recovery-startup")
     if seed_only_startup:
         configure_cmd.append("--enable-test-seed-only-startup")
+    if no_data_directory_startup:
+        configure_cmd.append("--enable-test-no-data-directory-startup")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -263,6 +268,7 @@ def build_variant(
     fast_analyze: bool,
     no_recovery_startup: bool,
     seed_only_startup: bool,
+    no_data_directory_startup: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -289,6 +295,7 @@ def build_variant(
             fast_analyze=fast_analyze,
             no_recovery_startup=no_recovery_startup,
             seed_only_startup=seed_only_startup,
+            no_data_directory_startup=no_data_directory_startup,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -311,6 +318,7 @@ def build_variant(
         fast_analyze=fast_analyze,
         no_recovery_startup=no_recovery_startup,
         seed_only_startup=seed_only_startup,
+        no_data_directory_startup=no_data_directory_startup,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -521,6 +529,11 @@ def main() -> int:
         action="store_true",
         help="do not treat the data directory as an immutable seed image in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-data-directory-startup",
+        action="store_true",
+        help="do not enable external seed-image startup support in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -530,6 +543,13 @@ def main() -> int:
         and args.clients != 1
     ):
         raise SystemExit("the snapshot workload currently requires --clients 1")
+    enable_no_data_directory_startup = (
+        not args.disable_no_data_directory_startup
+        and not args.disable_seed_only_startup
+        and not args.disable_no_recovery_startup
+        and not args.disable_mem_smgr
+        and not args.disable_mem_slru
+    )
 
     source = args.source.resolve()
     build_root = args.build_root.resolve()
@@ -561,6 +581,7 @@ def main() -> int:
             fast_analyze=False,
             no_recovery_startup=False,
             seed_only_startup=False,
+            no_data_directory_startup=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -588,6 +609,7 @@ def main() -> int:
             fast_analyze=not args.disable_fast_analyze,
             no_recovery_startup=not args.disable_no_recovery_startup,
             seed_only_startup=not args.disable_seed_only_startup,
+            no_data_directory_startup=enable_no_data_directory_startup,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -652,6 +674,7 @@ def main() -> int:
                 "fast_analyze": False,
                 "no_recovery_startup": False,
                 "seed_only_startup": False,
+                "no_data_directory_startup": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -671,6 +694,7 @@ def main() -> int:
                 "fast_analyze": not args.disable_fast_analyze,
                 "no_recovery_startup": not args.disable_no_recovery_startup,
                 "seed_only_startup": not args.disable_seed_only_startup,
+                "no_data_directory_startup": enable_no_data_directory_startup,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

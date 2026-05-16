@@ -387,6 +387,31 @@ if test "$enable_test_seed_only_startup" = yes &&
 fi
 
 #
+# Test-only no data directory startup
+#
+PGAC_ARG_BOOL(enable, test-no-data-directory-startup, no,
+              [start from an external seed image instead of PGDATA relation files (for testing)],
+              [AC_DEFINE([USE_TEST_NO_DATA_DIRECTORY_STARTUP], 1,
+                         [Define to 1 to start from an external seed image instead of PGDATA relation files. (--enable-test-no-data-directory-startup)])])
+AC_SUBST(enable_test_no_data_directory_startup)
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_seed_only_startup" != yes; then
+  AC_MSG_ERROR([--enable-test-no-data-directory-startup requires --enable-test-seed-only-startup])
+fi
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  AC_MSG_ERROR([--enable-test-no-data-directory-startup requires --enable-test-fake-wal])
+fi
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  AC_MSG_ERROR([--enable-test-no-data-directory-startup requires --enable-test-mem-smgr])
+fi
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_mem_slru" != yes; then
+  AC_MSG_ERROR([--enable-test-no-data-directory-startup requires --enable-test-mem-slru])
+fi
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

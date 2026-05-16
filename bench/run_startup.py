@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 from statistics import fmean, median
 
+from fastfork_seed import copy_runtime_skeleton
+
 
 FAST_SETTINGS = {
     "listen_addresses": "",
@@ -71,11 +73,15 @@ def quote_conf_value(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def append_fast_config(data_dir: Path, socket_dir: Path, port: int, extra: list[str]) -> dict[str, str]:
+def build_fast_settings(socket_dir: Path, port: int) -> dict[str, str]:
     settings = dict(FAST_SETTINGS)
     settings["unix_socket_directories"] = str(socket_dir)
     settings["port"] = str(port)
+    return settings
 
+
+def append_fast_config(data_dir: Path, socket_dir: Path, port: int, extra: list[str]) -> dict[str, str]:
+    settings = build_fast_settings(socket_dir, port)
     with (data_dir / "postgresql.conf").open("a", encoding="utf-8") as conf:
         conf.write("\n# bench/run_startup.py fast test settings\n")
         for key, value in settings.items():
@@ -206,7 +212,12 @@ def main() -> int:
     parser.add_argument("--workdir", type=Path, help="directory for the disposable cluster")
     parser.add_argument("--keep-workdir", action="store_true", help="do not delete the disposable cluster")
     parser.add_argument("--rounds", type=int, default=5)
-    parser.add_argument("--mode", choices=["reuse", "copy"], default="reuse")
+    parser.add_argument("--mode", choices=["reuse", "copy", "no-data-dir"], default="reuse")
+    parser.add_argument(
+        "--seed-image",
+        type=Path,
+        help="existing initdb-style seed directory for --mode no-data-dir",
+    )
     parser.add_argument(
         "--stop-mode",
         choices=["fast", "immediate"],
@@ -242,7 +253,7 @@ def main() -> int:
         workdir = Path(tempfile.mkdtemp(prefix="postgres-startup-"))
         remove_workdir = not args.keep_workdir
 
-    seed_dir = workdir / "seed"
+    seed_dir = args.seed_image.resolve() if args.seed_image else workdir / "seed"
     socket_dir = workdir / "socket"
     socket_dir.mkdir(parents=True, exist_ok=True)
     port = find_free_port()
@@ -251,22 +262,49 @@ def main() -> int:
     total_start = time.perf_counter()
 
     try:
-        _, initdb_seconds = timed_run(
-            [initdb, "-D", str(seed_dir), "--no-sync", "-A", "trust", "-U", "postgres"],
-            env=env,
-        )
-        settings = append_fast_config(seed_dir, socket_dir, port, args.config)
+        if args.seed_image:
+            if args.mode != "no-data-dir":
+                raise SystemExit("--seed-image is currently only supported with --mode no-data-dir")
+            if not seed_dir.is_dir():
+                raise SystemExit(f"--seed-image must be an existing directory: {seed_dir}")
+            initdb_seconds = 0.0
+        else:
+            _, initdb_seconds = timed_run(
+                [initdb, "-D", str(seed_dir), "--no-sync", "-A", "trust", "-U", "postgres"],
+                env=env,
+            )
+
+        if args.mode == "no-data-dir":
+            settings = build_fast_settings(socket_dir, port)
+        else:
+            settings = append_fast_config(seed_dir, socket_dir, port, args.config)
 
         rounds: list[dict[str, object]] = []
         for round_number in range(1, args.rounds + 1):
             if args.mode == "reuse":
                 data_dir = seed_dir
                 copy_seconds = None
-            else:
+                runtime_setup_seconds = None
+                skeleton_stats = None
+                round_env = env
+            elif args.mode == "copy":
                 data_dir = workdir / f"round-{round_number:03d}"
                 copy_start = time.perf_counter()
                 shutil.copytree(seed_dir, data_dir)
                 copy_seconds = round(time.perf_counter() - copy_start, 6)
+                runtime_setup_seconds = None
+                skeleton_stats = None
+                round_env = env
+            else:
+                data_dir = workdir / f"round-{round_number:03d}"
+                setup_start = time.perf_counter()
+                stats = copy_runtime_skeleton(seed_dir, data_dir)
+                append_fast_config(data_dir, socket_dir, port, args.config)
+                runtime_setup_seconds = round(time.perf_counter() - setup_start, 6)
+                skeleton_stats = stats.as_dict()
+                copy_seconds = None
+                round_env = env.copy()
+                round_env["PG_FASTFORK_SEED_DIR"] = str(seed_dir)
 
             log_file = workdir / f"postgres-{round_number:03d}.log"
             round_result, _ = start_query_stop_round(
@@ -277,14 +315,24 @@ def main() -> int:
                 psql=psql,
                 port=port,
                 stop_mode=args.stop_mode,
-                env=env,
+                env=round_env,
             )
             round_result["round"] = round_number
             if copy_seconds is not None:
                 round_result["copy_seconds"] = copy_seconds
+            if runtime_setup_seconds is not None:
+                round_result["runtime_setup_seconds"] = runtime_setup_seconds
+                round_result["seed_image_load_seconds"] = 0.0
+                round_result["runtime_skeleton"] = skeleton_stats
+            round_result["total_startup_path_seconds"] = round(
+                float(round_result["pg_ctl_start_seconds"])
+                + (copy_seconds or 0.0)
+                + (runtime_setup_seconds or 0.0),
+                6,
+            )
             rounds.append(round_result)
 
-            if args.mode == "copy" and not args.keep_workdir:
+            if args.mode in {"copy", "no-data-dir"} and not args.keep_workdir:
                 shutil.rmtree(data_dir, ignore_errors=True)
 
         start_times = [float(round_data["pg_ctl_start_seconds"]) for round_data in rounds]
@@ -292,10 +340,23 @@ def main() -> int:
         first_query_times = [float(round_data["first_query_seconds"]) for round_data in rounds]
         stop_times = [float(round_data["pg_ctl_stop_seconds"]) for round_data in rounds]
         query_attempts = [float(round_data["query_attempts"]) for round_data in rounds]
+        total_startup_path_times = [
+            float(round_data["total_startup_path_seconds"]) for round_data in rounds
+        ]
         copy_times = [
             float(round_data["copy_seconds"])
             for round_data in rounds
             if "copy_seconds" in round_data
+        ]
+        runtime_setup_times = [
+            float(round_data["runtime_setup_seconds"])
+            for round_data in rounds
+            if "runtime_setup_seconds" in round_data
+        ]
+        seed_image_load_times = [
+            float(round_data["seed_image_load_seconds"])
+            for round_data in rounds
+            if "seed_image_load_seconds" in round_data
         ]
 
         payload = {
@@ -310,9 +371,13 @@ def main() -> int:
             "stop_mode": args.stop_mode,
             "rounds": args.rounds,
             "initdb_seconds": initdb_seconds,
+            "seed_image": str(seed_dir),
             "round_results": rounds,
             "summary": {
                 "copy_seconds": summarize(copy_times),
+                "runtime_setup_seconds": summarize(runtime_setup_times),
+                "seed_image_load_seconds": summarize(seed_image_load_times),
+                "total_startup_path_seconds": summarize(total_startup_path_times),
                 "pg_ctl_launch_seconds": summarize(launch_times),
                 "pg_ctl_start_seconds": summarize(start_times),
                 "first_query_seconds": summarize(first_query_times),

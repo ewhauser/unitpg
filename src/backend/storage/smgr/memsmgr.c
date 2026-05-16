@@ -6,7 +6,7 @@
  * The normal md.c storage manager is still used for bootstrap and standalone
  * modes so initdb can create a durable seed cluster.  Backends under a
  * postmaster keep new and changed relation blocks in memory, lazily reading
- * unchanged seed-catalog pages from md.c when necessary.
+ * unchanged seed pages from the seed backing layer when necessary.
  *
  * Portions Copyright (c) 1996-2026, PostgreSQL Global Development Group
  *
@@ -17,18 +17,22 @@
  */
 #include "postgres.h"
 
+#include <fcntl.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "access/transam.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
 #include "commands/sequence.h"
+#include "common/relpath.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "portability/mem.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
+#include "storage/fd.h"
 #include "storage/lwlock.h"
 #include "storage/md.h"
 #include "storage/memsmgr.h"
@@ -39,6 +43,7 @@
 #include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/wait_event.h"
 
 /*
  * Shared non-temp storage is fixed-size by design: this is a disposable
@@ -173,6 +178,19 @@ static BlockNumber mem_nblocks_locked(SMgrRelation reln, ForkNumber forknum);
 static void mem_complete_aio_read(PgAioHandle *ioh, SMgrRelation reln,
 								  ForkNumber forknum, BlockNumber blocknum,
 								  void **buffers, BlockNumber nblocks);
+static const char *mem_seed_root(void);
+static bool mem_seed_active_for(const RelFileLocatorBackend *rlocator);
+static char *mem_seed_segment_path(RelFileLocatorBackend rlocator,
+								   ForkNumber forknum, BlockNumber segno);
+static bool mem_seed_segment_stat(RelFileLocatorBackend rlocator,
+								  ForkNumber forknum, BlockNumber segno,
+								  struct stat *statbuf);
+static bool mem_seed_exists(RelFileLocatorBackend rlocator, ForkNumber forknum);
+static BlockNumber mem_seed_nblocks(RelFileLocatorBackend rlocator,
+									ForkNumber forknum);
+static void mem_seed_read_block(RelFileLocatorBackend rlocator,
+								ForkNumber forknum, BlockNumber blocknum,
+								void *buffer);
 #ifdef USE_TEST_MEM_SMGR
 static void mem_require_snapshot_allowed(const char *function_name);
 static bool mem_snapshot_key_matches(const RelFileLocatorBackend *rlocator);
@@ -321,7 +339,18 @@ memexists(SMgrRelation reln, ForkNumber forknum)
 	entry = mem_lookup_fork_entry(reln->smgr_rlocator, forknum);
 	if (entry != NULL)
 		exists = entry->exists;
-	else if (!mem_key_is_temp(&reln->smgr_rlocator) && mdexists(reln, forknum))
+	else if (mem_seed_active_for(&reln->smgr_rlocator) &&
+			 mem_seed_exists(reln->smgr_rlocator, forknum))
+	{
+		entry = mem_create_fork_entry(reln->smgr_rlocator, forknum);
+		entry->exists = true;
+		entry->on_disk = true;
+		entry->nblocks = mem_seed_nblocks(reln->smgr_rlocator, forknum);
+		exists = true;
+	}
+	else if (!mem_seed_active_for(&reln->smgr_rlocator) &&
+			 !mem_key_is_temp(&reln->smgr_rlocator) &&
+			 mdexists(reln, forknum))
 	{
 		entry = mem_create_fork_entry(reln->smgr_rlocator, forknum);
 		entry->exists = true;
@@ -1027,6 +1056,160 @@ mem_lock_for(const RelFileLocatorBackend *rlocator)
 	return &MemSmgrState->lock;
 }
 
+static const char *
+mem_seed_root(void)
+{
+#ifdef USE_TEST_NO_DATA_DIRECTORY_STARTUP
+	const char *seed_root;
+
+	if (!IsUnderPostmaster)
+		return NULL;
+
+	seed_root = getenv("PG_FASTFORK_SEED_DIR");
+	if (seed_root == NULL || seed_root[0] == '\0')
+		return NULL;
+
+	return seed_root;
+#else
+	return NULL;
+#endif
+}
+
+static bool
+mem_seed_active_for(const RelFileLocatorBackend *rlocator)
+{
+	return !mem_key_is_temp(rlocator) && mem_seed_root() != NULL;
+}
+
+static char *
+mem_seed_segment_path(RelFileLocatorBackend rlocator, ForkNumber forknum,
+					  BlockNumber segno)
+{
+	const char *seed_root = mem_seed_root();
+	RelPathStr	path;
+
+	Assert(seed_root != NULL);
+
+	path = relpath(rlocator, forknum);
+	if (segno > 0)
+		return psprintf("%s/%s.%u", seed_root, path.str, segno);
+
+	return psprintf("%s/%s", seed_root, path.str);
+}
+
+static bool
+mem_seed_segment_stat(RelFileLocatorBackend rlocator, ForkNumber forknum,
+					  BlockNumber segno, struct stat *statbuf)
+{
+	char	   *path;
+	int			rc;
+	int			save_errno;
+
+	path = mem_seed_segment_path(rlocator, forknum, segno);
+	rc = stat(path, statbuf);
+	save_errno = errno;
+	pfree(path);
+
+	if (rc == 0)
+		return true;
+
+	errno = save_errno;
+	if (errno == ENOENT)
+		return false;
+
+	ereport(ERROR,
+			(errcode_for_file_access(),
+			 errmsg("could not stat fast-fork seed relation segment: %m")));
+	return false;
+}
+
+static bool
+mem_seed_exists(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	struct stat statbuf;
+
+	if (!mem_seed_active_for(&rlocator))
+		return false;
+
+	return mem_seed_segment_stat(rlocator, forknum, 0, &statbuf);
+}
+
+static BlockNumber
+mem_seed_nblocks(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	BlockNumber total_blocks = 0;
+
+	for (BlockNumber segno = 0;; segno++)
+	{
+		struct stat statbuf;
+		BlockNumber segment_blocks;
+
+		if (!mem_seed_segment_stat(rlocator, forknum, segno, &statbuf))
+		{
+			if (segno == 0)
+				return 0;
+			break;
+		}
+
+		if (statbuf.st_size % BLCKSZ != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fast-fork seed relation segment has partial block")));
+
+		segment_blocks = (BlockNumber) (statbuf.st_size / BLCKSZ);
+		if (segment_blocks > (BlockNumber) RELSEG_SIZE)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATA_CORRUPTED),
+					 errmsg("fast-fork seed relation segment is too large")));
+
+		total_blocks += segment_blocks;
+		if (segment_blocks < (BlockNumber) RELSEG_SIZE)
+			break;
+	}
+
+	return total_blocks;
+}
+
+static void
+mem_seed_read_block(RelFileLocatorBackend rlocator, ForkNumber forknum,
+					BlockNumber blocknum, void *buffer)
+{
+	BlockNumber segno = blocknum / ((BlockNumber) RELSEG_SIZE);
+	BlockNumber segoff = blocknum % ((BlockNumber) RELSEG_SIZE);
+	pgoff_t		offset = (pgoff_t) BLCKSZ * segoff;
+	char	   *path;
+	File		file;
+	ssize_t		nread;
+
+	path = mem_seed_segment_path(rlocator, forknum, segno);
+	file = PathNameOpenFile(path, O_RDONLY | PG_BINARY);
+	if (file < 0)
+	{
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not open fast-fork seed relation segment \"%s\": %m",
+						path)));
+	}
+
+	nread = FileRead(file, buffer, BLCKSZ, offset, WAIT_EVENT_DATA_FILE_READ);
+	FileClose(file);
+
+	if (nread != BLCKSZ)
+	{
+		if (nread < 0)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not read fast-fork seed relation segment \"%s\": %m",
+							path)));
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not read block %u from fast-fork seed relation segment \"%s\": read only %zd of %d bytes",
+						blocknum, path, nread, BLCKSZ)));
+	}
+
+	pfree(path);
+}
+
 static void
 mem_ensure_local_hashes(void)
 {
@@ -1123,7 +1306,16 @@ mem_get_fork_entry(SMgrRelation reln, ForkNumber forknum, bool create)
 
 	entry = mem_create_fork_entry(reln->smgr_rlocator, forknum);
 
-	if (!mem_key_is_temp(&reln->smgr_rlocator) && mdexists(reln, forknum))
+	if (mem_seed_active_for(&reln->smgr_rlocator) &&
+		mem_seed_exists(reln->smgr_rlocator, forknum))
+	{
+		entry->exists = true;
+		entry->on_disk = true;
+		entry->nblocks = mem_seed_nblocks(reln->smgr_rlocator, forknum);
+	}
+	else if (!mem_seed_active_for(&reln->smgr_rlocator) &&
+			 !mem_key_is_temp(&reln->smgr_rlocator) &&
+			 mdexists(reln, forknum))
 	{
 		entry->exists = true;
 		entry->on_disk = true;
@@ -1298,6 +1490,9 @@ mem_readv_locked(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 								  false);
 		if (page != NULL)
 			memcpy(buffers[i], mem_page_data(page), BLCKSZ);
+		else if (fork->on_disk && mem_seed_active_for(&reln->smgr_rlocator))
+			mem_seed_read_block(reln->smgr_rlocator, forknum, curblock,
+								buffers[i]);
 		else if (fork->on_disk)
 			mdreadv(reln, forknum, curblock, &buffers[i], 1);
 		else

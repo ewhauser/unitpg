@@ -46,7 +46,8 @@ Specs live in [spec/](spec/). The current work is organized around:
 - no durable maintenance
 - direct buffer access for ephemeral storage
 - trusted DDL shortcuts
-- startup/recovery benchmarks, startup fast paths, and seed-only restarts
+- startup/recovery benchmarks, startup fast paths, seed-only restarts, and
+  no-data-directory startup
 
 The agent workflow and validation loop are documented in [AGENTS.md](AGENTS.md).
 
@@ -61,6 +62,8 @@ performance work.
 | Runtime fixture restore | 244.532 TPS | 588.734 TPS | 2.408x TPS | `bench/results/seed-only-startup-pgbench-final`, 3 rounds, 200 transactions, 200 rows |
 | Runtime fixture restore latency | 4.089 ms | 1.699 ms | 0.416x latency | Same run as above |
 | Runtime plain rollback | 245.491 TPS | 129.768 TPS | 0.529x TPS | `bench/results/conservative-fast-startup-rollback-final`, 3 rounds, permanent-table rollback workload |
+| Startup fresh worker, setup+start | 0.164341 s | 0.053804 s | 3.054x | `bench/results/no-data-directory-startup-final2`, baseline copy mode vs fast-fork no-data-dir mode, 10 rounds |
+| Startup fresh worker, runtime setup only | 0.137665 s | 0.014868 s | 9.259x | Same run as above; baseline copies PGDATA, fast fork copies only a runtime skeleton |
 | Startup reuse, postmaster ready | 0.036009 s | 0.031566 s | 1.141x | `bench/results/seed-only-startup-final2`, 10 rounds, direct first-query polling |
 | Startup reuse, first query | 0.008751 s | 0.006006 s | 1.457x | Same run as above |
 | Startup copy, postmaster ready | 0.026903 s | 0.025781 s | 1.044x | `bench/results/seed-only-startup-copy-final2`, 10 rounds |
@@ -74,6 +77,10 @@ now measured by direct polling for the first successful query, so the
 postmaster-ready rows include client retry timing. Seed-only startup treats the
 data directory as an immutable seed image and proves that clean or immediate
 restarts discard runtime-created tables while resetting OID state.
+No-data-directory startup keeps a read-only seed backing image plus a mutable
+in-memory overlay; migrations can still mutate seed-backed catalogs and
+relations, but fresh workers avoid copying relation storage into their runtime
+directory.
 
 ## Build And Validate
 
@@ -164,6 +171,18 @@ python3 bench/compare_startup.py \
   --mode copy \
   --reuse-builds \
   --output-dir bench/results/startup-copy-compare
+```
+
+Use no-data-dir mode to model fresh workers that keep only a compatibility
+runtime skeleton and read seed relation pages through the memory storage
+manager:
+
+```sh
+python3 bench/compare_startup.py \
+  --rounds 10 \
+  --mode no-data-dir \
+  --reuse-builds \
+  --output-dir bench/results/startup-no-data-dir-compare
 ```
 
 ## Development Notes

@@ -17,7 +17,14 @@ ROOT = Path(__file__).resolve().parents[1]
 RUN_STARTUP = ROOT / "bench" / "run_startup.py"
 
 
-def startup_cmd(args: argparse.Namespace, bin_dir: Path, label: str, output: Path) -> list[str]:
+def startup_cmd(
+    args: argparse.Namespace,
+    bin_dir: Path,
+    label: str,
+    output: Path,
+    *,
+    mode: str,
+) -> list[str]:
     cmd = [
         sys.executable,
         "-B",
@@ -31,10 +38,12 @@ def startup_cmd(args: argparse.Namespace, bin_dir: Path, label: str, output: Pat
         "--rounds",
         str(args.rounds),
         "--mode",
-        args.mode,
+        mode,
         "--stop-mode",
         args.stop_mode,
     ]
+    if args.seed_image and mode == "no-data-dir":
+        cmd.extend(["--seed-image", str(args.seed_image)])
     for config in args.config:
         cmd.extend(["--config", config])
     return cmd
@@ -62,17 +71,29 @@ def write_summary_markdown(payload: dict[str, object], path: Path) -> None:
         f"Mode: `{payload['mode']}`",
         f"Stop mode: `{payload['parameters']['stop_mode']}`",
         "",
-        "| Variant | Rounds | Initdb (s) | Median launch (s) | Median start (s) | Mean start (s) | Median first query (s) | Median attempts | Median stop (s) |",
-        "| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
+        "| Variant | Mode | Rounds | Initdb (s) | Median setup+start (s) | Median copy (s) | Median runtime setup (s) | Median launch (s) | Median start (s) | Mean start (s) | Median first query (s) | Median attempts | Median stop (s) |",
+        "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |",
     ]
     for name in ("baseline", "fakewal"):
         run = variants[name]["run"]
         summary = run["summary"]
         lines.append(
-            "| {name} | {rounds} | {initdb:.6f} | {median_launch:.6f} | {median_start:.6f} | {mean_start:.6f} | {median_query:.6f} | {median_attempts:.1f} | {median_stop:.6f} |".format(
+            "| {name} | {mode} | {rounds} | {initdb:.6f} | {median_total:.6f} | {median_copy} | {median_setup} | {median_launch:.6f} | {median_start:.6f} | {mean_start:.6f} | {median_query:.6f} | {median_attempts:.1f} | {median_stop:.6f} |".format(
                 name=name,
+                mode=run["mode"],
                 rounds=run["rounds"],
                 initdb=run["initdb_seconds"],
+                median_total=summary["total_startup_path_seconds"]["median"],
+                median_copy=(
+                    "n/a"
+                    if summary["copy_seconds"]["median"] is None
+                    else f"{summary['copy_seconds']['median']:.6f}"
+                ),
+                median_setup=(
+                    "n/a"
+                    if summary["runtime_setup_seconds"]["median"] is None
+                    else f"{summary['runtime_setup_seconds']['median']:.6f}"
+                ),
                 median_launch=summary["pg_ctl_launch_seconds"]["median"],
                 median_start=summary["pg_ctl_start_seconds"]["median"],
                 mean_start=summary["pg_ctl_start_seconds"]["mean"],
@@ -89,6 +110,11 @@ def write_summary_markdown(payload: dict[str, object], path: Path) -> None:
                 "n/a"
                 if comparison["fakewal_vs_baseline_start_median_ratio"] is None
                 else f"{comparison['fakewal_vs_baseline_start_median_ratio']:.3f}x"
+            ),
+            "Fast-fork median setup+start speedup: `{}`".format(
+                "n/a"
+                if comparison["fakewal_vs_baseline_total_startup_path_median_ratio"] is None
+                else f"{comparison['fakewal_vs_baseline_total_startup_path_median_ratio']:.3f}x"
             ),
             "Fast-fork median first-query speedup: `{}`".format(
                 "n/a"
@@ -128,7 +154,12 @@ def main() -> int:
     )
     parser.add_argument("--build-jobs", type=int, default=os.cpu_count() or 1)
     parser.add_argument("--rounds", type=int, default=5)
-    parser.add_argument("--mode", choices=["reuse", "copy"], default="reuse")
+    parser.add_argument("--mode", choices=["reuse", "copy", "no-data-dir"], default="reuse")
+    parser.add_argument(
+        "--seed-image",
+        type=Path,
+        help="existing initdb-style seed directory for the fast-fork no-data-dir run",
+    )
     parser.add_argument(
         "--config",
         action="append",
@@ -203,10 +234,24 @@ def main() -> int:
         action="store_true",
         help="do not treat the data directory as an immutable seed image in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-no-data-directory-startup",
+        action="store_true",
+        help="do not enable external seed-image startup support in the fast-fork build",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
         raise SystemExit("--rounds must be at least 1")
+    enable_no_data_directory_startup = (
+        not args.disable_no_data_directory_startup
+        and not args.disable_seed_only_startup
+        and not args.disable_no_recovery_startup
+        and not args.disable_mem_smgr
+        and not args.disable_mem_slru
+    )
+    if args.mode == "no-data-dir" and not enable_no_data_directory_startup:
+        raise SystemExit("--mode no-data-dir requires no-data-directory startup support")
 
     source = args.source.resolve()
     build_root = args.build_root.resolve()
@@ -238,6 +283,7 @@ def main() -> int:
             fast_analyze=False,
             no_recovery_startup=False,
             seed_only_startup=False,
+            no_data_directory_startup=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -265,6 +311,7 @@ def main() -> int:
             fast_analyze=not args.disable_fast_analyze,
             no_recovery_startup=not args.disable_no_recovery_startup,
             seed_only_startup=not args.disable_seed_only_startup,
+            no_data_directory_startup=enable_no_data_directory_startup,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -274,12 +321,23 @@ def main() -> int:
     for name in ("baseline", "fakewal"):
         run_path = output_dir / "runs" / f"{name}.json"
         label = f"{name}-startup"
-        cmd = startup_cmd(args, bins[name], label, run_path)
+        run_mode = "copy" if args.mode == "no-data-dir" and name == "baseline" else args.mode
+        cmd = startup_cmd(args, bins[name], label, run_path, mode=run_mode)
         runs[name] = run_json(cmd, log=output_dir / "logs" / f"{name}-startup.log")
         runs[name]["result_path"] = str(run_path)
 
     baseline_start = summary_value(runs["baseline"], "pg_ctl_start_seconds", "median")
     fakewal_start = summary_value(runs["fakewal"], "pg_ctl_start_seconds", "median")
+    baseline_total_startup_path = summary_value(
+        runs["baseline"],
+        "total_startup_path_seconds",
+        "median",
+    )
+    fakewal_total_startup_path = summary_value(
+        runs["fakewal"],
+        "total_startup_path_seconds",
+        "median",
+    )
     baseline_first_query = summary_value(runs["baseline"], "first_query_seconds", "median")
     fakewal_first_query = summary_value(runs["fakewal"], "first_query_seconds", "median")
     baseline_stop = summary_value(runs["baseline"], "pg_ctl_stop_seconds", "median")
@@ -287,6 +345,10 @@ def main() -> int:
 
     comparison = {
         "fakewal_vs_baseline_start_median_ratio": ratio(baseline_start, fakewal_start),
+        "fakewal_vs_baseline_total_startup_path_median_ratio": ratio(
+            baseline_total_startup_path,
+            fakewal_total_startup_path,
+        ),
         "fakewal_vs_baseline_first_query_median_ratio": ratio(
             baseline_first_query,
             fakewal_first_query,
@@ -307,6 +369,7 @@ def main() -> int:
             "mode": args.mode,
             "stop_mode": args.stop_mode,
             "config": args.config,
+            "seed_image": None if args.seed_image is None else str(args.seed_image.resolve()),
         },
         "variants": {
             "baseline": {
@@ -327,6 +390,7 @@ def main() -> int:
                 "fast_analyze": not args.disable_fast_analyze,
                 "no_recovery_startup": not args.disable_no_recovery_startup,
                 "seed_only_startup": not args.disable_seed_only_startup,
+                "no_data_directory_startup": enable_no_data_directory_startup,
                 "bin_dir": str(bins["fakewal"]),
                 "run": runs["fakewal"],
             },

@@ -100,6 +100,10 @@
    startup. (--enable-test-seed-only-startup) */
 #undef USE_TEST_SEED_ONLY_STARTUP
 
+/* Define to 1 to start from an external seed image instead of PGDATA relation
+   files. (--enable-test-no-data-directory-startup) */
+#undef USE_TEST_NO_DATA_DIRECTORY_STARTUP
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

@@ -85,6 +85,9 @@ option('test_no_recovery_startup', type: 'boolean', value: false,
 option('test_seed_only_startup', type: 'boolean', value: false,
   description: 'Treat the data directory as an immutable seed image during startup for test-only builds')
 
+option('test_no_data_directory_startup', type: 'boolean', value: false,
+  description: 'Start from an external seed image instead of PGDATA relation files for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

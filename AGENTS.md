@@ -83,6 +83,8 @@ The validation script already:
 - fixes macOS temporary-install library names
 - runs the fast-fork fixture snapshot smoke test
 - runs the seed-only dirty-restart smoke test
+- runs the no-data-directory startup smoke test, including DDL that mutates
+  seed-backed catalogs through the in-memory overlay
 - skips known incompatible recovery/durability/replication/background-worker
   suites
 
@@ -160,6 +162,17 @@ python3 bench/compare_startup.py \
   --output-dir bench/results/startup-copy-compare
 ```
 
+No-data-directory startup comparison:
+
+```sh
+python3 bench/compare_startup.py \
+  --baseline-bin bench/.build/installs/baseline-meson/bin \
+  --fakewal-bin bench/.build/fastfork-validation/tmp_install/usr/local/pgsql/bin \
+  --rounds 10 \
+  --mode no-data-dir \
+  --output-dir bench/results/startup-no-data-dir-compare
+```
+
 For a single install smoke test:
 
 ```sh
@@ -170,8 +183,13 @@ python3 bench/run_startup.py \
   --output bench/results/startup-smoke.json
 ```
 
-Record `initdb`, start, first-query, stop, and copy-mode times separately when
-reporting startup changes.
+Record `initdb`, setup+start, start, first-query, stop, copy-mode time, and
+no-data-dir runtime setup time separately when reporting startup changes.
+
+When working on no-data-directory startup, treat the seed image as an immutable
+backing layer, not an immutable database. DDL and migrations must be able to
+modify seed-backed catalogs and relations by shadowing pages in the runtime
+memory overlay.
 
 ## Measure/Iterate Loop
 

@@ -105,12 +105,12 @@ from that directory.
 
 `memsmgr` becomes the owner of both seed and runtime relation pages.
 
-Seed pages:
+Seed backing pages:
 
 - loaded from the seed image
-- immutable
+- immutable only as the backing image
 - shared across backends where supported
-- copied into runtime memory on first write
+- shadowed by runtime memory on first write
 
 Runtime pages:
 
@@ -118,6 +118,15 @@ Runtime pages:
 - discarded on postmaster exit
 - included in fixture snapshots
 - never flushed to durable relation files
+
+The seed image is not a read-only database. It is a read-only base layer.
+Tests and migrations must be able to run normal DDL and DML against relations
+that originated in the seed image. When a backend writes, truncates, or unlinks
+a seed-backed relation fork, the storage manager records that change in the
+runtime memory overlay and subsequent reads observe the overlay before falling
+back to the seed image. This copy-on-write behavior is required so application
+migrations can modify catalog state, indexes, and test fixture tables after the
+server starts.
 
 The storage manager should expose a seed lookup path:
 
@@ -185,6 +194,7 @@ The benchmark should report:
 - postmaster start time
 - first query time
 - total runtime directory setup time
+- total fresh-worker setup+start time
 
 This lets us compare:
 

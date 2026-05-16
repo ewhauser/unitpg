@@ -1604,6 +1604,9 @@ Optional Features:
   --enable-test-seed-only-startup
                           treat the data directory as an immutable seed image
                           during startup (for testing)
+  --enable-test-no-data-directory-startup
+                          start from an external seed image instead of PGDATA
+                          relation files (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -4133,6 +4136,51 @@ fi
 if test "$enable_test_seed_only_startup" = yes &&
    test "$enable_test_mem_slru" != yes; then
   as_fn_error $? "--enable-test-seed-only-startup requires --enable-test-mem-slru" "$LINENO" 5
+fi
+
+
+#
+# Test-only no data directory startup
+#
+
+
+# Check whether --enable-test-no-data-directory-startup was given.
+if test "${enable_test_no_data_directory_startup+set}" = set; then :
+  enableval=$enable_test_no_data_directory_startup;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_DATA_DIRECTORY_STARTUP 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-data-directory-startup option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_data_directory_startup=no
+
+fi
+
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_seed_only_startup" != yes; then
+  as_fn_error $? "--enable-test-no-data-directory-startup requires --enable-test-seed-only-startup" "$LINENO" 5
+fi
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_fake_wal" != yes; then
+  as_fn_error $? "--enable-test-no-data-directory-startup requires --enable-test-fake-wal" "$LINENO" 5
+fi
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  as_fn_error $? "--enable-test-no-data-directory-startup requires --enable-test-mem-smgr" "$LINENO" 5
+fi
+if test "$enable_test_no_data_directory_startup" = yes &&
+   test "$enable_test_mem_slru" != yes; then
+  as_fn_error $? "--enable-test-no-data-directory-startup requires --enable-test-mem-slru" "$LINENO" 5
 fi
 
 

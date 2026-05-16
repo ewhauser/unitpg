@@ -518,6 +518,7 @@ cdata.set('USE_TEST_NO_DURABLE_MAINTENANCE', get_option('test_no_durable_mainten
 cdata.set('USE_TEST_FAST_ANALYZE', get_option('test_fast_analyze') ? 1 : false)
 cdata.set('USE_TEST_NO_RECOVERY_STARTUP', get_option('test_no_recovery_startup') ? 1 : false)
 cdata.set('USE_TEST_SEED_ONLY_STARTUP', get_option('test_seed_only_startup') ? 1 : false)
+cdata.set('USE_TEST_NO_DATA_DIRECTORY_STARTUP', get_option('test_no_data_directory_startup') ? 1 : false)
 
 if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
   error('test_no_wal_assembly requires test_fake_wal')
@@ -545,6 +546,21 @@ if get_option('test_seed_only_startup')
   endif
   if not get_option('test_mem_slru')
     error('test_seed_only_startup requires test_mem_slru')
+  endif
+endif
+
+if get_option('test_no_data_directory_startup')
+  if not get_option('test_seed_only_startup')
+    error('test_no_data_directory_startup requires test_seed_only_startup')
+  endif
+  if not get_option('test_fake_wal')
+    error('test_no_data_directory_startup requires test_fake_wal')
+  endif
+  if not get_option('test_mem_smgr')
+    error('test_no_data_directory_startup requires test_mem_smgr')
+  endif
+  if not get_option('test_mem_slru')
+    error('test_no_data_directory_startup requires test_mem_slru')
   endif
 endif
 
