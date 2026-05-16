@@ -239,6 +239,11 @@ def main() -> int:
         action="store_true",
         help="do not enable external seed-image startup support in the fast-fork build",
     )
+    parser.add_argument(
+        "--disable-macos-named-posix-semaphores",
+        action="store_true",
+        help="do not use named POSIX semaphores in the fast-fork build on macOS",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -252,6 +257,9 @@ def main() -> int:
     )
     if args.mode == "no-data-dir" and not enable_no_data_directory_startup:
         raise SystemExit("--mode no-data-dir requires no-data-directory startup support")
+    enable_macos_named_posix_semaphores = (
+        sys.platform == "darwin" and not args.disable_macos_named_posix_semaphores
+    )
 
     source = args.source.resolve()
     build_root = args.build_root.resolve()
@@ -284,6 +292,7 @@ def main() -> int:
             no_recovery_startup=False,
             seed_only_startup=False,
             no_data_directory_startup=False,
+            macos_named_posix_semaphores=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -312,6 +321,7 @@ def main() -> int:
             no_recovery_startup=not args.disable_no_recovery_startup,
             seed_only_startup=not args.disable_seed_only_startup,
             no_data_directory_startup=enable_no_data_directory_startup,
+            macos_named_posix_semaphores=enable_macos_named_posix_semaphores,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -391,6 +401,7 @@ def main() -> int:
                 "no_recovery_startup": not args.disable_no_recovery_startup,
                 "seed_only_startup": not args.disable_seed_only_startup,
                 "no_data_directory_startup": enable_no_data_directory_startup,
+                "macos_named_posix_semaphores": enable_macos_named_posix_semaphores,
                 "bin_dir": str(bins["fakewal"]),
                 "run": runs["fakewal"],
             },

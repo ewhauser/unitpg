@@ -104,6 +104,10 @@
    files. (--enable-test-no-data-directory-startup) */
 #undef USE_TEST_NO_DATA_DIRECTORY_STARTUP
 
+/* Define to 1 to use named POSIX semaphores instead of SysV semaphores on
+   macOS. (--enable-test-macos-named-posix-semaphores) */
+#undef USE_TEST_MACOS_NAMED_POSIX_SEMAPHORES
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

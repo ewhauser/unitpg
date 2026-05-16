@@ -269,6 +269,10 @@ elif host_system == 'cygwin'
   mod_link_with_dir = 'libdir'
 
 elif host_system == 'darwin'
+  if get_option('test_macos_named_posix_semaphores')
+    sema_kind = 'named_posix'
+  endif
+
   dlsuffix = '.dylib'
   library_path_var = 'DYLD_LIBRARY_PATH'
 
@@ -519,6 +523,7 @@ cdata.set('USE_TEST_FAST_ANALYZE', get_option('test_fast_analyze') ? 1 : false)
 cdata.set('USE_TEST_NO_RECOVERY_STARTUP', get_option('test_no_recovery_startup') ? 1 : false)
 cdata.set('USE_TEST_SEED_ONLY_STARTUP', get_option('test_seed_only_startup') ? 1 : false)
 cdata.set('USE_TEST_NO_DATA_DIRECTORY_STARTUP', get_option('test_no_data_directory_startup') ? 1 : false)
+cdata.set('USE_TEST_MACOS_NAMED_POSIX_SEMAPHORES', get_option('test_macos_named_posix_semaphores') ? 1 : false)
 
 if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
   error('test_no_wal_assembly requires test_fake_wal')
@@ -562,6 +567,10 @@ if get_option('test_no_data_directory_startup')
   if not get_option('test_mem_slru')
     error('test_no_data_directory_startup requires test_mem_slru')
   endif
+endif
+
+if get_option('test_macos_named_posix_semaphores') and host_system != 'darwin'
+  error('test_macos_named_posix_semaphores is only supported on macOS')
 endif
 
 blocksize = get_option('blocksize').to_int() * 1024
@@ -3285,6 +3294,7 @@ func_checks = [
   ['pthread_barrier_wait', {'dependencies': [thread_dep]}],
   ['pthread_is_threaded_np', {'dependencies': [thread_dep]}],
   ['sem_init', {'dependencies': [rt_dep, thread_dep], 'skip': sema_kind != 'unnamed_posix', 'define': false}],
+  ['sem_open', {'dependencies': [rt_dep, thread_dep], 'skip': sema_kind != 'named_posix', 'define': false}],
   ['setproctitle', {'dependencies': [util_dep]}],
   ['setproctitle_fast'],
   ['shm_open', {'dependencies': [rt_dep], 'define': false}],
@@ -3351,6 +3361,11 @@ endif
 if sema_kind == 'unnamed_posix' and \
    not func_check_results.get('sem_init', false)
   sema_kind = 'sysv'
+endif
+
+if sema_kind == 'named_posix' and \
+   not func_check_results.get('sem_open', false)
+  error('named POSIX semaphores require sem_open')
 endif
 
 cdata.set('USE_@0@_SHARED_MEMORY'.format(shmem_kind.to_upper()), 1)

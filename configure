@@ -782,6 +782,11 @@ enable_test_no_observability
 enable_test_fast_memory_contexts
 enable_test_ephemeral_catalog
 enable_test_no_durable_maintenance
+enable_test_fast_analyze
+enable_test_no_recovery_startup
+enable_test_seed_only_startup
+enable_test_no_data_directory_startup
+enable_test_macos_named_posix_semaphores
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -872,6 +877,11 @@ enable_test_no_observability
 enable_test_fast_memory_contexts
 enable_test_ephemeral_catalog
 enable_test_no_durable_maintenance
+enable_test_fast_analyze
+enable_test_no_recovery_startup
+enable_test_seed_only_startup
+enable_test_no_data_directory_startup
+enable_test_macos_named_posix_semaphores
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1607,6 +1617,9 @@ Optional Features:
   --enable-test-no-data-directory-startup
                           start from an external seed image instead of PGDATA
                           relation files (for testing)
+  --enable-test-macos-named-posix-semaphores
+                          use named POSIX semaphores instead of SysV
+                          semaphores on macOS (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -4181,6 +4194,42 @@ fi
 if test "$enable_test_no_data_directory_startup" = yes &&
    test "$enable_test_mem_slru" != yes; then
   as_fn_error $? "--enable-test-no-data-directory-startup requires --enable-test-mem-slru" "$LINENO" 5
+fi
+
+
+#
+# Test-only macOS named POSIX semaphores
+#
+
+
+# Check whether --enable-test-macos-named-posix-semaphores was given.
+if test "${enable_test_macos_named_posix_semaphores+set}" = set; then :
+  enableval=$enable_test_macos_named_posix_semaphores;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_MACOS_NAMED_POSIX_SEMAPHORES 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-macos-named-posix-semaphores option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_macos_named_posix_semaphores=no
+
+fi
+
+if test "$enable_test_macos_named_posix_semaphores" = yes; then
+  if test "$PORTNAME" != "darwin"; then
+    as_fn_error $? "--enable-test-macos-named-posix-semaphores is only supported on macOS" "$LINENO" 5
+  fi
+  PREFERRED_SEMAPHORES=NAMED_POSIX
+  USE_SYSV_SEMAPHORES=
 fi
 
 
@@ -19114,6 +19163,10 @@ if test "$ac_res" != no; then :
   USE_NAMED_POSIX_SEMAPHORES=1
 fi
 
+  fi
+  if test "$enable_test_macos_named_posix_semaphores" = yes &&
+     test x"$USE_NAMED_POSIX_SEMAPHORES" != x"1" ; then
+    as_fn_error $? "--enable-test-macos-named-posix-semaphores requires sem_open" "$LINENO" 5
   fi
   if test x"$PREFERRED_SEMAPHORES" = x"UNNAMED_POSIX" ; then
     # Need sem_init for this

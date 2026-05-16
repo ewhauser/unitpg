@@ -26,6 +26,7 @@ Build and validate the fast-fork Postgres configuration:
   -Dtest_no_durable_maintenance=true -Dtest_fast_analyze=true
   -Dtest_no_recovery_startup=true -Dtest_seed_only_startup=true
   -Dtest_no_data_directory_startup=true
+  -Dtest_macos_named_posix_semaphores=true on macOS
 
 Modes:
   quick       Fast compatible smoke tests plus async I/O tests when the local
@@ -184,6 +185,10 @@ SETUP_ARGS=(
 	"-Dzstd=disabled"
 )
 
+if [[ "$(uname -s)" == "Darwin" ]]; then
+	SETUP_ARGS+=("-Dtest_macos_named_posix_semaphores=true")
+fi
+
 QUICK_TESTS=(
 	"postgresql:test_copy_callbacks/regress"
 	"postgresql:test_parser/regress"
@@ -327,6 +332,10 @@ fix_darwin_tmp_install_names
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 "${PYTHON:-python3}" "$ROOT/bench/test_no_data_directory_startup.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+	"${PYTHON:-python3}" "$ROOT/bench/test_macos_named_posix_semaphores.py" \
+		--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
+fi
 
 TEST_ARGS=(
 	"-C" "$BUILD_DIR"

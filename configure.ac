@@ -412,6 +412,22 @@ if test "$enable_test_no_data_directory_startup" = yes &&
 fi
 
 #
+# Test-only macOS named POSIX semaphores
+#
+PGAC_ARG_BOOL(enable, test-macos-named-posix-semaphores, no,
+              [use named POSIX semaphores instead of SysV semaphores on macOS (for testing)],
+              [AC_DEFINE([USE_TEST_MACOS_NAMED_POSIX_SEMAPHORES], 1,
+                         [Define to 1 to use named POSIX semaphores instead of SysV semaphores on macOS. (--enable-test-macos-named-posix-semaphores)])])
+AC_SUBST(enable_test_macos_named_posix_semaphores)
+if test "$enable_test_macos_named_posix_semaphores" = yes; then
+  if test "$PORTNAME" != "darwin"; then
+    AC_MSG_ERROR([--enable-test-macos-named-posix-semaphores is only supported on macOS])
+  fi
+  PREFERRED_SEMAPHORES=NAMED_POSIX
+  USE_SYSV_SEMAPHORES=
+fi
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])
@@ -2516,6 +2532,10 @@ if test "$PORTNAME" != "win32"; then
   if test x"$PREFERRED_SEMAPHORES" = x"NAMED_POSIX" ; then
     # Need sem_open for this
     AC_SEARCH_LIBS(sem_open, [rt pthread], [USE_NAMED_POSIX_SEMAPHORES=1])
+  fi
+  if test "$enable_test_macos_named_posix_semaphores" = yes &&
+     test x"$USE_NAMED_POSIX_SEMAPHORES" != x"1" ; then
+    AC_MSG_ERROR([--enable-test-macos-named-posix-semaphores requires sem_open])
   fi
   if test x"$PREFERRED_SEMAPHORES" = x"UNNAMED_POSIX" ; then
     # Need sem_init for this
