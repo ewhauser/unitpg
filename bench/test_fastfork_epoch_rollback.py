@@ -311,6 +311,9 @@ SELECT pg_fastfork_epoch_leave();
 PARALLEL_NAMED_ACTIVE_FINISH_SQL = r"""
 \set ON_ERROR_STOP on
 SELECT pg_fastfork_epoch_finish('active-b');
+SELECT 1 / CASE
+    WHEN substring(pg_fastfork_epoch_status() from 'arena_free_pages=([0-9]+)')::int > 0
+    THEN 1 ELSE 0 END;
 """
 
 

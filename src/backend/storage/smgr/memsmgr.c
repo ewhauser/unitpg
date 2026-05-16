@@ -61,6 +61,7 @@
 #define MEMSMGR_EPOCH_MAX_PAGES		262144
 #define MEMSMGR_MAX_EPOCHS			64
 #define MEMSMGR_MAX_COMBINE			32
+#define MEMSMGR_INVALID_PAGE_INDEX	PG_UINT32_MAX
 
 typedef struct MemSmgrForkKey
 {
@@ -105,7 +106,6 @@ typedef struct MemSmgrEpochState
 	char		snapshot_name[NAMEDATALEN];
 	uint64		epoch_id;
 	int			participants;
-	uint32		page_start;
 	Oid			next_oid;
 	uint32		oid_count;
 	int			base_nforks;
@@ -124,6 +124,8 @@ typedef struct MemSmgrSharedState
 	LWLock		lock;
 	bool		initialized;
 	uint32		next_page;
+	uint32		free_page_head;
+	uint32		free_page_count;
 	char	   *page_data;
 #if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
 	uint64		next_epoch_id;
@@ -262,7 +264,11 @@ static MemSmgrPageEntry *mem_get_page_entry(RelFileLocatorBackend rlocator,
 											BlockNumber blocknum,
 											bool create);
 static char *mem_page_data(const MemSmgrPageEntry *entry);
+static char *mem_page_data_by_index(uint32 page_index);
 static uint32 mem_alloc_page_index(void);
+static uint32 mem_get_free_page_next(uint32 page_index);
+static void mem_set_free_page_next(uint32 page_index, uint32 next_page);
+static void mem_free_page_index(uint32 page_index);
 static void mem_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							 BlockNumber first_block);
 static bool mem_relation_is_memory_only(RelFileLocatorBackend rlocator);
@@ -354,6 +360,8 @@ MemSmgrShmemInit(void *arg)
 
 		LWLockInitialize(&MemSmgrState->lock, LWTRANCHE_BUFFER_MAPPING);
 		MemSmgrState->next_page = 0;
+		MemSmgrState->free_page_head = MEMSMGR_INVALID_PAGE_INDEX;
+		MemSmgrState->free_page_count = 0;
 #if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
 		MemSmgrState->next_epoch_id = 1;
 		for (int i = 0; i < MEMSMGR_MAX_EPOCHS; i++)
@@ -1298,7 +1306,9 @@ pg_fastfork_epoch_status(PG_FUNCTION_ARGS)
 					  " name=%s database=%u"
 					  " participants=%d joined=%s"
 					  " session_bound=%s"
-					  " base_forks=%d base_pages=%d",
+					  " base_forks=%d base_pages=%d"
+					  " arena_next_pages=%u arena_free_pages=%u"
+					  " arena_capacity_pages=%u",
 					  epoch->epoch_id,
 					  epoch->name[0] != '\0' ? epoch->name : "<unnamed>",
 					  epoch->database_id,
@@ -1306,7 +1316,10 @@ pg_fastfork_epoch_status(PG_FUNCTION_ARGS)
 					  MemSmgrEpochActiveFlag ? "true" : "false",
 					  MemSmgrEpochSessionBound ? "true" : "false",
 					  epoch->base_nforks,
-					  epoch->base_npages);
+					  epoch->base_npages,
+					  MemSmgrState->next_page,
+					  MemSmgrState->free_page_count,
+					  (unsigned) MEMSMGR_SHARED_MAX_PAGES);
 	LWLockRelease(&MemSmgrState->lock);
 
 	PG_RETURN_TEXT_P(cstring_to_text(status));
@@ -1784,11 +1797,20 @@ mem_restore_snapshot(MemSmgrSnapshot *snapshot)
 	while ((page = hash_seq_search(&status)) != NULL)
 	{
 		if (mem_snapshot_key_matches(&page->key.rlocator))
+		{
+			uint32		page_index = page->page_index;
+
 			hash_search(MemSmgrPageHash, &page->key, HASH_REMOVE, NULL);
+			mem_free_page_index(page_index);
+		}
 	}
 
 	if (reset_page_arena)
+	{
 		MemSmgrState->next_page = 0;
+		MemSmgrState->free_page_head = MEMSMGR_INVALID_PAGE_INDEX;
+		MemSmgrState->free_page_count = 0;
+	}
 
 	for (int i = 0; i < snapshot->nforks; i++)
 	{
@@ -2188,21 +2210,32 @@ mem_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 	MemSmgrPageKey key;
 	MemSmgrPageEntry *entry;
 	bool		found;
+	uint32		page_index;
 
 	mem_build_page_key(&key, rlocator, forknum, blocknum);
-	entry = hash_search(mem_page_hash_for(&rlocator), &key,
-						create ? HASH_ENTER_NULL : HASH_FIND, &found);
+	entry = hash_search(mem_page_hash_for(&rlocator), &key, HASH_FIND, NULL);
+	if (entry != NULL || !create)
+		return entry;
 
-	if (entry == NULL && create)
+	page_index = mem_alloc_page_index();
+	entry = hash_search(mem_page_hash_for(&rlocator), &key, HASH_ENTER_NULL,
+						&found);
+	if (entry == NULL)
+	{
+		mem_free_page_index(page_index);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("memory storage manager page table is full")));
-
-	if (entry != NULL && create && !found)
-	{
-		entry->page_index = mem_alloc_page_index();
-		memset(mem_page_data(entry), 0, BLCKSZ);
 	}
+
+	if (found)
+	{
+		mem_free_page_index(page_index);
+		return entry;
+	}
+
+	entry->page_index = page_index;
+	memset(mem_page_data(entry), 0, BLCKSZ);
 
 	return entry;
 }
@@ -2210,24 +2243,104 @@ mem_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 static char *
 mem_page_data(const MemSmgrPageEntry *entry)
 {
-	return MemSmgrState->page_data + ((Size) entry->page_index * BLCKSZ);
+	return mem_page_data_by_index(entry->page_index);
+}
+
+static char *
+mem_page_data_by_index(uint32 page_index)
+{
+	return MemSmgrState->page_data + ((Size) page_index * BLCKSZ);
 }
 
 static uint32
 mem_alloc_page_index(void)
 {
 	uint32		page_index;
+	bool		release_lock = false;
 
 	if (MemSmgrState == NULL || MemSmgrState->page_data == NULL)
 		elog(ERROR, "memory storage manager page arena is not initialized");
 
-	page_index = MemSmgrState->next_page++;
-	if (page_index >= MEMSMGR_SHARED_MAX_PAGES)
-		ereport(ERROR,
-				(errcode(ERRCODE_OUT_OF_MEMORY),
-				 errmsg("memory storage manager page arena is full")));
+	if (!LWLockHeldByMe(&MemSmgrState->lock))
+	{
+		LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+		release_lock = true;
+	}
+
+	/* Reuse discarded page slots before extending the fixed mmap arena. */
+	if (MemSmgrState->free_page_head != MEMSMGR_INVALID_PAGE_INDEX)
+	{
+		page_index = MemSmgrState->free_page_head;
+		MemSmgrState->free_page_head = mem_get_free_page_next(page_index);
+		Assert(MemSmgrState->free_page_count > 0);
+		if (MemSmgrState->free_page_count > 0)
+			MemSmgrState->free_page_count--;
+	}
+	else
+	{
+		if (MemSmgrState->next_page >= MEMSMGR_SHARED_MAX_PAGES)
+		{
+			uint32		next_page = MemSmgrState->next_page;
+			uint32		free_page_count = MemSmgrState->free_page_count;
+
+			if (release_lock)
+				LWLockRelease(&MemSmgrState->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("memory storage manager page arena is full"),
+					 errdetail("Arena capacity is %u pages; %u pages have been reserved and %u pages are reusable.",
+							   (unsigned) MEMSMGR_SHARED_MAX_PAGES,
+							   (unsigned) next_page,
+							   (unsigned) free_page_count)));
+		}
+		page_index = MemSmgrState->next_page++;
+	}
+
+	if (release_lock)
+		LWLockRelease(&MemSmgrState->lock);
 
 	return page_index;
+}
+
+static uint32
+mem_get_free_page_next(uint32 page_index)
+{
+	uint32		next_page;
+
+	memcpy(&next_page, mem_page_data_by_index(page_index), sizeof(next_page));
+	return next_page;
+}
+
+static void
+mem_set_free_page_next(uint32 page_index, uint32 next_page)
+{
+	memcpy(mem_page_data_by_index(page_index), &next_page, sizeof(next_page));
+}
+
+static void
+mem_free_page_index(uint32 page_index)
+{
+	bool		release_lock = false;
+
+	if (page_index >= MEMSMGR_SHARED_MAX_PAGES)
+		elog(ERROR, "memory storage manager page index is out of range");
+
+	if (MemSmgrState == NULL || MemSmgrState->page_data == NULL)
+		elog(ERROR, "memory storage manager page arena is not initialized");
+
+	if (!LWLockHeldByMe(&MemSmgrState->lock))
+	{
+		LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+		release_lock = true;
+	}
+
+	/* The page's contents are dead, so use the first word as a free-list link. */
+	mem_set_free_page_next(page_index, MemSmgrState->free_page_head);
+	MemSmgrState->free_page_head = page_index;
+	MemSmgrState->free_page_count++;
+
+	if (release_lock)
+		LWLockRelease(&MemSmgrState->lock);
 }
 
 static void
@@ -2246,8 +2359,10 @@ mem_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 			entry->key.blocknum >= first_block)
 		{
 			MemSmgrPageKey key = entry->key;
+			uint32		page_index = entry->page_index;
 
 			hash_search(hash, &key, HASH_REMOVE, NULL);
+			mem_free_page_index(page_index);
 		}
 	}
 }
@@ -2443,7 +2558,6 @@ mem_epoch_reset_state(MemSmgrEpochState *epoch)
 	epoch->snapshot_name[0] = '\0';
 	epoch->epoch_id = 0;
 	epoch->participants = 0;
-	epoch->page_start = 0;
 	epoch->next_oid = InvalidOid;
 	epoch->oid_count = 0;
 	epoch->base_nforks = 0;
@@ -2550,7 +2664,6 @@ mem_epoch_join_or_start(const char *name, MemSmgrSnapshot *snapshot, bool join)
 				sizeof(epoch->snapshot_name));
 		epoch->epoch_id = MemSmgrState->next_epoch_id++;
 		epoch->participants = 0;
-		epoch->page_start = MemSmgrState->next_page;
 		epoch->next_oid = next_oid;
 		epoch->oid_count = oid_count;
 		epoch->base_nforks = base_nforks;
@@ -2771,21 +2884,31 @@ mem_epoch_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 	MemSmgrPageKey key;
 	MemSmgrPageEntry *entry;
 	bool		found;
+	uint32		page_index;
 
 	mem_build_epoch_page_key(&key, rlocator, forknum, blocknum);
-	entry = hash_search(MemSmgrEpochPageHash, &key,
-						create ? HASH_ENTER_NULL : HASH_FIND, &found);
+	entry = hash_search(MemSmgrEpochPageHash, &key, HASH_FIND, NULL);
+	if (entry != NULL || !create)
+		return entry;
 
-	if (entry == NULL && create)
+	page_index = mem_alloc_page_index();
+	entry = hash_search(MemSmgrEpochPageHash, &key, HASH_ENTER_NULL, &found);
+	if (entry == NULL)
+	{
+		mem_free_page_index(page_index);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("memory storage manager epoch page table is full")));
-
-	if (entry != NULL && create && !found)
-	{
-		entry->page_index = mem_alloc_page_index();
-		memset(mem_page_data(entry), 0, BLCKSZ);
 	}
+
+	if (found)
+	{
+		mem_free_page_index(page_index);
+		return entry;
+	}
+
+	entry->page_index = page_index;
+	memset(mem_page_data(entry), 0, BLCKSZ);
 
 	return entry;
 }
@@ -2806,8 +2929,10 @@ mem_epoch_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 			entry->key.epoch_id == MemSmgrEpochId)
 		{
 			MemSmgrPageKey key = entry->key;
+			uint32		page_index = entry->page_index;
 
 			hash_search(MemSmgrEpochPageHash, &key, HASH_REMOVE, NULL);
+			mem_free_page_index(page_index);
 		}
 	}
 }
@@ -2951,8 +3076,6 @@ static void
 mem_epoch_discard(void)
 {
 	MemSmgrEpochState *epoch;
-	uint32		page_start = 0;
-	bool		any_other = false;
 	HASH_SEQ_STATUS status;
 	MemSmgrForkEntry *fork;
 	MemSmgrPageEntry *page;
@@ -2960,8 +3083,6 @@ mem_epoch_discard(void)
 
 	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
 	epoch = mem_epoch_find_by_id(epoch_id);
-	if (epoch != NULL)
-		page_start = epoch->page_start;
 
 	hash_seq_init(&status, MemSmgrEpochForkHash);
 	while ((fork = hash_seq_search(&status)) != NULL)
@@ -2978,23 +3099,16 @@ mem_epoch_discard(void)
 		MemSmgrPageKey key = page->key;
 
 		if (key.epoch_id == epoch_id)
+		{
+			uint32		page_index = page->page_index;
+
 			hash_search(MemSmgrEpochPageHash, &key, HASH_REMOVE, NULL);
+			mem_free_page_index(page_index);
+		}
 	}
 
 	if (epoch != NULL)
 		mem_epoch_reset_state(epoch);
-
-	for (int i = 0; i < MEMSMGR_MAX_EPOCHS; i++)
-	{
-		if (MemSmgrState->epochs[i].active)
-		{
-			any_other = true;
-			break;
-		}
-	}
-
-	if (!any_other && page_start <= MemSmgrState->next_page)
-		MemSmgrState->next_page = page_start;
 
 	LWLockRelease(&MemSmgrState->lock);
 }
