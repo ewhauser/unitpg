@@ -46,6 +46,7 @@ Specs live in [spec/](spec/). The current work is organized around:
 - no durable maintenance
 - direct buffer access for ephemeral storage
 - trusted DDL shortcuts
+- rollback-only test epochs for cheap per-test transaction discard
 - startup/recovery benchmarks, startup fast paths, seed-only restarts, and
   no-data-directory startup
 - macOS named POSIX semaphore and mmap-only shared-memory experiments to avoid
@@ -64,6 +65,8 @@ performance work.
 | Runtime fixture restore | 244.532 TPS | 588.734 TPS | 2.408x TPS | `bench/results/seed-only-startup-pgbench-final`, 3 rounds, 200 transactions, 200 rows |
 | Runtime fixture restore latency | 4.089 ms | 1.699 ms | 0.416x latency | Same run as above |
 | Runtime plain rollback | 245.491 TPS | 129.768 TPS | 0.529x TPS | `bench/results/conservative-fast-startup-rollback-final`, 3 rounds, permanent-table rollback workload |
+| Runtime epoch rollback | 255.419 TPS | 704.005 TPS | 2.756x TPS | `bench/results/epoch-rollback-final`, 3 rounds, 200 transactions, 200 rows |
+| Runtime epoch rollback latency | 3.915 ms | 1.420 ms | 0.363x latency | Same run as above |
 | Startup fresh worker, setup+start | 0.164341 s | 0.053804 s | 3.054x | `bench/results/no-data-directory-startup-final2`, baseline copy mode vs fast-fork no-data-dir mode, 10 rounds |
 | Startup fresh worker, runtime setup only | 0.137665 s | 0.014868 s | 9.259x | Same run as above; baseline copies PGDATA, fast fork copies only a runtime skeleton |
 | Startup reuse, postmaster ready | 0.036009 s | 0.031566 s | 1.141x | `bench/results/seed-only-startup-final2`, 10 rounds, direct first-query polling |
@@ -73,9 +76,12 @@ performance work.
 
 The runtime fixture-restore comparison measured stock PostgreSQL replaying the
 rollback-heavy setup workload against the fast fork restoring a captured
-fixture snapshot before each test body. Plain rollback remains slower in the
-current prototype; use fixture snapshots for the intended fast path. Startup is
-now measured by direct polling for the first successful query, so the
+fixture snapshot before each test body. Plain rollback without epoch enrollment
+remains slower in the current prototype; fixture snapshots and rollback-only
+epochs are the intended fast paths. The epoch rollback comparison measures stock
+PostgreSQL permanent-table rollback against the fast fork running
+`pg_fastfork_epoch_begin()` after restoring a fixture in the pgbench session.
+Startup is now measured by direct polling for the first successful query, so the
 postmaster-ready rows include client retry timing. Seed-only startup treats the
 data directory as an immutable seed image and proves that clean or immediate
 restarts discard runtime-created tables while resetting OID state.

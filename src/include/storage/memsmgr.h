@@ -12,6 +12,7 @@
 #ifndef MEMSMGR_H
 #define MEMSMGR_H
 
+#include "nodes/nodes.h"
 #include "storage/aio_types.h"
 #include "storage/block.h"
 #include "storage/relfilelocator.h"
@@ -52,6 +53,10 @@ extern void memimmedsync(SMgrRelation reln, ForkNumber forknum);
 extern void memregistersync(SMgrRelation reln, ForkNumber forknum);
 extern int	memfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  uint32 *off);
+
+extern bool FastForkEpochActive(void);
+extern void AtEOXact_FastForkEpoch(bool isCommit);
+extern void FastForkEpochCheckUtility(Node *parsetree);
 
 #if defined(USE_TEST_EPHEMERAL_BUFFERS) && defined(USE_TEST_MEM_SMGR)
 extern bool mem_buffer_direct_enabled(SMgrRelation reln);

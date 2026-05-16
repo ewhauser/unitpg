@@ -514,6 +514,7 @@ cdata.set('USE_TEST_NO_BG_JOBS', get_option('test_no_bg_jobs') ? 1 : false)
 cdata.set('USE_TEST_MEM_SMGR', get_option('test_mem_smgr') ? 1 : false)
 cdata.set('USE_TEST_EPHEMERAL_BUFFERS', get_option('test_ephemeral_buffers') ? 1 : false)
 cdata.set('USE_TEST_MEM_SLRU', get_option('test_mem_slru') ? 1 : false)
+cdata.set('USE_TEST_EPOCH_ROLLBACK', get_option('test_epoch_rollback') ? 1 : false)
 cdata.set('USE_TEST_NO_WAL_ASSEMBLY', get_option('test_no_wal_assembly') ? 1 : false)
 cdata.set('USE_TEST_NO_OBSERVABILITY', get_option('test_no_observability') ? 1 : false)
 cdata.set('USE_TEST_FAST_MEMORY_CONTEXTS', get_option('test_fast_memory_contexts') ? 1 : false)
@@ -532,6 +533,18 @@ endif
 
 if get_option('test_ephemeral_buffers') and not get_option('test_mem_smgr')
   error('test_ephemeral_buffers requires test_mem_smgr')
+endif
+
+if get_option('test_epoch_rollback')
+  if not get_option('test_mem_smgr')
+    error('test_epoch_rollback requires test_mem_smgr')
+  endif
+  if not get_option('test_mem_slru')
+    error('test_epoch_rollback requires test_mem_slru')
+  endif
+  if not get_option('test_ephemeral_buffers')
+    error('test_epoch_rollback requires test_ephemeral_buffers')
+  endif
 endif
 
 if get_option('test_no_recovery_startup')

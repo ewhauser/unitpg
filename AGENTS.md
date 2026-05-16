@@ -271,6 +271,7 @@ Specs live in `spec/` and are intended to be implemented incrementally:
 - `012-conservative-fast-startup.md`
 - `013-seed-only-startup.md`
 - `014-no-data-directory-startup.md`
+- `015-epochal-test-transaction-overlay.md`
 
 When adding a new spec, use the next `NNN-name.md` prefix.
 

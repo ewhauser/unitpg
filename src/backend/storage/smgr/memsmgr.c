@@ -22,12 +22,14 @@
 #include <sys/stat.h>
 
 #include "access/transam.h"
+#include "access/parallel.h"
 #include "access/xact.h"
 #include "access/xlogutils.h"
 #include "commands/sequence.h"
 #include "common/relpath.h"
 #include "fmgr.h"
 #include "miscadmin.h"
+#include "nodes/parsenodes.h"
 #include "portability/mem.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
@@ -124,6 +126,14 @@ static HTAB *LocalPageHash;
 #ifdef USE_TEST_MEM_SMGR
 static MemoryContext MemSmgrSnapshotCxt;
 static MemSmgrSnapshot *MemSmgrSnapshots;
+#endif
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+static MemSmgrSnapshot *MemSmgrEpochSnapshot;
+static MemSmgrSnapshot *MemSmgrLastRestoredSnapshot;
+static uint64 MemSmgrNextEpochId = 1;
+static uint64 MemSmgrEpochId = 0;
+static bool MemSmgrEpochOwnsSnapshot = false;
 #endif
 
 static void MemSmgrShmemRequest(void *arg);
@@ -666,6 +676,10 @@ pg_fastfork_snapshot(PG_FUNCTION_ARGS)
 	snapshot = mem_create_snapshot(name);
 	mem_capture_snapshot(snapshot);
 
+#if defined(USE_TEST_EPOCH_ROLLBACK)
+	MemSmgrLastRestoredSnapshot = NULL;
+#endif
+
 	pfree(name);
 	PG_RETURN_VOID();
 #endif
@@ -695,6 +709,9 @@ pg_fastfork_restore(PG_FUNCTION_ARGS)
 	DropDatabaseBuffers(MyDatabaseId);
 	mem_restore_snapshot(snapshot);
 	mem_restore_reset_caches();
+#if defined(USE_TEST_EPOCH_ROLLBACK)
+	MemSmgrLastRestoredSnapshot = snapshot;
+#endif
 
 	pfree(name);
 	PG_RETURN_VOID();
@@ -721,6 +738,171 @@ pg_fastfork_drop_snapshot(PG_FUNCTION_ARGS)
 
 	pfree(name);
 	PG_RETURN_VOID();
+#endif
+}
+
+Datum
+pg_fastfork_epoch_begin(PG_FUNCTION_ARGS)
+{
+#if !defined(USE_TEST_EPOCH_ROLLBACK)
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("pg_fastfork_epoch_begin() requires --enable-test-epoch-rollback")));
+	PG_RETURN_VOID();
+#else
+	int			notherbackends;
+	int			npreparedxacts;
+	char		name[NAMEDATALEN];
+
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("must be superuser to call pg_fastfork_epoch_begin()")));
+
+	if (!IsTransactionBlock())
+		ereport(ERROR,
+				(errcode(ERRCODE_NO_ACTIVE_SQL_TRANSACTION),
+				 errmsg("pg_fastfork_epoch_begin() must run inside a transaction block")));
+
+	if (!IsUnderPostmaster || MemSmgrState == NULL ||
+		MemSmgrForkHash == NULL || MemSmgrPageHash == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_fastfork_epoch_begin() requires the in-memory storage manager")));
+
+	if (!OidIsValid(MyDatabaseId))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("pg_fastfork_epoch_begin() requires a database connection")));
+
+	if (MemSmgrEpochSnapshot != NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
+				 errmsg("fast-fork epoch transaction is already active")));
+
+	if (IsParallelWorker())
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("fast-fork epoch transactions are not supported in parallel workers")));
+
+	if (CountOtherDBBackends(MyDatabaseId, &notherbackends, &npreparedxacts))
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("database is being accessed by other users"),
+				 errdetail("%d other session(s) and %d prepared transaction(s) are using the database.",
+						   notherbackends, npreparedxacts)));
+
+	FlushDatabaseBuffers(InvalidOid);
+	FlushDatabaseBuffers(MyDatabaseId);
+
+	MemSmgrEpochId = MemSmgrNextEpochId++;
+	if (MemSmgrLastRestoredSnapshot != NULL)
+	{
+		MemSmgrEpochSnapshot = MemSmgrLastRestoredSnapshot;
+		MemSmgrEpochOwnsSnapshot = false;
+	}
+	else
+	{
+		snprintf(name, sizeof(name), "__fastfork_epoch_" UINT64_FORMAT,
+				 MemSmgrEpochId);
+		MemSmgrEpochSnapshot = mem_create_snapshot(name);
+		mem_capture_snapshot(MemSmgrEpochSnapshot);
+		MemSmgrEpochOwnsSnapshot = true;
+	}
+
+	PG_RETURN_VOID();
+#endif
+}
+
+Datum
+pg_fastfork_epoch_status(PG_FUNCTION_ARGS)
+{
+#if !defined(USE_TEST_EPOCH_ROLLBACK)
+	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
+#else
+	if (MemSmgrEpochSnapshot == NULL)
+		PG_RETURN_TEXT_P(cstring_to_text("inactive"));
+
+	PG_RETURN_TEXT_P(cstring_to_text(psprintf("active epoch_id=" UINT64_FORMAT
+											  " forks=%d pages=%d",
+											  MemSmgrEpochId,
+											  MemSmgrEpochSnapshot->nforks,
+											  MemSmgrEpochSnapshot->npages)));
+#endif
+}
+
+bool
+FastForkEpochActive(void)
+{
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+	return MemSmgrEpochSnapshot != NULL;
+#else
+	return false;
+#endif
+}
+
+void
+FastForkEpochCheckUtility(Node *parsetree)
+{
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+	if (MemSmgrEpochSnapshot == NULL || parsetree == NULL)
+		return;
+
+	switch (nodeTag(parsetree))
+	{
+		case T_TransactionStmt:
+			{
+				TransactionStmt *stmt = castNode(TransactionStmt, parsetree);
+
+				if (stmt->kind == TRANS_STMT_PREPARE ||
+					stmt->kind == TRANS_STMT_COMMIT_PREPARED ||
+					stmt->kind == TRANS_STMT_ROLLBACK_PREPARED)
+					ereport(ERROR,
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("prepared transactions are not supported in fast-fork epoch transactions")));
+				return;
+			}
+
+		case T_VariableSetStmt:
+		case T_VariableShowStmt:
+		case T_ConstraintsSetStmt:
+		case T_LockStmt:
+		case T_ExplainStmt:
+			return;
+		default:
+			break;
+	}
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("DDL inside fast-fork epoch transactions requires test_ephemeral_catalog"),
+			 errhint("Run schema setup before pg_fastfork_epoch_begin(), or disable epoch rollback for this transaction.")));
+#endif
+}
+
+void
+AtEOXact_FastForkEpoch(bool isCommit)
+{
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+	if (MemSmgrEpochSnapshot == NULL)
+		return;
+
+	if (isCommit)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fast-fork epoch transactions are rollback-only"),
+				 errhint("Disable epoch rollback for setup transactions, or use fixture snapshot/restore after setup.")));
+
+	DropDatabaseBuffers(InvalidOid);
+	DropDatabaseBuffers(MyDatabaseId);
+	mem_restore_snapshot(MemSmgrEpochSnapshot);
+	mem_restore_reset_caches();
+	MemSmgrLastRestoredSnapshot = MemSmgrEpochSnapshot;
+	if (MemSmgrEpochOwnsSnapshot)
+		mem_delete_snapshot(MemSmgrEpochSnapshot);
+	MemSmgrEpochSnapshot = NULL;
+	MemSmgrEpochOwnsSnapshot = false;
+	MemSmgrEpochId = 0;
 #endif
 }
 
@@ -832,6 +1014,16 @@ mem_delete_snapshot(MemSmgrSnapshot *snapshot)
 		if (*link == snapshot)
 		{
 			*link = snapshot->next;
+#if defined(USE_TEST_EPOCH_ROLLBACK)
+			if (MemSmgrLastRestoredSnapshot == snapshot)
+				MemSmgrLastRestoredSnapshot = NULL;
+			if (MemSmgrEpochSnapshot == snapshot)
+			{
+				MemSmgrEpochSnapshot = NULL;
+				MemSmgrEpochOwnsSnapshot = false;
+				MemSmgrEpochId = 0;
+			}
+#endif
 			MemoryContextDelete(snapshot->context);
 			return;
 		}
@@ -947,8 +1139,20 @@ mem_restore_snapshot(MemSmgrSnapshot *snapshot)
 	HASH_SEQ_STATUS status;
 	MemSmgrForkEntry *fork;
 	MemSmgrPageEntry *page;
+	bool		reset_page_arena = true;
 
 	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&status, MemSmgrPageHash);
+	while ((page = hash_seq_search(&status)) != NULL)
+	{
+		if (!mem_snapshot_key_matches(&page->key.rlocator))
+		{
+			reset_page_arena = false;
+			hash_seq_term(&status);
+			break;
+		}
+	}
 
 	hash_seq_init(&status, MemSmgrForkHash);
 	while ((fork = hash_seq_search(&status)) != NULL)
@@ -963,6 +1167,9 @@ mem_restore_snapshot(MemSmgrSnapshot *snapshot)
 		if (mem_snapshot_key_matches(&page->key.rlocator))
 			hash_search(MemSmgrPageHash, &page->key, HASH_REMOVE, NULL);
 	}
+
+	if (reset_page_arena)
+		MemSmgrState->next_page = 0;
 
 	for (int i = 0; i < snapshot->nforks; i++)
 	{

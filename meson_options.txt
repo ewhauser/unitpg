@@ -61,6 +61,9 @@ option('test_ephemeral_buffers', type: 'boolean', value: false,
 option('test_mem_slru', type: 'boolean', value: false,
   description: 'Use memory-backed transaction-status SLRUs for test-only builds')
 
+option('test_epoch_rollback', type: 'boolean', value: false,
+  description: 'Enable rollback-only fast-fork epoch transactions for test-only builds')
+
 option('test_no_wal_assembly', type: 'boolean', value: false,
   description: 'Skip ordinary WAL record assembly for test-only builds')
 

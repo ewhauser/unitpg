@@ -19,6 +19,12 @@ snapshot implementation stores snapshots in the backend session, the runner
 does not run a separate warmup pgbench process for this workload; use enough
 transactions that the one-time fixture setup is amortized.
 
+The optional `unit-test-epoch-rollback.pgbench` workload creates the same
+fixture once, restores it once to establish the epoch base image, then runs DML
+inside `BEGIN; SELECT pg_fastfork_epoch_begin(); ... ROLLBACK;`. It is the
+benchmark entrypoint for the rollback-only epoch overlay flag and currently
+expects `--clients 1`.
+
 ## Baseline
 
 Build and install PostgreSQL, then point the runner at that install's `bin`
@@ -50,6 +56,16 @@ python3 bench/run_pgbench.py \
   --output bench/results/fork-snapshot.json
 ```
 
+To measure the epoch rollback path against a fast-fork build:
+
+```sh
+python3 bench/run_pgbench.py \
+  --bin /path/to/fork/install/bin \
+  --label fork-epoch-rollback \
+  --workload epoch-rollback \
+  --output bench/results/fork-epoch-rollback.json
+```
+
 The runner initializes a disposable cluster and applies these fast test
 settings: `fsync=off`, `synchronous_commit=off`, `full_page_writes=off`,
 `wal_level=minimal`, `archive_mode=off`, `max_wal_senders=0`,
@@ -76,6 +92,17 @@ fast-fork snapshot/restore path, use:
 ```sh
 python3 bench/compare_pgbench.py \
   --fakewal-workload snapshot \
+  --rounds 5 \
+  --transactions 200 \
+  --rows 200
+```
+
+To compare stock Postgres doing DDL/data setup in every transaction against the
+fast-fork epoch rollback path, use:
+
+```sh
+python3 bench/compare_pgbench.py \
+  --fakewal-workload epoch-rollback \
   --rounds 5 \
   --transactions 200 \
   --rows 200

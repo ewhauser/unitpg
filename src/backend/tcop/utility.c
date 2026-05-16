@@ -63,6 +63,7 @@
 #include "postmaster/bgwriter.h"
 #include "rewrite/rewriteDefine.h"
 #include "storage/fd.h"
+#include "storage/memsmgr.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
 #include "utils/guc.h"
@@ -577,6 +578,7 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 	/* Prohibit read/write commands in read-only states. */
 	readonly_flags = ClassifyUtilityCommandAsReadOnly(parsetree);
+	FastForkEpochCheckUtility(parsetree);
 	if (readonly_flags != COMMAND_IS_STRICTLY_READ_ONLY &&
 		(XactReadOnly || IsInParallelMode()))
 	{

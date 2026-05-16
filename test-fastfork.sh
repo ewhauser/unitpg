@@ -21,6 +21,7 @@ Usage: ./test-fastfork.sh [quick|core|full] [options] [-- extra meson test args]
 Build and validate the fast-fork Postgres configuration:
   -Dtest_fake_wal=true -Dtest_no_bg_jobs=true -Dtest_mem_smgr=true
   -Dtest_ephemeral_buffers=true -Dtest_mem_slru=true
+  -Dtest_epoch_rollback=true
   -Dtest_no_wal_assembly=true -Dtest_no_observability=true
   -Dtest_fast_memory_contexts=true -Dtest_ephemeral_catalog=true
   -Dtest_no_durable_maintenance=true -Dtest_fast_analyze=true
@@ -167,6 +168,7 @@ SETUP_ARGS=(
 	"-Dtest_mem_smgr=true"
 	"-Dtest_ephemeral_buffers=true"
 	"-Dtest_mem_slru=true"
+	"-Dtest_epoch_rollback=true"
 	"-Dtest_no_wal_assembly=true"
 	"-Dtest_no_observability=true"
 	"-Dtest_fast_memory_contexts=true"
@@ -329,6 +331,8 @@ done
 "$MESON" test "${SETUP_ARGS_FOR_TEST[@]}"
 fix_darwin_tmp_install_names
 "${PYTHON:-python3}" "$ROOT/bench/test_fastfork_snapshot.py" \
+	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
+"${PYTHON:-python3}" "$ROOT/bench/test_fastfork_epoch_rollback.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 "${PYTHON:-python3}" "$ROOT/bench/test_seed_only_startup.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"

@@ -291,6 +291,27 @@ PGAC_ARG_BOOL(enable, test-mem-slru, no,
 AC_SUBST(enable_test_mem_slru)
 
 #
+# Test-only epoch rollback
+#
+PGAC_ARG_BOOL(enable, test-epoch-rollback, no,
+              [enable rollback-only fast-fork epoch transactions (for testing)],
+              [AC_DEFINE([USE_TEST_EPOCH_ROLLBACK], 1,
+                         [Define to 1 to enable rollback-only fast-fork epoch transactions. (--enable-test-epoch-rollback)])])
+AC_SUBST(enable_test_epoch_rollback)
+if test "$enable_test_epoch_rollback" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  AC_MSG_ERROR([--enable-test-epoch-rollback requires --enable-test-mem-smgr])
+fi
+if test "$enable_test_epoch_rollback" = yes &&
+   test "$enable_test_mem_slru" != yes; then
+  AC_MSG_ERROR([--enable-test-epoch-rollback requires --enable-test-mem-slru])
+fi
+if test "$enable_test_epoch_rollback" = yes &&
+   test "$enable_test_ephemeral_buffers" != yes; then
+  AC_MSG_ERROR([--enable-test-epoch-rollback requires --enable-test-ephemeral-buffers])
+fi
+
+#
 # Test-only no WAL assembly
 #
 PGAC_ARG_BOOL(enable, test-no-wal-assembly, no,

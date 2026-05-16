@@ -116,6 +116,7 @@ def build_with_meson(
     mem_smgr: bool,
     ephemeral_buffers: bool,
     mem_slru: bool,
+    epoch_rollback: bool,
     no_wal_assembly: bool,
     no_observability: bool,
     fast_memory_contexts: bool,
@@ -153,6 +154,7 @@ def build_with_meson(
         f"-Dtest_mem_smgr={'true' if mem_smgr else 'false'}",
         f"-Dtest_ephemeral_buffers={'true' if ephemeral_buffers else 'false'}",
         f"-Dtest_mem_slru={'true' if mem_slru else 'false'}",
+        f"-Dtest_epoch_rollback={'true' if epoch_rollback else 'false'}",
         f"-Dtest_no_wal_assembly={'true' if no_wal_assembly else 'false'}",
         f"-Dtest_no_observability={'true' if no_observability else 'false'}",
         f"-Dtest_fast_memory_contexts={'true' if fast_memory_contexts else 'false'}",
@@ -184,6 +186,7 @@ def build_with_configure(
     mem_smgr: bool,
     ephemeral_buffers: bool,
     mem_slru: bool,
+    epoch_rollback: bool,
     no_wal_assembly: bool,
     no_observability: bool,
     fast_memory_contexts: bool,
@@ -226,6 +229,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-ephemeral-buffers")
     if mem_slru:
         configure_cmd.append("--enable-test-mem-slru")
+    if epoch_rollback:
+        configure_cmd.append("--enable-test-epoch-rollback")
     if no_wal_assembly:
         configure_cmd.append("--enable-test-no-wal-assembly")
     if no_observability:
@@ -269,6 +274,7 @@ def build_variant(
     mem_smgr: bool,
     ephemeral_buffers: bool,
     mem_slru: bool,
+    epoch_rollback: bool,
     no_wal_assembly: bool,
     no_observability: bool,
     fast_memory_contexts: bool,
@@ -298,6 +304,7 @@ def build_variant(
             mem_smgr=mem_smgr,
             ephemeral_buffers=ephemeral_buffers,
             mem_slru=mem_slru,
+            epoch_rollback=epoch_rollback,
             no_wal_assembly=no_wal_assembly,
             no_observability=no_observability,
             fast_memory_contexts=fast_memory_contexts,
@@ -323,6 +330,7 @@ def build_variant(
         mem_smgr=mem_smgr,
         ephemeral_buffers=ephemeral_buffers,
         mem_slru=mem_slru,
+        epoch_rollback=epoch_rollback,
         no_wal_assembly=no_wal_assembly,
         no_observability=no_observability,
         fast_memory_contexts=fast_memory_contexts,
@@ -466,13 +474,13 @@ def main() -> int:
     parser.add_argument("--random-seed", default="1")
     parser.add_argument(
         "--baseline-workload",
-        choices=["rollback", "snapshot"],
+        choices=["epoch-rollback", "rollback", "snapshot"],
         default="rollback",
         help="workload to run against the baseline build",
     )
     parser.add_argument(
         "--fakewal-workload",
-        choices=["rollback", "snapshot"],
+        choices=["epoch-rollback", "rollback", "snapshot"],
         default="rollback",
         help="workload to run against the fast-fork build",
     )
@@ -503,6 +511,11 @@ def main() -> int:
         "--disable-mem-slru",
         action="store_true",
         help="do not enable in-memory transaction-status SLRUs in the fast-fork build",
+    )
+    parser.add_argument(
+        "--disable-epoch-rollback",
+        action="store_true",
+        help="do not enable rollback-only epoch transactions in the fast-fork build",
     )
     parser.add_argument(
         "--disable-no-wal-assembly",
@@ -564,10 +577,13 @@ def main() -> int:
     if args.rounds < 1:
         raise SystemExit("--rounds must be at least 1")
     if (
-        (args.baseline_workload == "snapshot" or args.fakewal_workload == "snapshot")
+        (
+            args.baseline_workload in {"epoch-rollback", "snapshot"}
+            or args.fakewal_workload in {"epoch-rollback", "snapshot"}
+        )
         and args.clients != 1
     ):
-        raise SystemExit("the snapshot workload currently requires --clients 1")
+        raise SystemExit("the epoch-rollback and snapshot workloads currently require --clients 1")
     enable_no_data_directory_startup = (
         not args.disable_no_data_directory_startup
         and not args.disable_seed_only_startup
@@ -604,6 +620,7 @@ def main() -> int:
             mem_smgr=False,
             ephemeral_buffers=False,
             mem_slru=False,
+            epoch_rollback=False,
             no_wal_assembly=False,
             no_observability=False,
             fast_memory_contexts=False,
@@ -634,6 +651,7 @@ def main() -> int:
             mem_smgr=not args.disable_mem_smgr,
             ephemeral_buffers=not args.disable_ephemeral_buffers,
             mem_slru=not args.disable_mem_slru,
+            epoch_rollback=not args.disable_epoch_rollback,
             no_wal_assembly=not args.disable_no_wal_assembly,
             no_observability=not args.disable_no_observability,
             fast_memory_contexts=not args.disable_fast_memory_contexts,
@@ -701,6 +719,7 @@ def main() -> int:
                 "mem_smgr": False,
                 "ephemeral_buffers": False,
                 "mem_slru": False,
+                "epoch_rollback": False,
                 "no_wal_assembly": False,
                 "no_observability": False,
                 "fast_memory_contexts": False,
@@ -723,6 +742,7 @@ def main() -> int:
                 "mem_smgr": not args.disable_mem_smgr,
                 "ephemeral_buffers": not args.disable_ephemeral_buffers,
                 "mem_slru": not args.disable_mem_slru,
+                "epoch_rollback": not args.disable_epoch_rollback,
                 "no_wal_assembly": not args.disable_no_wal_assembly,
                 "no_observability": not args.disable_no_observability,
                 "fast_memory_contexts": not args.disable_fast_memory_contexts,

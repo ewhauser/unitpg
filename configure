@@ -777,6 +777,7 @@ enable_test_no_bg_jobs
 enable_test_mem_smgr
 enable_test_ephemeral_buffers
 enable_test_mem_slru
+enable_test_epoch_rollback
 enable_test_no_wal_assembly
 enable_test_no_observability
 enable_test_fast_memory_contexts
@@ -873,6 +874,7 @@ enable_test_no_bg_jobs
 enable_test_mem_smgr
 enable_test_ephemeral_buffers
 enable_test_mem_slru
+enable_test_epoch_rollback
 enable_test_no_wal_assembly
 enable_test_no_observability
 enable_test_fast_memory_contexts
@@ -1597,6 +1599,9 @@ Optional Features:
                           use direct memory-backed temp buffers (for testing)
   --enable-test-mem-slru  use memory-backed transaction-status SLRUs (for
                           testing)
+  --enable-test-epoch-rollback
+                          enable rollback-only fast-fork epoch transactions
+                          (for testing)
   --enable-test-no-wal-assembly
                           skip ordinary WAL record assembly (for testing)
   --enable-test-no-observability
@@ -3903,6 +3908,46 @@ $as_echo "#define USE_TEST_MEM_SLRU 1" >>confdefs.h
 else
   enable_test_mem_slru=no
 
+fi
+
+
+#
+# Test-only epoch rollback
+#
+
+
+# Check whether --enable-test-epoch-rollback was given.
+if test "${enable_test_epoch_rollback+set}" = set; then :
+  enableval=$enable_test_epoch_rollback;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_EPOCH_ROLLBACK 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-epoch-rollback option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_epoch_rollback=no
+
+fi
+if test "$enable_test_epoch_rollback" = yes &&
+   test "$enable_test_mem_smgr" != yes; then
+  as_fn_error $? "--enable-test-epoch-rollback requires --enable-test-mem-smgr" "$LINENO" 5
+fi
+if test "$enable_test_epoch_rollback" = yes &&
+   test "$enable_test_mem_slru" != yes; then
+  as_fn_error $? "--enable-test-epoch-rollback requires --enable-test-mem-slru" "$LINENO" 5
+fi
+if test "$enable_test_epoch_rollback" = yes &&
+   test "$enable_test_ephemeral_buffers" != yes; then
+  as_fn_error $? "--enable-test-epoch-rollback requires --enable-test-ephemeral-buffers" "$LINENO" 5
 fi
 
 
