@@ -1,0 +1,145 @@
+name: Release server binaries
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-server-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - target: macos-aarch64
+            runner: macos-15
+
+    env:
+      FASTFORK_BUILD_DIR: bench/.build/release-${{ matrix.target }}
+      FASTFORK_JOBS: 4
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            flex \
+            libipc-run-perl \
+            meson \
+            ninja-build \
+            patchelf \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison flex meson ninja
+          {
+            echo "$(brew --prefix bison)/bin"
+            echo "$(brew --prefix flex)/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Build fast-fork server
+        run: ./test-fastfork.sh quick --setup-only --wipe
+
+      - name: Install into staging prefix
+        run: meson install -C "$FASTFORK_BUILD_DIR" --destdir "$RUNNER_TEMP/postgres-install" --quiet
+
+      - name: Package server distribution
+        run: |
+          ci/package-server-dist.sh \
+            "$RUNNER_TEMP/postgres-install/usr/local/pgsql" \
+            "${{ matrix.target }}" \
+            "$RUNNER_TEMP/server-dist"
+
+      - name: Smoke-test packaged server
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/server-dist/postgres-fastfork-${{ matrix.target }}"
+          workdir="$RUNNER_TEMP/server-smoke"
+          rm -rf "$workdir"
+          mkdir -p "$workdir"
+          export LC_ALL=C
+          "$dist/bin/initdb" \
+            -D "$workdir/data" \
+            --no-sync \
+            -A trust \
+            -U postgres \
+            -c shared_memory_type=mmap
+          "$dist/bin/pg_ctl" -D "$workdir/data" -l "$workdir/postgres.log" -w start
+          "$dist/bin/pg_ctl" -D "$workdir/data" -m fast -w stop
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-dist-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/server-dist/*.tar.gz
+            ${{ runner.temp }}/server-dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          tag="fastfork-server-${short_sha}"
+          title="Fast-fork server binaries ${short_sha}"
+          notes="$RUNNER_TEMP/release-notes.md"
+
+          {
+            echo "Fast-fork PostgreSQL server binary distributions for ${GITHUB_SHA}."
+            echo
+            echo "Assets:"
+            for archive in dist/*.tar.gz; do
+              echo "- $(basename "$archive")"
+            done
+          } > "$notes"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file "$notes"
+          fi
