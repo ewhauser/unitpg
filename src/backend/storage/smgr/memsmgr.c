@@ -28,6 +28,7 @@
 #include "commands/sequence.h"
 #include "common/relpath.h"
 #include "fmgr.h"
+#include "funcapi.h"
 #include "miscadmin.h"
 #include "nodes/parsenodes.h"
 #include "portability/mem.h"
@@ -45,6 +46,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
+#include "utils/tuplestore.h"
 #include "utils/wait_event.h"
 
 /*
@@ -62,6 +64,7 @@
 #define MEMSMGR_MAX_EPOCHS			64
 #define MEMSMGR_MAX_COMBINE			32
 #define MEMSMGR_INVALID_PAGE_INDEX	PG_UINT32_MAX
+#define PG_FASTFORK_EPOCH_STATS_COLS	22
 
 typedef struct MemSmgrForkKey
 {
@@ -111,6 +114,24 @@ typedef struct MemSmgrEpochState
 	int			base_nforks;
 	int			base_npages;
 } MemSmgrEpochState;
+
+typedef struct MemSmgrEpochStatsRow
+{
+	uint64		epoch_id;
+	Oid			database_id;
+	char		name[NAMEDATALEN];
+	char		snapshot_name[NAMEDATALEN];
+	int			participants;
+	bool		joined;
+	bool		session_bound;
+	bool		aborting;
+	int			base_nforks;
+	int			base_npages;
+	int64		overlay_forks;
+	int64		overlay_pages;
+	int64		overlay_buffers;
+	int64		dirty_overlay_buffers;
+} MemSmgrEpochStatsRow;
 #endif
 
 typedef struct MemSmgrSnapshotPageEntry
@@ -188,6 +209,11 @@ static MemSmgrEpochState *mem_epoch_first_active(Oid database_id);
 static bool mem_epoch_any_active_for_database(Oid database_id);
 static void mem_epoch_reset_state(MemSmgrEpochState *epoch);
 static void mem_epoch_mark_current_aborting_locked(void);
+static void mem_epoch_count_overlay(uint64 epoch_id, int64 *forks,
+									int64 *pages);
+static int	mem_epoch_collect_stats(MemSmgrEpochStatsRow *rows,
+									uint32 *arena_next_pages,
+									uint32 *arena_reusable_pages);
 static void mem_epoch_join_or_start(const char *name,
 									MemSmgrSnapshot *snapshot,
 									bool join);
@@ -267,10 +293,12 @@ static MemSmgrPageEntry *mem_get_page_entry(RelFileLocatorBackend rlocator,
 											bool create);
 static char *mem_page_data(const MemSmgrPageEntry *entry);
 static char *mem_page_data_by_index(uint32 page_index);
-static uint32 mem_alloc_page_index(void);
+static uint32 mem_alloc_page_index(uint64 epoch_id);
 static uint32 mem_get_free_page_next(uint32 page_index);
 static void mem_set_free_page_next(uint32 page_index, uint32 next_page);
 static void mem_free_page_index(uint32 page_index);
+static char *mem_page_arena_full_detail(uint64 epoch_id,
+										uint32 attempted_page_index);
 static void mem_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							 BlockNumber first_block);
 static bool mem_relation_is_memory_only(RelFileLocatorBackend rlocator);
@@ -1353,6 +1381,112 @@ pg_fastfork_epoch_status(PG_FUNCTION_ARGS)
 #endif
 }
 
+Datum
+pg_fastfork_epoch_stats(PG_FUNCTION_ARGS)
+{
+	ReturnSetInfo *rsinfo;
+
+	InitMaterializedSRF(fcinfo, 0);
+	rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (MemSmgrState != NULL && MemSmgrState->page_data != NULL)
+	{
+		MemSmgrEpochStatsRow rows[MEMSMGR_MAX_EPOCHS];
+		uint32		arena_next_pages;
+		uint32		arena_reusable_pages;
+		uint32		arena_pages_used;
+		int64		arena_pages_free;
+		int			nrows;
+		int64		total_overlay_forks = 0;
+		int64		total_overlay_pages = 0;
+		int64		total_overlay_buffers = 0;
+		int64		total_dirty_overlay_buffers = 0;
+		Datum		values[PG_FASTFORK_EPOCH_STATS_COLS] = {0};
+		bool		nulls[PG_FASTFORK_EPOCH_STATS_COLS] = {0};
+
+		nrows = mem_epoch_collect_stats(rows, &arena_next_pages,
+										&arena_reusable_pages);
+		arena_pages_used = arena_next_pages - arena_reusable_pages;
+		arena_pages_free =
+			Max((int64) MEMSMGR_SHARED_MAX_PAGES - arena_pages_used, 0);
+
+		for (int i = 0; i < nrows; i++)
+		{
+			total_overlay_forks += rows[i].overlay_forks;
+			total_overlay_pages += rows[i].overlay_pages;
+			total_overlay_buffers += rows[i].overlay_buffers;
+			total_dirty_overlay_buffers += rows[i].dirty_overlay_buffers;
+		}
+
+		values[0] = CStringGetTextDatum("arena");
+		nulls[1] = true;
+		nulls[2] = true;
+		nulls[3] = true;
+		nulls[4] = true;
+		nulls[5] = true;
+		nulls[6] = true;
+		nulls[7] = true;
+		nulls[8] = true;
+		nulls[9] = true;
+		nulls[10] = true;
+		values[11] = Int64GetDatum(total_overlay_forks);
+		values[12] = Int64GetDatum(total_overlay_pages);
+		values[13] = Int64GetDatum(total_overlay_pages * (int64) BLCKSZ);
+		values[14] = Int64GetDatum(total_overlay_buffers);
+		values[15] = Int64GetDatum(total_dirty_overlay_buffers);
+		values[16] = CStringGetTextDatum("postmaster");
+		values[17] = Int64GetDatum(arena_pages_used);
+		values[18] = Int64GetDatum(MEMSMGR_SHARED_MAX_PAGES);
+		values[19] = Int64GetDatum(arena_pages_free);
+		values[20] = Int64GetDatum(arena_next_pages);
+		values[21] = Int64GetDatum(arena_reusable_pages);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+							 values, nulls);
+
+		for (int i = 0; i < nrows; i++)
+		{
+			MemSmgrEpochStatsRow *row = &rows[i];
+
+			memset(values, 0, sizeof(values));
+			memset(nulls, 0, sizeof(nulls));
+
+			values[0] = CStringGetTextDatum("epoch");
+			values[1] = Int64GetDatum(row->epoch_id);
+			values[2] = CStringGetTextDatum(row->name[0] != '\0' ?
+											row->name : "<unnamed>");
+			values[3] = ObjectIdGetDatum(row->database_id);
+			if (row->snapshot_name[0] != '\0')
+				values[4] = CStringGetTextDatum(row->snapshot_name);
+			else
+				nulls[4] = true;
+			values[5] = Int32GetDatum(row->participants);
+			values[6] = BoolGetDatum(row->joined);
+			values[7] = BoolGetDatum(row->session_bound);
+			values[8] = BoolGetDatum(row->aborting);
+			values[9] = Int32GetDatum(row->base_nforks);
+			values[10] = Int32GetDatum(row->base_npages);
+			values[11] = Int64GetDatum(row->overlay_forks);
+			values[12] = Int64GetDatum(row->overlay_pages);
+			values[13] = Int64GetDatum(row->overlay_pages * (int64) BLCKSZ);
+			values[14] = Int64GetDatum(row->overlay_buffers);
+			values[15] = Int64GetDatum(row->dirty_overlay_buffers);
+			values[16] = CStringGetTextDatum("postmaster");
+			values[17] = Int64GetDatum(arena_pages_used);
+			values[18] = Int64GetDatum(MEMSMGR_SHARED_MAX_PAGES);
+			values[19] = Int64GetDatum(arena_pages_free);
+			values[20] = Int64GetDatum(arena_next_pages);
+			values[21] = Int64GetDatum(arena_reusable_pages);
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc,
+								 values, nulls);
+		}
+	}
+#endif
+
+	return (Datum) 0;
+}
+
 bool
 FastForkEpochActive(void)
 {
@@ -1865,7 +1999,7 @@ mem_restore_snapshot(MemSmgrSnapshot *snapshot)
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("memory storage manager page table is full")));
 		if (!found)
-			target->page_index = mem_alloc_page_index();
+			target->page_index = mem_alloc_page_index(0);
 		memcpy(mem_page_data(target), snapshot->pages[i].data, BLCKSZ);
 	}
 
@@ -2244,7 +2378,7 @@ mem_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 	if (entry != NULL || !create)
 		return entry;
 
-	page_index = mem_alloc_page_index();
+	page_index = mem_alloc_page_index(0);
 	entry = hash_search(mem_page_hash_for(&rlocator), &key, HASH_ENTER_NULL,
 						&found);
 	if (entry == NULL)
@@ -2280,7 +2414,7 @@ mem_page_data_by_index(uint32 page_index)
 }
 
 static uint32
-mem_alloc_page_index(void)
+mem_alloc_page_index(uint64 epoch_id)
 {
 	uint32		page_index;
 	bool		release_lock = false;
@@ -2310,7 +2444,6 @@ mem_alloc_page_index(void)
 		if (MemSmgrState->next_page >= MEMSMGR_SHARED_MAX_PAGES)
 		{
 			uint32		next_page = MemSmgrState->next_page;
-			uint32		free_page_count = MemSmgrState->free_page_count;
 
 #if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
 			mem_epoch_mark_current_aborting_locked();
@@ -2319,10 +2452,9 @@ mem_alloc_page_index(void)
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("memory storage manager page arena is full"),
-					 errdetail("Arena capacity is %u pages; %u pages have been reserved and %u pages are reusable.",
-							   (unsigned) MEMSMGR_SHARED_MAX_PAGES,
-							   (unsigned) next_page,
-							   (unsigned) free_page_count)));
+					 errdetail("%s",
+							   mem_page_arena_full_detail(epoch_id,
+														  next_page))));
 		}
 		page_index = MemSmgrState->next_page++;
 	}
@@ -2372,6 +2504,116 @@ mem_free_page_index(uint32 page_index)
 
 	if (release_lock)
 		LWLockRelease(&MemSmgrState->lock);
+}
+
+static char *
+mem_page_arena_full_detail(uint64 epoch_id, uint32 attempted_page_index)
+{
+	uint32		next_pages;
+	uint32		reusable_pages;
+	int64		used_pages;
+	int64		free_pages;
+
+	if (MemSmgrState == NULL)
+		return psprintf("The memory storage manager page arena was not initialized.");
+
+	next_pages = Min(MemSmgrState->next_page,
+					 (uint32) MEMSMGR_SHARED_MAX_PAGES);
+	reusable_pages = Min(MemSmgrState->free_page_count, next_pages);
+	used_pages = (int64) next_pages - reusable_pages;
+	free_pages = Max((int64) MEMSMGR_SHARED_MAX_PAGES - used_pages, 0);
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (epoch_id != 0 &&
+		MemSmgrEpochForkHash != NULL &&
+		MemSmgrEpochPageHash != NULL)
+	{
+		MemSmgrEpochState *epoch = mem_epoch_find_by_id(epoch_id);
+		MemSmgrEpochState *largest_epoch = NULL;
+		int64		current_forks = 0;
+		int64		current_pages = 0;
+		int64		largest_forks = 0;
+		int64		largest_pages = 0;
+		int64		total_epoch_pages = 0;
+		int			active_epochs = 0;
+
+		mem_epoch_count_overlay(epoch_id, &current_forks, &current_pages);
+
+		for (int i = 0; i < MEMSMGR_MAX_EPOCHS; i++)
+		{
+			MemSmgrEpochState *candidate = &MemSmgrState->epochs[i];
+			int64		candidate_forks;
+			int64		candidate_pages;
+
+			if (!candidate->active)
+				continue;
+
+			active_epochs++;
+			mem_epoch_count_overlay(candidate->epoch_id,
+									&candidate_forks,
+									&candidate_pages);
+			total_epoch_pages += candidate_pages;
+			if (largest_epoch == NULL || candidate_pages > largest_pages)
+			{
+				largest_epoch = candidate;
+				largest_forks = candidate_forks;
+				largest_pages = candidate_pages;
+			}
+		}
+
+		return psprintf("attempted_page_index=%u, arena_pages_used="
+						INT64_FORMAT ", "
+						"arena_pages_limit=%u, arena_pages_free=" INT64_FORMAT
+						", arena_next_pages=%u, arena_reusable_pages=%u"
+						", active_epochs=%d, total_epoch_overlay_pages="
+						INT64_FORMAT ", current_epoch_id=" UINT64_FORMAT
+						", current_epoch_name=\"%s\", current_epoch_database=%u, "
+						"current_epoch_overlay_forks=" INT64_FORMAT
+						", current_epoch_overlay_pages=" INT64_FORMAT
+						", current_epoch_participants=%d, largest_epoch_id="
+						UINT64_FORMAT ", largest_epoch_name=\"%s\", "
+						"largest_epoch_database=%u, largest_epoch_overlay_forks="
+						INT64_FORMAT ", largest_epoch_overlay_pages="
+						INT64_FORMAT ". The page arena limit is shared by the "
+						"postmaster, not per epoch, database, or backend.",
+						attempted_page_index,
+						used_pages,
+						(uint32) MEMSMGR_SHARED_MAX_PAGES,
+						free_pages,
+						next_pages,
+						reusable_pages,
+						active_epochs,
+						total_epoch_pages,
+						epoch_id,
+						epoch != NULL && epoch->name[0] != '\0' ?
+						epoch->name : "<unnamed>",
+						epoch != NULL ? epoch->database_id : InvalidOid,
+						current_forks,
+						current_pages,
+						epoch != NULL ? epoch->participants : 0,
+						largest_epoch != NULL ? largest_epoch->epoch_id : 0,
+						largest_epoch != NULL &&
+						largest_epoch->name[0] != '\0' ?
+						largest_epoch->name : "<none>",
+						largest_epoch != NULL ? largest_epoch->database_id :
+						InvalidOid,
+						largest_forks,
+						largest_pages);
+	}
+#endif
+
+	return psprintf("attempted_page_index=%u, arena_pages_used="
+					INT64_FORMAT ", "
+					"arena_pages_limit=%u, arena_pages_free=" INT64_FORMAT
+					", arena_next_pages=%u, arena_reusable_pages=%u"
+					". The page arena limit is shared by the postmaster, not "
+					"per epoch, database, or backend.",
+					attempted_page_index,
+					used_pages,
+					(uint32) MEMSMGR_SHARED_MAX_PAGES,
+					free_pages,
+					next_pages,
+					reusable_pages);
 }
 
 static void
@@ -2606,6 +2848,90 @@ mem_epoch_mark_current_aborting_locked(void)
 	epoch = mem_epoch_find_by_id(MemSmgrEpochId);
 	if (epoch != NULL && epoch->database_id == MyDatabaseId)
 		epoch->aborting = true;
+}
+
+static void
+mem_epoch_count_overlay(uint64 epoch_id, int64 *forks, int64 *pages)
+{
+	HASH_SEQ_STATUS status;
+	MemSmgrForkEntry *fork;
+	MemSmgrPageEntry *page;
+
+	*forks = 0;
+	*pages = 0;
+
+	if (epoch_id == 0)
+		return;
+
+	hash_seq_init(&status, MemSmgrEpochForkHash);
+	while ((fork = hash_seq_search(&status)) != NULL)
+	{
+		if (fork->key.epoch_id == epoch_id)
+			(*forks)++;
+	}
+
+	hash_seq_init(&status, MemSmgrEpochPageHash);
+	while ((page = hash_seq_search(&status)) != NULL)
+	{
+		if (page->key.epoch_id == epoch_id)
+			(*pages)++;
+	}
+}
+
+static int
+mem_epoch_collect_stats(MemSmgrEpochStatsRow *rows, uint32 *arena_next_pages,
+						uint32 *arena_reusable_pages)
+{
+	int			nrows = 0;
+
+	*arena_next_pages = 0;
+	*arena_reusable_pages = 0;
+
+	if (MemSmgrState == NULL || MemSmgrState->page_data == NULL ||
+		MemSmgrEpochForkHash == NULL || MemSmgrEpochPageHash == NULL)
+		return 0;
+
+	LWLockAcquire(&MemSmgrState->lock, LW_SHARED);
+
+	*arena_next_pages = Min(MemSmgrState->next_page,
+							(uint32) MEMSMGR_SHARED_MAX_PAGES);
+	*arena_reusable_pages = Min(MemSmgrState->free_page_count,
+								*arena_next_pages);
+	for (int i = 0; i < MEMSMGR_MAX_EPOCHS; i++)
+	{
+		MemSmgrEpochState *epoch = &MemSmgrState->epochs[i];
+		MemSmgrEpochStatsRow *row;
+
+		if (!epoch->active)
+			continue;
+
+		row = &rows[nrows++];
+		row->epoch_id = epoch->epoch_id;
+		row->database_id = epoch->database_id;
+		strlcpy(row->name, epoch->name, sizeof(row->name));
+		strlcpy(row->snapshot_name, epoch->snapshot_name,
+				sizeof(row->snapshot_name));
+		row->participants = epoch->participants;
+		row->joined = MemSmgrEpochActiveFlag &&
+			MemSmgrEpochId == epoch->epoch_id;
+		row->session_bound = row->joined && MemSmgrEpochSessionBound;
+		row->aborting = epoch->aborting;
+		row->base_nforks = epoch->base_nforks;
+		row->base_npages = epoch->base_npages;
+		mem_epoch_count_overlay(epoch->epoch_id, &row->overlay_forks,
+								&row->overlay_pages);
+		row->overlay_buffers = 0;
+		row->dirty_overlay_buffers = 0;
+	}
+
+	LWLockRelease(&MemSmgrState->lock);
+
+	for (int i = 0; i < nrows; i++)
+		FastForkEpochCountBuffers(rows[i].epoch_id,
+								  &rows[i].overlay_buffers,
+								  &rows[i].dirty_overlay_buffers);
+
+	return nrows;
 }
 
 static void
@@ -2965,7 +3291,7 @@ mem_epoch_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 	if (entry != NULL || !create)
 		return entry;
 
-	page_index = mem_alloc_page_index();
+	page_index = mem_alloc_page_index(key.epoch_id);
 	entry = hash_search(MemSmgrEpochPageHash, &key, HASH_ENTER_NULL, &found);
 	if (entry == NULL)
 	{

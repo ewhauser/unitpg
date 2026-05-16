@@ -160,6 +160,12 @@ Practical integration notes:
 - `pg_fastfork_epoch_finish(test_id)` is safe to call more than once during
   cleanup. If another cleanup path already discarded the named epoch, the later
   call is a no-op.
+- `pg_fastfork_epoch_stats()` reports one `arena` row plus one row for each
+  active epoch. The arena row makes the page limit explicit as postmaster-wide;
+  epoch rows include the epoch name, database, participant count, storage
+  overlay pages, and tagged shared buffers. Query it before and after
+  `pg_fastfork_epoch_finish(test_id)` to confirm that an epoch's overlay rows
+  disappeared and the active overlay totals returned to zero.
 - DDL inside session-bound named epochs is not supported yet. Run migrations and
   schema setup before `pg_fastfork_snapshot('fixture')`. Use the older
   transaction-bound `BEGIN; SELECT pg_fastfork_epoch_begin(); ... ROLLBACK;`
