@@ -1091,6 +1091,9 @@ set_null_conf(void)
 static const char *
 choose_dsm_implementation(void)
 {
+#ifdef USE_TEST_NO_SYSV_SHARED_MEMORY
+	return "mmap";
+#else
 #if defined(HAVE_SHM_OPEN) && !defined(__sun__)
 	int			ntries = 10;
 	pg_prng_state prng_state;
@@ -1123,6 +1126,7 @@ choose_dsm_implementation(void)
 #else
 	return "sysv";
 #endif
+#endif							/* USE_TEST_NO_SYSV_SHARED_MEMORY */
 }
 
 /*

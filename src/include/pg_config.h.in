@@ -108,6 +108,10 @@
    macOS. (--enable-test-macos-named-posix-semaphores) */
 #undef USE_TEST_MACOS_NAMED_POSIX_SEMAPHORES
 
+/* Define to 1 to use mmap-only shared memory without the SysV interlock.
+   (--enable-test-no-sysv-shared-memory) */
+#undef USE_TEST_NO_SYSV_SHARED_MEMORY
+
 /* Define to 1 if you have the `append_history' function. */
 #undef HAVE_APPEND_HISTORY
 

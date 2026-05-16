@@ -91,6 +91,9 @@ option('test_no_data_directory_startup', type: 'boolean', value: false,
 option('test_macos_named_posix_semaphores', type: 'boolean', value: false,
   description: 'Use named POSIX semaphores instead of SysV semaphores on macOS for test-only builds')
 
+option('test_no_sysv_shared_memory', type: 'boolean', value: false,
+  description: 'Use mmap-only shared memory without the SysV interlock for test-only builds')
+
 option('PG_TEST_EXTRA', type: 'string', value: '',
   description: 'Enable selected extra tests. Overridden by PG_TEST_EXTRA environment variable.')
 

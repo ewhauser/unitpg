@@ -524,6 +524,7 @@ cdata.set('USE_TEST_NO_RECOVERY_STARTUP', get_option('test_no_recovery_startup')
 cdata.set('USE_TEST_SEED_ONLY_STARTUP', get_option('test_seed_only_startup') ? 1 : false)
 cdata.set('USE_TEST_NO_DATA_DIRECTORY_STARTUP', get_option('test_no_data_directory_startup') ? 1 : false)
 cdata.set('USE_TEST_MACOS_NAMED_POSIX_SEMAPHORES', get_option('test_macos_named_posix_semaphores') ? 1 : false)
+cdata.set('USE_TEST_NO_SYSV_SHARED_MEMORY', get_option('test_no_sysv_shared_memory') ? 1 : false)
 
 if get_option('test_no_wal_assembly') and not get_option('test_fake_wal')
   error('test_no_wal_assembly requires test_fake_wal')
@@ -571,6 +572,10 @@ endif
 
 if get_option('test_macos_named_posix_semaphores') and host_system != 'darwin'
   error('test_macos_named_posix_semaphores is only supported on macOS')
+endif
+
+if get_option('test_no_sysv_shared_memory') and host_system == 'windows'
+  error('test_no_sysv_shared_memory is only supported on non-Windows platforms')
 endif
 
 blocksize = get_option('blocksize').to_int() * 1024

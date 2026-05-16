@@ -16,9 +16,10 @@ explicitly says otherwise.
 - Do preserve parser/planner/executor behavior, MVCC visibility, rollback,
   relcache/syscache correctness, ordinary DDL/query behavior, and constraints
   for supported app-test workloads.
-- On macOS, prefer the fast-fork named POSIX semaphore flag over SysV
-  semaphores for validation and benchmark builds. This avoids leaving SysV
-  semaphore sets behind when a test postmaster is killed.
+- On macOS, prefer the fast-fork named POSIX semaphore and no-SysV shared
+  memory flags for validation and benchmark builds. This avoids SysV IPC in
+  sandboxed test launchers and avoids leaving IPC resources behind when a test
+  postmaster is killed.
 - Update the performance snapshot in `README.md` whenever committing a
   performance change, or state there why the table is unchanged.
 - Do not commit generated benchmark results under `bench/results/`, build

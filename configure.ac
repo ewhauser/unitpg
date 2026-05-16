@@ -428,6 +428,19 @@ if test "$enable_test_macos_named_posix_semaphores" = yes; then
 fi
 
 #
+# Test-only no SysV shared memory
+#
+PGAC_ARG_BOOL(enable, test-no-sysv-shared-memory, no,
+              [use mmap-only shared memory without the SysV interlock (for testing)],
+              [AC_DEFINE([USE_TEST_NO_SYSV_SHARED_MEMORY], 1,
+                         [Define to 1 to use mmap-only shared memory without the SysV interlock. (--enable-test-no-sysv-shared-memory)])])
+AC_SUBST(enable_test_no_sysv_shared_memory)
+if test "$enable_test_no_sysv_shared_memory" = yes &&
+   test "$PORTNAME" = "win32"; then
+  AC_MSG_ERROR([--enable-test-no-sysv-shared-memory is only supported on non-Windows platforms])
+fi
+
+#
 # Block size
 #
 AC_MSG_CHECKING([for block size])

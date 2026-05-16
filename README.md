@@ -48,8 +48,8 @@ Specs live in [spec/](spec/). The current work is organized around:
 - trusted DDL shortcuts
 - startup/recovery benchmarks, startup fast paths, seed-only restarts, and
   no-data-directory startup
-- macOS named POSIX semaphore experiments to avoid SysV semaphore leaks after
-  killed test postmasters
+- macOS named POSIX semaphore and mmap-only shared-memory experiments to avoid
+  SysV IPC usage in sandboxed test launchers
 
 The agent workflow and validation loop are documented in [AGENTS.md](AGENTS.md).
 
@@ -193,8 +193,9 @@ python3 bench/compare_startup.py \
 - Keep stock PostgreSQL behavior unchanged when those flags are disabled.
 - Validate correctness before trusting benchmark numbers.
 - On macOS, the fast-fork validation build uses named POSIX semaphores instead
-  of SysV semaphores so killed test postmasters do not leave `ipcs -s`
-  semaphore sets behind.
+  of SysV semaphores and mmap-only shared memory without the SysV interlock.
+  This avoids SysV IPC usage in sandboxed test launchers and avoids leaving
+  `ipcs` resources behind after killed test postmasters.
 - Do not commit generated benchmark results from `bench/results/` or build
   artifacts from `bench/.build/`.
 - When a change is meant to improve performance, update the performance table

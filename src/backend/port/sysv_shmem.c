@@ -22,9 +22,11 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/file.h>
+#ifndef USE_TEST_NO_SYSV_SHARED_MEMORY
 #include <sys/ipc.h>
-#include <sys/mman.h>
 #include <sys/shm.h>
+#endif
+#include <sys/mman.h>
 #include <sys/stat.h>
 
 #include "miscadmin.h"
@@ -67,7 +69,11 @@
  * to sysv (though this is not the default).
  */
 
+#if defined(USE_TEST_NO_SYSV_SHARED_MEMORY) && defined(EXEC_BACKEND)
+#error cannot use test-only mmap shared memory without SysV interlock with EXEC_BACKEND
+#endif
 
+#ifndef USE_TEST_NO_SYSV_SHARED_MEMORY
 typedef key_t IpcMemoryKey;		/* shared memory key passed to shmget(2) */
 typedef int IpcMemoryId;		/* shared memory ID returned by shmget(2) */
 
@@ -90,6 +96,7 @@ typedef enum
 	SHMSTATE_FOREIGN,			/* exists, but not pertinent to DataDir */
 	SHMSTATE_UNATTACHED,		/* pertinent to DataDir, no attached PIDs */
 } IpcMemoryState;
+#endif
 
 
 unsigned long UsedShmemSegID = 0;
@@ -98,14 +105,17 @@ void	   *UsedShmemSegAddr = NULL;
 static Size AnonymousShmemSize;
 static void *AnonymousShmem = NULL;
 
+#ifndef USE_TEST_NO_SYSV_SHARED_MEMORY
 static void *InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size);
 static void IpcMemoryDetach(int status, Datum shmaddr);
 static void IpcMemoryDelete(int status, Datum shmId);
 static IpcMemoryState PGSharedMemoryAttach(IpcMemoryId shmId,
 										   void *attachAt,
 										   PGShmemHeader **addr);
+#endif
 
 
+#ifndef USE_TEST_NO_SYSV_SHARED_MEMORY
 /*
  *	InternalIpcMemoryCreate(memKey, size)
  *
@@ -302,6 +312,7 @@ IpcMemoryDelete(int status, Datum shmId)
 		elog(LOG, "shmctl(%d, %d, 0) failed: %m",
 			 DatumGetInt32(shmId), IPC_RMID);
 }
+#endif							/* !USE_TEST_NO_SYSV_SHARED_MEMORY */
 
 /*
  * PGSharedMemoryIsInUse
@@ -317,6 +328,9 @@ IpcMemoryDelete(int status, Datum shmId)
 bool
 PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 {
+#ifdef USE_TEST_NO_SYSV_SHARED_MEMORY
+	return false;
+#else
 	PGShmemHeader *memAddress;
 	IpcMemoryState state;
 
@@ -334,6 +348,7 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
 			return true;
 	}
 	return true;
+#endif
 }
 
 /*
@@ -344,6 +359,7 @@ PGSharedMemoryIsInUse(unsigned long id1, unsigned long id2)
  *
  * *addr is set to the segment memory address if we attached to it, else NULL.
  */
+#ifndef USE_TEST_NO_SYSV_SHARED_MEMORY
 static IpcMemoryState
 PGSharedMemoryAttach(IpcMemoryId shmId,
 					 void *attachAt,
@@ -453,6 +469,7 @@ PGSharedMemoryAttach(IpcMemoryId shmId,
 	 */
 	return shmStat.shm_nattch == 0 ? SHMSTATE_UNATTACHED : SHMSTATE_ATTACHED;
 }
+#endif							/* !USE_TEST_NO_SYSV_SHARED_MEMORY */
 
 /*
  * Identify the huge page size to use, and compute the related mmap flags.
@@ -702,11 +719,13 @@ PGShmemHeader *
 PGSharedMemoryCreate(Size size,
 					 PGShmemHeader **shim)
 {
+#ifndef USE_TEST_NO_SYSV_SHARED_MEMORY
 	IpcMemoryKey NextShmemSegID;
 	void	   *memAddress;
+	Size		sysvsize;
+#endif
 	PGShmemHeader *hdr;
 	struct stat statbuf;
-	Size		sysvsize;
 
 	/*
 	 * We use the data directory's ID info (inode and device numbers) to
@@ -736,6 +755,33 @@ PGSharedMemoryCreate(Size size,
 	/* Room for a header? */
 	Assert(size > MAXALIGN(sizeof(PGShmemHeader)));
 
+#ifdef USE_TEST_NO_SYSV_SHARED_MEMORY
+	if (shared_memory_type != SHMEM_TYPE_MMAP)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("test-only no-SysV shared memory requires \"shared_memory_type\" = \"mmap\"")));
+
+	AnonymousShmem = CreateAnonymousSegment(&size);
+	AnonymousShmemSize = size;
+
+	/* Register on-exit routine to unmap the anonymous segment */
+	on_shmem_exit(AnonymousShmemDetach, (Datum) 0);
+
+	hdr = (PGShmemHeader *) AnonymousShmem;
+	hdr->creatorPID = getpid();
+	hdr->magic = PGShmemMagic;
+	hdr->dsm_control = 0;
+	hdr->device = statbuf.st_dev;
+	hdr->inode = statbuf.st_ino;
+	hdr->totalsize = size;
+	hdr->content_offset = MAXALIGN(sizeof(PGShmemHeader));
+	*shim = hdr;
+
+	UsedShmemSegAddr = AnonymousShmem;
+	UsedShmemSegID = 0;
+
+	return hdr;
+#else
 	if (shared_memory_type == SHMEM_TYPE_MMAP)
 	{
 		AnonymousShmem = CreateAnonymousSegment(&size);
@@ -872,6 +918,7 @@ PGSharedMemoryCreate(Size size,
 		return hdr;
 	memcpy(AnonymousShmem, hdr, sizeof(PGShmemHeader));
 	return (PGShmemHeader *) AnonymousShmem;
+#endif							/* USE_TEST_NO_SYSV_SHARED_MEMORY */
 }
 
 #ifdef EXEC_BACKEND
@@ -973,6 +1020,12 @@ PGSharedMemoryDetach(void)
 {
 	if (UsedShmemSegAddr != NULL)
 	{
+#ifdef USE_TEST_NO_SYSV_SHARED_MEMORY
+		if (UsedShmemSegAddr != AnonymousShmem)
+			elog(LOG, "unexpected shared memory address without SysV interlock: %p",
+				 UsedShmemSegAddr);
+		UsedShmemSegAddr = NULL;
+#else
 		if ((shmdt(UsedShmemSegAddr) < 0)
 #if defined(EXEC_BACKEND) && defined(__CYGWIN__)
 		/* Work-around for cygipc exec bug */
@@ -981,6 +1034,7 @@ PGSharedMemoryDetach(void)
 			)
 			elog(LOG, "shmdt(%p) failed: %m", UsedShmemSegAddr);
 		UsedShmemSegAddr = NULL;
+#endif
 	}
 
 	if (AnonymousShmem != NULL)

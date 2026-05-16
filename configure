@@ -787,6 +787,7 @@ enable_test_no_recovery_startup
 enable_test_seed_only_startup
 enable_test_no_data_directory_startup
 enable_test_macos_named_posix_semaphores
+enable_test_no_sysv_shared_memory
 PG_TEST_EXTRA
 enable_tap_tests
 enable_dtrace
@@ -882,6 +883,7 @@ enable_test_no_recovery_startup
 enable_test_seed_only_startup
 enable_test_no_data_directory_startup
 enable_test_macos_named_posix_semaphores
+enable_test_no_sysv_shared_memory
 with_blocksize
 with_segsize
 with_segsize_blocks
@@ -1620,6 +1622,9 @@ Optional Features:
   --enable-test-macos-named-posix-semaphores
                           use named POSIX semaphores instead of SysV
                           semaphores on macOS (for testing)
+  --enable-test-no-sysv-shared-memory
+                          use mmap-only shared memory without the SysV
+                          interlock (for testing)
   --enable-depend         turn on automatic dependency tracking
   --enable-cassert        enable assertion checks (for debugging)
   --disable-largefile     omit support for large files
@@ -4230,6 +4235,39 @@ if test "$enable_test_macos_named_posix_semaphores" = yes; then
   fi
   PREFERRED_SEMAPHORES=NAMED_POSIX
   USE_SYSV_SEMAPHORES=
+fi
+
+
+#
+# Test-only no SysV shared memory
+#
+
+
+# Check whether --enable-test-no-sysv-shared-memory was given.
+if test "${enable_test_no_sysv_shared_memory+set}" = set; then :
+  enableval=$enable_test_no_sysv_shared_memory;
+  case $enableval in
+    yes)
+
+$as_echo "#define USE_TEST_NO_SYSV_SHARED_MEMORY 1" >>confdefs.h
+
+      ;;
+    no)
+      :
+      ;;
+    *)
+      as_fn_error $? "no argument expected for --enable-test-no-sysv-shared-memory option" "$LINENO" 5
+      ;;
+  esac
+
+else
+  enable_test_no_sysv_shared_memory=no
+
+fi
+
+if test "$enable_test_no_sysv_shared_memory" = yes &&
+   test "$PORTNAME" = "win32"; then
+  as_fn_error $? "--enable-test-no-sysv-shared-memory is only supported on non-Windows platforms" "$LINENO" 5
 fi
 
 

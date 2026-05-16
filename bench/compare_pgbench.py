@@ -126,6 +126,7 @@ def build_with_meson(
     seed_only_startup: bool,
     no_data_directory_startup: bool,
     macos_named_posix_semaphores: bool,
+    no_sysv_shared_memory: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -162,6 +163,7 @@ def build_with_meson(
         f"-Dtest_seed_only_startup={'true' if seed_only_startup else 'false'}",
         f"-Dtest_no_data_directory_startup={'true' if no_data_directory_startup else 'false'}",
         f"-Dtest_macos_named_posix_semaphores={'true' if macos_named_posix_semaphores else 'false'}",
+        f"-Dtest_no_sysv_shared_memory={'true' if no_sysv_shared_memory else 'false'}",
     ]
     if reuse and (build_dir / "build.ninja").exists():
         setup_cmd.insert(2, "--reconfigure")
@@ -192,6 +194,7 @@ def build_with_configure(
     seed_only_startup: bool,
     no_data_directory_startup: bool,
     macos_named_posix_semaphores: bool,
+    no_sysv_shared_memory: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -243,6 +246,8 @@ def build_with_configure(
         configure_cmd.append("--enable-test-no-data-directory-startup")
     if macos_named_posix_semaphores:
         configure_cmd.append("--enable-test-macos-named-posix-semaphores")
+    if no_sysv_shared_memory:
+        configure_cmd.append("--enable-test-no-sysv-shared-memory")
 
     if not reuse or not (build_dir / "Makefile").exists():
         run_logged(configure_cmd, cwd=build_dir, log=log)
@@ -274,6 +279,7 @@ def build_variant(
     seed_only_startup: bool,
     no_data_directory_startup: bool,
     macos_named_posix_semaphores: bool,
+    no_sysv_shared_memory: bool,
     jobs: int,
     reuse: bool,
     skip_if_installed: bool,
@@ -302,6 +308,7 @@ def build_variant(
             seed_only_startup=seed_only_startup,
             no_data_directory_startup=no_data_directory_startup,
             macos_named_posix_semaphores=macos_named_posix_semaphores,
+            no_sysv_shared_memory=no_sysv_shared_memory,
             jobs=jobs,
             reuse=reuse,
             skip_if_installed=skip_if_installed,
@@ -326,6 +333,7 @@ def build_variant(
         seed_only_startup=seed_only_startup,
         no_data_directory_startup=no_data_directory_startup,
         macos_named_posix_semaphores=macos_named_posix_semaphores,
+        no_sysv_shared_memory=no_sysv_shared_memory,
         jobs=jobs,
         reuse=reuse,
         skip_if_installed=skip_if_installed,
@@ -546,6 +554,11 @@ def main() -> int:
         action="store_true",
         help="do not use named POSIX semaphores in the fast-fork build on macOS",
     )
+    parser.add_argument(
+        "--disable-no-sysv-shared-memory",
+        action="store_true",
+        help="do not use mmap-only shared memory in the fast-fork build on macOS",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -564,6 +577,9 @@ def main() -> int:
     )
     enable_macos_named_posix_semaphores = (
         sys.platform == "darwin" and not args.disable_macos_named_posix_semaphores
+    )
+    enable_no_sysv_shared_memory = (
+        sys.platform == "darwin" and not args.disable_no_sysv_shared_memory
     )
 
     source = args.source.resolve()
@@ -598,6 +614,7 @@ def main() -> int:
             seed_only_startup=False,
             no_data_directory_startup=False,
             macos_named_posix_semaphores=False,
+            no_sysv_shared_memory=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -627,6 +644,7 @@ def main() -> int:
             seed_only_startup=not args.disable_seed_only_startup,
             no_data_directory_startup=enable_no_data_directory_startup,
             macos_named_posix_semaphores=enable_macos_named_posix_semaphores,
+            no_sysv_shared_memory=enable_no_sysv_shared_memory,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -693,6 +711,7 @@ def main() -> int:
                 "seed_only_startup": False,
                 "no_data_directory_startup": False,
                 "macos_named_posix_semaphores": False,
+                "no_sysv_shared_memory": False,
                 "bin_dir": str(bins["baseline"]),
                 "summary": baseline_summary,
                 "runs": runs["baseline"],
@@ -714,6 +733,7 @@ def main() -> int:
                 "seed_only_startup": not args.disable_seed_only_startup,
                 "no_data_directory_startup": enable_no_data_directory_startup,
                 "macos_named_posix_semaphores": enable_macos_named_posix_semaphores,
+                "no_sysv_shared_memory": enable_no_sysv_shared_memory,
                 "bin_dir": str(bins["fakewal"]),
                 "summary": fakewal_summary,
                 "runs": runs["fakewal"],

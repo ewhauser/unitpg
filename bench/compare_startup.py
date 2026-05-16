@@ -244,6 +244,11 @@ def main() -> int:
         action="store_true",
         help="do not use named POSIX semaphores in the fast-fork build on macOS",
     )
+    parser.add_argument(
+        "--disable-no-sysv-shared-memory",
+        action="store_true",
+        help="do not use mmap-only shared memory in the fast-fork build on macOS",
+    )
     args = parser.parse_args()
 
     if args.rounds < 1:
@@ -259,6 +264,9 @@ def main() -> int:
         raise SystemExit("--mode no-data-dir requires no-data-directory startup support")
     enable_macos_named_posix_semaphores = (
         sys.platform == "darwin" and not args.disable_macos_named_posix_semaphores
+    )
+    enable_no_sysv_shared_memory = (
+        sys.platform == "darwin" and not args.disable_no_sysv_shared_memory
     )
 
     source = args.source.resolve()
@@ -293,6 +301,7 @@ def main() -> int:
             seed_only_startup=False,
             no_data_directory_startup=False,
             macos_named_posix_semaphores=False,
+            no_sysv_shared_memory=False,
             jobs=args.build_jobs,
             reuse=args.reuse_builds or not args.rebuild_baseline,
             skip_if_installed=not args.rebuild_baseline,
@@ -322,6 +331,7 @@ def main() -> int:
             seed_only_startup=not args.disable_seed_only_startup,
             no_data_directory_startup=enable_no_data_directory_startup,
             macos_named_posix_semaphores=enable_macos_named_posix_semaphores,
+            no_sysv_shared_memory=enable_no_sysv_shared_memory,
             jobs=args.build_jobs,
             reuse=args.reuse_builds,
             skip_if_installed=False,
@@ -402,6 +412,7 @@ def main() -> int:
                 "seed_only_startup": not args.disable_seed_only_startup,
                 "no_data_directory_startup": enable_no_data_directory_startup,
                 "macos_named_posix_semaphores": enable_macos_named_posix_semaphores,
+                "no_sysv_shared_memory": enable_no_sysv_shared_memory,
                 "bin_dir": str(bins["fakewal"]),
                 "run": runs["fakewal"],
             },

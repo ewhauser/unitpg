@@ -456,7 +456,7 @@ static const struct config_enum_entry recovery_init_sync_method_options[] = {
 };
 
 static const struct config_enum_entry shared_memory_options[] = {
-#ifndef WIN32
+#if !defined(WIN32) && !defined(USE_TEST_NO_SYSV_SHARED_MEMORY)
 	{"sysv", SHMEM_TYPE_SYSV, false},
 #endif
 #ifndef EXEC_BACKEND
