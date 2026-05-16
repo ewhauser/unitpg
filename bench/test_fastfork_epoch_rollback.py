@@ -218,10 +218,13 @@ SELECT pg_fastfork_epoch_start('named-b', 'fixture');
 PARALLEL_NAMED_CONN1_SQL = """
 SELECT pg_fastfork_epoch_join('named-a');
 BEGIN;
-INSERT INTO epoch_child VALUES (3000, 2, 60);
+INSERT INTO epoch_child
+SELECT 300000 + g, 2, g % 100
+FROM generate_series(1, 6000) AS g;
 SELECT pg_sleep(1.0);
 COMMIT;
-SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM epoch_child WHERE id = 3000)
+SELECT 1 / CASE WHEN (SELECT count(*) FROM epoch_child
+                      WHERE id BETWEEN 300001 AND 306000) = 6000
            THEN 1 ELSE 0 END;
 SELECT pg_fastfork_epoch_leave();
 """
@@ -230,9 +233,12 @@ SELECT pg_fastfork_epoch_leave();
 PARALLEL_NAMED_CONN2_SQL = """
 SELECT pg_fastfork_epoch_join('named-b');
 BEGIN;
-INSERT INTO epoch_child VALUES (3000, 3, 61);
+INSERT INTO epoch_child
+SELECT 300000 + g, 3, g % 100
+FROM generate_series(1, 6000) AS g;
 COMMIT;
-SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM epoch_child WHERE id = 3000)
+SELECT 1 / CASE WHEN (SELECT count(*) FROM epoch_child
+                      WHERE id BETWEEN 300001 AND 306000) = 6000
            THEN 1 ELSE 0 END;
 SELECT pg_fastfork_epoch_leave();
 """
@@ -244,8 +250,44 @@ SELECT pg_fastfork_epoch_finish('named-a');
 SELECT pg_fastfork_epoch_finish('named-b');
 DO $$
 BEGIN
-  IF EXISTS (SELECT 1 FROM epoch_child WHERE id = 3000) THEN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id BETWEEN 300001 AND 306000) THEN
     RAISE EXCEPTION 'parallel named epoch finish leaked inserted row';
+  END IF;
+END $$;
+"""
+
+
+REUSED_BACKEND_NAMED_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_restore('fixture');
+SELECT pg_fastfork_epoch_start('reuse-a', 'fixture');
+SELECT pg_fastfork_epoch_join('reuse-a');
+BEGIN;
+INSERT INTO epoch_child
+SELECT 400000 + g, 2, g % 100
+FROM generate_series(1, 6000) AS g;
+SELECT 1 / CASE WHEN (SELECT count(*) FROM epoch_child
+                      WHERE id BETWEEN 400001 AND 406000) = 6000
+           THEN 1 ELSE 0 END;
+ROLLBACK;
+SELECT pg_fastfork_epoch_leave();
+SELECT pg_fastfork_epoch_start('reuse-b', 'fixture');
+SELECT pg_fastfork_epoch_join('reuse-b');
+BEGIN;
+INSERT INTO epoch_child
+SELECT 400000 + g, 3, g % 100
+FROM generate_series(1, 6000) AS g;
+SELECT 1 / CASE WHEN (SELECT count(*) FROM epoch_child
+                      WHERE id BETWEEN 400001 AND 406000) = 6000
+           THEN 1 ELSE 0 END;
+ROLLBACK;
+SELECT pg_fastfork_epoch_leave();
+SELECT pg_fastfork_epoch_finish('reuse-a');
+SELECT pg_fastfork_epoch_finish('reuse-b');
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id BETWEEN 400001 AND 406000) THEN
+    RAISE EXCEPTION 'reused backend named epoch leaked inserted row';
   END IF;
 END $$;
 """
@@ -441,6 +483,7 @@ def main() -> int:
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + SESSION_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + NAMED_SQL)
         run_parallel_named_epochs(psql, conn_args, env)
+        run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + REUSED_BACKEND_NAMED_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + "SELECT pg_fastfork_restore('fixture');\n")
         run_parallel_epoch(psql, conn_args, env)
         expect_error(

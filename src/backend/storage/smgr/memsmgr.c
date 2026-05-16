@@ -44,6 +44,7 @@
 #include "utils/builtins.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/relcache.h"
 #include "utils/wait_event.h"
 
 /*
@@ -301,6 +302,7 @@ static void mem_delete_snapshot(MemSmgrSnapshot *snapshot);
 static MemSmgrSnapshot *mem_create_snapshot(const char *name);
 static void mem_capture_snapshot(MemSmgrSnapshot *snapshot);
 static void mem_restore_snapshot(MemSmgrSnapshot *snapshot);
+static void mem_epoch_reset_backend_caches(void);
 static void mem_restore_reset_caches(void);
 #endif
 
@@ -1019,6 +1021,7 @@ pg_fastfork_epoch_begin(PG_FUNCTION_ARGS)
 				 errmsg("fast-fork epoch transactions are not supported in parallel workers")));
 
 	mem_epoch_join_or_start("", MemSmgrLastRestoredSnapshot, true);
+	mem_epoch_reset_backend_caches();
 
 	PG_RETURN_VOID();
 #endif
@@ -1059,6 +1062,7 @@ pg_fastfork_epoch_session_begin(PG_FUNCTION_ARGS)
 
 	mem_epoch_join_or_start("", MemSmgrLastRestoredSnapshot, true);
 	MemSmgrEpochSessionBound = true;
+	mem_epoch_reset_backend_caches();
 
 	PG_RETURN_VOID();
 #endif
@@ -1172,6 +1176,7 @@ pg_fastfork_epoch_join(PG_FUNCTION_ARGS)
 
 	mem_epoch_join_or_start(name, NULL, true);
 	MemSmgrEpochSessionBound = true;
+	mem_epoch_reset_backend_caches();
 
 	pfree(name);
 	PG_RETURN_VOID();
@@ -1186,6 +1191,7 @@ pg_fastfork_epoch_leave(PG_FUNCTION_ARGS)
 #else
 	bool		finish_on_last = false;
 	bool		last_participant;
+	bool		cache_reset_done = false;
 	Oid			next_oid = InvalidOid;
 	uint32		oid_count = 0;
 
@@ -1214,12 +1220,15 @@ pg_fastfork_epoch_leave(PG_FUNCTION_ARGS)
 		TestFastForkSetOidState(next_oid, oid_count);
 		mem_epoch_discard();
 		mem_restore_reset_caches();
+		cache_reset_done = true;
 	}
 
 	MemSmgrEpochActiveFlag = false;
 	MemSmgrEpochSessionBound = false;
 	MemSmgrEpochSnapshot = NULL;
 	MemSmgrEpochId = 0;
+	if (!cache_reset_done)
+		mem_epoch_reset_backend_caches();
 
 	PG_RETURN_VOID();
 #endif
@@ -1480,6 +1489,7 @@ AtEOXact_FastForkEpoch(bool isCommit)
 {
 #if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
 	bool		last_participant;
+	bool		cache_reset_done = false;
 	Oid			next_oid = InvalidOid;
 	uint32		oid_count = 0;
 
@@ -1503,12 +1513,15 @@ AtEOXact_FastForkEpoch(bool isCommit)
 		TestFastForkSetOidState(next_oid, oid_count);
 		mem_epoch_discard();
 		mem_restore_reset_caches();
+		cache_reset_done = true;
 	}
 
 	MemSmgrEpochActiveFlag = false;
 	MemSmgrEpochSessionBound = false;
 	MemSmgrEpochSnapshot = NULL;
 	MemSmgrEpochId = 0;
+	if (!cache_reset_done)
+		mem_epoch_reset_backend_caches();
 #endif
 }
 
@@ -1804,6 +1817,18 @@ mem_restore_snapshot(MemSmgrSnapshot *snapshot)
 #ifdef USE_TEST_MEM_SMGR
 	TestFastForkSetOidState(snapshot->next_oid, snapshot->oid_count);
 #endif
+}
+
+static void
+mem_epoch_reset_backend_caches(void)
+{
+	/*
+	 * A backend can join many named epochs over its lifetime.  Relcache and
+	 * smgr state are backend-local but epoch overlays are not, so btree
+	 * metapage caches and cached fork sizes must not survive an epoch boundary.
+	 */
+	RelationCacheInvalidate(false);
+	ResetSequenceCaches();
 }
 
 static void
