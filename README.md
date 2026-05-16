@@ -213,12 +213,12 @@ GitHub release containing minimal fast-fork server archives for:
 - `macos-aarch64`
 
 Each archive contains the server runtime needed to initialize, start, stop, and
-connect to a fast-fork cluster: `initdb`, `pg_ctl`, `postgres`, `psql`, optional
-server-adjacent helpers such as `postmaster` and `pg_isready`, server runtime
-libraries, pgvector extension files, and `share` runtime data files. The release
-archives intentionally omit source code, benchmark outputs, headers, PGXS files,
-documentation, and backup or auxiliary client utilities such as `pg_dump` and
-`pg_basebackup`.
+connect to a fast-fork cluster, plus `pg_dump` for one-database dumps: `initdb`,
+`pg_ctl`, `pg_dump`, `postgres`, `psql`, optional server-adjacent helpers such
+as `postmaster` and `pg_isready`, server runtime libraries, pgvector extension
+files, and `share` runtime data files. The release archives intentionally omit
+source code, benchmark outputs, headers, PGXS files, documentation, and backup
+or auxiliary client utilities other than `pg_dump`, such as `pg_basebackup`.
 
 ## Measure Runtime Performance
 
