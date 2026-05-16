@@ -75,6 +75,49 @@ copy_required_tree() {
 	cp -Rp "$source" "$destination"
 }
 
+is_runtime_shared_object() {
+	local path="$1"
+	local base
+	local description
+
+	base="$(basename "$path")"
+	case "$base" in
+		*.so|*.so.*|*.dylib)
+			return 0
+			;;
+	esac
+
+	description="$(file "$path" 2>/dev/null || true)"
+	case "$description" in
+		*'ELF'*'shared object'*|*'Mach-O'*'dynamically linked shared library'*|*'Mach-O'*'bundle'*)
+			return 0
+			;;
+	esac
+
+	return 1
+}
+
+copy_runtime_shared_tree() {
+	local source_root="$1"
+	local destination_root="$2"
+	local path
+	local relative_path
+	local destination_dir
+
+	if [[ ! -d "$source_root" ]]; then
+		return
+	fi
+
+	while IFS= read -r -d '' path; do
+		if is_runtime_shared_object "$path"; then
+			relative_path="${path#$source_root/}"
+			destination_dir="$destination_root/$(dirname "$relative_path")"
+			mkdir -p "$destination_dir"
+			cp -pP "$path" "$destination_dir/"
+		fi
+	done < <(find "$source_root" \( -type f -o -type l \) -print0)
+}
+
 # Keep the executable surface intentionally small: enough to initialize, run,
 # and stop a fast-fork server without shipping client suites, benchmarks,
 # headers, documentation, or developer tooling.
@@ -88,18 +131,37 @@ copy_required_tree share
 rm -rf "$PACKAGE_DIR/share/doc" "$PACKAGE_DIR/share/man"
 
 if [[ -d "$INSTALL_PREFIX/lib" ]]; then
-	while IFS= read -r -d '' library; do
-		cp -pP "$library" "$PACKAGE_DIR/lib/"
-	done < <(
-		find "$INSTALL_PREFIX/lib" -maxdepth 1 \( -type f -o -type l \) \
-			\( -name '*.so' -o -name '*.so.*' -o -name '*.dylib' \) -print0
-	)
-
-	if [[ -d "$INSTALL_PREFIX/lib/postgresql" ]]; then
-		cp -Rp "$INSTALL_PREFIX/lib/postgresql" "$PACKAGE_DIR/lib/postgresql"
-		rm -rf "$PACKAGE_DIR/lib/postgresql/pgxs"
-	fi
+	copy_runtime_shared_tree "$INSTALL_PREFIX/lib" "$PACKAGE_DIR/lib"
 fi
+
+mirror_pkglib_layouts() {
+	local path
+	local base
+
+	mkdir -p "$PACKAGE_DIR/lib/postgresql"
+
+	while IFS= read -r -d '' path; do
+		if ! is_runtime_shared_object "$path"; then
+			continue
+		fi
+		base="$(basename "$path")"
+		if [[ ! -e "$PACKAGE_DIR/lib/postgresql/$base" ]]; then
+			cp -pP "$path" "$PACKAGE_DIR/lib/postgresql/"
+		fi
+	done < <(find "$PACKAGE_DIR/lib" -maxdepth 1 \( -type f -o -type l \) -print0)
+
+	while IFS= read -r -d '' path; do
+		if ! is_runtime_shared_object "$path"; then
+			continue
+		fi
+		base="$(basename "$path")"
+		if [[ ! -e "$PACKAGE_DIR/lib/$base" ]]; then
+			cp -pP "$path" "$PACKAGE_DIR/lib/"
+		fi
+	done < <(find "$PACKAGE_DIR/lib/postgresql" -maxdepth 1 \( -type f -o -type l \) -print0)
+}
+
+mirror_pkglib_layouts
 
 cat > "$PACKAGE_DIR/README.fastfork.txt" <<EOF
 This archive contains a minimal PostgreSQL fast-fork server runtime for $TARGET.
@@ -174,6 +236,9 @@ rewrite_darwin_install_names() {
 rewrite_linux_rpaths() {
 	local path
 	local rpath
+	local dir
+	local relative_dir
+	local bin_rpath
 
 	if [[ "$TARGET" != linux-* ]]; then
 		return
@@ -183,6 +248,12 @@ rewrite_linux_rpaths() {
 		exit 1
 	fi
 
+	bin_rpath='$ORIGIN/../lib'
+	while IFS= read -r -d '' dir; do
+		relative_dir="${dir#$PACKAGE_DIR/lib}"
+		bin_rpath="$bin_rpath:\$ORIGIN/../lib$relative_dir"
+	done < <(find "$PACKAGE_DIR/lib" -mindepth 1 -type d -print0)
+
 	while IFS= read -r -d '' path; do
 		if ! file "$path" | grep -q 'ELF'; then
 			continue
@@ -190,13 +261,13 @@ rewrite_linux_rpaths() {
 
 		case "$path" in
 			"$PACKAGE_DIR/bin/"*)
-				rpath='$ORIGIN/../lib'
+				rpath="$bin_rpath"
 				;;
 			"$PACKAGE_DIR/lib/postgresql/"*)
-				rpath='$ORIGIN/..'
+				rpath='$ORIGIN:$ORIGIN/..'
 				;;
 			"$PACKAGE_DIR/lib/"*)
-				rpath='$ORIGIN'
+				rpath='$ORIGIN:$ORIGIN/..'
 				;;
 			*)
 				continue

@@ -66,15 +66,24 @@ jobs:
       - name: Build fast-fork server
         run: ./test-fastfork.sh quick --setup-only --wipe
 
-      - name: Install into staging prefix
-        run: meson install -C "$FASTFORK_BUILD_DIR" --destdir "$RUNNER_TEMP/postgres-install" --quiet
+      - name: Create temporary server install
+        run: meson test -C "$FASTFORK_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
 
       - name: Package server distribution
         run: |
           ci/package-server-dist.sh \
-            "$RUNNER_TEMP/postgres-install/usr/local/pgsql" \
+            "$FASTFORK_BUILD_DIR/tmp_install/usr/local/pgsql" \
             "${{ matrix.target }}" \
             "$RUNNER_TEMP/server-dist"
+
+      - name: Check package module layout
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/server-dist/postgres-fastfork-${{ matrix.target }}"
+          find "$dist/lib" -maxdepth 3 \
+            \( -name 'dict_snowball*' -o -name 'plpgsql*' \) \
+            -print
+          test -n "$(find "$dist/lib" -maxdepth 3 -name 'dict_snowball*' -print -quit)"
 
       - name: Smoke-test packaged server
         run: |
