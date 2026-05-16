@@ -295,6 +295,9 @@ extern BlockNumber RelationGetNumberOfBlocksInFork(Relation relation,
 extern void FlushOneBuffer(Buffer buffer);
 extern void FlushRelationBuffers(Relation rel);
 extern void FlushRelationsAllBuffers(SMgrRelation *smgrs, int nrels);
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+extern void FastForkEpochDropBuffers(uint64 epoch_id);
+#endif
 extern void CreateAndCopyRelationData(RelFileLocator src_rlocator,
 									  RelFileLocator dst_rlocator,
 									  bool permanent);

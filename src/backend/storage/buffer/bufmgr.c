@@ -5184,6 +5184,36 @@ DropDatabaseBuffers(Oid dbid)
 	}
 }
 
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+void
+FastForkEpochDropBuffers(uint64 epoch_id)
+{
+	int			i;
+
+	if (epoch_id == 0)
+		return;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *bufHdr = GetBufferDescriptor(i);
+
+		/*
+		 * Named epochs share relation identity but have distinct buffer tags.
+		 * When one epoch is discarded, do not drop dirty buffers that belong
+		 * to another still-running epoch.
+		 */
+		if (bufHdr->tag.fastfork_epoch_id != epoch_id)
+			continue;
+
+		LockBufHdr(bufHdr);
+		if (bufHdr->tag.fastfork_epoch_id == epoch_id)
+			InvalidateBuffer(bufHdr);	/* releases spinlock */
+		else
+			UnlockBufHdr(bufHdr);
+	}
+}
+#endif
+
 /* ---------------------------------------------------------------------
  *		FlushRelationBuffers
  *

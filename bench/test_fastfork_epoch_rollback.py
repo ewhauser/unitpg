@@ -257,6 +257,55 @@ END $$;
 """
 
 
+PARALLEL_NAMED_ACTIVE_CONN1_SQL = """
+SELECT pg_fastfork_epoch_join('active-a');
+SET enable_seqscan = off;
+BEGIN;
+INSERT INTO epoch_child
+SELECT 500000 + g, 2, g % 100
+FROM generate_series(1, 6000) AS g;
+SELECT pg_sleep(1.0);
+SELECT 1 / CASE WHEN (SELECT count(*) FROM epoch_child
+                      WHERE id BETWEEN 500001 AND 506000) = 6000
+           THEN 1 ELSE 0 END;
+COMMIT;
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+PARALLEL_NAMED_ACTIVE_CONN2_SQL = """
+SELECT pg_fastfork_epoch_join('active-b');
+SET enable_seqscan = off;
+BEGIN;
+INSERT INTO epoch_child
+SELECT 500000 + g, 3, g % 100
+FROM generate_series(1, 6000) AS g;
+COMMIT;
+SELECT 1 / CASE WHEN (SELECT count(*) FROM epoch_child
+                      WHERE id BETWEEN 500001 AND 506000) = 6000
+           THEN 1 ELSE 0 END;
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+PARALLEL_NAMED_ACTIVE_FINISH_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_epoch_finish('active-b');
+"""
+
+
+PARALLEL_NAMED_ACTIVE_FINAL_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_epoch_finish('active-a');
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id BETWEEN 500001 AND 506000) THEN
+    RAISE EXCEPTION 'active parallel named epoch finish leaked inserted row';
+  END IF;
+END $$;
+"""
+
+
 REUSED_BACKEND_NAMED_SQL = r"""
 \set ON_ERROR_STOP on
 SELECT pg_fastfork_restore('fixture');
@@ -446,6 +495,61 @@ def run_parallel_named_epochs(psql: str, conn_args: list[str], env: dict[str, st
     run([psql, *conn_args, "-d", "bench"], env=env, input_text=PARALLEL_NAMED_FINISH_SQL)
 
 
+def run_parallel_named_finish_while_active(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
+    setup_sql = (
+        CAPTURE_SQL
+        + "\nSELECT pg_fastfork_restore('fixture');\n"
+        + "SELECT pg_fastfork_epoch_start('active-a', 'fixture');\n"
+        + "SELECT pg_fastfork_epoch_start('active-b', 'fixture');\n"
+    )
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=setup_sql)
+
+    cmd = [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1"]
+    first = subprocess.Popen(
+        [*cmd, "-c", PARALLEL_NAMED_ACTIVE_CONN1_SQL],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.2)
+        second = run([*cmd, "-c", PARALLEL_NAMED_ACTIVE_CONN2_SQL], env=env, check=False)
+        if second.returncode != 0:
+            raise RuntimeError(
+                "parallel named active second participant failed:\n"
+                f"{second.stdout or ''}{second.stderr or ''}"
+            )
+
+        finish = run(
+            [psql, *conn_args, "-d", "bench"],
+            env=env,
+            input_text=PARALLEL_NAMED_ACTIVE_FINISH_SQL,
+            check=False,
+        )
+        if finish.returncode != 0:
+            raise RuntimeError(
+                "parallel named active finish failed:\n"
+                f"{finish.stdout or ''}{finish.stderr or ''}"
+            )
+
+        stdout, stderr = first.communicate(timeout=10)
+        if first.returncode != 0:
+            raise RuntimeError(
+                "parallel named active first participant failed:\n"
+                f"{stdout or ''}{stderr or ''}"
+            )
+    finally:
+        if first.poll() is None:
+            first.terminate()
+            try:
+                first.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                first.kill()
+
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=PARALLEL_NAMED_ACTIVE_FINAL_SQL)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", required=True, type=Path, help="PostgreSQL install bin directory")
@@ -483,6 +587,7 @@ def main() -> int:
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + SESSION_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + NAMED_SQL)
         run_parallel_named_epochs(psql, conn_args, env)
+        run_parallel_named_finish_while_active(psql, conn_args, env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + REUSED_BACKEND_NAMED_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + "SELECT pg_fastfork_restore('fixture');\n")
         run_parallel_epoch(psql, conn_args, env)
