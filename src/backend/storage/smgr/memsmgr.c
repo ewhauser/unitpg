@@ -2753,9 +2753,7 @@ mem_epoch_finish_named(const char *name)
 	if (epoch == NULL)
 	{
 		LWLockRelease(&MemSmgrState->lock);
-		ereport(ERROR,
-				(errcode(ERRCODE_UNDEFINED_OBJECT),
-				 errmsg("fast-fork epoch \"%s\" does not exist", name)));
+		return;
 	}
 
 	if (epoch->participants > 0)

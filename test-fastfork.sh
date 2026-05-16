@@ -334,6 +334,10 @@ fix_darwin_tmp_install_names
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 "${PYTHON:-python3}" "$ROOT/bench/test_fastfork_epoch_rollback.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
+if [[ "$MODE" != "quick" ]]; then
+	"${PYTHON:-python3}" "$ROOT/bench/test_fastfork_named_epoch_stress.py" \
+		--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
+fi
 "${PYTHON:-python3}" "$ROOT/bench/test_seed_only_startup.py" \
 	--bin "$BUILD_DIR/tmp_install/usr/local/pgsql/bin"
 "${PYTHON:-python3}" "$ROOT/bench/test_no_data_directory_startup.py" \
