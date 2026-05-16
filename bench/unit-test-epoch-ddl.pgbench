@@ -1,0 +1,41 @@
+\set probe_id random(1, :bench_rows)
+\set delta random(1, 50)
+\if :setup_done
+\else
+CREATE TABLE bench_parent (
+    id integer PRIMARY KEY,
+    payload text NOT NULL,
+    bucket integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+INSERT INTO bench_parent (id, payload, bucket)
+SELECT g, md5(g::text), g % 16
+FROM generate_series(1, :bench_rows) AS g;
+CREATE INDEX bench_parent_bucket_idx ON bench_parent (bucket, id);
+ANALYZE bench_parent;
+SELECT pg_fastfork_snapshot('bench_fixture');
+SELECT pg_fastfork_restore('bench_fixture');
+\set setup_done 1
+\endif
+BEGIN;
+SELECT pg_fastfork_epoch_begin();
+CREATE TABLE bench_epoch_local (
+    id integer PRIMARY KEY,
+    parent_id integer NOT NULL REFERENCES bench_parent(id),
+    amount integer NOT NULL,
+    payload text NOT NULL
+);
+CREATE INDEX bench_epoch_local_parent_idx ON bench_epoch_local (parent_id, amount);
+INSERT INTO bench_epoch_local (id, parent_id, amount, payload)
+SELECT g, ((g + :probe_id - 1) % :bench_rows) + 1, :delta + g, md5(g::text)
+FROM generate_series(1, 16) AS g;
+SELECT count(*), sum(e.amount)
+FROM bench_parent AS p
+JOIN bench_epoch_local AS e ON e.parent_id = p.id
+WHERE p.bucket = :probe_id % 16;
+SAVEPOINT ddl_savepoint;
+CREATE TABLE bench_epoch_savepoint(id integer PRIMARY KEY);
+INSERT INTO bench_epoch_savepoint VALUES (1);
+ROLLBACK TO SAVEPOINT ddl_savepoint;
+SELECT to_regclass('bench_epoch_savepoint') IS NULL;
+ROLLBACK;

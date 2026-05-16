@@ -65,8 +65,12 @@ performance work.
 | Runtime fixture restore | 244.532 TPS | 588.734 TPS | 2.408x TPS | `bench/results/seed-only-startup-pgbench-final`, 3 rounds, 200 transactions, 200 rows |
 | Runtime fixture restore latency | 4.089 ms | 1.699 ms | 0.416x latency | Same run as above |
 | Runtime plain rollback | 245.491 TPS | 129.768 TPS | 0.529x TPS | `bench/results/conservative-fast-startup-rollback-final`, 3 rounds, permanent-table rollback workload |
-| Runtime epoch rollback | 255.419 TPS | 704.005 TPS | 2.756x TPS | `bench/results/epoch-rollback-final`, 3 rounds, 200 transactions, 200 rows |
-| Runtime epoch rollback latency | 3.915 ms | 1.420 ms | 0.363x latency | Same run as above |
+| Runtime epoch rollback | 244.376 TPS | 823.818 TPS | 3.371x TPS | `bench/results/epoch-shared-parallel-final2`, 5 rounds, 200 transactions, 200 rows |
+| Runtime epoch rollback latency | 4.092 ms | 1.214 ms | 0.297x latency | Same run as above |
+| Runtime epoch rollback vs previous main | 671.359 TPS | 829.016 TPS | 1.235x TPS | `bench/results/epoch-shared-parallel-vs-main2`, 5 rounds, previous main fast fork at `de6bce7c894` vs current shared overlay |
+| Runtime epoch rollback latency vs previous main | 1.490 ms | 1.206 ms | 0.809x latency | Same run as above |
+| Runtime epoch DDL rollback | 252.352 TPS | 298.446 TPS | 1.183x TPS | `bench/results/epoch-ddl-phase2-final`, 3 rounds, 200 transactions, 200 rows |
+| Runtime epoch DDL rollback latency | 3.963 ms | 3.351 ms | 0.846x latency | Same run as above |
 | Startup fresh worker, setup+start | 0.164341 s | 0.053804 s | 3.054x | `bench/results/no-data-directory-startup-final2`, baseline copy mode vs fast-fork no-data-dir mode, 10 rounds |
 | Startup fresh worker, runtime setup only | 0.137665 s | 0.014868 s | 9.259x | Same run as above; baseline copies PGDATA, fast fork copies only a runtime skeleton |
 | Startup reuse, postmaster ready | 0.036009 s | 0.031566 s | 1.141x | `bench/results/seed-only-startup-final2`, 10 rounds, direct first-query polling |
@@ -81,6 +85,14 @@ remains slower in the current prototype; fixture snapshots and rollback-only
 epochs are the intended fast paths. The epoch rollback comparison measures stock
 PostgreSQL permanent-table rollback against the fast fork running
 `pg_fastfork_epoch_begin()` after restoring a fixture in the pgbench session.
+The shared epoch overlay comparison keeps base fixture pages in place and
+discards per-epoch storage overlays on rollback instead of restoring a copied
+snapshot image. Parallel test connections can join the same shared epoch by
+running `BEGIN; SELECT pg_fastfork_epoch_begin();`; the overlay is discarded
+when the last joined transaction rolls back. The epoch DDL rollback comparison
+measures stock PostgreSQL replaying the per-transaction rollback workload
+against the fast fork creating and indexing a small table inside each
+rollback-only epoch.
 Startup is now measured by direct polling for the first successful query, so the
 postmaster-ready rows include client retry timing. Seed-only startup treats the
 data directory as an immutable seed image and proves that clean or immediate

@@ -20,6 +20,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 WORKLOADS = {
+    "epoch-ddl": ROOT / "bench" / "unit-test-epoch-ddl.pgbench",
     "epoch-rollback": ROOT / "bench" / "unit-test-epoch-rollback.pgbench",
     "rollback": ROOT / "bench" / "unit-test-rollback.pgbench",
     "snapshot": ROOT / "bench" / "unit-test-snapshot.pgbench",
@@ -144,7 +145,7 @@ def main() -> int:
     )
     args = parser.parse_args()
 
-    if args.workload in {"epoch-rollback", "snapshot"} and args.clients != 1:
+    if args.workload in {"epoch-ddl", "epoch-rollback", "snapshot"} and args.clients != 1:
         raise SystemExit(f"the {args.workload} workload currently requires --clients 1")
 
     bin_dir = args.bin.resolve()
@@ -176,7 +177,7 @@ def main() -> int:
     started_at = dt.datetime.now(dt.UTC).isoformat()
     t0 = time.perf_counter()
     workload = WORKLOADS[args.workload]
-    warmup_transactions = 0 if args.workload in {"epoch-rollback", "snapshot"} else args.warmup_transactions
+    warmup_transactions = 0 if args.workload in {"epoch-ddl", "epoch-rollback", "snapshot"} else args.warmup_transactions
 
     try:
         run([initdb, "-D", str(data_dir), "--no-sync", "-A", "trust", "-U", "postgres"], env=base_env)
@@ -204,7 +205,7 @@ def main() -> int:
             "-f",
             str(workload),
         ]
-        if args.workload in {"epoch-rollback", "snapshot"}:
+        if args.workload in {"epoch-ddl", "epoch-rollback", "snapshot"}:
             common_pgbench.extend(["-D", "setup_done=0"])
 
         warmup = None

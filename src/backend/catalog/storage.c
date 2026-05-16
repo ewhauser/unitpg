@@ -745,6 +745,41 @@ smgrDoPendingDeletes(bool isCommit)
 }
 
 /*
+ *	smgrForgetPendingDeletes() -- Forget pending relation deletes.
+ *
+ * This is for rollback-only fast-fork epochs whose storage manager will restore
+ * the whole relation map to the epoch base image.  In that mode, walking the
+ * pending delete list and unlinking each relation is duplicate work.
+ */
+void
+smgrForgetPendingDeletes(void)
+{
+	int			nestLevel = GetCurrentTransactionNestLevel();
+	PendingRelDelete *pending;
+	PendingRelDelete *prev;
+	PendingRelDelete *next;
+
+	prev = NULL;
+	for (pending = pendingDeletes; pending != NULL; pending = next)
+	{
+		next = pending->next;
+		if (pending->nestLevel < nestLevel)
+		{
+			prev = pending;
+		}
+		else
+		{
+			if (prev)
+				prev->next = next;
+			else
+				pendingDeletes = next;
+
+			pfree(pending);
+		}
+	}
+}
+
+/*
  *	smgrDoPendingSyncs() -- Take care of relation syncs at end of xact.
  */
 void

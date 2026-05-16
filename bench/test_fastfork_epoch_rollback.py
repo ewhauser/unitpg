@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -103,7 +104,65 @@ DDL_SQL = r"""
 SELECT pg_fastfork_restore('fixture');
 BEGIN;
 SELECT pg_fastfork_epoch_begin();
-CREATE TABLE epoch_bad(id int);
+CREATE TABLE epoch_ddl_parent(
+    id int PRIMARY KEY,
+    parent_id int NOT NULL REFERENCES epoch_parent(id),
+    amount int NOT NULL
+);
+CREATE INDEX epoch_ddl_parent_amount_idx ON epoch_ddl_parent(amount, id);
+INSERT INTO epoch_ddl_parent VALUES (1, 1, 10), (2, 2, 20);
+SAVEPOINT ddl_savepoint;
+CREATE TABLE epoch_ddl_child(id int PRIMARY KEY);
+INSERT INTO epoch_ddl_child VALUES (1);
+ROLLBACK TO ddl_savepoint;
+SELECT 1 / CASE WHEN to_regclass('epoch_ddl_child') IS NULL
+           THEN 1 ELSE 0 END;
+SELECT count(*) FROM epoch_ddl_parent WHERE amount >= 10;
+ROLLBACK;
+SELECT 1 / CASE WHEN to_regclass('epoch_ddl_parent') IS NULL
+           THEN 1 ELSE 0 END;
+SELECT 1 / CASE WHEN to_regclass('epoch_ddl_parent_amount_idx') IS NULL
+           THEN 1 ELSE 0 END;
+"""
+
+
+PARALLEL_CONN1_SQL = """
+BEGIN;
+SELECT pg_fastfork_epoch_begin();
+INSERT INTO epoch_child VALUES (2000, 2, 50);
+SELECT pg_sleep(1.0);
+SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM epoch_child WHERE id = 2000)
+           THEN 1 ELSE 0 END;
+ROLLBACK;
+"""
+
+
+PARALLEL_CONN2_SQL = """
+BEGIN;
+SELECT pg_fastfork_epoch_begin();
+INSERT INTO epoch_child VALUES (2001, 3, 51);
+SELECT pg_fastfork_epoch_status();
+ROLLBACK;
+"""
+
+
+PARALLEL_VERIFY_SQL = r"""
+\set ON_ERROR_STOP on
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id IN (2000, 2001)) THEN
+    RAISE EXCEPTION 'parallel epoch rollback leaked inserted rows';
+  END IF;
+END $$;
+"""
+
+
+UNSUPPORTED_DDL_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_restore('fixture');
+BEGIN;
+SELECT pg_fastfork_epoch_begin();
+CREATE SCHEMA epoch_bad;
 ROLLBACK;
 """
 
@@ -179,6 +238,41 @@ def expect_error(
         raise RuntimeError(f"expected error containing {expected!r}, got:\n{combined}")
 
 
+def run_parallel_epoch(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
+    cmd = [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1"]
+    first = subprocess.Popen(
+        [*cmd, "-c", PARALLEL_CONN1_SQL],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.2)
+        second = run([*cmd, "-c", PARALLEL_CONN2_SQL], env=env, check=False)
+        if second.returncode != 0:
+            raise RuntimeError(
+                "parallel epoch join failed:\n"
+                f"{second.stdout or ''}{second.stderr or ''}"
+            )
+
+        stdout, stderr = first.communicate(timeout=10)
+        if first.returncode != 0:
+            raise RuntimeError(
+                "parallel epoch leader failed:\n"
+                f"{stdout or ''}{stderr or ''}"
+            )
+    finally:
+        if first.poll() is None:
+            first.terminate()
+            try:
+                first.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                first.kill()
+
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=PARALLEL_VERIFY_SQL)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", required=True, type=Path, help="PostgreSQL install bin directory")
@@ -213,6 +307,8 @@ def main() -> int:
         run([createdb, *conn_args, "bench"], env=env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=SETUP_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + DML_SQL)
+        run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + "SELECT pg_fastfork_restore('fixture');\n")
+        run_parallel_epoch(psql, conn_args, env)
         expect_error(
             psql,
             conn_args,
@@ -224,8 +320,8 @@ def main() -> int:
             psql,
             conn_args,
             env,
-            CAPTURE_SQL + DDL_SQL,
-            "DDL inside fast-fork epoch transactions requires test_ephemeral_catalog",
+            CAPTURE_SQL + UNSUPPORTED_DDL_SQL,
+            "DDL is not supported for this object type in fast-fork epoch transactions",
         )
         expect_error(
             psql,
@@ -234,6 +330,7 @@ def main() -> int:
             CAPTURE_SQL + PREPARE_SQL,
             "prepared transactions are not supported in fast-fork epoch transactions",
         )
+        run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + DDL_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + DML_SQL)
         print("fast-fork epoch rollback smoke test passed")
         return 0

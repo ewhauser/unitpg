@@ -3031,8 +3031,13 @@ AbortTransaction(void)
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_AFTER_LOCKS,
 							 false, true);
-		smgrDoPendingDeletes(false);
-		AtEOXact_FastForkEpoch(false);
+		if (FastForkEpochActive())
+		{
+			smgrForgetPendingDeletes();
+			AtEOXact_FastForkEpoch(false);
+		}
+		else
+			smgrDoPendingDeletes(false);
 
 		AtEOXact_GUC(false, 1);
 		AtEOXact_SPI(false);

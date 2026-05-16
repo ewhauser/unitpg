@@ -371,6 +371,14 @@ that reference epoch rows.
 First-version DDL support can use broad invalidation. Fine-grained invalidation
 can come after correctness is proven.
 
+The first incremental implementation may allow a conservative DDL subset inside
+rollback-only epochs before the shared catalog overlay exists. In that bridge
+mode, DDL still uses PostgreSQL's normal catalog path during the active epoch,
+but top-level abort skips redundant per-relation storage unlinking and restores
+the epoch base snapshot to discard the catalog and relation changes. This is a
+correctness and compatibility step; the full catalog overlay remains the target
+for larger DDL speedups.
+
 ## Sequences
 
 Sequence behavior needs an explicit policy because PostgreSQL sequence
@@ -394,14 +402,28 @@ restores sequence state to the epoch-start value.
 
 ## Locks And Concurrency
 
-The first version should require a single active backend in the target database
-while an epoch transaction is active. Shared buffer descriptors are keyed by
-relation/fork/block, not by epoch. If two backends can use different epoch
-overlays for the same buffer tag, the existing shared buffer table cannot
-safely point at both pages without a larger buffer-manager redesign.
+The implemented first multi-connection slice uses one shared database epoch.
+The first backend to run `pg_fastfork_epoch_begin()` starts the epoch. Other
+test connections can join by running the same function inside their own
+transaction:
 
-`pg_fastfork_epoch_begin()` checks that no other backend is active in the
-database. Idle connections should be rejected in the first version.
+```sql
+BEGIN;
+SELECT pg_fastfork_epoch_begin();
+```
+
+All joined transactions share one `memsmgr` overlay. Rollback of an individual
+participant decrements the shared participant count but leaves the overlay alive
+for other joined transactions. The final participant rollback drops database
+buffers, discards the overlay maps/pages, resets OID state, and clears the
+shared epoch state.
+
+This deliberately avoids giving each backend its own overlay because shared
+buffer descriptors are still keyed by relation/fork/block, not by epoch. Writes
+during a shared epoch require the connection to have joined the epoch; otherwise
+the fork errors instead of letting a normal transaction mutate or commit into
+the shared rollback overlay. Snapshot/restore remain base-image operations and
+should be run while the pool is quiesced, before starting the shared test epoch.
 
 ## Unsupported Operations
 
@@ -584,7 +606,8 @@ Passing means:
 - Mark epoch transactions rollback-only.
 - Reject `COMMIT` with writes.
 - Reject DDL unless catalog overlay support is enabled.
-- Reject multiple active backends in the same database.
+- Add shared epoch participant state so multiple connections can join the same
+  rollback-only epoch.
 - Add sequence policy GUC with default `preserve`.
 - Add memory limit GUC and clear exhaustion errors.
 - Add SQL regression tests for DML, indexes, savepoints, truncate, TOAST, and
@@ -602,15 +625,14 @@ Passing means:
 - Add DDL rollback tests.
 - Add benchmark variant with test-created objects inside epoch.
 
-### Phase 3: Multi-connection epoch support
+### Phase 3: Richer Multi-connection Epoch Support
 
-- Design a shared test epoch across multiple connections, or add epoch identity
-  to buffer lookup.
-- Add coordinated quiesce before rollback.
-- Handle snapshots, locks, relcache/syscache state, and direct buffer pointers
-  across participating backends.
-- Add multi-connection tests.
-- Keep this separate from the first implementation.
+- Add an optional coordinated quiesce protocol for harnesses that want the
+  server to enforce final rollback barriers across all pool connections.
+- Decide whether read-only nonparticipants should auto-join or continue to fail
+  on utility/write paths while a shared epoch is active.
+- Add broader multi-connection tests for DDL, sequences, catalog cache
+  invalidation, and connection churn during active epochs.
 
 ## Risks
 

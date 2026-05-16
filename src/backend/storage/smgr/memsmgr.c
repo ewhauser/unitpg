@@ -38,7 +38,6 @@
 #include "storage/lwlock.h"
 #include "storage/md.h"
 #include "storage/memsmgr.h"
-#include "storage/procarray.h"
 #include "storage/relfilelocator.h"
 #include "storage/shmem.h"
 #include "utils/hsearch.h"
@@ -57,6 +56,8 @@
  */
 #define MEMSMGR_SHARED_MAX_FORKS	8192
 #define MEMSMGR_SHARED_MAX_PAGES	262144
+#define MEMSMGR_EPOCH_MAX_FORKS		8192
+#define MEMSMGR_EPOCH_MAX_PAGES		262144
 #define MEMSMGR_MAX_COMBINE			32
 
 typedef struct MemSmgrForkKey
@@ -86,6 +87,22 @@ typedef struct MemSmgrPageEntry
 	uint32		page_index;
 } MemSmgrPageEntry;
 
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+typedef struct MemSmgrEpochState
+{
+	bool		active;
+	bool		aborting;
+	Oid			database_id;
+	uint64		epoch_id;
+	int			participants;
+	uint32		page_start;
+	Oid			next_oid;
+	uint32		oid_count;
+	int			base_nforks;
+	int			base_npages;
+} MemSmgrEpochState;
+#endif
+
 typedef struct MemSmgrSnapshotPageEntry
 {
 	MemSmgrPageKey key;
@@ -98,6 +115,10 @@ typedef struct MemSmgrSharedState
 	bool		initialized;
 	uint32		next_page;
 	char	   *page_data;
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	uint64		next_epoch_id;
+	MemSmgrEpochState epoch;
+#endif
 } MemSmgrSharedState;
 
 #ifdef USE_TEST_MEM_SMGR
@@ -118,6 +139,10 @@ typedef struct MemSmgrSnapshot
 static MemSmgrSharedState *MemSmgrState;
 static HTAB *MemSmgrForkHash;
 static HTAB *MemSmgrPageHash;
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+static HTAB *MemSmgrEpochForkHash;
+static HTAB *MemSmgrEpochPageHash;
+#endif
 
 static MemoryContext MemSmgrLocalCxt;
 static HTAB *LocalForkHash;
@@ -131,9 +156,44 @@ static MemSmgrSnapshot *MemSmgrSnapshots;
 #if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
 static MemSmgrSnapshot *MemSmgrEpochSnapshot;
 static MemSmgrSnapshot *MemSmgrLastRestoredSnapshot;
-static uint64 MemSmgrNextEpochId = 1;
 static uint64 MemSmgrEpochId = 0;
-static bool MemSmgrEpochOwnsSnapshot = false;
+static bool MemSmgrEpochActiveFlag = false;
+#endif
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+static bool FastForkEpochUtilityAllowed(Node *parsetree);
+static bool FastForkEpochCatalogUtilityAllowed(Node *parsetree);
+static bool mem_epoch_shared_active_for(RelFileLocatorBackend rlocator);
+static bool mem_epoch_active_for(RelFileLocatorBackend rlocator);
+static void mem_epoch_join_or_start(void);
+static bool mem_epoch_leave(Oid *next_oid, uint32 *oid_count);
+static MemSmgrForkEntry *mem_epoch_lookup_fork_entry(RelFileLocatorBackend rlocator,
+													 ForkNumber forknum);
+static MemSmgrForkEntry *mem_epoch_get_fork_entry(SMgrRelation reln,
+												  ForkNumber forknum,
+												  bool create);
+static MemSmgrPageEntry *mem_epoch_get_page_entry(RelFileLocatorBackend rlocator,
+												  ForkNumber forknum,
+												  BlockNumber blocknum,
+												  bool create);
+static void mem_epoch_remove_pages(RelFileLocatorBackend rlocator,
+								   ForkNumber forknum,
+								   BlockNumber first_block);
+static void mem_epoch_remove_fork(RelFileLocatorBackend rlocator,
+								  ForkNumber forknum);
+static void mem_epoch_readv_locked(SMgrRelation reln, ForkNumber forknum,
+								   BlockNumber blocknum, void **buffers,
+								   BlockNumber nblocks);
+static void mem_epoch_writev_locked(SMgrRelation reln, ForkNumber forknum,
+									BlockNumber blocknum,
+									const void **buffers,
+									BlockNumber nblocks);
+static void mem_epoch_zeroextend_locked(SMgrRelation reln, ForkNumber forknum,
+										BlockNumber blocknum, int nblocks);
+static BlockNumber mem_epoch_nblocks_locked(SMgrRelation reln,
+											ForkNumber forknum);
+static void mem_epoch_discard(void);
+static void mem_epoch_require_participant(LWLock *lock);
 #endif
 
 static void MemSmgrShmemRequest(void *arg);
@@ -232,6 +292,22 @@ MemSmgrShmemRequest(void *arg)
 					 .hash_info.keysize = sizeof(MemSmgrPageKey),
 					 .hash_info.entrysize = sizeof(MemSmgrPageEntry),
 					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	ShmemRequestHash(.name = "MemSmgr Epoch Fork Hash",
+					 .nelems = MEMSMGR_EPOCH_MAX_FORKS,
+					 .ptr = &MemSmgrEpochForkHash,
+					 .hash_info.keysize = sizeof(MemSmgrForkKey),
+					 .hash_info.entrysize = sizeof(MemSmgrForkEntry),
+					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
+
+	ShmemRequestHash(.name = "MemSmgr Epoch Page Hash",
+					 .nelems = MEMSMGR_EPOCH_MAX_PAGES,
+					 .ptr = &MemSmgrEpochPageHash,
+					 .hash_info.keysize = sizeof(MemSmgrPageKey),
+					 .hash_info.entrysize = sizeof(MemSmgrPageEntry),
+					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
+#endif
 }
 
 static void
@@ -244,6 +320,19 @@ MemSmgrShmemInit(void *arg)
 
 		LWLockInitialize(&MemSmgrState->lock, LWTRANCHE_BUFFER_MAPPING);
 		MemSmgrState->next_page = 0;
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+		MemSmgrState->next_epoch_id = 1;
+		MemSmgrState->epoch.active = false;
+		MemSmgrState->epoch.aborting = false;
+		MemSmgrState->epoch.database_id = InvalidOid;
+		MemSmgrState->epoch.epoch_id = 0;
+		MemSmgrState->epoch.participants = 0;
+		MemSmgrState->epoch.page_start = 0;
+		MemSmgrState->epoch.next_oid = InvalidOid;
+		MemSmgrState->epoch.oid_count = 0;
+		MemSmgrState->epoch.base_nforks = 0;
+		MemSmgrState->epoch.base_npages = 0;
+#endif
 
 		/*
 		 * Keep page contents out of PostgreSQL's fixed-size shared hash.
@@ -313,6 +402,33 @@ memcreate(SMgrRelation reln, ForkNumber forknum, bool isRedo)
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+	{
+		mem_epoch_require_participant(lock);
+
+		entry = mem_epoch_get_fork_entry(reln, forknum, false);
+		if (entry != NULL && entry->exists && !isRedo)
+		{
+			if (lock != NULL)
+				LWLockRelease(lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_DUPLICATE_FILE),
+					 errmsg("memory relation fork already exists")));
+		}
+
+		entry = mem_epoch_get_fork_entry(reln, forknum, true);
+		entry->exists = true;
+		entry->on_disk = false;
+		entry->nblocks = 0;
+		mem_epoch_remove_pages(reln->smgr_rlocator, forknum, 0);
+
+		if (lock != NULL)
+			LWLockRelease(lock);
+		return;
+	}
+#endif
+
 	entry = mem_get_fork_entry(reln, forknum, true);
 	if (entry->exists && !isRedo)
 	{
@@ -345,6 +461,20 @@ memexists(SMgrRelation reln, ForkNumber forknum)
 	lock = mem_lock_for(&reln->smgr_rlocator);
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+	{
+		entry = mem_epoch_lookup_fork_entry(reln->smgr_rlocator, forknum);
+		if (entry != NULL)
+		{
+			exists = entry->exists;
+			if (lock != NULL)
+				LWLockRelease(lock);
+			return exists;
+		}
+	}
+#endif
 
 	entry = mem_lookup_fork_entry(reln->smgr_rlocator, forknum);
 	if (entry != NULL)
@@ -392,6 +522,25 @@ memunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(rlocator))
+	{
+		mem_epoch_require_participant(lock);
+
+		if (forknum == InvalidForkNumber)
+		{
+			for (ForkNumber fork = 0; fork <= MAX_FORKNUM; fork++)
+				mem_epoch_remove_fork(rlocator, fork);
+		}
+		else
+			mem_epoch_remove_fork(rlocator, forknum);
+
+		if (lock != NULL)
+			LWLockRelease(lock);
+		return;
+	}
+#endif
+
 	if (forknum == InvalidForkNumber)
 	{
 		if (mem_relation_is_memory_only(rlocator))
@@ -430,7 +579,15 @@ memextend(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	mem_writev_locked(reln, forknum, blocknum, buffers, 1);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+	{
+		mem_epoch_require_participant(lock);
+		mem_epoch_writev_locked(reln, forknum, blocknum, buffers, 1);
+	}
+	else
+#endif
+		mem_writev_locked(reln, forknum, blocknum, buffers, 1);
 
 	if (lock != NULL)
 		LWLockRelease(lock);
@@ -452,7 +609,15 @@ memzeroextend(SMgrRelation reln, ForkNumber forknum,
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	mem_zeroextend_locked(reln, forknum, blocknum, nblocks);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+	{
+		mem_epoch_require_participant(lock);
+		mem_epoch_zeroextend_locked(reln, forknum, blocknum, nblocks);
+	}
+	else
+#endif
+		mem_zeroextend_locked(reln, forknum, blocknum, nblocks);
 
 	if (lock != NULL)
 		LWLockRelease(lock);
@@ -472,7 +637,12 @@ memprefetch(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	blocks = mem_nblocks_locked(reln, forknum);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+		blocks = mem_epoch_nblocks_locked(reln, forknum);
+	else
+#endif
+		blocks = mem_nblocks_locked(reln, forknum);
 
 	if (lock != NULL)
 		LWLockRelease(lock);
@@ -494,7 +664,12 @@ memmaxcombine(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum)
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	blocks = mem_nblocks_locked(reln, forknum);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+		blocks = mem_epoch_nblocks_locked(reln, forknum);
+	else
+#endif
+		blocks = mem_nblocks_locked(reln, forknum);
 	if (blocknum >= blocks)
 		ret = 1;
 	else
@@ -523,7 +698,12 @@ memreadv(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	mem_readv_locked(reln, forknum, blocknum, buffers, nblocks);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+		mem_epoch_readv_locked(reln, forknum, blocknum, buffers, nblocks);
+	else
+#endif
+		mem_readv_locked(reln, forknum, blocknum, buffers, nblocks);
 
 	if (lock != NULL)
 		LWLockRelease(lock);
@@ -558,7 +738,15 @@ memwritev(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	mem_writev_locked(reln, forknum, blocknum, buffers, nblocks);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+	{
+		mem_epoch_require_participant(lock);
+		mem_epoch_writev_locked(reln, forknum, blocknum, buffers, nblocks);
+	}
+	else
+#endif
+		mem_writev_locked(reln, forknum, blocknum, buffers, nblocks);
 
 	if (lock != NULL)
 		LWLockRelease(lock);
@@ -585,7 +773,12 @@ memnblocks(SMgrRelation reln, ForkNumber forknum)
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	nblocks = mem_nblocks_locked(reln, forknum);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+		nblocks = mem_epoch_nblocks_locked(reln, forknum);
+	else
+#endif
+		nblocks = mem_nblocks_locked(reln, forknum);
 
 	if (lock != NULL)
 		LWLockRelease(lock);
@@ -609,6 +802,22 @@ memtruncate(SMgrRelation reln, ForkNumber forknum,
 	lock = mem_lock_for(&reln->smgr_rlocator);
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
+
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+	{
+		mem_epoch_require_participant(lock);
+
+		entry = mem_epoch_get_fork_entry(reln, forknum, true);
+		entry->exists = true;
+		entry->nblocks = nblocks;
+		mem_epoch_remove_pages(reln->smgr_rlocator, forknum, nblocks);
+
+		if (lock != NULL)
+			LWLockRelease(lock);
+		return;
+	}
+#endif
 
 	entry = mem_get_fork_entry(reln, forknum, true);
 	entry->exists = true;
@@ -747,13 +956,9 @@ pg_fastfork_epoch_begin(PG_FUNCTION_ARGS)
 #if !defined(USE_TEST_EPOCH_ROLLBACK)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_fastfork_epoch_begin() requires --enable-test-epoch-rollback")));
+				 errmsg("pg_fastfork_epoch_begin() requires --enable-test-epoch-rollback")));
 	PG_RETURN_VOID();
 #else
-	int			notherbackends;
-	int			npreparedxacts;
-	char		name[NAMEDATALEN];
-
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -775,7 +980,7 @@ pg_fastfork_epoch_begin(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("pg_fastfork_epoch_begin() requires a database connection")));
 
-	if (MemSmgrEpochSnapshot != NULL)
+	if (MemSmgrEpochActiveFlag)
 		ereport(ERROR,
 				(errcode(ERRCODE_ACTIVE_SQL_TRANSACTION),
 				 errmsg("fast-fork epoch transaction is already active")));
@@ -785,30 +990,7 @@ pg_fastfork_epoch_begin(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
 				 errmsg("fast-fork epoch transactions are not supported in parallel workers")));
 
-	if (CountOtherDBBackends(MyDatabaseId, &notherbackends, &npreparedxacts))
-		ereport(ERROR,
-				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database is being accessed by other users"),
-				 errdetail("%d other session(s) and %d prepared transaction(s) are using the database.",
-						   notherbackends, npreparedxacts)));
-
-	FlushDatabaseBuffers(InvalidOid);
-	FlushDatabaseBuffers(MyDatabaseId);
-
-	MemSmgrEpochId = MemSmgrNextEpochId++;
-	if (MemSmgrLastRestoredSnapshot != NULL)
-	{
-		MemSmgrEpochSnapshot = MemSmgrLastRestoredSnapshot;
-		MemSmgrEpochOwnsSnapshot = false;
-	}
-	else
-	{
-		snprintf(name, sizeof(name), "__fastfork_epoch_" UINT64_FORMAT,
-				 MemSmgrEpochId);
-		MemSmgrEpochSnapshot = mem_create_snapshot(name);
-		mem_capture_snapshot(MemSmgrEpochSnapshot);
-		MemSmgrEpochOwnsSnapshot = true;
-	}
+	mem_epoch_join_or_start();
 
 	PG_RETURN_VOID();
 #endif
@@ -820,14 +1002,20 @@ pg_fastfork_epoch_status(PG_FUNCTION_ARGS)
 #if !defined(USE_TEST_EPOCH_ROLLBACK)
 	PG_RETURN_TEXT_P(cstring_to_text("disabled"));
 #else
-	if (MemSmgrEpochSnapshot == NULL)
+	if (MemSmgrState == NULL || !MemSmgrState->epoch.active)
 		PG_RETURN_TEXT_P(cstring_to_text("inactive"));
 
 	PG_RETURN_TEXT_P(cstring_to_text(psprintf("active epoch_id=" UINT64_FORMAT
-											  " forks=%d pages=%d",
-											  MemSmgrEpochId,
-											  MemSmgrEpochSnapshot->nforks,
-											  MemSmgrEpochSnapshot->npages)));
+											  " database=%u participants=%d"
+											  " joined=%s base_forks=%d"
+											  " base_pages=%d",
+											  MemSmgrState->epoch.epoch_id,
+											  MemSmgrState->epoch.database_id,
+											  MemSmgrState->epoch.participants,
+											  MemSmgrEpochActiveFlag ?
+											  "true" : "false",
+											  MemSmgrState->epoch.base_nforks,
+											  MemSmgrState->epoch.base_npages)));
 #endif
 }
 
@@ -835,19 +1023,15 @@ bool
 FastForkEpochActive(void)
 {
 #if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	return MemSmgrEpochSnapshot != NULL;
+	return MemSmgrEpochActiveFlag;
 #else
 	return false;
 #endif
 }
 
-void
-FastForkEpochCheckUtility(Node *parsetree)
+static bool
+FastForkEpochUtilityAllowed(Node *parsetree)
 {
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	if (MemSmgrEpochSnapshot == NULL || parsetree == NULL)
-		return;
-
 	switch (nodeTag(parsetree))
 	{
 		case T_TransactionStmt:
@@ -860,23 +1044,120 @@ FastForkEpochCheckUtility(Node *parsetree)
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 							 errmsg("prepared transactions are not supported in fast-fork epoch transactions")));
-				return;
+				return true;
 			}
 
+		case T_ClosePortalStmt:
+		case T_DeallocateStmt:
+		case T_DeclareCursorStmt:
+		case T_ExecuteStmt:
+		case T_FetchStmt:
+		case T_PrepareStmt:
 		case T_VariableSetStmt:
 		case T_VariableShowStmt:
 		case T_ConstraintsSetStmt:
 		case T_LockStmt:
 		case T_ExplainStmt:
-			return;
+			return true;
 		default:
 			break;
 	}
 
+	return false;
+}
+
+static bool
+FastForkEpochCatalogUtilityAllowed(Node *parsetree)
+{
+#if defined(USE_TEST_EPHEMERAL_CATALOG)
+	switch (nodeTag(parsetree))
+	{
+		case T_CreateStmt:
+		case T_CreateSeqStmt:
+		case T_IndexStmt:
+		case T_TruncateStmt:
+			return true;
+
+		case T_CopyStmt:
+			{
+				CopyStmt   *stmt = castNode(CopyStmt, parsetree);
+
+				return stmt->relation != NULL && stmt->is_from &&
+					!stmt->is_program;
+			}
+
+		case T_AlterSeqStmt:
+			return true;
+
+		case T_AlterTableStmt:
+			{
+				AlterTableStmt *stmt = castNode(AlterTableStmt, parsetree);
+
+				return stmt->objtype == OBJECT_TABLE ||
+					stmt->objtype == OBJECT_INDEX ||
+					stmt->objtype == OBJECT_SEQUENCE;
+			}
+
+		case T_DropStmt:
+			{
+				DropStmt   *stmt = castNode(DropStmt, parsetree);
+
+				if (stmt->concurrent)
+					return false;
+
+				return stmt->removeType == OBJECT_TABLE ||
+					stmt->removeType == OBJECT_INDEX ||
+					stmt->removeType == OBJECT_SEQUENCE;
+			}
+
+		default:
+			break;
+	}
+#endif
+
+	return false;
+}
+
+void
+FastForkEpochCheckUtility(Node *parsetree)
+{
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+	if (parsetree == NULL)
+		return;
+
+	if (!MemSmgrEpochActiveFlag)
+	{
+		if (MemSmgrState != NULL && MemSmgrState->epoch.active &&
+			MemSmgrState->epoch.database_id == MyDatabaseId)
+		{
+			if (FastForkEpochUtilityAllowed(parsetree))
+				return;
+
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+					 errmsg("utility statement during fast-fork epoch requires pg_fastfork_epoch_begin() in this transaction"),
+					 errhint("Run BEGIN; SELECT pg_fastfork_epoch_begin(); before using this connection during the test epoch.")));
+		}
+		return;
+	}
+
+	if (FastForkEpochUtilityAllowed(parsetree))
+		return;
+
+	if (FastForkEpochCatalogUtilityAllowed(parsetree))
+		return;
+
+#if defined(USE_TEST_EPHEMERAL_CATALOG)
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("DDL is not supported for this object type in fast-fork epoch transactions"),
+			 errhint("Run unsupported schema setup before pg_fastfork_epoch_begin(), or disable epoch rollback for this transaction.")));
+#else
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("DDL inside fast-fork epoch transactions requires test_ephemeral_catalog"),
 			 errhint("Run schema setup before pg_fastfork_epoch_begin(), or disable epoch rollback for this transaction.")));
+#endif
 #endif
 }
 
@@ -884,7 +1165,11 @@ void
 AtEOXact_FastForkEpoch(bool isCommit)
 {
 #if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	if (MemSmgrEpochSnapshot == NULL)
+	bool		last_participant;
+	Oid			next_oid = InvalidOid;
+	uint32		oid_count = 0;
+
+	if (!MemSmgrEpochActiveFlag)
 		return;
 
 	if (isCommit)
@@ -893,16 +1178,19 @@ AtEOXact_FastForkEpoch(bool isCommit)
 				 errmsg("fast-fork epoch transactions are rollback-only"),
 				 errhint("Disable epoch rollback for setup transactions, or use fixture snapshot/restore after setup.")));
 
-	DropDatabaseBuffers(InvalidOid);
-	DropDatabaseBuffers(MyDatabaseId);
-	mem_restore_snapshot(MemSmgrEpochSnapshot);
-	mem_restore_reset_caches();
-	MemSmgrLastRestoredSnapshot = MemSmgrEpochSnapshot;
-	if (MemSmgrEpochOwnsSnapshot)
-		mem_delete_snapshot(MemSmgrEpochSnapshot);
+	last_participant = mem_epoch_leave(&next_oid, &oid_count);
+	MemSmgrEpochActiveFlag = false;
 	MemSmgrEpochSnapshot = NULL;
-	MemSmgrEpochOwnsSnapshot = false;
 	MemSmgrEpochId = 0;
+
+	if (last_participant)
+	{
+		DropDatabaseBuffers(InvalidOid);
+		DropDatabaseBuffers(MyDatabaseId);
+		TestFastForkSetOidState(next_oid, oid_count);
+		mem_epoch_discard();
+		mem_restore_reset_caches();
+	}
 #endif
 }
 
@@ -946,9 +1234,6 @@ mem_buffer_direct_page(SMgrRelation reln, ForkNumber forknum,
 static void
 mem_require_snapshot_allowed(const char *function_name)
 {
-	int			notherbackends;
-	int			npreparedxacts;
-
 	if (!superuser())
 		ereport(ERROR,
 				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
@@ -972,12 +1257,11 @@ mem_require_snapshot_allowed(const char *function_name)
 				 errmsg("%s() cannot run inside a transaction block",
 						function_name)));
 
-	if (CountOtherDBBackends(MyDatabaseId, &notherbackends, &npreparedxacts))
+	if (MemSmgrState->epoch.active)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_IN_USE),
-				 errmsg("database is being accessed by other users"),
-				 errdetail("%d other session(s) and %d prepared transaction(s) are using the database.",
-						   notherbackends, npreparedxacts)));
+				 errmsg("%s() cannot run while a fast-fork epoch is active",
+						function_name)));
 }
 
 static bool
@@ -1018,11 +1302,7 @@ mem_delete_snapshot(MemSmgrSnapshot *snapshot)
 			if (MemSmgrLastRestoredSnapshot == snapshot)
 				MemSmgrLastRestoredSnapshot = NULL;
 			if (MemSmgrEpochSnapshot == snapshot)
-			{
 				MemSmgrEpochSnapshot = NULL;
-				MemSmgrEpochOwnsSnapshot = false;
-				MemSmgrEpochId = 0;
-			}
 #endif
 			MemoryContextDelete(snapshot->context);
 			return;
@@ -1675,6 +1955,424 @@ mem_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
 	mem_remove_pages(rlocator, forknum, 0);
 }
 
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+static bool
+mem_epoch_shared_active_for(RelFileLocatorBackend rlocator)
+{
+	return MemSmgrState != NULL &&
+		MemSmgrState->epoch.active &&
+		MemSmgrForkHash != NULL &&
+		MemSmgrPageHash != NULL &&
+		MemSmgrEpochForkHash != NULL &&
+		MemSmgrEpochPageHash != NULL &&
+		MyDatabaseId == MemSmgrState->epoch.database_id &&
+		mem_snapshot_key_matches(&rlocator);
+}
+
+static bool
+mem_epoch_active_for(RelFileLocatorBackend rlocator)
+{
+	return mem_epoch_shared_active_for(rlocator);
+}
+
+static void
+mem_epoch_join_or_start(void)
+{
+	Oid			next_oid = InvalidOid;
+	uint32		oid_count = 0;
+	int			base_nforks;
+	int			base_npages;
+
+	base_nforks = MemSmgrLastRestoredSnapshot != NULL ?
+		MemSmgrLastRestoredSnapshot->nforks : 0;
+	base_npages = MemSmgrLastRestoredSnapshot != NULL ?
+		MemSmgrLastRestoredSnapshot->npages : 0;
+
+	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	if (MemSmgrState->epoch.active)
+	{
+		if (MemSmgrState->epoch.database_id != MyDatabaseId)
+		{
+			LWLockRelease(&MemSmgrState->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("fast-fork epoch transaction is active in another database")));
+		}
+
+		if (MemSmgrState->epoch.aborting)
+		{
+			LWLockRelease(&MemSmgrState->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("fast-fork epoch rollback is in progress")));
+		}
+	}
+	else
+	{
+		LWLockRelease(&MemSmgrState->lock);
+
+		FlushDatabaseBuffers(InvalidOid);
+		FlushDatabaseBuffers(MyDatabaseId);
+		TestFastForkGetOidState(&next_oid, &oid_count);
+
+		LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+		if (MemSmgrState->epoch.active)
+		{
+			if (MemSmgrState->epoch.database_id != MyDatabaseId)
+			{
+				LWLockRelease(&MemSmgrState->lock);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_IN_USE),
+						 errmsg("fast-fork epoch transaction is active in another database")));
+			}
+
+			if (MemSmgrState->epoch.aborting)
+			{
+				LWLockRelease(&MemSmgrState->lock);
+				ereport(ERROR,
+						(errcode(ERRCODE_OBJECT_IN_USE),
+						 errmsg("fast-fork epoch rollback is in progress")));
+			}
+		}
+		else
+		{
+			MemSmgrState->epoch.active = true;
+			MemSmgrState->epoch.aborting = false;
+			MemSmgrState->epoch.database_id = MyDatabaseId;
+			MemSmgrState->epoch.epoch_id = MemSmgrState->next_epoch_id++;
+			MemSmgrState->epoch.participants = 0;
+			MemSmgrState->epoch.page_start = MemSmgrState->next_page;
+			MemSmgrState->epoch.next_oid = next_oid;
+			MemSmgrState->epoch.oid_count = oid_count;
+			MemSmgrState->epoch.base_nforks = base_nforks;
+			MemSmgrState->epoch.base_npages = base_npages;
+		}
+	}
+
+	MemSmgrState->epoch.participants++;
+	MemSmgrEpochId = MemSmgrState->epoch.epoch_id;
+	MemSmgrEpochSnapshot = MemSmgrLastRestoredSnapshot;
+	MemSmgrEpochActiveFlag = true;
+
+	LWLockRelease(&MemSmgrState->lock);
+}
+
+static bool
+mem_epoch_leave(Oid *next_oid, uint32 *oid_count)
+{
+	bool		last_participant;
+
+	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	if (!MemSmgrState->epoch.active ||
+		MemSmgrState->epoch.epoch_id != MemSmgrEpochId ||
+		MemSmgrState->epoch.database_id != MyDatabaseId ||
+		MemSmgrState->epoch.participants <= 0)
+	{
+		LWLockRelease(&MemSmgrState->lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+				 errmsg("fast-fork epoch participant state is inconsistent")));
+	}
+
+	MemSmgrState->epoch.participants--;
+	last_participant = MemSmgrState->epoch.participants == 0;
+	if (last_participant)
+	{
+		MemSmgrState->epoch.aborting = true;
+		*next_oid = MemSmgrState->epoch.next_oid;
+		*oid_count = MemSmgrState->epoch.oid_count;
+	}
+
+	LWLockRelease(&MemSmgrState->lock);
+	return last_participant;
+}
+
+static void
+mem_epoch_require_participant(LWLock *lock)
+{
+	if (!MemSmgrEpochActiveFlag ||
+		MemSmgrEpochId != MemSmgrState->epoch.epoch_id)
+	{
+		if (lock != NULL)
+			LWLockRelease(lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("write during fast-fork epoch requires pg_fastfork_epoch_begin() in this transaction"),
+				 errhint("Run BEGIN; SELECT pg_fastfork_epoch_begin(); before using this connection for test writes.")));
+	}
+}
+
+static MemSmgrForkEntry *
+mem_epoch_lookup_fork_entry(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	MemSmgrForkKey key;
+
+	mem_build_fork_key(&key, rlocator, forknum);
+	return hash_search(MemSmgrEpochForkHash, &key, HASH_FIND, NULL);
+}
+
+static MemSmgrForkEntry *
+mem_epoch_get_fork_entry(SMgrRelation reln, ForkNumber forknum, bool create)
+{
+	MemSmgrForkKey key;
+	MemSmgrForkEntry *entry;
+	bool		found;
+
+	mem_build_fork_key(&key, reln->smgr_rlocator, forknum);
+	entry = hash_search(MemSmgrEpochForkHash, &key,
+						create ? HASH_ENTER_NULL : HASH_FIND, &found);
+
+	if (entry == NULL && create)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("memory storage manager epoch fork table is full")));
+
+	if (entry != NULL && create && !found)
+	{
+		MemSmgrForkEntry *base;
+
+		base = mem_get_fork_entry(reln, forknum, true);
+		if (base != NULL)
+			*entry = *base;
+		else
+		{
+			entry->key = key;
+			entry->exists = false;
+			entry->on_disk = false;
+			entry->nblocks = 0;
+		}
+	}
+
+	return entry;
+}
+
+static MemSmgrPageEntry *
+mem_epoch_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
+						 BlockNumber blocknum, bool create)
+{
+	MemSmgrPageKey key;
+	MemSmgrPageEntry *entry;
+	bool		found;
+
+	mem_build_page_key(&key, rlocator, forknum, blocknum);
+	entry = hash_search(MemSmgrEpochPageHash, &key,
+						create ? HASH_ENTER_NULL : HASH_FIND, &found);
+
+	if (entry == NULL && create)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("memory storage manager epoch page table is full")));
+
+	if (entry != NULL && create && !found)
+	{
+		entry->page_index = mem_alloc_page_index();
+		memset(mem_page_data(entry), 0, BLCKSZ);
+	}
+
+	return entry;
+}
+
+static void
+mem_epoch_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
+					   BlockNumber first_block)
+{
+	HASH_SEQ_STATUS status;
+	MemSmgrPageEntry *entry;
+
+	hash_seq_init(&status, MemSmgrEpochPageHash);
+	while ((entry = hash_seq_search(&status)) != NULL)
+	{
+		if (RelFileLocatorBackendEquals(entry->key.rlocator, rlocator) &&
+			entry->key.forknum == forknum &&
+			entry->key.blocknum >= first_block)
+		{
+			MemSmgrPageKey key = entry->key;
+
+			hash_search(MemSmgrEpochPageHash, &key, HASH_REMOVE, NULL);
+		}
+	}
+}
+
+static void
+mem_epoch_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	MemSmgrForkKey key;
+	MemSmgrForkEntry *entry;
+	bool		found;
+
+	mem_build_fork_key(&key, rlocator, forknum);
+	entry = hash_search(MemSmgrEpochForkHash, &key, HASH_ENTER_NULL, &found);
+	if (entry == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("memory storage manager epoch fork table is full")));
+
+	entry->key = key;
+	entry->exists = false;
+	entry->on_disk = true;
+	entry->nblocks = 0;
+	mem_epoch_remove_pages(rlocator, forknum, 0);
+}
+
+static void
+mem_epoch_readv_locked(SMgrRelation reln, ForkNumber forknum,
+					   BlockNumber blocknum, void **buffers,
+					   BlockNumber nblocks)
+{
+	MemSmgrForkEntry *fork;
+	MemSmgrForkEntry *base_fork;
+
+	fork = mem_epoch_lookup_fork_entry(reln->smgr_rlocator, forknum);
+	if (fork == NULL)
+		fork = mem_get_fork_entry(reln, forknum, true);
+
+	if (fork == NULL || !fork->exists || blocknum + nblocks > fork->nblocks)
+		ereport(ERROR,
+				(errcode(ERRCODE_DATA_CORRUPTED),
+				 errmsg("could not read blocks %u..%u in memory relation fork",
+						blocknum, blocknum + nblocks - 1)));
+
+	base_fork = mem_get_fork_entry(reln, forknum, true);
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		BlockNumber curblock = blocknum + i;
+		MemSmgrPageEntry *page;
+
+		page = mem_epoch_get_page_entry(reln->smgr_rlocator, forknum,
+										curblock, false);
+		if (page != NULL)
+			memcpy(buffers[i], mem_page_data(page), BLCKSZ);
+		else if (base_fork != NULL && base_fork->exists &&
+				 curblock < base_fork->nblocks)
+		{
+			page = mem_get_page_entry(reln->smgr_rlocator, forknum, curblock,
+									  false);
+			if (page != NULL)
+				memcpy(buffers[i], mem_page_data(page), BLCKSZ);
+			else if (base_fork->on_disk &&
+					 mem_seed_active_for(&reln->smgr_rlocator))
+				mem_seed_read_block(reln->smgr_rlocator, forknum, curblock,
+									buffers[i]);
+			else if (base_fork->on_disk)
+				mdreadv(reln, forknum, curblock, &buffers[i], 1);
+			else
+				memset(buffers[i], 0, BLCKSZ);
+		}
+		else
+			memset(buffers[i], 0, BLCKSZ);
+	}
+}
+
+static void
+mem_epoch_writev_locked(SMgrRelation reln, ForkNumber forknum,
+						BlockNumber blocknum, const void **buffers,
+						BlockNumber nblocks)
+{
+	MemSmgrForkEntry *fork;
+
+	fork = mem_epoch_get_fork_entry(reln, forknum, true);
+	fork->exists = true;
+
+	if (blocknum > fork->nblocks)
+		mem_epoch_zeroextend_locked(reln, forknum, fork->nblocks,
+									blocknum - fork->nblocks);
+
+	for (BlockNumber i = 0; i < nblocks; i++)
+	{
+		MemSmgrPageEntry *page;
+
+		page = mem_epoch_get_page_entry(reln->smgr_rlocator, forknum,
+										blocknum + i, true);
+		memcpy(mem_page_data(page), buffers[i], BLCKSZ);
+	}
+
+	if (blocknum + nblocks > fork->nblocks)
+		fork->nblocks = blocknum + nblocks;
+}
+
+static void
+mem_epoch_zeroextend_locked(SMgrRelation reln, ForkNumber forknum,
+							BlockNumber blocknum, int nblocks)
+{
+	MemSmgrForkEntry *fork;
+
+	fork = mem_epoch_get_fork_entry(reln, forknum, true);
+	fork->exists = true;
+
+	for (int i = 0; i < nblocks; i++)
+	{
+		MemSmgrPageEntry *page;
+
+		page = mem_epoch_get_page_entry(reln->smgr_rlocator, forknum,
+										blocknum + i, true);
+		memset(mem_page_data(page), 0, BLCKSZ);
+	}
+
+	if (blocknum + nblocks > fork->nblocks)
+		fork->nblocks = blocknum + nblocks;
+}
+
+static BlockNumber
+mem_epoch_nblocks_locked(SMgrRelation reln, ForkNumber forknum)
+{
+	MemSmgrForkEntry *fork;
+
+	fork = mem_epoch_lookup_fork_entry(reln->smgr_rlocator, forknum);
+	if (fork == NULL)
+		fork = mem_get_fork_entry(reln, forknum, true);
+
+	if (fork == NULL || !fork->exists)
+		return 0;
+
+	return fork->nblocks;
+}
+
+static void
+mem_epoch_discard(void)
+{
+	HASH_SEQ_STATUS status;
+	MemSmgrForkEntry *fork;
+	MemSmgrPageEntry *page;
+
+	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
+
+	hash_seq_init(&status, MemSmgrEpochForkHash);
+	while ((fork = hash_seq_search(&status)) != NULL)
+	{
+		MemSmgrForkKey key = fork->key;
+
+		hash_search(MemSmgrEpochForkHash, &key, HASH_REMOVE, NULL);
+	}
+
+	hash_seq_init(&status, MemSmgrEpochPageHash);
+	while ((page = hash_seq_search(&status)) != NULL)
+	{
+		MemSmgrPageKey key = page->key;
+
+		hash_search(MemSmgrEpochPageHash, &key, HASH_REMOVE, NULL);
+	}
+
+	if (MemSmgrState->epoch.page_start <= MemSmgrState->next_page)
+		MemSmgrState->next_page = MemSmgrState->epoch.page_start;
+
+	MemSmgrState->epoch.active = false;
+	MemSmgrState->epoch.aborting = false;
+	MemSmgrState->epoch.database_id = InvalidOid;
+	MemSmgrState->epoch.epoch_id = 0;
+	MemSmgrState->epoch.participants = 0;
+	MemSmgrState->epoch.page_start = 0;
+	MemSmgrState->epoch.next_oid = InvalidOid;
+	MemSmgrState->epoch.oid_count = 0;
+	MemSmgrState->epoch.base_nforks = 0;
+	MemSmgrState->epoch.base_npages = 0;
+
+	LWLockRelease(&MemSmgrState->lock);
+}
+#endif
+
 static void
 mem_readv_locked(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				 void **buffers, BlockNumber nblocks)
@@ -1795,7 +2493,12 @@ mem_complete_aio_read(PgAioHandle *ioh, SMgrRelation reln, ForkNumber forknum,
 	if (lock != NULL)
 		LWLockAcquire(lock, LW_EXCLUSIVE);
 
-	mem_readv_locked(reln, forknum, blocknum, buffers, nblocks);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+	if (mem_epoch_active_for(reln->smgr_rlocator))
+		mem_epoch_readv_locked(reln, forknum, blocknum, buffers, nblocks);
+	else
+#endif
+		mem_readv_locked(reln, forknum, blocknum, buffers, nblocks);
 
 	if (lock != NULL)
 		LWLockRelease(lock);

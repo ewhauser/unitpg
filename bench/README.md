@@ -25,6 +25,18 @@ inside `BEGIN; SELECT pg_fastfork_epoch_begin(); ... ROLLBACK;`. It is the
 benchmark entrypoint for the rollback-only epoch overlay flag and currently
 expects `--clients 1`.
 
+The epoch implementation itself can now support multiple test connections. The
+first connection to call `pg_fastfork_epoch_begin()` starts a shared database
+epoch; later connections call the same function inside their own transaction to
+join it. Rollback of one joined connection leaves the shared overlay alive for
+the others, and the final joined rollback discards the overlay. The pgbench
+workload remains single-client because its fixture setup is session-local.
+
+The optional `unit-test-epoch-ddl.pgbench` workload also restores a fixture once
+and then creates per-test tables and indexes inside each rollback-only epoch.
+It exercises the conservative DDL-in-epoch path enabled by
+`test_ephemeral_catalog` and currently expects `--clients 1`.
+
 ## Baseline
 
 Build and install PostgreSQL, then point the runner at that install's `bin`
@@ -66,6 +78,16 @@ python3 bench/run_pgbench.py \
   --output bench/results/fork-epoch-rollback.json
 ```
 
+To measure rollback-only dynamic DDL inside epochs:
+
+```sh
+python3 bench/run_pgbench.py \
+  --bin /path/to/fork/install/bin \
+  --label fork-epoch-ddl \
+  --workload epoch-ddl \
+  --output bench/results/fork-epoch-ddl.json
+```
+
 The runner initializes a disposable cluster and applies these fast test
 settings: `fsync=off`, `synchronous_commit=off`, `full_page_writes=off`,
 `wal_level=minimal`, `archive_mode=off`, `max_wal_senders=0`,
@@ -103,6 +125,17 @@ fast-fork epoch rollback path, use:
 ```sh
 python3 bench/compare_pgbench.py \
   --fakewal-workload epoch-rollback \
+  --rounds 5 \
+  --transactions 200 \
+  --rows 200
+```
+
+To compare that same stock rollback baseline against fast-fork dynamic DDL
+inside epochs, use:
+
+```sh
+python3 bench/compare_pgbench.py \
+  --fakewal-workload epoch-ddl \
   --rounds 5 \
   --transactions 200 \
   --rows 200
