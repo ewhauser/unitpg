@@ -123,9 +123,10 @@ GitHub release containing minimal fast-fork server archives for:
 Each archive contains the server runtime needed to initialize, start, stop, and
 connect to a fast-fork cluster: `initdb`, `pg_ctl`, `postgres`, `psql`, optional
 server-adjacent helpers such as `postmaster` and `pg_isready`, server runtime
-libraries, and `share` runtime data files. The release archives intentionally
-omit source code, benchmark outputs, headers, PGXS files, documentation, and
-backup or auxiliary client utilities such as `pg_dump` and `pg_basebackup`.
+libraries, pgvector extension files, and `share` runtime data files. The release
+archives intentionally omit source code, benchmark outputs, headers, PGXS files,
+documentation, and backup or auxiliary client utilities such as `pg_dump` and
+`pg_basebackup`.
 
 ## Measure Runtime Performance
 
