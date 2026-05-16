@@ -91,6 +91,7 @@ jobs:
           find "$dist/lib" -maxdepth 3 \
             \( -name 'dict_snowball*' -o -name 'plpgsql*' -o -name 'vector*' \) \
             -print
+          test -x "$dist/bin/pg_dump"
           test -n "$(find "$dist/lib" -maxdepth 3 -name 'dict_snowball*' -print -quit)"
           test -n "$(find "$dist/lib" -maxdepth 3 -name 'vector*' -print -quit)"
           test -f "$dist/share/extension/vector.control"
@@ -114,6 +115,7 @@ jobs:
           "$dist/bin/psql" -h "$workdir" -d postgres -U postgres -Atqc "select 1" | grep -Fx 1
           "$dist/bin/psql" -h "$workdir" -d postgres -U postgres -Atqc \
             "create extension vector; select vector_dims('[1,2,3]'::vector);" | grep -Fx 3
+          "$dist/bin/pg_dump" -h "$workdir" -d postgres -U postgres --schema-only >/dev/null
           "$dist/bin/pg_ctl" -D "$workdir/data" -m fast -w stop
 
       - name: Upload binary archive

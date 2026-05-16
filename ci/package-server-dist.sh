@@ -119,10 +119,11 @@ copy_runtime_shared_tree() {
 }
 
 # Keep the executable surface intentionally small: enough to initialize, run,
-# stop, and connect to a fast-fork server without shipping client suites,
-# benchmarks, headers, documentation, or developer tooling.
+# stop, connect to, and dump a fast-fork server without shipping broader client
+# suites, benchmarks, headers, documentation, or developer tooling.
 copy_required_binary initdb
 copy_required_binary pg_ctl
+copy_required_binary pg_dump
 copy_required_binary postgres
 copy_required_binary psql
 copy_optional_binary postmaster
@@ -170,6 +171,7 @@ This archive contains a minimal PostgreSQL fast-fork server runtime for $TARGET.
 Included:
 - bin/initdb
 - bin/pg_ctl
+- bin/pg_dump
 - bin/postgres
 - bin/psql
 - bin/postmaster, when installed
@@ -183,7 +185,7 @@ Intentionally omitted:
 - benchmark outputs and build directories
 - headers and PGXS files
 - documentation and manpages
-- backup and auxiliary client utilities such as pg_dump and pg_basebackup
+- backup and auxiliary client utilities other than pg_dump, such as pg_basebackup
 EOF
 
 rewrite_darwin_install_names() {
