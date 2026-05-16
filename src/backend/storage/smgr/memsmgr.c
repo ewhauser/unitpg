@@ -187,6 +187,7 @@ static MemSmgrEpochState *mem_epoch_find_free(void);
 static MemSmgrEpochState *mem_epoch_first_active(Oid database_id);
 static bool mem_epoch_any_active_for_database(Oid database_id);
 static void mem_epoch_reset_state(MemSmgrEpochState *epoch);
+static void mem_epoch_mark_current_aborting_locked(void);
 static void mem_epoch_join_or_start(const char *name,
 									MemSmgrSnapshot *snapshot,
 									bool join);
@@ -195,6 +196,7 @@ static bool mem_epoch_leave(bool finish_on_last, Oid *next_oid,
 							uint32 *oid_count);
 static void mem_epoch_finish_named(const char *name);
 static void mem_epoch_validate_name(const char *name, const char *function_name);
+static void mem_epoch_discard_id(uint64 epoch_id);
 static void mem_build_epoch_fork_key(MemSmgrForkKey *key,
 									 RelFileLocatorBackend rlocator,
 									 ForkNumber forknum);
@@ -1062,6 +1064,18 @@ pg_fastfork_epoch_session_begin(PG_FUNCTION_ARGS)
 
 	if (MemSmgrEpochActiveFlag)
 	{
+		MemSmgrEpochState *epoch;
+
+		LWLockAcquire(&MemSmgrState->lock, LW_SHARED);
+		epoch = mem_epoch_find_by_id(MemSmgrEpochId);
+		if (epoch != NULL && epoch->aborting)
+		{
+			LWLockRelease(&MemSmgrState->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("fast-fork epoch rollback is in progress")));
+		}
+		LWLockRelease(&MemSmgrState->lock);
 		FastForkEpochFlushBuffers(MemSmgrEpochId);
 		mem_epoch_reset_backend_caches();
 		PG_RETURN_VOID();
@@ -1177,6 +1191,13 @@ pg_fastfork_epoch_join(PG_FUNCTION_ARGS)
 					 errmsg("backend is already joined to fast-fork epoch \"%s\"",
 							joined_name)));
 		}
+		if (epoch->aborting)
+		{
+			LWLockRelease(&MemSmgrState->lock);
+			ereport(ERROR,
+					(errcode(ERRCODE_OBJECT_IN_USE),
+					 errmsg("fast-fork epoch rollback is in progress")));
+		}
 		LWLockRelease(&MemSmgrState->lock);
 		FastForkEpochFlushBuffers(MemSmgrEpochId);
 		mem_epoch_reset_backend_caches();
@@ -1206,6 +1227,7 @@ pg_fastfork_epoch_leave(PG_FUNCTION_ARGS)
 	PG_RETURN_VOID();
 #else
 	bool		finish_on_last = false;
+	bool		epoch_aborting = false;
 	bool		last_participant;
 	bool		cache_reset_done = false;
 	Oid			next_oid = InvalidOid;
@@ -1223,12 +1245,17 @@ pg_fastfork_epoch_leave(PG_FUNCTION_ARGS)
 	{
 		MemSmgrEpochState *epoch = mem_epoch_find_by_id(MemSmgrEpochId);
 
-		if (epoch != NULL && epoch->name[0] == '\0')
-			finish_on_last = true;
+		if (epoch != NULL)
+		{
+			epoch_aborting = epoch->aborting;
+			if (epoch->name[0] == '\0' || epoch_aborting)
+				finish_on_last = true;
+		}
 	}
 	LWLockRelease(&MemSmgrState->lock);
 
-	FastForkEpochFlushBuffers(MemSmgrEpochId);
+	if (!epoch_aborting)
+		FastForkEpochFlushBuffers(MemSmgrEpochId);
 
 	last_participant = mem_epoch_leave(finish_on_last, &next_oid, &oid_count);
 	if (last_participant && finish_on_last)
@@ -2257,11 +2284,13 @@ mem_alloc_page_index(void)
 {
 	uint32		page_index;
 	bool		release_lock = false;
+	bool		lock_held;
 
 	if (MemSmgrState == NULL || MemSmgrState->page_data == NULL)
 		elog(ERROR, "memory storage manager page arena is not initialized");
 
-	if (!LWLockHeldByMe(&MemSmgrState->lock))
+	lock_held = LWLockHeldByMe(&MemSmgrState->lock);
+	if (!lock_held)
 	{
 		LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
 		release_lock = true;
@@ -2283,8 +2312,10 @@ mem_alloc_page_index(void)
 			uint32		next_page = MemSmgrState->next_page;
 			uint32		free_page_count = MemSmgrState->free_page_count;
 
-			if (release_lock)
-				LWLockRelease(&MemSmgrState->lock);
+#if defined(USE_TEST_MEM_SMGR) && defined(USE_TEST_EPOCH_ROLLBACK)
+			mem_epoch_mark_current_aborting_locked();
+#endif
+			LWLockRelease(&MemSmgrState->lock);
 			ereport(ERROR,
 					(errcode(ERRCODE_OUT_OF_MEMORY),
 					 errmsg("memory storage manager page arena is full"),
@@ -2565,6 +2596,19 @@ mem_epoch_reset_state(MemSmgrEpochState *epoch)
 }
 
 static void
+mem_epoch_mark_current_aborting_locked(void)
+{
+	MemSmgrEpochState *epoch;
+
+	if (!MemSmgrEpochActiveFlag || MemSmgrEpochId == 0)
+		return;
+
+	epoch = mem_epoch_find_by_id(MemSmgrEpochId);
+	if (epoch != NULL && epoch->database_id == MyDatabaseId)
+		epoch->aborting = true;
+}
+
+static void
 mem_epoch_join_or_start(const char *name, MemSmgrSnapshot *snapshot, bool join)
 {
 	MemSmgrEpochState *epoch;
@@ -2685,6 +2729,10 @@ static void
 mem_epoch_detach_on_exit(void)
 {
 	MemSmgrEpochState *epoch;
+	uint64		epoch_id = 0;
+	Oid			next_oid = InvalidOid;
+	uint32		oid_count = 0;
+	bool		last_participant = false;
 
 	if (!MemSmgrEpochActiveFlag || MemSmgrState == NULL)
 		return;
@@ -2692,10 +2740,24 @@ mem_epoch_detach_on_exit(void)
 	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
 	epoch = mem_epoch_find_by_id(MemSmgrEpochId);
 	if (epoch != NULL &&
-		epoch->database_id == MyDatabaseId &&
-		epoch->participants > 0)
-		epoch->participants--;
+		epoch->database_id == MyDatabaseId)
+	{
+		epoch->aborting = true;
+		epoch_id = epoch->epoch_id;
+		next_oid = epoch->next_oid;
+		oid_count = epoch->oid_count;
+		if (epoch->participants > 0)
+			epoch->participants--;
+		last_participant = epoch->participants == 0;
+	}
 	LWLockRelease(&MemSmgrState->lock);
+
+	if (last_participant)
+	{
+		FastForkEpochDropBuffers(epoch_id);
+		TestFastForkSetOidState(next_oid, oid_count);
+		mem_epoch_discard_id(epoch_id);
+	}
 
 	MemSmgrEpochActiveFlag = false;
 	MemSmgrEpochSessionBound = false;
@@ -2826,6 +2888,15 @@ mem_epoch_require_participant(LWLock *lock)
 				 errmsg("write during fast-fork epoch requires joining the epoch first"),
 				 errhint("Run SELECT pg_fastfork_epoch_join(name) for session-bound epochs, or BEGIN; SELECT pg_fastfork_epoch_begin() for transaction-bound epochs.")));
 	}
+
+	if (epoch->aborting)
+	{
+		if (lock != NULL)
+			LWLockRelease(lock);
+		ereport(ERROR,
+				(errcode(ERRCODE_OBJECT_IN_USE),
+				 errmsg("fast-fork epoch rollback is in progress")));
+	}
 }
 
 static MemSmgrForkEntry *
@@ -2849,9 +2920,14 @@ mem_epoch_get_fork_entry(SMgrRelation reln, ForkNumber forknum, bool create)
 						create ? HASH_ENTER_NULL : HASH_FIND, &found);
 
 	if (entry == NULL && create)
+	{
+		mem_epoch_mark_current_aborting_locked();
+		if (LWLockHeldByMe(&MemSmgrState->lock))
+			LWLockRelease(&MemSmgrState->lock);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("memory storage manager epoch fork table is full")));
+	}
 
 	if (entry != NULL && create && !found)
 	{
@@ -2894,6 +2970,9 @@ mem_epoch_get_page_entry(RelFileLocatorBackend rlocator, ForkNumber forknum,
 	if (entry == NULL)
 	{
 		mem_free_page_index(page_index);
+		mem_epoch_mark_current_aborting_locked();
+		if (LWLockHeldByMe(&MemSmgrState->lock))
+			LWLockRelease(&MemSmgrState->lock);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("memory storage manager epoch page table is full")));
@@ -2945,9 +3024,14 @@ mem_epoch_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
 	mem_build_epoch_fork_key(&key, rlocator, forknum);
 	entry = hash_search(MemSmgrEpochForkHash, &key, HASH_ENTER_NULL, &found);
 	if (entry == NULL)
+	{
+		mem_epoch_mark_current_aborting_locked();
+		if (LWLockHeldByMe(&MemSmgrState->lock))
+			LWLockRelease(&MemSmgrState->lock);
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
 				 errmsg("memory storage manager epoch fork table is full")));
+	}
 
 	entry->key = key;
 	entry->exists = false;
@@ -3071,13 +3155,12 @@ mem_epoch_nblocks_locked(SMgrRelation reln, ForkNumber forknum)
 }
 
 static void
-mem_epoch_discard(void)
+mem_epoch_discard_id(uint64 epoch_id)
 {
 	MemSmgrEpochState *epoch;
 	HASH_SEQ_STATUS status;
 	MemSmgrForkEntry *fork;
 	MemSmgrPageEntry *page;
-	uint64		epoch_id = MemSmgrEpochId;
 
 	LWLockAcquire(&MemSmgrState->lock, LW_EXCLUSIVE);
 	epoch = mem_epoch_find_by_id(epoch_id);
@@ -3109,6 +3192,12 @@ mem_epoch_discard(void)
 		mem_epoch_reset_state(epoch);
 
 	LWLockRelease(&MemSmgrState->lock);
+}
+
+static void
+mem_epoch_discard(void)
+{
+	mem_epoch_discard_id(MemSmgrEpochId);
 }
 #endif
 

@@ -445,6 +445,36 @@ PREPARE TRANSACTION 'epoch_bad';
 """
 
 
+BROKEN_NAMED_CONN_SQL = """
+SELECT pg_fastfork_epoch_join('broken-cleanup');
+BEGIN;
+INSERT INTO epoch_child VALUES (6100, 2, 61);
+SELECT 1 / 0;
+"""
+
+
+BROKEN_NAMED_RECOVERY_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_epoch_finish('broken-cleanup');
+SELECT pg_fastfork_epoch_finish('broken-cleanup');
+SELECT pg_fastfork_snapshot('fixture');
+SELECT pg_fastfork_restore('fixture');
+SELECT pg_fastfork_epoch_start('broken-cleanup', 'fixture');
+SELECT pg_fastfork_epoch_join('broken-cleanup');
+BEGIN;
+INSERT INTO epoch_child VALUES (6101, 2, 62);
+COMMIT;
+SELECT pg_fastfork_epoch_leave();
+SELECT pg_fastfork_epoch_finish('broken-cleanup');
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id IN (6100, 6101)) THEN
+    RAISE EXCEPTION 'broken named epoch cleanup leaked inserted row';
+  END IF;
+END $$;
+"""
+
+
 def run(
     cmd: list[str],
     *,
@@ -671,6 +701,31 @@ def run_named_session_visibility(psql: str, conn_args: list[str], env: dict[str,
     run([psql, *conn_args, "-d", "bench"], env=env, input_text=NAMED_SESSION_VISIBILITY_FINISH_SQL)
 
 
+def run_named_epoch_cleanup_after_error(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
+    setup_sql = (
+        CAPTURE_SQL
+        + "\nSELECT pg_fastfork_restore('fixture');\n"
+        + "SELECT pg_fastfork_epoch_start('broken-cleanup', 'fixture');\n"
+    )
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=setup_sql)
+
+    failed = run(
+        [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1", "-c", BROKEN_NAMED_CONN_SQL],
+        env=env,
+        check=False,
+    )
+    combined = (failed.stdout or "") + (failed.stderr or "")
+    if failed.returncode == 0:
+        raise RuntimeError("expected broken named epoch participant to fail")
+    if "division by zero" not in combined:
+        raise RuntimeError(
+            "expected broken named epoch participant to fail with division by zero:\n"
+            f"{combined}"
+        )
+
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=BROKEN_NAMED_RECOVERY_SQL)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", required=True, type=Path, help="PostgreSQL install bin directory")
@@ -710,6 +765,7 @@ def main() -> int:
         run_parallel_named_epochs(psql, conn_args, env)
         run_parallel_named_finish_while_active(psql, conn_args, env)
         run_named_session_visibility(psql, conn_args, env)
+        run_named_epoch_cleanup_after_error(psql, conn_args, env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + REUSED_BACKEND_NAMED_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + "SELECT pg_fastfork_restore('fixture');\n")
         run_parallel_epoch(psql, conn_args, env)
