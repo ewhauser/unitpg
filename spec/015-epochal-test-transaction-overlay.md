@@ -118,7 +118,7 @@ until the catalog overlay is mature enough to stand alone.
 
 ## User Model
 
-The first version uses an explicit SQL function so the test harness opts into
+The original API uses an explicit SQL function so the test harness opts into
 rollback-only behavior deliberately:
 
 ```sql
@@ -155,6 +155,62 @@ top-level epoch transaction reaches `COMMIT`, it should raise:
 ERROR: fast-fork epoch transactions are rollback-only
 HINT: Disable epoch rollback for setup transactions, or use fixture snapshot/restore after setup.
 ```
+
+### Named/session epoch API
+
+Large pooled test harnesses need an API that maps to a test ID rather than to a
+single checked-out connection. The target API is:
+
+```sql
+-- once after migrations and fixture setup
+SELECT pg_fastfork_snapshot('fixture');
+
+-- per test
+SELECT pg_fastfork_epoch_start('test-id', 'fixture');
+
+-- on each connection used by that test
+SELECT pg_fastfork_epoch_join('test-id');
+
+-- optional explicit detach on pool release
+SELECT pg_fastfork_epoch_leave();
+
+-- test cleanup
+SELECT pg_fastfork_epoch_finish('test-id');
+```
+
+`pg_fastfork_epoch_join()` is session-bound, not transaction-bound. Ordinary
+application transactions can run after a backend joins an epoch. For DML-only
+workloads, `COMMIT` inside a joined session materializes changes into that
+test's overlay, not into the fixture image; `pg_fastfork_epoch_finish()`
+discards the overlay. DDL inside a session-bound epoch should fail until the
+catalog overlay can isolate committed catalog changes by epoch ID.
+
+This is intentionally closer to a disposable copy-on-write database branch than
+to a PostgreSQL transaction. The speed target remains:
+
+```text
+test cleanup = discard epoch overlay metadata/pages
+not normal per-tuple rollback cleanup
+```
+
+### Staged experiment
+
+Implement and measure the named/session design in four stages:
+
+1. **Session-bound single epoch.** Add a backend/session lifecycle primitive so
+   a pooled connection can join once, run ordinary DML transactions, and leave
+   or be cleaned up at backend exit. Only one database epoch may be active.
+2. **Named epoch registry, one active epoch.** Add `start/join/leave/finish`
+   with a test ID and fixture name, but still reject a second active epoch in
+   the same database. This validates pool ergonomics before paying the cost of
+   concurrent epoch identity in buffers.
+3. **Epoch-ID storage overlay keys.** Add epoch ID to `memsmgr` overlay keys so
+   relation/fork/block state is namespaced by epoch. Keep only one active
+   buffer-visible epoch until the buffer manager can distinguish versions.
+4. **Concurrent named epochs.** Add epoch identity to the shared-buffer identity
+   and flush path so two tests can mutate the same relation page concurrently
+   without sharing cached page contents. Measure the query overhead against the
+   simpler shared-epoch path before keeping this design.
 
 ## Design
 
@@ -504,6 +560,10 @@ SQL API:
 
 ```sql
 SELECT pg_fastfork_epoch_begin();
+SELECT pg_fastfork_epoch_start('test-id', 'fixture');
+SELECT pg_fastfork_epoch_join('test-id');
+SELECT pg_fastfork_epoch_leave();
+SELECT pg_fastfork_epoch_finish('test-id');
 SELECT pg_fastfork_epoch_status();
 ```
 
@@ -627,12 +687,16 @@ Passing means:
 
 ### Phase 3: Richer Multi-connection Epoch Support
 
-- Add an optional coordinated quiesce protocol for harnesses that want the
-  server to enforce final rollback barriers across all pool connections.
-- Decide whether read-only nonparticipants should auto-join or continue to fail
-  on utility/write paths while a shared epoch is active.
-- Add broader multi-connection tests for DDL, sequences, catalog cache
-  invalidation, and connection churn during active epochs.
+1. Add session-bound epoch join/leave support for DML-only workloads.
+2. Add a named epoch registry and `start/join/leave/finish` SQL functions.
+3. Add epoch ID to `memsmgr` overlay keys.
+4. Add epoch ID to shared `BufferTag` and ensure dirty buffer flushes route to
+   the epoch encoded in the buffer tag.
+5. Add optional coordinated quiesce or force-finish behavior for harnesses that
+   want the server to enforce final rollback barriers across all pool
+   connections.
+6. Add broader multi-connection tests for DML, DDL rejection, sequences,
+   catalog cache invalidation, and connection churn during active epochs.
 
 ## Risks
 
@@ -640,8 +704,8 @@ Passing means:
   copy-on-write. One missed path can corrupt the fixture image.
 - Hint-bit and visibility-map updates are easy to underestimate because they
   look like optimizations but still mutate pages.
-- Shared buffer descriptors are not epoch-keyed. First-version single-backend
-  enforcement is important.
+- Shared buffer descriptors must be epoch-keyed before two named epochs can
+  safely mutate the same relation page concurrently.
 - Buffer descriptors can point at discarded epoch memory if detachment ordering
   is wrong.
 - Subtransaction behavior can become subtly wrong if child overlays are merged

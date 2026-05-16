@@ -89,6 +89,56 @@ SELECT val FROM epoch_parent WHERE bucket = 1 AND id = 5;
 """
 
 
+SESSION_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_restore('fixture');
+SELECT pg_fastfork_epoch_session_begin();
+BEGIN;
+UPDATE epoch_parent SET val = 'session-changed' WHERE id = 1;
+INSERT INTO epoch_child VALUES (1500, 2, 45);
+COMMIT;
+SELECT 1 / CASE WHEN (SELECT val FROM epoch_parent WHERE id = 1) = 'session-changed'
+           THEN 1 ELSE 0 END;
+SELECT pg_fastfork_epoch_leave();
+DO $$
+BEGIN
+  IF (SELECT val FROM epoch_parent WHERE id = 1) <> 'base-1' THEN
+    RAISE EXCEPTION 'session epoch leave leaked heap update';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id = 1500) THEN
+    RAISE EXCEPTION 'session epoch leave leaked inserted row';
+  END IF;
+END $$;
+"""
+
+
+NAMED_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_restore('fixture');
+SELECT pg_fastfork_epoch_start('named-test', 'fixture');
+SELECT pg_fastfork_epoch_join('named-test');
+BEGIN;
+UPDATE epoch_parent SET val = 'named-changed' WHERE id = 1;
+INSERT INTO epoch_child VALUES (1600, 2, 46);
+COMMIT;
+SELECT 1 / CASE WHEN (SELECT val FROM epoch_parent WHERE id = 1) = 'named-changed'
+           THEN 1 ELSE 0 END;
+SELECT pg_fastfork_epoch_leave();
+SELECT pg_fastfork_epoch_finish('named-test');
+DO $$
+BEGIN
+  IF (SELECT val FROM epoch_parent WHERE id = 1) <> 'base-1' THEN
+    RAISE EXCEPTION 'named epoch finish leaked heap update';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id = 1600) THEN
+    RAISE EXCEPTION 'named epoch finish leaked inserted row';
+  END IF;
+END $$;
+"""
+
+
 COMMIT_SQL = r"""
 \set ON_ERROR_STOP on
 SELECT pg_fastfork_restore('fixture');
@@ -152,6 +202,50 @@ DO $$
 BEGIN
   IF EXISTS (SELECT 1 FROM epoch_child WHERE id IN (2000, 2001)) THEN
     RAISE EXCEPTION 'parallel epoch rollback leaked inserted rows';
+  END IF;
+END $$;
+"""
+
+
+PARALLEL_NAMED_SETUP_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_restore('fixture');
+SELECT pg_fastfork_epoch_start('named-a', 'fixture');
+SELECT pg_fastfork_epoch_start('named-b', 'fixture');
+"""
+
+
+PARALLEL_NAMED_CONN1_SQL = """
+SELECT pg_fastfork_epoch_join('named-a');
+BEGIN;
+INSERT INTO epoch_child VALUES (3000, 2, 60);
+SELECT pg_sleep(1.0);
+COMMIT;
+SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM epoch_child WHERE id = 3000)
+           THEN 1 ELSE 0 END;
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+PARALLEL_NAMED_CONN2_SQL = """
+SELECT pg_fastfork_epoch_join('named-b');
+BEGIN;
+INSERT INTO epoch_child VALUES (3000, 3, 61);
+COMMIT;
+SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM epoch_child WHERE id = 3000)
+           THEN 1 ELSE 0 END;
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+PARALLEL_NAMED_FINISH_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_epoch_finish('named-a');
+SELECT pg_fastfork_epoch_finish('named-b');
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id = 3000) THEN
+    RAISE EXCEPTION 'parallel named epoch finish leaked inserted row';
   END IF;
 END $$;
 """
@@ -273,6 +367,43 @@ def run_parallel_epoch(psql: str, conn_args: list[str], env: dict[str, str]) -> 
     run([psql, *conn_args, "-d", "bench"], env=env, input_text=PARALLEL_VERIFY_SQL)
 
 
+def run_parallel_named_epochs(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + PARALLEL_NAMED_SETUP_SQL)
+
+    cmd = [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1"]
+    first = subprocess.Popen(
+        [*cmd, "-c", PARALLEL_NAMED_CONN1_SQL],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.2)
+        second = run([*cmd, "-c", PARALLEL_NAMED_CONN2_SQL], env=env, check=False)
+        if second.returncode != 0:
+            raise RuntimeError(
+                "parallel named epoch second participant failed:\n"
+                f"{second.stdout or ''}{second.stderr or ''}"
+            )
+
+        stdout, stderr = first.communicate(timeout=10)
+        if first.returncode != 0:
+            raise RuntimeError(
+                "parallel named epoch first participant failed:\n"
+                f"{stdout or ''}{stderr or ''}"
+            )
+    finally:
+        if first.poll() is None:
+            first.terminate()
+            try:
+                first.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                first.kill()
+
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=PARALLEL_NAMED_FINISH_SQL)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", required=True, type=Path, help="PostgreSQL install bin directory")
@@ -307,6 +438,9 @@ def main() -> int:
         run([createdb, *conn_args, "bench"], env=env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=SETUP_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + DML_SQL)
+        run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + SESSION_SQL)
+        run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + NAMED_SQL)
+        run_parallel_named_epochs(psql, conn_args, env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + "SELECT pg_fastfork_restore('fixture');\n")
         run_parallel_epoch(psql, conn_args, env)
         expect_error(

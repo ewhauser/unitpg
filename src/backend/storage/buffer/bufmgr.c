@@ -58,6 +58,7 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
+#include "storage/memsmgr.h"
 #include "storage/proc.h"
 #include "storage/proclist.h"
 #include "storage/procsignal.h"
@@ -4600,11 +4601,28 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+	FastForkEpochSetWriteEpoch(buf->tag.fastfork_epoch_id);
+	PG_TRY();
+	{
+		smgrwrite(reln,
+				  BufTagGetForkNum(&buf->tag),
+				  buf->tag.blockNum,
+				  bufBlock,
+				  false);
+	}
+	PG_FINALLY();
+	{
+		FastForkEpochClearWriteEpoch();
+	}
+	PG_END_TRY();
+#else
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
 			  bufBlock,
 			  false);
+#endif
 
 	/*
 	 * When a strategy is in use, only flushes of dirty buffers already in the
@@ -7636,6 +7654,13 @@ buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
 		return -1;
 	if (ba->blockNum > bb->blockNum)
 		return 1;
+
+#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
+	if (ba->fastfork_epoch_id < bb->fastfork_epoch_id)
+		return -1;
+	if (ba->fastfork_epoch_id > bb->fastfork_epoch_id)
+		return 1;
+#endif
 
 	return 0;
 }

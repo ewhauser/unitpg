@@ -55,6 +55,9 @@ extern int	memfd(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 				  uint32 *off);
 
 extern bool FastForkEpochActive(void);
+extern uint64 FastForkEpochBufferTagId(const RelFileLocator *rlocator);
+extern void FastForkEpochSetWriteEpoch(uint64 epoch_id);
+extern void FastForkEpochClearWriteEpoch(void);
 extern void AtEOXact_FastForkEpoch(bool isCommit);
 extern void FastForkEpochCheckUtility(Node *parsetree);
 

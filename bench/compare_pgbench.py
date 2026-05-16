@@ -474,13 +474,13 @@ def main() -> int:
     parser.add_argument("--random-seed", default="1")
     parser.add_argument(
         "--baseline-workload",
-        choices=["epoch-ddl", "epoch-rollback", "rollback", "snapshot"],
+        choices=["epoch-ddl", "epoch-named", "epoch-rollback", "epoch-session", "rollback", "snapshot"],
         default="rollback",
         help="workload to run against the baseline build",
     )
     parser.add_argument(
         "--fakewal-workload",
-        choices=["epoch-ddl", "epoch-rollback", "rollback", "snapshot"],
+        choices=["epoch-ddl", "epoch-named", "epoch-rollback", "epoch-session", "rollback", "snapshot"],
         default="rollback",
         help="workload to run against the fast-fork build",
     )
@@ -578,12 +578,12 @@ def main() -> int:
         raise SystemExit("--rounds must be at least 1")
     if (
         (
-            args.baseline_workload in {"epoch-ddl", "epoch-rollback", "snapshot"}
-            or args.fakewal_workload in {"epoch-ddl", "epoch-rollback", "snapshot"}
+            args.baseline_workload in {"epoch-ddl", "epoch-named", "epoch-rollback", "epoch-session", "snapshot"}
+            or args.fakewal_workload in {"epoch-ddl", "epoch-named", "epoch-rollback", "epoch-session", "snapshot"}
         )
         and args.clients != 1
     ):
-        raise SystemExit("the epoch-ddl, epoch-rollback, and snapshot workloads currently require --clients 1")
+        raise SystemExit("the epoch and snapshot workloads currently require --clients 1")
     enable_no_data_directory_startup = (
         not args.disable_no_data_directory_startup
         and not args.disable_seed_only_startup

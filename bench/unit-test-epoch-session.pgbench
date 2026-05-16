@@ -1,0 +1,61 @@
+\set probe_id random(1, :bench_rows)
+\set delta random(1, 50)
+\if :setup_done
+\else
+CREATE TABLE bench_parent (
+    id integer PRIMARY KEY,
+    payload text NOT NULL,
+    bucket integer NOT NULL,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE bench_child (
+    id integer PRIMARY KEY,
+    parent_id integer NOT NULL REFERENCES bench_parent(id),
+    amount integer NOT NULL,
+    payload text NOT NULL
+);
+INSERT INTO bench_parent (id, payload, bucket)
+SELECT g, md5(g::text), g % 16
+FROM generate_series(1, :bench_rows) AS g;
+INSERT INTO bench_child (id, parent_id, amount, payload)
+SELECT g, ((g - 1) % :bench_rows) + 1, g % 100, md5((g * 17)::text)
+FROM generate_series(1, :bench_rows * 4) AS g;
+CREATE INDEX bench_parent_bucket_idx ON bench_parent (bucket, id);
+CREATE INDEX bench_child_parent_amount_idx ON bench_child (parent_id, amount);
+ANALYZE bench_parent;
+ANALYZE bench_child;
+SELECT pg_fastfork_snapshot('bench_fixture');
+SELECT pg_fastfork_restore('bench_fixture');
+\set setup_done 1
+\endif
+SELECT pg_fastfork_epoch_session_begin();
+BEGIN;
+SELECT count(*), sum(c.amount)
+FROM bench_parent AS p
+JOIN bench_child AS c ON c.parent_id = p.id
+WHERE p.bucket = :probe_id % 16
+  AND c.amount BETWEEN 10 AND 90;
+SAVEPOINT mutate;
+UPDATE bench_child
+SET amount = amount + :delta
+WHERE parent_id BETWEEN greatest(1, :probe_id - 8)
+                    AND least(:bench_rows, :probe_id + 8);
+DELETE FROM bench_child
+WHERE amount > 120;
+SELECT p.id, count(c.id), coalesce(sum(c.amount), 0)
+FROM bench_parent AS p
+LEFT JOIN bench_child AS c ON c.parent_id = p.id
+WHERE p.id BETWEEN greatest(1, :probe_id - 4)
+               AND least(:bench_rows, :probe_id + 4)
+GROUP BY p.id
+ORDER BY p.id;
+ROLLBACK TO SAVEPOINT mutate;
+INSERT INTO bench_child (id, parent_id, amount, payload)
+SELECT :bench_rows * 100 + :probe_id * 10 + g, :probe_id, :delta, md5(g::text)
+FROM generate_series(1, 8) AS g
+ON CONFLICT DO NOTHING;
+SELECT count(*)
+FROM bench_child
+WHERE parent_id = :probe_id;
+ROLLBACK;
+SELECT pg_fastfork_epoch_leave();
