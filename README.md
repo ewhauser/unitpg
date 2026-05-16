@@ -157,6 +157,9 @@ Practical integration notes:
 - If a joined backend exits, the server detaches it from the epoch, but explicit
   `pg_fastfork_epoch_leave()` is preferred so harness failures are easier to
   diagnose.
+- `pg_fastfork_epoch_finish(test_id)` is safe to call more than once during
+  cleanup. If another cleanup path already discarded the named epoch, the later
+  call is a no-op.
 - DDL inside session-bound named epochs is not supported yet. Run migrations and
   schema setup before `pg_fastfork_snapshot('fixture')`. Use the older
   transaction-bound `BEGIN; SELECT pg_fastfork_epoch_begin(); ... ROLLBACK;`
