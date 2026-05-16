@@ -5186,6 +5186,43 @@ DropDatabaseBuffers(Oid dbid)
 
 #if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
 void
+FastForkEpochFlushBuffers(uint64 epoch_id)
+{
+	int			i;
+
+	if (epoch_id == 0)
+		return;
+
+	for (i = 0; i < NBuffers; i++)
+	{
+		BufferDesc *bufHdr = GetBufferDescriptor(i);
+		uint64		buf_state;
+
+		/*
+		 * Session-bound named epochs use ordinary COMMIT, so make that
+		 * committed state independent of whether the modified page happens to
+		 * remain in shared buffers for the next joined backend.
+		 */
+		if (bufHdr->tag.fastfork_epoch_id != epoch_id)
+			continue;
+
+		ReservePrivateRefCountEntry();
+		ResourceOwnerEnlarge(CurrentResourceOwner);
+
+		buf_state = LockBufHdr(bufHdr);
+		if (bufHdr->tag.fastfork_epoch_id == epoch_id &&
+			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
+		{
+			PinBuffer_Locked(bufHdr);
+			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
+			UnpinBuffer(bufHdr);
+		}
+		else
+			UnlockBufHdr(bufHdr);
+	}
+}
+
+void
 FastForkEpochDropBuffers(uint64 epoch_id)
 {
 	int			i;

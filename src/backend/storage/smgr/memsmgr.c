@@ -1053,7 +1053,11 @@ pg_fastfork_epoch_session_begin(PG_FUNCTION_ARGS)
 				 errmsg("pg_fastfork_epoch_session_begin() requires a database connection")));
 
 	if (MemSmgrEpochActiveFlag)
+	{
+		FastForkEpochFlushBuffers(MemSmgrEpochId);
+		mem_epoch_reset_backend_caches();
 		PG_RETURN_VOID();
+	}
 
 	if (IsParallelWorker())
 		ereport(ERROR,
@@ -1062,6 +1066,7 @@ pg_fastfork_epoch_session_begin(PG_FUNCTION_ARGS)
 
 	mem_epoch_join_or_start("", MemSmgrLastRestoredSnapshot, true);
 	MemSmgrEpochSessionBound = true;
+	FastForkEpochFlushBuffers(MemSmgrEpochId);
 	mem_epoch_reset_backend_caches();
 
 	PG_RETURN_VOID();
@@ -1165,6 +1170,8 @@ pg_fastfork_epoch_join(PG_FUNCTION_ARGS)
 							joined_name)));
 		}
 		LWLockRelease(&MemSmgrState->lock);
+		FastForkEpochFlushBuffers(MemSmgrEpochId);
+		mem_epoch_reset_backend_caches();
 		pfree(name);
 		PG_RETURN_VOID();
 	}
@@ -1176,6 +1183,7 @@ pg_fastfork_epoch_join(PG_FUNCTION_ARGS)
 
 	mem_epoch_join_or_start(name, NULL, true);
 	MemSmgrEpochSessionBound = true;
+	FastForkEpochFlushBuffers(MemSmgrEpochId);
 	mem_epoch_reset_backend_caches();
 
 	pfree(name);
@@ -1211,6 +1219,8 @@ pg_fastfork_epoch_leave(PG_FUNCTION_ARGS)
 			finish_on_last = true;
 	}
 	LWLockRelease(&MemSmgrState->lock);
+
+	FastForkEpochFlushBuffers(MemSmgrEpochId);
 
 	last_participant = mem_epoch_leave(finish_on_last, &next_oid, &oid_count);
 	if (last_participant && finish_on_last)
