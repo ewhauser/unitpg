@@ -175,6 +175,7 @@ Included:
 - bin/postmaster, when installed
 - bin/pg_isready, when installed
 - server runtime libraries
+- pgvector extension files, when installed
 - share runtime data, including timezone and initdb files
 
 Intentionally omitted:

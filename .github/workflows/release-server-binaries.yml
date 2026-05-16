@@ -33,6 +33,7 @@ jobs:
     env:
       FASTFORK_BUILD_DIR: bench/.build/release-${{ matrix.target }}
       FASTFORK_JOBS: 4
+      PGVECTOR_VERSION: v0.8.2
 
     steps:
       - name: Check out source
@@ -69,6 +70,13 @@ jobs:
       - name: Create temporary server install
         run: meson test -C "$FASTFORK_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
 
+      - name: Build pgvector extension
+        run: |
+          ci/build-pgvector.sh \
+            "$FASTFORK_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RUNNER_TEMP/pgvector" \
+            "$PGVECTOR_VERSION"
+
       - name: Package server distribution
         run: |
           ci/package-server-dist.sh \
@@ -81,9 +89,12 @@ jobs:
           set -euo pipefail
           dist="$RUNNER_TEMP/server-dist/postgres-fastfork-${{ matrix.target }}"
           find "$dist/lib" -maxdepth 3 \
-            \( -name 'dict_snowball*' -o -name 'plpgsql*' \) \
+            \( -name 'dict_snowball*' -o -name 'plpgsql*' -o -name 'vector*' \) \
             -print
           test -n "$(find "$dist/lib" -maxdepth 3 -name 'dict_snowball*' -print -quit)"
+          test -n "$(find "$dist/lib" -maxdepth 3 -name 'vector*' -print -quit)"
+          test -f "$dist/share/extension/vector.control"
+          test -n "$(find "$dist/share/extension" -maxdepth 1 -name 'vector--*.sql' -print -quit)"
 
       - name: Smoke-test packaged server
         run: |
@@ -101,6 +112,8 @@ jobs:
             -c shared_memory_type=mmap
           "$dist/bin/pg_ctl" -D "$workdir/data" -l "$workdir/postgres.log" -o "-k $workdir" -w start
           "$dist/bin/psql" -h "$workdir" -d postgres -U postgres -Atqc "select 1" | grep -Fx 1
+          "$dist/bin/psql" -h "$workdir" -d postgres -U postgres -Atqc \
+            "create extension vector; select vector_dims('[1,2,3]'::vector);" | grep -Fx 3
           "$dist/bin/pg_ctl" -D "$workdir/data" -m fast -w stop
 
       - name: Upload binary archive
