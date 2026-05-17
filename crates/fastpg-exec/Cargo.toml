@@ -6,6 +6,8 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+fastpg-bind.workspace = true
+fastpg-parser.workspace = true
 fastpg-plan.workspace = true
 fastpg-storage.workspace = true
 fastpg-tx.workspace = true

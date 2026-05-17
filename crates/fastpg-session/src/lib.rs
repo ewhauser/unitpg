@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-pub use fastpg_exec::{QueryDescription, QueryExecution, QueryResult};
+pub use fastpg_exec::{CopyTarget, QueryDescription, QueryExecution, QueryResult};
 pub use fastpg_types::{Column, PgType, Value};
 
 use fastpg_exec::QueryExecutor;
@@ -23,6 +23,10 @@ impl SessionState {
 
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
         self.executor.execute(sql, parameters)
+    }
+
+    pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
+        self.executor.copy_text_line(table, line)
     }
 }
 

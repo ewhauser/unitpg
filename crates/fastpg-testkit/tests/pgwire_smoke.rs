@@ -20,8 +20,17 @@ async fn tokio_postgres_simple_query_smoke() -> Result<(), Box<dyn Error>> {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("server_version"), Some("17.0-fastpg"));
 
+    client.simple_query("DROP TABLE IF EXISTS smoke").await?;
+    client
+        .simple_query("CREATE TABLE smoke(id int, value int)")
+        .await?;
+    let messages = client.simple_query("SELECT count(*) FROM smoke").await?;
+    let rows = rows_only(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("count"), Some("0"));
+
     let error = client
-        .simple_query("CREATE TABLE unsupported(id int)")
+        .simple_query("SELECT 2")
         .await
         .expect_err("unsupported SQL should return a Postgres-shaped error");
     assert_eq!(error.code(), Some(&SqlState::FEATURE_NOT_SUPPORTED));

@@ -263,6 +263,8 @@ dependencies = [
 name = "fastpg-exec"
 version = "0.1.0"
 dependencies = [
+ "fastpg-bind",
+ "fastpg-parser",
  "fastpg-plan",
  "fastpg-storage",
  "fastpg-tx",

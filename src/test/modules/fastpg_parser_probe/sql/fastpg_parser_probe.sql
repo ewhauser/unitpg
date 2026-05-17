@@ -22,3 +22,20 @@ CREATE TABLE fastpg_mem_probe(id int);
 INSERT INTO fastpg_mem_probe VALUES (1), (2);
 SELECT id FROM fastpg_mem_probe ORDER BY id;
 SELECT pg_relation_size('fastpg_mem_probe'::regclass);
+
+CREATE TABLE fastpg_mem_xact_probe(id int, note text);
+BEGIN;
+INSERT INTO fastpg_mem_xact_probe VALUES (1, 'rolled back');
+ROLLBACK;
+SELECT count(*) FROM fastpg_mem_xact_probe;
+BEGIN;
+INSERT INTO fastpg_mem_xact_probe VALUES (2, 'committed');
+SAVEPOINT fastpg_mem_nested;
+INSERT INTO fastpg_mem_xact_probe VALUES (3, 'nested rollback');
+ROLLBACK TO fastpg_mem_nested;
+COMMIT;
+SELECT id, note FROM fastpg_mem_xact_probe ORDER BY id;
+
+CREATE TABLE fastpg_mem_many(id int);
+INSERT INTO fastpg_mem_many SELECT generate_series(1, 3000);
+SELECT count(*), min(ctid), max(ctid), max(id) FROM fastpg_mem_many;

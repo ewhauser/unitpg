@@ -1,24 +1,26 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Debug;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use fastpg_session::{
-    Column, PgType, QueryDescription, QueryExecution, QueryResult, SessionState, Value,
+    Column, CopyTarget, PgType, QueryDescription, QueryExecution, QueryResult, SessionState, Value,
 };
-use futures::{Sink, stream};
+use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
+use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
-    QueryResponse, Response, Tag,
+    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
+    FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 
@@ -57,6 +59,10 @@ impl PgWireServerHandlers for FastPgServerHandlers {
     }
 
     fn startup_handler(&self) -> Arc<impl StartupHandler> {
+        self.handler.clone()
+    }
+
+    fn copy_handler(&self) -> Arc<impl CopyHandler> {
         self.handler.clone()
     }
 }
@@ -100,16 +106,15 @@ impl NoopStartupHandler for FastPgWireHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for FastPgWireHandler {
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        Ok(vec![execution_to_response(
-            self.session.execute(query, &[]),
-            FieldFormat::Text,
-        )?])
+        let execution = self.session.execute(query, &[]);
+        remember_copy_target(client, &execution);
+        Ok(vec![execution_to_response(execution, FieldFormat::Text)?])
     }
 }
 
@@ -178,11 +183,64 @@ impl ExtendedQueryHandler for FastPgWireHandler {
             Some(description) => decode_parameters(portal, &description)?,
             None => vec![],
         };
+        let execution = self.session.execute(query, &parameters);
+        remember_copy_target(_client, &execution);
 
-        execution_to_response(
-            self.session.execute(query, &parameters),
-            portal.result_column_format.format_for(0),
-        )
+        execution_to_response(execution, portal.result_column_format.format_for(0))
+    }
+}
+
+#[async_trait]
+impl CopyHandler for FastPgWireHandler {
+    async fn on_copy_data<C>(&self, client: &mut C, copy_data: CopyData) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let active_copy = active_copy(client)?;
+        let mut active_copy = active_copy
+            .lock()
+            .expect("fastpg active COPY mutex poisoned");
+        active_copy
+            .push_data(&self.session, copy_data.data.as_ref())
+            .map_err(copy_data_error)?;
+        Ok(())
+    }
+
+    async fn on_copy_done<C>(&self, client: &mut C, _done: CopyDone) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let rows = {
+            let active_copy = active_copy(client)?;
+            let mut active_copy = active_copy
+                .lock()
+                .expect("fastpg active COPY mutex poisoned");
+            active_copy.finish(&self.session).map_err(copy_data_error)?
+        };
+
+        client
+            .send(PgWireBackendMessage::CommandComplete(
+                Tag::new("COPY").with_rows(rows).into(),
+            ))
+            .await?;
+        Ok(())
+    }
+
+    async fn on_copy_fail<C>(&self, _client: &mut C, fail: CopyFail) -> PgWireError
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        PgWireError::UserError(Box::new(ErrorInfo::new(
+            "ERROR".to_owned(),
+            "57014".to_owned(),
+            format!("COPY cancelled by client: {}", fail.message),
+        )))
     }
 }
 
@@ -223,6 +281,7 @@ fn field_info(field: &Column, format: FieldFormat) -> FieldInfo {
 fn to_pgwire_type(data_type: PgType) -> Type {
     match data_type {
         PgType::Int4 => Type::INT4,
+        PgType::Int8 => Type::INT8,
         PgType::Varchar => Type::VARCHAR,
     }
 }
@@ -239,6 +298,9 @@ fn decode_parameters(
             PgType::Int4 => portal
                 .parameter::<i32>(idx, &Type::INT4)
                 .map(|value| value.map(Value::Int4).unwrap_or(Value::Null)),
+            PgType::Int8 => portal
+                .parameter::<i64>(idx, &Type::INT8)
+                .map(|value| value.map(Value::Int8).unwrap_or(Value::Null)),
             PgType::Varchar => portal
                 .parameter::<String>(idx, &Type::VARCHAR)
                 .map(|value| value.map(Value::Text).unwrap_or(Value::Null)),
@@ -249,8 +311,15 @@ fn decode_parameters(
 fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWireResult<Response> {
     match execution {
         QueryExecution::Rows(result) => query_result_response(result, format),
+        QueryExecution::Command { tag, rows } => Ok(command_complete(&tag, rows)),
+        QueryExecution::CopyIn(target) => Ok(Response::CopyIn(CopyResponse::new(
+            0,
+            target.columns,
+            stream::empty(),
+        ))),
         QueryExecution::Unsupported { query } => Ok(unsupported_response(&query)),
         QueryExecution::InvalidParameters { message } => Ok(invalid_parameter_response(&message)),
+        QueryExecution::Error { sqlstate, message } => Ok(error_response(&sqlstate, &message)),
     }
 }
 
@@ -287,8 +356,10 @@ fn encode_value(
 ) -> PgWireResult<()> {
     match (data_type, value) {
         (PgType::Int4, Value::Int4(value)) => encoder.encode_field(&Some(*value)),
+        (PgType::Int8, Value::Int8(value)) => encoder.encode_field(&Some(*value)),
         (PgType::Varchar, Value::Text(value)) => encoder.encode_field(&Some(value.as_str())),
         (PgType::Int4, Value::Null) => encoder.encode_field(&Option::<i32>::None),
+        (PgType::Int8, Value::Null) => encoder.encode_field(&Option::<i64>::None),
         (PgType::Varchar, Value::Null) => encoder.encode_field(&Option::<&str>::None),
         (expected, actual) => Err(PgWireError::ApiError(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -313,6 +384,94 @@ fn invalid_parameter_response(message: &str) -> Response {
     )))
 }
 
+fn error_response(sqlstate: &str, message: &str) -> Response {
+    Response::Error(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        sqlstate.to_owned(),
+        message.to_owned(),
+    )))
+}
+
 pub fn command_complete(tag: &str, rows: usize) -> Response {
     Response::Execution(Tag::new(tag).with_rows(rows))
+}
+
+#[derive(Debug)]
+struct ActiveCopy {
+    target: CopyTarget,
+    pending: String,
+    rows: usize,
+}
+
+impl ActiveCopy {
+    fn new(target: CopyTarget) -> Self {
+        Self {
+            target,
+            pending: String::new(),
+            rows: 0,
+        }
+    }
+
+    fn push_data(&mut self, session: &SessionState, data: &[u8]) -> Result<(), String> {
+        let chunk = std::str::from_utf8(data).map_err(|error| error.to_string())?;
+        self.pending.push_str(chunk);
+
+        while let Some(newline) = self.pending.find('\n') {
+            let line = self.pending[..newline].trim_end_matches('\r').to_owned();
+            self.pending.drain(..=newline);
+            self.process_line(session, &line)?;
+        }
+
+        Ok(())
+    }
+
+    fn finish(&mut self, session: &SessionState) -> Result<usize, String> {
+        if !self.pending.is_empty() {
+            let line = std::mem::take(&mut self.pending);
+            self.process_line(session, line.trim_end_matches('\r'))?;
+        }
+        Ok(self.rows)
+    }
+
+    fn process_line(&mut self, session: &SessionState, line: &str) -> Result<(), String> {
+        if session.copy_text_line(&self.target.table, line)? {
+            self.rows += 1;
+        }
+        Ok(())
+    }
+}
+
+fn remember_copy_target<C>(client: &mut C, execution: &QueryExecution)
+where
+    C: ClientInfo,
+{
+    if let QueryExecution::CopyIn(target) = execution {
+        client
+            .session_extensions()
+            .insert(Mutex::new(ActiveCopy::new(target.clone())));
+    }
+}
+
+fn active_copy<C>(client: &C) -> PgWireResult<Arc<Mutex<ActiveCopy>>>
+where
+    C: ClientInfo,
+{
+    client
+        .session_extensions()
+        .get::<Mutex<ActiveCopy>>()
+        .ok_or_else(|| {
+            PgWireError::UserError(Box::new(ErrorInfo::new(
+                "ERROR".to_owned(),
+                "08P01".to_owned(),
+                "COPY data received without an active COPY target".to_owned(),
+            )))
+        })
+}
+
+fn copy_data_error(message: String) -> PgWireError {
+    PgWireError::UserError(Box::new(ErrorInfo::new(
+        "ERROR".to_owned(),
+        "22P04".to_owned(),
+        message,
+    )))
 }

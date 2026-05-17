@@ -18,14 +18,14 @@
 #include "access/xact.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
-#include "utils/datum.h"
+#include "storage/off.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
-#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
 #include <stdint.h>
+#include <string.h>
 
 typedef struct FastPgMemScanDesc
 {
@@ -43,8 +43,12 @@ extern size_t fastpg_rust_relation_row_count(uint32_t relid);
 extern bool fastpg_rust_relation_insert(uint32_t relid,
 										const uintptr_t *values,
 										const uint8_t *isnull,
+										const uint8_t *byval,
+										const size_t *value_lens,
 										size_t natts,
-										uint16_t *tid_offset);
+										uint64_t *row_id);
+extern bool fastpg_rust_relation_contains_row(uint32_t relid,
+											  uint64_t row_id);
 extern uint64_t fastpg_rust_scan_begin(uint32_t relid);
 extern void fastpg_rust_scan_reset(uint64_t scan_handle);
 extern void fastpg_rust_scan_end(uint64_t scan_handle);
@@ -53,16 +57,21 @@ extern bool fastpg_rust_scan_next(uint64_t scan_handle,
 								  uintptr_t *values,
 								  uint8_t *isnull,
 								  size_t natts,
-								  uint16_t *tid_offset);
+								  uint64_t *row_id);
 extern bool fastpg_rust_fetch_row(uint32_t relid,
-								  uint16_t tid_offset,
+								  uint64_t row_id,
 								  uintptr_t *values,
 								  uint8_t *isnull,
 								  size_t natts);
-
-static MemoryContext fastpg_mem_context = NULL;
+extern void fastpg_rust_xact_begin(void);
+extern void fastpg_rust_xact_commit(void);
+extern void fastpg_rust_xact_abort(void);
+extern void fastpg_rust_subxact_begin(void);
+extern void fastpg_rust_subxact_commit(void);
+extern void fastpg_rust_subxact_abort(void);
 
 static const TableAmRoutine fastpg_mem_methods;
+static bool fastpg_mem_xact_callbacks_registered = false;
 
 static void
 fastpg_mem_unsupported(const char *operation)
@@ -73,49 +82,154 @@ fastpg_mem_unsupported(const char *operation)
 					operation)));
 }
 
-static MemoryContext
-fastpg_mem_get_context(void)
+static void
+fastpg_mem_xact_callback(XactEvent event, void *arg)
 {
-	if (fastpg_mem_context == NULL)
-		fastpg_mem_context =
-			AllocSetContextCreate(TopMemoryContext,
-								  "fastpg_mem tableam storage",
-								  ALLOCSET_DEFAULT_SIZES);
-
-	return fastpg_mem_context;
+	switch (event)
+	{
+		case XACT_EVENT_COMMIT:
+		case XACT_EVENT_PARALLEL_COMMIT:
+		case XACT_EVENT_PREPARE:
+			fastpg_rust_xact_commit();
+			break;
+		case XACT_EVENT_ABORT:
+		case XACT_EVENT_PARALLEL_ABORT:
+			fastpg_rust_xact_abort();
+			break;
+		default:
+			break;
+	}
 }
 
 static void
-fastpg_mem_copy_slot_values(Relation rel,
-							TupleTableSlot *slot,
-							uintptr_t **values_out,
-							uint8_t **isnull_out)
+fastpg_mem_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
+							SubTransactionId parentSubid, void *arg)
+{
+	switch (event)
+	{
+		case SUBXACT_EVENT_START_SUB:
+			fastpg_rust_subxact_begin();
+			break;
+		case SUBXACT_EVENT_COMMIT_SUB:
+			fastpg_rust_subxact_commit();
+			break;
+		case SUBXACT_EVENT_ABORT_SUB:
+			fastpg_rust_subxact_abort();
+			break;
+		default:
+			break;
+	}
+}
+
+static void
+fastpg_mem_ensure_xact_callbacks(void)
+{
+	if (!fastpg_mem_xact_callbacks_registered)
+	{
+		RegisterXactCallback(fastpg_mem_xact_callback, NULL);
+		RegisterSubXactCallback(fastpg_mem_subxact_callback, NULL);
+		fastpg_mem_xact_callbacks_registered = true;
+	}
+}
+
+static void
+fastpg_mem_ensure_write_xact(void)
+{
+	fastpg_mem_ensure_xact_callbacks();
+	fastpg_rust_xact_begin();
+}
+
+static bool
+fastpg_mem_row_id_to_tid(uint64_t row_id, ItemPointer tid)
+{
+	uint64_t	zero_index;
+	uint64_t	block;
+	OffsetNumber offset;
+
+	if (row_id == 0)
+		return false;
+
+	zero_index = row_id - 1;
+	block = zero_index / (uint64_t) MaxOffsetNumber;
+	if (block > UINT32_MAX)
+		return false;
+
+	offset = (OffsetNumber) (zero_index % (uint64_t) MaxOffsetNumber) +
+		FirstOffsetNumber;
+	ItemPointerSet(tid, (BlockNumber) block, offset);
+	return true;
+}
+
+static bool
+fastpg_mem_tid_to_row_id(ItemPointer tid, uint64_t *row_id)
+{
+	BlockNumber block = ItemPointerGetBlockNumber(tid);
+	OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
+
+	if (!OffsetNumberIsValid(offset))
+		return false;
+
+	*row_id = ((uint64_t) block * (uint64_t) MaxOffsetNumber) +
+		(uint64_t) offset;
+	return true;
+}
+
+static size_t
+fastpg_mem_datum_size(Datum value, Form_pg_attribute attr)
+{
+	if (attr->attbyval)
+		return 0;
+	if (attr->attlen > 0)
+		return attr->attlen;
+	if (attr->attlen == -1)
+		return VARSIZE_ANY(DatumGetPointer(value));
+	if (attr->attlen == -2)
+		return strlen((const char *) DatumGetPointer(value)) + 1;
+
+	elog(ERROR, "fastpg_mem found unsupported attribute length %d",
+		 attr->attlen);
+	return 0;
+}
+
+static void
+fastpg_mem_prepare_slot_values(Relation rel,
+							   TupleTableSlot *slot,
+							   uintptr_t **values_out,
+							   uint8_t **isnull_out,
+							   uint8_t **byval_out,
+							   size_t **value_lens_out)
 {
 	TupleDesc	tupdesc;
 	uintptr_t  *values;
 	uint8_t    *isnull;
-	MemoryContext oldcontext;
+	uint8_t    *byval;
+	size_t	   *value_lens;
 
 	slot_getallattrs(slot);
 	tupdesc = RelationGetDescr(rel);
 	values = palloc0_array(uintptr_t, tupdesc->natts);
 	isnull = palloc0_array(uint8_t, tupdesc->natts);
+	byval = palloc0_array(uint8_t, tupdesc->natts);
+	value_lens = palloc0_array(size_t, tupdesc->natts);
 
-	oldcontext = MemoryContextSwitchTo(fastpg_mem_get_context());
 	for (int index = 0; index < tupdesc->natts; index++)
 	{
 		Form_pg_attribute attr = TupleDescAttr(tupdesc, index);
 
 		isnull[index] = slot->tts_isnull[index] ? 1 : 0;
+		byval[index] = attr->attbyval ? 1 : 0;
 		if (isnull[index] == 0)
-			values[index] = (uintptr_t) datumCopy(slot->tts_values[index],
-												  attr->attbyval,
-												  attr->attlen);
+		{
+			values[index] = (uintptr_t) slot->tts_values[index];
+			value_lens[index] =
+				fastpg_mem_datum_size(slot->tts_values[index], attr);
+		}
 	}
-	MemoryContextSwitchTo(oldcontext);
 
 	*values_out = values;
 	*isnull_out = isnull;
+	*byval_out = byval;
+	*value_lens_out = value_lens;
 }
 
 static void
@@ -123,7 +237,7 @@ fastpg_mem_store_virtual_tuple(Relation rel,
 							   TupleTableSlot *slot,
 							   const uintptr_t *values,
 							   const uint8_t *isnull,
-							   uint16_t tid_offset)
+							   uint64_t row_id)
 {
 	int			natts = slot->tts_tupleDescriptor->natts;
 
@@ -133,7 +247,9 @@ fastpg_mem_store_virtual_tuple(Relation rel,
 		slot->tts_isnull[index] = isnull[index] != 0;
 	}
 
-	ItemPointerSet(&slot->tts_tid, 0, (OffsetNumber) tid_offset);
+	if (!fastpg_mem_row_id_to_tid(row_id, &slot->tts_tid))
+		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
+			 (unsigned long long) row_id);
 	slot->tts_tableOid = RelationGetRelid(rel);
 	ExecStoreVirtualTuple(slot);
 }
@@ -210,7 +326,7 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 	int			natts = slot->tts_tupleDescriptor->natts;
 	uintptr_t  *values;
 	uint8_t    *isnull;
-	uint16_t	tid_offset = 0;
+	uint64_t	row_id = 0;
 	bool		found;
 
 	ExecClearTuple(slot);
@@ -222,13 +338,13 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 								  values,
 								  isnull,
 								  natts,
-								  &tid_offset);
+								  &row_id);
 	if (found)
 		fastpg_mem_store_virtual_tuple(scan->base.rs_rd,
 									   slot,
 									   values,
 									   isnull,
-									   tid_offset);
+									   row_id);
 
 	pfree(values);
 	pfree(isnull);
@@ -281,26 +397,25 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 								   Snapshot snapshot,
 								   TupleTableSlot *slot)
 {
-	OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
 	int			natts = slot->tts_tupleDescriptor->natts;
 	uintptr_t  *values;
 	uint8_t    *isnull;
+	uint64_t	row_id;
 	bool		found;
 
-	if (ItemPointerGetBlockNumber(tid) != 0 ||
-		offset == InvalidOffsetNumber)
+	if (!fastpg_mem_tid_to_row_id(tid, &row_id))
 		return false;
 
 	ExecClearTuple(slot);
 	values = palloc0_array(uintptr_t, natts);
 	isnull = palloc0_array(uint8_t, natts);
 	found = fastpg_rust_fetch_row(RelationGetRelid(rel),
-								  offset,
+								  row_id,
 								  values,
 								  isnull,
 								  natts);
 	if (found)
-		fastpg_mem_store_virtual_tuple(rel, slot, values, isnull, offset);
+		fastpg_mem_store_virtual_tuple(rel, slot, values, isnull, row_id);
 	pfree(values);
 	pfree(isnull);
 
@@ -324,13 +439,13 @@ fastpg_mem_index_fetch_tuple(IndexFetchTableData *scan,
 static bool
 fastpg_mem_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 {
-	OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
-	size_t		row_count =
-		fastpg_rust_relation_row_count(RelationGetRelid(scan->rs_rd));
+	uint64_t	row_id;
 
-	return ItemPointerGetBlockNumber(tid) == 0 &&
-		offset != InvalidOffsetNumber &&
-		offset <= row_count;
+	if (!fastpg_mem_tid_to_row_id(tid, &row_id))
+		return false;
+
+	return fastpg_rust_relation_contains_row(RelationGetRelid(scan->rs_rd),
+											row_id);
 }
 
 static void
@@ -362,20 +477,30 @@ fastpg_mem_tuple_insert(Relation rel,
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	uintptr_t  *values;
 	uint8_t    *isnull;
-	uint16_t	tid_offset = 0;
+	uint8_t    *byval;
+	size_t	   *value_lens;
+	uint64_t	row_id = 0;
 
-	fastpg_mem_copy_slot_values(rel, slot, &values, &isnull);
+	fastpg_mem_ensure_write_xact();
+	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
+								   &value_lens);
 	if (!fastpg_rust_relation_insert(RelationGetRelid(rel),
 									 values,
 									 isnull,
+									 byval,
+									 value_lens,
 									 tupdesc->natts,
-									 &tid_offset))
+									 &row_id))
 		elog(ERROR, "fastpg_mem failed to insert row into Rust storage");
 
-	ItemPointerSet(&slot->tts_tid, 0, (OffsetNumber) tid_offset);
+	if (!fastpg_mem_row_id_to_tid(row_id, &slot->tts_tid))
+		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
+			 (unsigned long long) row_id);
 	slot->tts_tableOid = RelationGetRelid(rel);
 	pfree(values);
 	pfree(isnull);
+	pfree(byval);
+	pfree(value_lens);
 }
 
 static void
@@ -586,7 +711,10 @@ fastpg_mem_relation_estimate_size(Relation rel,
 		fastpg_rust_relation_row_count(RelationGetRelid(rel));
 
 	*tuples = row_count;
-	*pages = *tuples == 0 ? 0 : 1;
+	*pages = row_count == 0 ? 0 :
+		(BlockNumber) (((uint64_t) row_count +
+						(uint64_t) MaxOffsetNumber - 1) /
+					   (uint64_t) MaxOffsetNumber);
 	*allvisfrac = 1.0;
 }
 
@@ -677,6 +805,7 @@ static const TableAmRoutine fastpg_mem_methods = {
 const TableAmRoutine *
 GetFastPgMemTableAmRoutine(void)
 {
+	fastpg_mem_ensure_xact_callbacks();
 	return &fastpg_mem_methods;
 }
 

@@ -16,6 +16,7 @@
 *.a
 *.mo
 *.pot
+__pycache__/
 objfiles.txt
 .deps/
 *.gcno
@@ -44,3 +45,5 @@ lib*.pc
 /Release/
 /tmp_install/
 /portlock/
+/benches/.build/
+/benches/results/

@@ -1,0 +1,817 @@
+#!/usr/bin/env python3
+"""Build normal/fastpg Postgres variants and compare them with pgbench."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import platform
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from pathlib import Path
+from statistics import median
+from typing import Any
+
+
+TPS_RE = re.compile(r"^tps =\s+([0-9.]+)\s+\(without initial connection time\)", re.MULTILINE)
+LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
+
+
+@dataclass(frozen=True)
+class Variant:
+    name: str
+    fastpg: bool
+    engine: str
+
+
+@dataclass
+class CommandResult:
+    command: list[str]
+    cwd: str
+    returncode: int
+    stdout: str
+    stderr: str
+    seconds: float
+
+    def as_json(self) -> dict[str, Any]:
+        return {
+            "command": self.command,
+            "cwd": self.cwd,
+            "returncode": self.returncode,
+            "seconds": self.seconds,
+        }
+
+
+class BenchmarkFailure(Exception):
+    def __init__(self, variant: str, phase: str, result: CommandResult, output_dir: Path):
+        self.variant = variant
+        self.phase = phase
+        self.result = result
+        self.output_dir = output_dir
+        super().__init__(f"{variant} failed during {phase}")
+
+
+class PgBenchCompare:
+    def __init__(self, args: argparse.Namespace):
+        self.args = args
+        self.source_root = Path(__file__).resolve().parents[1]
+        self.bench_root = self.source_root / "benches"
+        self.build_root = self.bench_root / ".build" / "pgbench"
+        self.pgbench_client_paths: dict[str, Path] | None = None
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.result_root = self.bench_root / "results" / "pgbench" / timestamp
+        self.result_root.mkdir(parents=True, exist_ok=True)
+        self.results: dict[str, Any] = {
+            "status": "running",
+            "created_at": timestamp,
+            "config": {
+                "builtin": args.builtin,
+                "init_steps": args.init_steps,
+                "scale": args.scale,
+                "transactions": args.transactions,
+                "clients": args.clients,
+                "jobs": args.jobs,
+                "runs": args.runs,
+                "protocol": args.protocol,
+                "fastpg_engine": args.fastpg_engine,
+            },
+            "variants": {},
+        }
+
+    def run(self) -> int:
+        print(f"results: {self.result_root}")
+        for variant in (
+            Variant("normal", False, "postgres"),
+            Variant("fastpg", True, self.args.fastpg_engine),
+        ):
+            self.run_variant(variant)
+
+        self.results["status"] = "ok"
+        self.write_results()
+        self.print_success()
+        return 0
+
+    def run_variant(self, variant: Variant) -> None:
+        variant_dir = self.result_root / variant.name
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        self.results["variants"][variant.name] = {
+            "fastpg": variant.fastpg,
+            "engine": variant.engine,
+            "status": "running",
+            "runs": [],
+        }
+
+        print(f"[{variant.name}] build/install")
+        if variant.engine == "rust-server":
+            paths = self.ensure_rust_server_install(variant, variant_dir / "setup")
+            self.results["variants"][variant.name]["server_binary"] = str(paths["server_binary"])
+            self.results["variants"][variant.name]["pgbench_client_prefix"] = str(paths["client_prefix"])
+        else:
+            paths = self.ensure_variant_install(variant, variant_dir / "setup")
+            self.results["variants"][variant.name]["build_dir"] = str(paths["build_dir"])
+            self.results["variants"][variant.name]["install_prefix"] = str(paths["prefix"])
+            if variant.name == "normal":
+                self.pgbench_client_paths = paths
+
+        for run_index in range(1, self.args.runs + 1):
+            print(f"[{variant.name}] pgbench run {run_index}/{self.args.runs}")
+            run_result = self.run_pgbench_once(variant, paths, run_index, variant_dir)
+            self.results["variants"][variant.name]["runs"].append(run_result)
+            self.write_results()
+
+        self.results["variants"][variant.name]["status"] = "ok"
+        self.results["variants"][variant.name]["summary"] = summarize_runs(
+            self.results["variants"][variant.name]["runs"]
+        )
+        self.write_results()
+
+    def ensure_variant_install(self, variant: Variant, output_dir: Path) -> dict[str, Path]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        build_dir = self.build_root / variant.name
+        setup_args = [
+            "meson",
+            "setup",
+            str(build_dir),
+            str(self.source_root),
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            f"-Dfastpg={'true' if variant.fastpg else 'false'}",
+        ]
+        reconfigure_args = [
+            "meson",
+            "setup",
+            "--reconfigure",
+            str(build_dir),
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            f"-Dfastpg={'true' if variant.fastpg else 'false'}",
+        ]
+
+        if (build_dir / "build.ninja").exists():
+            self.checked_command(variant.name, "setup", reconfigure_args, output_dir, "meson-reconfigure")
+        else:
+            self.checked_command(variant.name, "setup", setup_args, output_dir, "meson-setup")
+
+        self.checked_command(
+            variant.name,
+            "setup",
+            ["meson", "test", "-C", str(build_dir), "--suite", "setup", "--print-errorlogs"],
+            output_dir,
+            "meson-test-setup",
+        )
+
+        prefix = build_dir / "tmp_install" / "usr" / "local" / "pgsql"
+        bindir = prefix / "bin"
+        libdir = prefix / "lib"
+        for program in ("initdb", "pg_ctl", "psql", "pgbench"):
+            if not (bindir / program).exists():
+                raise BenchmarkFailure(
+                    variant.name,
+                    "setup",
+                    CommandResult([str(bindir / program)], str(self.source_root), 1, "", "missing installed binary", 0.0),
+                    output_dir,
+                )
+
+        self.repair_macos_libpq_names(variant.name, bindir, libdir, output_dir)
+        return {"build_dir": build_dir, "prefix": prefix, "bindir": bindir, "libdir": libdir}
+
+    def ensure_rust_server_install(self, variant: Variant, output_dir: Path) -> dict[str, Path]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if self.pgbench_client_paths is None:
+            raise BenchmarkFailure(
+                variant.name,
+                "setup",
+                CommandResult([], str(self.source_root), 1, "", "normal pgbench client paths are missing", 0.0),
+                output_dir,
+            )
+
+        build = self.checked_command(
+            variant.name,
+            "setup",
+            ["cargo", "build", "-p", "fastpg-server"],
+            output_dir,
+            "cargo-build-fastpg-server",
+        )
+        server_binary_name = "fastpg-server.exe" if os.name == "nt" else "fastpg-server"
+        server_binary = self.source_root / "target" / "debug" / server_binary_name
+        if not server_binary.exists():
+            raise BenchmarkFailure(
+                variant.name,
+                "setup",
+                CommandResult(
+                    build.command,
+                    str(self.source_root),
+                    1,
+                    build.stdout,
+                    f"missing built server binary: {server_binary}",
+                    build.seconds,
+                ),
+                output_dir,
+            )
+
+        return {
+            "server_binary": server_binary,
+            "client_prefix": self.pgbench_client_paths["prefix"],
+            "client_bindir": self.pgbench_client_paths["bindir"],
+            "client_libdir": self.pgbench_client_paths["libdir"],
+        }
+
+    def repair_macos_libpq_names(self, variant: str, bindir: Path, libdir: Path, output_dir: Path) -> None:
+        if platform.system() != "Darwin":
+            return
+
+        old_name = "/usr/local/pgsql/lib/libpq.5.dylib"
+        new_name = str(libdir / "libpq.5.dylib")
+        for binary_name in ("psql", "pgbench"):
+            binary = bindir / binary_name
+            otool = self.command(["otool", "-L", str(binary)], output_dir, f"otool-{binary_name}")
+            if otool.returncode != 0:
+                raise BenchmarkFailure(variant, "setup", otool, output_dir)
+            if old_name in otool.stdout:
+                changed = self.command(
+                    ["install_name_tool", "-change", old_name, new_name, str(binary)],
+                    output_dir,
+                    f"install-name-{binary_name}",
+                )
+                if changed.returncode != 0:
+                    raise BenchmarkFailure(variant, "setup", changed, output_dir)
+
+    def run_pgbench_once(
+        self, variant: Variant, paths: dict[str, Path], run_index: int, variant_dir: Path
+    ) -> dict[str, Any]:
+        if variant.engine == "rust-server":
+            return self.run_rust_server_pgbench_once(variant, paths, run_index, variant_dir)
+        return self.run_postgres_pgbench_once(variant, paths, run_index, variant_dir)
+
+    def run_postgres_pgbench_once(
+        self, variant: Variant, paths: dict[str, Path], run_index: int, variant_dir: Path
+    ) -> dict[str, Any]:
+        run_dir = variant_dir / f"run-{run_index}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        data_dir = run_dir / "data"
+        socket_dir = Path(f"/private/tmp/fpgb-{os.getpid()}-{variant.name}-{run_index}")
+        socket_dir.mkdir(parents=True, exist_ok=True)
+        port = free_port()
+        env = postgres_env(paths["bindir"], paths["libdir"])
+        logfile = run_dir / "postgres.log"
+        started = False
+        stop_failure: BenchmarkFailure | None = None
+
+        run_record: dict[str, Any] = {
+            "run": run_index,
+            "data_dir": str(data_dir),
+            "socket_dir": str(socket_dir),
+            "port": port,
+            "commands": {},
+        }
+
+        try:
+            initdb = self.checked_command(
+                variant.name,
+                "initdb",
+                [
+                    str(paths["bindir"] / "initdb"),
+                    "-D",
+                    str(data_dir),
+                    "-U",
+                    "postgres",
+                    "-A",
+                    "trust",
+                    "--no-locale",
+                ],
+                run_dir,
+                "initdb",
+                env=env,
+            )
+            run_record["commands"]["initdb"] = initdb.as_json()
+
+            start = self.checked_command(
+                variant.name,
+                "start",
+                [
+                    str(paths["bindir"] / "pg_ctl"),
+                    "-D",
+                    str(data_dir),
+                    "-l",
+                    str(logfile),
+                    "-o",
+                    f"-p {port} -k {socket_dir}",
+                    "start",
+                    "-w",
+                ],
+                run_dir,
+                "pg_ctl-start",
+                env=env,
+            )
+            started = True
+            run_record["commands"]["start"] = start.as_json()
+
+            init = self.checked_command(
+                variant.name,
+                "pgbench-init",
+                self.pgbench_init_command(paths["bindir"], str(socket_dir), port),
+                run_dir,
+                "pgbench-init",
+                env=env,
+            )
+            run_record["commands"]["pgbench_init"] = init.as_json()
+
+            bench = self.checked_command(
+                variant.name,
+                "pgbench-run",
+                self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
+                run_dir,
+                "pgbench-run",
+                env=env,
+            )
+            run_record["commands"]["pgbench_run"] = bench.as_json()
+            run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
+            return run_record
+        finally:
+            if started:
+                stopped = self.command(
+                    [
+                        str(paths["bindir"] / "pg_ctl"),
+                        "-D",
+                        str(data_dir),
+                        "stop",
+                        "-m",
+                        "fast",
+                        "-w",
+                    ],
+                    run_dir,
+                    "pg_ctl-stop",
+                    env=env,
+                )
+                run_record["commands"]["stop"] = stopped.as_json()
+                if stopped.returncode != 0:
+                    stop_failure = BenchmarkFailure(variant.name, "stop", stopped, run_dir)
+            shutil.rmtree(socket_dir, ignore_errors=True)
+            self.write_results()
+            if stop_failure is not None:
+                raise stop_failure
+
+    def run_rust_server_pgbench_once(
+        self, variant: Variant, paths: dict[str, Path], run_index: int, variant_dir: Path
+    ) -> dict[str, Any]:
+        run_dir = variant_dir / f"run-{run_index}"
+        run_dir.mkdir(parents=True, exist_ok=True)
+        host = "127.0.0.1"
+        port = free_port()
+        env = rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"])
+        server: dict[str, Any] | None = None
+        stop_failure: BenchmarkFailure | None = None
+
+        run_record: dict[str, Any] = {
+            "run": run_index,
+            "host": host,
+            "port": port,
+            "commands": {},
+        }
+
+        try:
+            server = self.start_rust_server(variant.name, paths["server_binary"], host, port, run_dir)
+            run_record["commands"]["start"] = server["result"].as_json()
+
+            init = self.checked_command(
+                variant.name,
+                "pgbench-init",
+                self.pgbench_init_command(paths["client_bindir"], host, port),
+                run_dir,
+                "pgbench-init",
+                env=env,
+            )
+            run_record["commands"]["pgbench_init"] = init.as_json()
+
+            bench = self.checked_command(
+                variant.name,
+                "pgbench-run",
+                self.pgbench_run_command(paths["client_bindir"], host, port),
+                run_dir,
+                "pgbench-run",
+                env=env,
+            )
+            run_record["commands"]["pgbench_run"] = bench.as_json()
+            run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
+            return run_record
+        finally:
+            if server is not None:
+                stopped = self.stop_rust_server(server, run_dir)
+                run_record["commands"]["stop"] = stopped.as_json()
+                if stopped.returncode != 0:
+                    stop_failure = BenchmarkFailure(variant.name, "stop", stopped, run_dir)
+            self.write_results()
+            if stop_failure is not None:
+                raise stop_failure
+
+    def start_rust_server(
+        self, variant: str, server_binary: Path, host: str, port: int, output_dir: Path
+    ) -> dict[str, Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        command = [str(server_binary), f"{host}:{port}"]
+        stdout_path = output_dir / "fastpg-server.stdout"
+        stderr_path = output_dir / "fastpg-server.stderr"
+        stdout_file = stdout_path.open("w")
+        stderr_file = stderr_path.open("w")
+        started = time.monotonic()
+        process = subprocess.Popen(
+            command,
+            cwd=self.source_root,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        result = CommandResult(command, str(self.source_root), 0, "", "", time.monotonic() - started)
+        server = {
+            "command": command,
+            "process": process,
+            "stdout_file": stdout_file,
+            "stderr_file": stderr_file,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "result": result,
+        }
+
+        if not wait_for_tcp_server(process, host, port):
+            stdout_file.flush()
+            stderr_file.flush()
+            failure = CommandResult(
+                command,
+                str(self.source_root),
+                process.poll() if process.poll() is not None else 1,
+                read_text(stdout_path),
+                read_text(stderr_path),
+                time.monotonic() - started,
+            )
+            self.stop_rust_server(server, output_dir)
+            raise BenchmarkFailure(variant, "start", failure, output_dir)
+
+        result.seconds = time.monotonic() - started
+        (output_dir / "fastpg-server-start.command.json").write_text(
+            json.dumps(result.as_json(), indent=2) + "\n"
+        )
+        return server
+
+    def stop_rust_server(self, server: dict[str, Any], output_dir: Path) -> CommandResult:
+        started = time.monotonic()
+        process = server["process"]
+        command = ["terminate", f"pid={process.pid}"]
+        terminated_by_harness = False
+        if process.poll() is None:
+            terminated_by_harness = True
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+        for key in ("stdout_file", "stderr_file"):
+            server[key].close()
+
+        result = CommandResult(
+            command,
+            str(self.source_root),
+            0 if terminated_by_harness else (process.returncode if process.returncode is not None else 1),
+            read_text(server["stdout_path"]),
+            read_text(server["stderr_path"]),
+            time.monotonic() - started,
+        )
+        (output_dir / "fastpg-server-stop.command.json").write_text(
+            json.dumps(result.as_json(), indent=2) + "\n"
+        )
+        return result
+
+    def pgbench_init_command(self, bindir: Path, host: str, port: int) -> list[str]:
+        command = [
+            str(bindir / "pgbench"),
+            "-h",
+            host,
+            "-p",
+            str(port),
+            "-U",
+            "postgres",
+            "-i",
+            "-s",
+            str(self.args.scale),
+            "-q",
+        ]
+        init_steps = normalize_init_steps(self.args.init_steps)
+        if init_steps is not None:
+            command.append(f"--init-steps={init_steps}")
+        command.append("postgres")
+        return command
+
+    def pgbench_run_command(self, bindir: Path, host: str, port: int) -> list[str]:
+        return [
+            str(bindir / "pgbench"),
+            "-h",
+            host,
+            "-p",
+            str(port),
+            "-U",
+            "postgres",
+            "-b",
+            self.args.builtin,
+            "-s",
+            str(self.args.scale),
+            "-t",
+            str(self.args.transactions),
+            "-c",
+            str(self.args.clients),
+            "-j",
+            str(self.args.jobs),
+            "-M",
+            self.args.protocol,
+            "-n",
+            "-r",
+            "postgres",
+        ]
+
+    def checked_command(
+        self,
+        variant: str,
+        phase: str,
+        command: list[str],
+        output_dir: Path,
+        label: str,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        result = self.command(command, output_dir, label, env=env)
+        if result.returncode != 0:
+            raise BenchmarkFailure(variant, phase, result, output_dir)
+        return result
+
+    def command(
+        self,
+        command: list[str],
+        output_dir: Path,
+        label: str,
+        env: dict[str, str] | None = None,
+    ) -> CommandResult:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        completed = subprocess.run(
+            command,
+            cwd=self.source_root,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            check=False,
+        )
+        result = CommandResult(
+            command=command,
+            cwd=str(self.source_root),
+            returncode=completed.returncode,
+            stdout=completed.stdout,
+            stderr=completed.stderr,
+            seconds=time.monotonic() - started,
+        )
+        (output_dir / f"{label}.stdout").write_text(result.stdout)
+        (output_dir / f"{label}.stderr").write_text(result.stderr)
+        (output_dir / f"{label}.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
+        return result
+
+    def write_results(self) -> None:
+        result_json = self.result_root / "summary.json"
+        result_json.write_text(json.dumps(self.results, indent=2, sort_keys=True) + "\n")
+        (self.result_root / "summary.md").write_text(render_markdown(self.results, self.result_root))
+
+    def print_success(self) -> None:
+        normal = self.results["variants"]["normal"]["summary"]
+        fastpg = self.results["variants"]["fastpg"]["summary"]
+        print(f"normal median TPS: {normal.get('median_tps')}")
+        print(f"fastpg median TPS: {fastpg.get('median_tps')}")
+        ratio = speedup_ratio(fastpg.get("median_tps"), normal.get("median_tps"))
+        print(f"fastpg/normal TPS ratio: {ratio}")
+        print(f"summary: {self.result_root / 'summary.md'}")
+
+
+def parse_args(argv: list[str]) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--builtin", default="simple-update")
+    parser.add_argument("--init-steps", default="dt")
+    parser.add_argument("--scale", type=int, default=1)
+    parser.add_argument("--transactions", type=int, default=20)
+    parser.add_argument("--clients", type=int, default=1)
+    parser.add_argument("--jobs", type=int, default=1)
+    parser.add_argument("--runs", type=int, default=3)
+    parser.add_argument("--protocol", choices=["simple", "extended", "prepared"], default="simple")
+    parser.add_argument(
+        "--fastpg-engine",
+        choices=["rust-server", "postgres-wrapper"],
+        default="postgres-wrapper",
+        help="run fastpg as the Rust single-process server or as the Postgres tableam wrapper",
+    )
+    args = parser.parse_args(argv)
+    if args.runs < 1:
+        parser.error("--runs must be at least 1")
+    return args
+
+
+def normalize_init_steps(init_steps: str | None) -> str | None:
+    if init_steps is None:
+        return None
+    cleaned = init_steps.strip()
+    if cleaned == "" or cleaned == "default":
+        return None
+    return cleaned
+
+
+def postgres_env(bindir: Path, libdir: Path) -> dict[str, str]:
+    env = os.environ.copy()
+    env["PATH"] = f"{bindir}{os.pathsep}{env.get('PATH', '')}"
+    library_path = "DYLD_LIBRARY_PATH" if platform.system() == "Darwin" else "LD_LIBRARY_PATH"
+    env[library_path] = f"{libdir}{os.pathsep}{env.get(library_path, '')}"
+    return env
+
+
+def rust_server_pgbench_env(bindir: Path, libdir: Path) -> dict[str, str]:
+    env = postgres_env(bindir, libdir)
+    env["PGMAXPROTOCOLVERSION"] = "3.0"
+    env["PGSSLMODE"] = "disable"
+    env["PGGSSENCMODE"] = "disable"
+    return env
+
+
+def free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def wait_for_tcp_server(
+    process: subprocess.Popen[str],
+    host: str,
+    port: int,
+    timeout_seconds: float = 5.0,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        try:
+            with socket.create_connection((host, port), timeout=0.2):
+                return True
+        except OSError:
+            time.sleep(0.05)
+    return False
+
+
+def read_text(path: Path) -> str:
+    try:
+        return path.read_text()
+    except FileNotFoundError:
+        return ""
+
+
+def parse_pgbench_metrics(stdout: str) -> dict[str, float | None]:
+    tps_match = TPS_RE.search(stdout)
+    latency_match = LATENCY_RE.search(stdout)
+    return {
+        "tps_without_initial_connection": float(tps_match.group(1)) if tps_match else None,
+        "latency_average_ms": float(latency_match.group(1)) if latency_match else None,
+    }
+
+
+def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
+    tps_values = [
+        run.get("metrics", {}).get("tps_without_initial_connection")
+        for run in runs
+        if run.get("metrics", {}).get("tps_without_initial_connection") is not None
+    ]
+    latency_values = [
+        run.get("metrics", {}).get("latency_average_ms")
+        for run in runs
+        if run.get("metrics", {}).get("latency_average_ms") is not None
+    ]
+    return {
+        "median_tps": median(tps_values) if tps_values else None,
+        "median_latency_average_ms": median(latency_values) if latency_values else None,
+        "runs": len(runs),
+    }
+
+
+def speedup_ratio(fastpg_tps: float | None, normal_tps: float | None) -> float | None:
+    if fastpg_tps is None or normal_tps in (None, 0):
+        return None
+    return fastpg_tps / normal_tps
+
+
+def render_markdown(results: dict[str, Any], result_root: Path) -> str:
+    lines = [
+        "# pgbench comparison",
+        "",
+        f"Status: `{results['status']}`",
+        "",
+        "## Config",
+        "",
+    ]
+    for key, value in results["config"].items():
+        lines.append(f"- `{key}`: `{value}`")
+    lines.extend(["", "## Variants", ""])
+    variants = results.get("variants", {})
+    for name in ("normal", "fastpg"):
+        if name not in variants:
+            continue
+        variant = variants[name]
+        lines.append(f"### {name}")
+        lines.append("")
+        lines.append(f"- status: `{variant.get('status')}`")
+        if "summary" in variant:
+            summary = variant["summary"]
+            lines.append(f"- median TPS: `{summary.get('median_tps')}`")
+            lines.append(f"- median average latency ms: `{summary.get('median_latency_average_ms')}`")
+        for run in variant.get("runs", []):
+            metrics = run.get("metrics", {})
+            lines.append(
+                f"- run {run['run']}: TPS `{metrics.get('tps_without_initial_connection')}`, "
+                f"average latency ms `{metrics.get('latency_average_ms')}`"
+            )
+        lines.append("")
+
+    if all(name in variants and "summary" in variants[name] for name in ("normal", "fastpg")):
+        ratio = speedup_ratio(
+            variants["fastpg"]["summary"].get("median_tps"),
+            variants["normal"]["summary"].get("median_tps"),
+        )
+        lines.extend(["## Comparison", "", f"- fastpg/normal median TPS ratio: `{ratio}`", ""])
+
+    if results.get("failure"):
+        failure = results["failure"]
+        lines.extend(
+            [
+                "## Failure",
+                "",
+                f"- variant: `{failure['variant']}`",
+                f"- phase: `{failure['phase']}`",
+                f"- exit code: `{failure['exit_code']}`",
+                f"- command: `{failure['command']}`",
+                "",
+                "### stdout tail",
+                "",
+                "```text",
+                failure["stdout_tail"],
+                "```",
+                "",
+                "### stderr tail",
+                "",
+                "```text",
+                failure["stderr_tail"],
+                "```",
+                "",
+            ]
+        )
+
+    lines.append(f"Raw results: `{result_root / 'summary.json'}`")
+    lines.append("")
+    return "\n".join(lines)
+
+
+def tail(text: str, limit: int = 4000) -> str:
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def main(argv: list[str]) -> int:
+    runner = PgBenchCompare(parse_args(argv))
+    try:
+        return runner.run()
+    except BenchmarkFailure as failure:
+        runner.results["status"] = "failed"
+        runner.results["failure"] = {
+            "variant": failure.variant,
+            "phase": failure.phase,
+            "exit_code": failure.result.returncode,
+            "command": " ".join(failure.result.command),
+            "stdout_tail": tail(failure.result.stdout),
+            "stderr_tail": tail(failure.result.stderr),
+            "output_dir": str(failure.output_dir),
+        }
+        if failure.variant in runner.results["variants"]:
+            runner.results["variants"][failure.variant]["status"] = "failed"
+        runner.write_results()
+        if failure.variant == "normal":
+            print("normal Postgres failed; the benchmark harness is broken.", file=sys.stderr)
+        else:
+            print("fastpg failed; this is a benchmark-driven implementation target.", file=sys.stderr)
+        print(f"phase: {failure.phase}", file=sys.stderr)
+        print(f"command: {' '.join(failure.result.command)}", file=sys.stderr)
+        print(f"exit code: {failure.result.returncode}", file=sys.stderr)
+        print(f"stdout tail:\n{tail(failure.result.stdout)}", file=sys.stderr)
+        print(f"stderr tail:\n{tail(failure.result.stderr)}", file=sys.stderr)
+        print(f"results: {runner.result_root}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
