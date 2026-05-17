@@ -31,8 +31,8 @@ jobs:
             runner: macos-15
 
     env:
-      FASTFORK_BUILD_DIR: bench/.build/release-${{ matrix.target }}
-      FASTFORK_JOBS: 4
+      RELEASE_BUILD_DIR: bench/.build/release-${{ matrix.target }}
+      RELEASE_JOBS: 4
       PGVECTOR_VERSION: v0.8.2
 
     steps:
@@ -64,30 +64,59 @@ jobs:
             echo "$(brew --prefix flex)/bin"
           } >> "$GITHUB_PATH"
 
-      - name: Build fast-fork server
-        run: ./test-fastfork.sh quick --setup-only --wipe
+      - name: Build release server
+        run: |
+          set -euo pipefail
+          rm -rf "$RELEASE_BUILD_DIR"
+          meson setup "$RELEASE_BUILD_DIR" \
+            -Dauto_features=disabled \
+            -Dtap_tests=auto \
+            -Dicu=disabled \
+            -Dreadline=disabled \
+            -Dssl=none \
+            -Dzlib=disabled \
+            -Dlz4=disabled \
+            -Dzstd=disabled \
+            -Dtest_fake_wal=false \
+            -Dtest_no_bg_jobs=false \
+            -Dtest_mem_smgr=false \
+            -Dtest_ephemeral_buffers=false \
+            -Dtest_mem_slru=false \
+            -Dtest_epoch_rollback=false \
+            -Dtest_no_wal_assembly=false \
+            -Dtest_no_observability=false \
+            -Dtest_fast_memory_contexts=false \
+            -Dtest_ephemeral_catalog=false \
+            -Dtest_no_durable_maintenance=false \
+            -Dtest_fast_analyze=false \
+            -Dtest_no_recovery_startup=false \
+            -Dtest_seed_only_startup=false \
+            -Dtest_no_data_directory_startup=false \
+            -Dtest_macos_named_posix_semaphores=false \
+            -Dtest_no_sysv_shared_memory=false
+          meson compile -C "$RELEASE_BUILD_DIR" -j "$RELEASE_JOBS"
 
       - name: Create temporary server install
-        run: meson test -C "$FASTFORK_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
+        run: meson test -C "$RELEASE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
 
       - name: Build pgvector extension
         run: |
           ci/build-pgvector.sh \
-            "$FASTFORK_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RELEASE_BUILD_DIR/tmp_install/usr/local/pgsql" \
             "$RUNNER_TEMP/pgvector" \
             "$PGVECTOR_VERSION"
 
       - name: Package server distribution
         run: |
           ci/package-server-dist.sh \
-            "$FASTFORK_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RELEASE_BUILD_DIR/tmp_install/usr/local/pgsql" \
             "${{ matrix.target }}" \
             "$RUNNER_TEMP/server-dist"
 
       - name: Check package module layout
         run: |
           set -euo pipefail
-          dist="$RUNNER_TEMP/server-dist/postgres-fastfork-${{ matrix.target }}"
+          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
           find "$dist/lib" -maxdepth 3 \
             \( -name 'dict_snowball*' -o -name 'plpgsql*' -o -name 'vector*' \) \
             -print
@@ -100,7 +129,7 @@ jobs:
       - name: Smoke-test packaged server
         run: |
           set -euo pipefail
-          dist="$RUNNER_TEMP/server-dist/postgres-fastfork-${{ matrix.target }}"
+          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
           workdir="$RUNNER_TEMP/server-smoke"
           rm -rf "$workdir"
           mkdir -p "$workdir"
@@ -148,12 +177,14 @@ jobs:
         run: |
           set -euo pipefail
           short_sha="${GITHUB_SHA::12}"
-          tag="fastfork-server-${short_sha}"
-          title="Fast-fork server binaries ${short_sha}"
+          tag="postgres-server-${short_sha}"
+          title="PostgreSQL server binaries ${short_sha}"
           notes="$RUNNER_TEMP/release-notes.md"
 
           {
-            echo "Fast-fork PostgreSQL server binary distributions for ${GITHUB_SHA}."
+            echo "PostgreSQL server binary distributions for ${GITHUB_SHA}."
+            echo
+            echo "Fast-fork experimental build flags are disabled in these release artifacts."
             echo
             echo "Assets:"
             for archive in dist/*.tar.gz; do

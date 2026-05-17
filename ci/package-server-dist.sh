@@ -13,7 +13,7 @@ fi
 INSTALL_PREFIX="$1"
 TARGET="$2"
 OUTPUT_DIR="$3"
-PACKAGE_NAME="postgres-fastfork-${TARGET}"
+PACKAGE_NAME="postgres-server-${TARGET}"
 
 if [[ ! -d "$INSTALL_PREFIX" ]]; then
 	printf 'install prefix does not exist: %s\n' "$INSTALL_PREFIX" >&2
@@ -35,6 +35,28 @@ OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 PACKAGE_DIR="$OUTPUT_DIR/$PACKAGE_NAME"
 ARCHIVE="$OUTPUT_DIR/$PACKAGE_NAME.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
+
+ensure_fastfork_disabled() {
+	local config_header="$INSTALL_PREFIX/include/server/pg_config.h"
+	local enabled_defines
+
+	if [[ ! -f "$config_header" ]]; then
+		config_header="$INSTALL_PREFIX/include/pg_config.h"
+	fi
+	if [[ ! -f "$config_header" ]]; then
+		printf 'cannot verify release build flags; missing pg_config.h under %s\n' "$INSTALL_PREFIX" >&2
+		exit 1
+	fi
+
+	enabled_defines="$(grep -E '^#define USE_TEST_' "$config_header" || true)"
+	if [[ -n "$enabled_defines" ]]; then
+		printf 'refusing to package an experimental fast-fork/test build for release\n' >&2
+		printf '%s\n' "$enabled_defines" >&2
+		exit 1
+	fi
+}
+
+ensure_fastfork_disabled
 
 rm -rf "$PACKAGE_DIR" "$ARCHIVE" "$CHECKSUM"
 mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" "$PACKAGE_DIR/share"
@@ -119,8 +141,8 @@ copy_runtime_shared_tree() {
 }
 
 # Keep the executable surface intentionally small: enough to initialize, run,
-# stop, connect to, and dump a fast-fork server without shipping broader client
-# suites, benchmarks, headers, documentation, or developer tooling.
+# stop, connect to, and dump a server without shipping broader client suites,
+# benchmarks, headers, documentation, or developer tooling.
 copy_required_binary initdb
 copy_required_binary pg_ctl
 copy_required_binary pg_dump
@@ -165,8 +187,10 @@ mirror_pkglib_layouts() {
 
 mirror_pkglib_layouts
 
-cat > "$PACKAGE_DIR/README.fastfork.txt" <<EOF
-This archive contains a minimal PostgreSQL fast-fork server runtime for $TARGET.
+cat > "$PACKAGE_DIR/README.server.txt" <<EOF
+This archive contains a minimal PostgreSQL server runtime for $TARGET.
+
+The experimental fast-fork build flags are disabled in release archives.
 
 Included:
 - bin/initdb
