@@ -17,3 +17,8 @@ SELECT fastpg_plan_summary('SELECT $1::int4;');
 SELECT fastpg_plan_summary('CREATE TABLE fastpg_planned(id int);');
 
 SELECT fastpg_execute_summary('SELECT 1;');
+
+CREATE TABLE fastpg_mem_probe(id int);
+INSERT INTO fastpg_mem_probe VALUES (1), (2);
+SELECT id FROM fastpg_mem_probe ORDER BY id;
+SELECT pg_relation_size('fastpg_mem_probe'::regclass);

@@ -30,6 +30,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#include "access/transam.h"
+#endif
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
@@ -1813,6 +1817,20 @@ InitTableAmRoutine(Relation relation)
 	relation->rd_tableam = GetTableAmRoutine(relation->rd_amhandler);
 }
 
+#ifdef USE_FASTPG
+static bool
+UseFastPgMemTableAm(Relation relation)
+{
+	Oid			relnamespace = RelationGetNamespace(relation);
+
+	return relation->rd_rel->relkind == RELKIND_RELATION &&
+		relation->rd_rel->relam == HEAP_TABLE_AM_OID &&
+		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
+		!IsCatalogNamespace(relnamespace) &&
+		!IsToastNamespace(relnamespace);
+}
+#endif
+
 /*
  * Initialize table access method support for a table like relation
  */
@@ -1840,6 +1858,14 @@ RelationInitTableAccessMethod(Relation relation)
 		Assert(relation->rd_rel->relam == HEAP_TABLE_AM_OID);
 		relation->rd_amhandler = F_HEAP_TABLEAM_HANDLER;
 	}
+#ifdef USE_FASTPG
+	else if (UseFastPgMemTableAm(relation))
+	{
+		relation->rd_amhandler = F_HEAP_TABLEAM_HANDLER;
+		relation->rd_tableam = GetFastPgMemTableAmRoutine();
+		return;
+	}
+#endif
 	else
 	{
 		/*

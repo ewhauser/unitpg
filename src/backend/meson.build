@@ -40,6 +40,32 @@ subdir('po', if_found: libintl)
 backend_link_args = []
 backend_link_depends = []
 
+if get_option('fastpg')
+  fastpg_cargo = find_program('cargo', required: true)
+  fastpg_sh = find_program('sh', required: true)
+  fastpg_storage_inputs = files(
+    '../../Cargo.toml',
+    '../../crates/fastpg-storage/Cargo.toml',
+    '../../crates/fastpg-storage/src/lib.rs',
+  )
+  fastpg_storage_target_dir = meson.current_build_dir() / 'fastpg-cargo-target'
+  fastpg_storage_static = custom_target('backend_fastpg_storage_static',
+    input: fastpg_storage_inputs,
+    output: 'libfastpg_storage_backend.a',
+    command: [
+      fastpg_sh, '-c',
+      'set -eu; target_dir="$1"; output="$2"; manifest="$3"; cargo build --manifest-path "$manifest" --package fastpg-storage --release --target-dir "$target_dir"; cp "$target_dir/release/libfastpg_storage.a" "$output"',
+      'backend_fastpg_storage_static',
+      fastpg_storage_target_dir,
+      '@OUTPUT@',
+      meson.project_source_root() / 'Cargo.toml',
+    ],
+  )
+
+  backend_link_args += fastpg_storage_static.full_path()
+  backend_link_depends += fastpg_storage_static
+endif
+
 
 # On Windows also make the backend depend on dbghelp, for backtrace support
 if host_system == 'windows' and cc.get_id() == 'msvc'

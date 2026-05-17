@@ -2,6 +2,9 @@
 
 subdir('brin')
 subdir('common')
+if get_option('fastpg')
+  subdir('fastpg')
+endif
 subdir('gin')
 subdir('gist')
 subdir('hash')

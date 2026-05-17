@@ -77,3 +77,18 @@ SELECT fastpg_execute_summary('SELECT 1;');
  ok statements=1 stmt[0]={command=CMD_SELECT,plan=T_Result,columns=1,rows=1,column[0]={name=?column?,type_oid=23},row[0]=[?column?=1]}
 (1 row)
 
+CREATE TABLE fastpg_mem_probe(id int);
+INSERT INTO fastpg_mem_probe VALUES (1), (2);
+SELECT id FROM fastpg_mem_probe ORDER BY id;
+ id 
+----
+  1
+  2
+(2 rows)
+
+SELECT pg_relation_size('fastpg_mem_probe'::regclass);
+ pg_relation_size 
+------------------
+                0
+(1 row)
+
