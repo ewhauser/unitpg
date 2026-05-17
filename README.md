@@ -1,5 +1,12 @@
 # Ephemeral Postgres Fast Fork
 
+## Should You Use This?
+
+Probably not. This is an experiment. I'm not a Postgres expert, and it's a
+vibe-coded attempt to make Postgres faster. Someone with real Postgres
+internals skills could probably make a much, much faster version of this, but
+it would require a lot more surgery to Postgres internals.
+
 This repository is an experimental PostgreSQL fork for running application unit
 tests quickly. It is intentionally optimized for disposable test clusters, not
 for production databases.
