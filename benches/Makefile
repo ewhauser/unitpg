@@ -10,8 +10,17 @@ CLIENTS ?= 1
 JOBS ?= 1
 RUNS ?= 3
 PROTOCOL ?= simple
+MESON_BUILDTYPE ?= release
+RUST_BUILD_PROFILE ?= release
+PROFILE_TRANSACTIONS ?= 500
+PROFILE_RUNS ?= 1
+PROFILE_TOOL ?= flamegraph
+PROFILE_PHASE ?= run
+PROFILE_OPEN ?= 0
+PROFILE_WARMUP_SECONDS ?= 1.0
+PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server
+.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-profile-rust-server pgbench-profile-rust-server-open pgbench-open-latest-flamegraph
 
 pgbench-compare:
 	$(PYTHON) pgbench_compare.py \
@@ -22,7 +31,8 @@ pgbench-compare:
 		--clients "$(CLIENTS)" \
 		--jobs "$(JOBS)" \
 		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)"
+		--protocol "$(PROTOCOL)" \
+		--meson-buildtype "$(MESON_BUILDTYPE)"
 
 pgbench-compare-strict:
 	$(PYTHON) pgbench_compare.py \
@@ -33,7 +43,8 @@ pgbench-compare-strict:
 		--clients "$(CLIENTS)" \
 		--jobs "$(JOBS)" \
 		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)"
+		--protocol "$(PROTOCOL)" \
+		--meson-buildtype "$(MESON_BUILDTYPE)"
 
 pgbench-compare-rust-server:
 	$(PYTHON) pgbench_compare.py \
@@ -45,4 +56,30 @@ pgbench-compare-rust-server:
 		--jobs "$(JOBS)" \
 		--runs "$(RUNS)" \
 		--protocol "$(PROTOCOL)" \
-		--fastpg-engine "rust-server"
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--fastpg-engine "rust-server" \
+		--rust-build-profile "$(RUST_BUILD_PROFILE)"
+
+pgbench-profile-rust-server:
+	$(PYTHON) pgbench_compare.py \
+		--builtin "$(BUILTIN)" \
+		--init-steps "$(INIT_STEPS)" \
+		--scale "$(SCALE)" \
+		--transactions "$(PROFILE_TRANSACTIONS)" \
+		--clients "$(CLIENTS)" \
+		--jobs "$(JOBS)" \
+		--runs "$(PROFILE_RUNS)" \
+		--protocol "$(PROTOCOL)" \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--fastpg-engine "rust-server" \
+		--rust-build-profile "release" \
+		--profile-fastpg-rust-server \
+		--profile-tool "$(PROFILE_TOOL)" \
+		--profile-phase "$(PROFILE_PHASE)" \
+		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" $(PROFILE_OPEN_FLAG)
+
+pgbench-profile-rust-server-open:
+	$(MAKE) pgbench-profile-rust-server PROFILE_OPEN=1
+
+pgbench-open-latest-flamegraph:
+	$(PYTHON) open_latest_profile.py

@@ -81,6 +81,13 @@ class PgBenchCompare:
                 "runs": args.runs,
                 "protocol": args.protocol,
                 "fastpg_engine": args.fastpg_engine,
+                "meson_buildtype": args.meson_buildtype,
+                "rust_build_profile": args.rust_build_profile,
+                "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
+                "profile_tool": args.profile_tool,
+                "profile_phase": args.profile_phase,
+                "profile_open": args.profile_open,
+                "profile_warmup_seconds": args.profile_warmup_seconds,
             },
             "variants": {},
         }
@@ -140,6 +147,7 @@ class PgBenchCompare:
             "setup",
             str(build_dir),
             str(self.source_root),
+            f"--buildtype={self.args.meson_buildtype}",
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
@@ -149,6 +157,7 @@ class PgBenchCompare:
             "setup",
             "--reconfigure",
             str(build_dir),
+            f"--buildtype={self.args.meson_buildtype}",
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
@@ -192,15 +201,19 @@ class PgBenchCompare:
                 output_dir,
             )
 
+        build_command = ["cargo", "build", "-p", "fastpg-server"]
+        if self.args.rust_build_profile == "release":
+            build_command.append("--release")
+
         build = self.checked_command(
             variant.name,
             "setup",
-            ["cargo", "build", "-p", "fastpg-server"],
+            build_command,
             output_dir,
             "cargo-build-fastpg-server",
         )
         server_binary_name = "fastpg-server.exe" if os.name == "nt" else "fastpg-server"
-        server_binary = self.source_root / "target" / "debug" / server_binary_name
+        server_binary = self.source_root / "target" / self.args.rust_build_profile / server_binary_name
         if not server_binary.exists():
             raise BenchmarkFailure(
                 variant.name,
@@ -367,6 +380,7 @@ class PgBenchCompare:
         port = free_port()
         env = rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"])
         server: dict[str, Any] | None = None
+        profiler: dict[str, Any] | None = None
         stop_failure: BenchmarkFailure | None = None
 
         run_record: dict[str, Any] = {
@@ -379,6 +393,9 @@ class PgBenchCompare:
         try:
             server = self.start_rust_server(variant.name, paths["server_binary"], host, port, run_dir)
             run_record["commands"]["start"] = server["result"].as_json()
+            if "profiler" in server:
+                profiler = server["profiler"]
+                run_record["commands"]["profile_start"] = profiler["result"].as_json()
 
             init = self.checked_command(
                 variant.name,
@@ -389,6 +406,10 @@ class PgBenchCompare:
                 env=env,
             )
             run_record["commands"]["pgbench_init"] = init.as_json()
+
+            if self.should_profile_rust_server(variant) and self.args.profile_phase == "run":
+                profiler = self.start_rust_profiler(variant.name, server, run_dir)
+                run_record["commands"]["profile_start"] = profiler["result"].as_json()
 
             bench = self.checked_command(
                 variant.name,
@@ -407,6 +428,12 @@ class PgBenchCompare:
                 run_record["commands"]["stop"] = stopped.as_json()
                 if stopped.returncode != 0:
                     stop_failure = BenchmarkFailure(variant.name, "stop", stopped, run_dir)
+            if profiler is not None:
+                profile_result = self.finish_rust_profiler(profiler, run_dir)
+                run_record["commands"]["profile_stop"] = profile_result.as_json()
+                run_record["profile"] = profiler["profile_record"]
+                if profile_result.returncode != 0 and stop_failure is None:
+                    stop_failure = BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
             self.write_results()
             if stop_failure is not None:
                 raise stop_failure
@@ -457,6 +484,15 @@ class PgBenchCompare:
         (output_dir / "fastpg-server-start.command.json").write_text(
             json.dumps(result.as_json(), indent=2) + "\n"
         )
+
+        if self.should_profile_rust_server_name(variant) and self.args.profile_phase == "init-and-run":
+            profiler = self.start_rust_profiler(
+                variant,
+                server,
+                output_dir,
+            )
+            server["profiler"] = profiler
+
         return server
 
     def stop_rust_server(self, server: dict[str, Any], output_dir: Path) -> CommandResult:
@@ -485,6 +521,149 @@ class PgBenchCompare:
             time.monotonic() - started,
         )
         (output_dir / "fastpg-server-stop.command.json").write_text(
+            json.dumps(result.as_json(), indent=2) + "\n"
+        )
+        return result
+
+    def should_profile_rust_server(self, variant: Variant) -> bool:
+        return self.should_profile_rust_server_name(variant.name) and variant.engine == "rust-server"
+
+    def should_profile_rust_server_name(self, variant_name: str) -> bool:
+        return self.args.profile_fastpg_rust_server and variant_name == "fastpg"
+
+    def start_rust_profiler(
+        self,
+        variant: str,
+        server: dict[str, Any],
+        output_dir: Path,
+    ) -> dict[str, Any]:
+        process = server["process"]
+        pid = process.pid
+        profile_dir = output_dir / "profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        tool = self.args.profile_tool
+        if tool == "flamegraph":
+            command, profile_path = self.flamegraph_command(pid, profile_dir)
+        else:
+            raise BenchmarkFailure(
+                variant,
+                "profile",
+                CommandResult([], str(self.source_root), 1, "", f"unsupported profile tool: {tool}", 0.0),
+                profile_dir,
+            )
+
+        stdout_path = profile_dir / f"{tool}.stdout"
+        stderr_path = profile_dir / f"{tool}.stderr"
+        stdout_file = stdout_path.open("w")
+        stderr_file = stderr_path.open("w")
+        started = time.monotonic()
+        profiler_process = subprocess.Popen(
+            command,
+            cwd=self.source_root,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        if self.args.profile_warmup_seconds > 0:
+            time.sleep(self.args.profile_warmup_seconds)
+        if profiler_process.poll() is not None:
+            stdout_file.flush()
+            stderr_file.flush()
+            failure = CommandResult(
+                command,
+                str(self.source_root),
+                profiler_process.returncode if profiler_process.returncode is not None else 1,
+                read_text(stdout_path),
+                read_text(stderr_path),
+                time.monotonic() - started,
+            )
+            stdout_file.close()
+            stderr_file.close()
+            raise BenchmarkFailure(variant, "profile", failure, profile_dir)
+
+        result = CommandResult(command, str(self.source_root), 0, "", "", time.monotonic() - started)
+        (profile_dir / f"{tool}-start.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
+        return {
+            "command": command,
+            "process": profiler_process,
+            "stdout_file": stdout_file,
+            "stderr_file": stderr_file,
+            "stdout_path": stdout_path,
+            "stderr_path": stderr_path,
+            "profile_dir": profile_dir,
+            "profile_path": profile_path,
+            "result": result,
+            "profile_record": {
+                "tool": tool,
+                "pid": pid,
+                "path": str(profile_path),
+                "opened": bool(self.args.profile_open),
+            },
+        }
+
+    def flamegraph_command(self, pid: int, profile_dir: Path) -> tuple[list[str], Path]:
+        flamegraph = shutil.which("flamegraph")
+        if flamegraph is None:
+            raise BenchmarkFailure(
+                "fastpg",
+                "profile",
+                CommandResult(
+                    ["flamegraph"],
+                    str(self.source_root),
+                    1,
+                    "",
+                    "missing profiler: install cargo-flamegraph or put `flamegraph` on PATH",
+                    0.0,
+                ),
+                profile_dir,
+            )
+
+        output = profile_dir / "fastpg-server-flamegraph.svg"
+        command = [
+            flamegraph,
+            "-p",
+            str(pid),
+            "-o",
+            str(output),
+            "--title",
+            "fastpg Rust server pgbench",
+            "--notes",
+            f"builtin={self.args.builtin} scale={self.args.scale} transactions={self.args.transactions}",
+        ]
+        if self.args.profile_open:
+            command.append("--open")
+        return command, output
+
+    def finish_rust_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
+        started = time.monotonic()
+        process = profiler["process"]
+        command = ["wait-profile", f"pid={process.pid}"]
+        try:
+            process.wait(timeout=30)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=5)
+
+        for key in ("stdout_file", "stderr_file"):
+            profiler[key].close()
+
+        profile_path = profiler["profile_path"]
+        returncode = process.returncode if process.returncode is not None else 1
+        if returncode == 0 and not profile_path.exists():
+            returncode = 1
+        result = CommandResult(
+            command,
+            str(self.source_root),
+            returncode,
+            read_text(profiler["stdout_path"]),
+            read_text(profiler["stderr_path"]),
+            time.monotonic() - started,
+        )
+        (profiler["profile_dir"] / "profile-stop.command.json").write_text(
             json.dumps(result.as_json(), indent=2) + "\n"
         )
         return result
@@ -606,14 +785,58 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--protocol", choices=["simple", "extended", "prepared"], default="simple")
     parser.add_argument(
+        "--meson-buildtype",
+        choices=["plain", "debug", "debugoptimized", "release", "minsize"],
+        default="release",
+        help="Meson buildtype for normal/Postgres-wrapper variants and pgbench client binaries",
+    )
+    parser.add_argument(
+        "--rust-build-profile",
+        choices=["debug", "release"],
+        default="release",
+        help="Cargo build profile for the Rust server when --fastpg-engine=rust-server",
+    )
+    parser.add_argument(
         "--fastpg-engine",
         choices=["rust-server", "postgres-wrapper"],
         default="postgres-wrapper",
         help="run fastpg as the Rust single-process server or as the Postgres tableam wrapper",
     )
+    parser.add_argument(
+        "--profile-fastpg-rust-server",
+        action="store_true",
+        help="profile the fastpg Rust server during the pgbench run",
+    )
+    parser.add_argument(
+        "--profile-tool",
+        choices=["flamegraph"],
+        default="flamegraph",
+        help="profiler to use with --profile-fastpg-rust-server",
+    )
+    parser.add_argument(
+        "--profile-phase",
+        choices=["run", "init-and-run"],
+        default="run",
+        help="profile only the transaction run or both pgbench init and run",
+    )
+    parser.add_argument(
+        "--profile-open",
+        action="store_true",
+        help="open the generated profile after recording, when supported by the profiler",
+    )
+    parser.add_argument(
+        "--profile-warmup-seconds",
+        type=float,
+        default=1.0,
+        help="seconds to wait after starting the profiler before running pgbench",
+    )
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
+    if args.profile_fastpg_rust_server and args.fastpg_engine != "rust-server":
+        parser.error("--profile-fastpg-rust-server requires --fastpg-engine=rust-server")
+    if args.profile_warmup_seconds < 0:
+        parser.error("--profile-warmup-seconds must be non-negative")
     return args
 
 
@@ -736,6 +959,8 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
                 f"- run {run['run']}: TPS `{metrics.get('tps_without_initial_connection')}`, "
                 f"average latency ms `{metrics.get('latency_average_ms')}`"
             )
+            if "profile" in run:
+                lines.append(f"- run {run['run']} profile: `{run['profile'].get('path')}`")
         lines.append("")
 
     if all(name in variants and "summary" in variants[name] for name in ("normal", "fastpg")):

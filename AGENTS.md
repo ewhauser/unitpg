@@ -16,7 +16,7 @@ For a quick smoke run, use:
 make -C benches pgbench-compare SCALE=1 TRANSACTIONS=1 RUNS=1
 ```
 
-The harness builds and temp-installs two Meson variants under
+The harness builds and temp-installs two release-mode Meson variants under
 `benches/.build/pgbench/`:
 
 - `normal`: `-Dfastpg=false`
@@ -36,6 +36,8 @@ CLIENTS=1
 JOBS=1
 RUNS=3
 PROTOCOL=simple
+MESON_BUILDTYPE=release
+RUST_BUILD_PROFILE=release
 ```
 
 `INIT_STEPS=dtg` is intentional. pgbench built-in transaction scripts derive
@@ -55,20 +57,65 @@ of the transitional Postgres tableam wrapper:
 make -C benches pgbench-compare-rust-server
 ```
 
+That target defaults to a release Rust build. To temporarily run a quicker
+debug build:
+
+```sh
+make -C benches pgbench-compare-rust-server RUST_BUILD_PROFILE=debug
+```
+
+To capture a CPU flamegraph of the Rust server during the pgbench transaction
+run:
+
+```sh
+make -C benches pgbench-profile-rust-server
+```
+
+The profiling target builds `fastpg-server` in release mode, starts the normal
+Postgres variant only to reuse its `pgbench` client, then records the Rust
+server while the fastpg pgbench run executes. Flamegraphs are written to:
+
+```text
+benches/results/pgbench/<timestamp>/fastpg/run-<n>/profile/fastpg-server-flamegraph.svg
+```
+
+To run and open the flamegraph immediately:
+
+```sh
+make -C benches pgbench-profile-rust-server-open
+```
+
+To open the newest saved flamegraph:
+
+```sh
+make -C benches pgbench-open-latest-flamegraph
+```
+
+Useful profiling knobs:
+
+```text
+PROFILE_TRANSACTIONS=500
+PROFILE_RUNS=1
+PROFILE_TOOL=flamegraph
+PROFILE_PHASE=run
+PROFILE_OPEN=0
+PROFILE_WARMUP_SECONDS=1.0
+```
+
 The harness treats normal Postgres failures as harness failures. It treats
 fastpg failures as useful implementation targets and reports the failing phase:
-`setup`, `initdb`, `start`, `pgbench-init`, `pgbench-run`, or `stop`.
+`setup`, `initdb`, `start`, `pgbench-init`, `pgbench-run`, `profile`, or
+`stop`.
 
-Current expected state: normal Postgres should pass the quick smoke run, while
-fastpg is expected to fail during pgbench initialization until the in-memory
-storage path can load the full pgbench fixture. The Rust-server target is
-expected to fail earlier, at the first unsupported pgbench setup query, until
-the Rust executor supports enough DDL/COPY/INSERT behavior for pgbench setup.
+Current expected state: normal Postgres should pass the quick smoke run. The
+Rust-server target should also pass the simple-update smoke run with
+`INIT_STEPS=dtg`, while stricter pgbench paths remain implementation targets.
 
 Useful validation commands after harness edits:
 
 ```sh
 python3 -m py_compile benches/pgbench_compare.py
+python3 -m py_compile benches/open_latest_profile.py
 cargo test -p fastpg-storage
 meson test -C benches/.build/pgbench/fastpg --suite fastpg_parser_probe --print-errorlogs
 ```
