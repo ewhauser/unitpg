@@ -1,0 +1,45 @@
+[workspace]
+members = [
+    "crates/fastpg-bind",
+    "crates/fastpg-catalog",
+    "crates/fastpg-compat",
+    "crates/fastpg-exec",
+    "crates/fastpg-index",
+    "crates/fastpg-parser",
+    "crates/fastpg-plan",
+    "crates/fastpg-server",
+    "crates/fastpg-session",
+    "crates/fastpg-snapshot",
+    "crates/fastpg-storage",
+    "crates/fastpg-testkit",
+    "crates/fastpg-tx",
+    "crates/fastpg-types",
+    "crates/fastpg-wire",
+]
+resolver = "3"
+
+[workspace.package]
+edition = "2024"
+license = "PostgreSQL"
+rust-version = "1.94"
+
+[workspace.dependencies]
+async-trait = "0.1"
+fastpg-bind = { path = "crates/fastpg-bind" }
+fastpg-catalog = { path = "crates/fastpg-catalog" }
+fastpg-compat = { path = "crates/fastpg-compat" }
+fastpg-exec = { path = "crates/fastpg-exec" }
+fastpg-index = { path = "crates/fastpg-index" }
+fastpg-parser = { path = "crates/fastpg-parser" }
+fastpg-plan = { path = "crates/fastpg-plan" }
+fastpg-server = { path = "crates/fastpg-server" }
+fastpg-session = { path = "crates/fastpg-session" }
+fastpg-snapshot = { path = "crates/fastpg-snapshot" }
+fastpg-storage = { path = "crates/fastpg-storage" }
+fastpg-tx = { path = "crates/fastpg-tx" }
+fastpg-types = { path = "crates/fastpg-types" }
+fastpg-wire = { path = "crates/fastpg-wire" }
+futures = "0.3"
+pgwire = { version = "=0.40.0", default-features = false, features = ["server-api"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
+tokio-postgres = "0.7"

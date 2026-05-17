@@ -1,0 +1,10 @@
+[package]
+name = "fastpg-index"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fastpg-storage.workspace = true
+fastpg-types.workspace = true

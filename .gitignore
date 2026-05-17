@@ -24,6 +24,7 @@ objfiles.txt
 *.gcov.out
 lcov*.info
 coverage/
+/target/
 coverage-html-stamp
 *.vcproj
 *.vcxproj
