@@ -10,3 +10,11 @@ CREATE FUNCTION fastpg_parse_summary(query pg_catalog.text)
 CREATE FUNCTION fastpg_analyze_summary(query pg_catalog.text)
 	RETURNS pg_catalog.text
 	AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL SAFE;
+
+CREATE FUNCTION fastpg_rewrite_summary(query pg_catalog.text)
+	RETURNS pg_catalog.text
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL SAFE;
+
+CREATE FUNCTION fastpg_plan_summary(query pg_catalog.text)
+	RETURNS pg_catalog.text
+	AS 'MODULE_PATHNAME' LANGUAGE C STRICT PARALLEL SAFE;

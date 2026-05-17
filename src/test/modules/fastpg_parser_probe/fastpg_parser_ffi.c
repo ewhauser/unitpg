@@ -35,9 +35,29 @@ struct FastPgParseResult
 struct FastPgAnalyzeResult
 {
 	MemoryContext analyze_context;
+	char	   *source_text;
 	Query	   *query;
 	Oid		   *parameter_type_oids;
 	int			parameter_count;
+	char		error_sqlstate[6];
+	char	   *error_message;
+	int			error_cursorpos;
+};
+
+struct FastPgRewriteResult
+{
+	MemoryContext rewrite_context;
+	char	   *source_text;
+	List	   *querytrees;
+	char		error_sqlstate[6];
+	char	   *error_message;
+	int			error_cursorpos;
+};
+
+struct FastPgPlanResult
+{
+	MemoryContext plan_context;
+	List	   *planned_statements;
 	char		error_sqlstate[6];
 	char	   *error_message;
 	int			error_cursorpos;
@@ -66,6 +86,30 @@ fastpg_node_tag_name(NodeTag tag)
 			return "T_VariableSetStmt";
 		case T_VariableShowStmt:
 			return "T_VariableShowStmt";
+		case T_PlannedStmt:
+			return "T_PlannedStmt";
+		case T_Result:
+			return "T_Result";
+		case T_ProjectSet:
+			return "T_ProjectSet";
+		case T_SeqScan:
+			return "T_SeqScan";
+		case T_IndexScan:
+			return "T_IndexScan";
+		case T_IndexOnlyScan:
+			return "T_IndexOnlyScan";
+		case T_BitmapHeapScan:
+			return "T_BitmapHeapScan";
+		case T_ModifyTable:
+			return "T_ModifyTable";
+		case T_LockRows:
+			return "T_LockRows";
+		case T_Limit:
+			return "T_Limit";
+		case T_Sort:
+			return "T_Sort";
+		case T_Agg:
+			return "T_Agg";
 		default:
 			return "T_Unknown";
 	}
@@ -112,6 +156,28 @@ fastpg_analyze_result_set_error(FastPgAnalyzeResult *result,
 								const char *sqlstate,
 								const char *message,
 								int cursorpos)
+{
+	strlcpy(result->error_sqlstate, sqlstate, sizeof(result->error_sqlstate));
+	result->error_message = pstrdup(message);
+	result->error_cursorpos = cursorpos;
+}
+
+static void
+fastpg_rewrite_result_set_error(FastPgRewriteResult *result,
+								const char *sqlstate,
+								const char *message,
+								int cursorpos)
+{
+	strlcpy(result->error_sqlstate, sqlstate, sizeof(result->error_sqlstate));
+	result->error_message = pstrdup(message);
+	result->error_cursorpos = cursorpos;
+}
+
+static void
+fastpg_plan_result_set_error(FastPgPlanResult *result,
+							 const char *sqlstate,
+							 const char *message,
+							 int cursorpos)
 {
 	strlcpy(result->error_sqlstate, sqlstate, sizeof(result->error_sqlstate));
 	result->error_message = pstrdup(message);
@@ -306,8 +372,9 @@ fastpg_parser_analyze(FastPgParseResult *parse_result, int statement_index)
 	PG_TRY();
 	{
 		MemoryContextSwitchTo(result->analyze_context);
+		result->source_text = pstrdup(parse_result->source_text);
 		result->query = parse_analyze_varparams(rawstmt,
-												parse_result->source_text,
+												result->source_text,
 												&result->parameter_type_oids,
 												&result->parameter_count,
 												NULL);
@@ -491,4 +558,354 @@ fastpg_analyze_target_type_oid(const FastPgAnalyzeResult *result, int index)
 		return InvalidOid;
 
 	return exprType((const Node *) target->expr);
+}
+
+FastPgRewriteResult *
+fastpg_parser_rewrite(FastPgAnalyzeResult *analyze_result)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	FastPgRewriteResult *result;
+
+	result = palloc0_object(FastPgRewriteResult);
+	result->rewrite_context = AllocSetContextCreate(CurrentMemoryContext,
+													"fastpg rewrite ffi",
+													ALLOCSET_DEFAULT_SIZES);
+
+	if (!fastpg_analyze_result_ok(analyze_result) || analyze_result->query == NULL)
+	{
+		fastpg_rewrite_result_set_error(result, "XX000",
+										"analyze result is not successful",
+										0);
+		return result;
+	}
+
+	PG_TRY();
+	{
+		Query	   *query_copy;
+
+		MemoryContextSwitchTo(result->rewrite_context);
+		result->source_text = pstrdup(analyze_result->source_text);
+		query_copy = copyObject(analyze_result->query);
+		result->querytrees = pg_rewrite_query(query_copy);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		fastpg_rewrite_result_set_error(result,
+										unpack_sql_state(edata->sqlerrcode),
+										edata->message ? edata->message : "",
+										edata->cursorpos);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcontext);
+	return result;
+}
+
+void
+fastpg_rewrite_result_free(FastPgRewriteResult *result)
+{
+	if (result == NULL)
+		return;
+
+	if (result->rewrite_context != NULL)
+		MemoryContextDelete(result->rewrite_context);
+	if (result->error_message != NULL)
+		pfree(result->error_message);
+
+	pfree(result);
+}
+
+bool
+fastpg_rewrite_result_ok(const FastPgRewriteResult *result)
+{
+	return result != NULL && result->error_sqlstate[0] == '\0';
+}
+
+const char *
+fastpg_rewrite_error_sqlstate(const FastPgRewriteResult *result)
+{
+	if (result == NULL || fastpg_rewrite_result_ok(result))
+		return NULL;
+
+	return result->error_sqlstate;
+}
+
+const char *
+fastpg_rewrite_error_message(const FastPgRewriteResult *result)
+{
+	if (result == NULL || fastpg_rewrite_result_ok(result))
+		return NULL;
+
+	return result->error_message;
+}
+
+int
+fastpg_rewrite_error_cursorpos(const FastPgRewriteResult *result)
+{
+	if (result == NULL || fastpg_rewrite_result_ok(result))
+		return 0;
+
+	return result->error_cursorpos;
+}
+
+static const Query *
+fastpg_rewrite_query_at(const FastPgRewriteResult *result, int index)
+{
+	if (!fastpg_rewrite_result_ok(result) ||
+		index < 0 ||
+		index >= list_length(result->querytrees))
+		return NULL;
+
+	return list_nth_node(Query, result->querytrees, index);
+}
+
+int
+fastpg_rewrite_query_count(const FastPgRewriteResult *result)
+{
+	if (!fastpg_rewrite_result_ok(result))
+		return 0;
+
+	return list_length(result->querytrees);
+}
+
+const char *
+fastpg_rewrite_query_command_tag(const FastPgRewriteResult *result, int index)
+{
+	const Query *query = fastpg_rewrite_query_at(result, index);
+
+	if (query == NULL)
+		return "CMD_UNKNOWN";
+
+	return fastpg_command_tag_name(query->commandType);
+}
+
+bool
+fastpg_rewrite_query_is_utility(const FastPgRewriteResult *result, int index)
+{
+	const Query *query = fastpg_rewrite_query_at(result, index);
+
+	return query != NULL && query->commandType == CMD_UTILITY;
+}
+
+const char *
+fastpg_rewrite_query_utility_stmt_tag(const FastPgRewriteResult *result, int index)
+{
+	const Query *query = fastpg_rewrite_query_at(result, index);
+
+	if (query == NULL ||
+		query->commandType != CMD_UTILITY ||
+		query->utilityStmt == NULL)
+		return "NULL";
+
+	return fastpg_node_tag_name(nodeTag(query->utilityStmt));
+}
+
+int
+fastpg_rewrite_query_target_count(const FastPgRewriteResult *result, int index)
+{
+	const Query *query = fastpg_rewrite_query_at(result, index);
+	ListCell   *lc;
+	int			target_count = 0;
+
+	if (query == NULL)
+		return 0;
+
+	foreach(lc, query->targetList)
+	{
+		const TargetEntry *target = lfirst_node(TargetEntry, lc);
+
+		if (!target->resjunk)
+			target_count++;
+	}
+
+	return target_count;
+}
+
+FastPgPlanResult *
+fastpg_parser_plan(FastPgRewriteResult *rewrite_result)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	FastPgPlanResult *result;
+
+	result = palloc0_object(FastPgPlanResult);
+	result->plan_context = AllocSetContextCreate(CurrentMemoryContext,
+												 "fastpg plan ffi",
+												 ALLOCSET_DEFAULT_SIZES);
+
+	if (!fastpg_rewrite_result_ok(rewrite_result))
+	{
+		fastpg_plan_result_set_error(result, "XX000",
+									 "rewrite result is not successful",
+									 0);
+		return result;
+	}
+
+	PG_TRY();
+	{
+		List	   *querytrees_copy;
+
+		MemoryContextSwitchTo(result->plan_context);
+		querytrees_copy = copyObject(rewrite_result->querytrees);
+		result->planned_statements = pg_plan_queries(querytrees_copy,
+													 rewrite_result->source_text,
+													 CURSOR_OPT_PARALLEL_OK,
+													 NULL);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		fastpg_plan_result_set_error(result,
+									 unpack_sql_state(edata->sqlerrcode),
+									 edata->message ? edata->message : "",
+									 edata->cursorpos);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcontext);
+	return result;
+}
+
+void
+fastpg_plan_result_free(FastPgPlanResult *result)
+{
+	if (result == NULL)
+		return;
+
+	if (result->plan_context != NULL)
+		MemoryContextDelete(result->plan_context);
+	if (result->error_message != NULL)
+		pfree(result->error_message);
+
+	pfree(result);
+}
+
+bool
+fastpg_plan_result_ok(const FastPgPlanResult *result)
+{
+	return result != NULL && result->error_sqlstate[0] == '\0';
+}
+
+const char *
+fastpg_plan_error_sqlstate(const FastPgPlanResult *result)
+{
+	if (result == NULL || fastpg_plan_result_ok(result))
+		return NULL;
+
+	return result->error_sqlstate;
+}
+
+const char *
+fastpg_plan_error_message(const FastPgPlanResult *result)
+{
+	if (result == NULL || fastpg_plan_result_ok(result))
+		return NULL;
+
+	return result->error_message;
+}
+
+int
+fastpg_plan_error_cursorpos(const FastPgPlanResult *result)
+{
+	if (result == NULL || fastpg_plan_result_ok(result))
+		return 0;
+
+	return result->error_cursorpos;
+}
+
+static const PlannedStmt *
+fastpg_plan_statement_at(const FastPgPlanResult *result, int index)
+{
+	if (!fastpg_plan_result_ok(result) ||
+		index < 0 ||
+		index >= list_length(result->planned_statements))
+		return NULL;
+
+	return list_nth_node(PlannedStmt, result->planned_statements, index);
+}
+
+int
+fastpg_plan_statement_count(const FastPgPlanResult *result)
+{
+	if (!fastpg_plan_result_ok(result))
+		return 0;
+
+	return list_length(result->planned_statements);
+}
+
+const char *
+fastpg_plan_statement_command_tag(const FastPgPlanResult *result, int index)
+{
+	const PlannedStmt *statement = fastpg_plan_statement_at(result, index);
+
+	if (statement == NULL)
+		return "CMD_UNKNOWN";
+
+	return fastpg_command_tag_name(statement->commandType);
+}
+
+const char *
+fastpg_plan_statement_plan_tree_tag(const FastPgPlanResult *result, int index)
+{
+	const PlannedStmt *statement = fastpg_plan_statement_at(result, index);
+
+	if (statement == NULL || statement->planTree == NULL)
+		return "NULL";
+
+	return fastpg_node_tag_name(nodeTag(statement->planTree));
+}
+
+const char *
+fastpg_plan_statement_utility_stmt_tag(const FastPgPlanResult *result, int index)
+{
+	const PlannedStmt *statement = fastpg_plan_statement_at(result, index);
+
+	if (statement == NULL || statement->utilityStmt == NULL)
+		return "NULL";
+
+	return fastpg_node_tag_name(nodeTag(statement->utilityStmt));
+}
+
+int
+fastpg_plan_statement_target_count(const FastPgPlanResult *result, int index)
+{
+	const PlannedStmt *statement = fastpg_plan_statement_at(result, index);
+	ListCell   *lc;
+	int			target_count = 0;
+
+	if (statement == NULL || statement->planTree == NULL)
+		return 0;
+
+	foreach(lc, statement->planTree->targetlist)
+	{
+		const TargetEntry *target = lfirst_node(TargetEntry, lc);
+
+		if (!target->resjunk)
+			target_count++;
+	}
+
+	return target_count;
+}
+
+int
+fastpg_plan_statement_relation_count(const FastPgPlanResult *result, int index)
+{
+	const PlannedStmt *statement = fastpg_plan_statement_at(result, index);
+
+	if (statement == NULL)
+		return 0;
+
+	return list_length(statement->rtable);
 }

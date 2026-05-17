@@ -1,4 +1,4 @@
-Below is a draft for `spec/001-overview.md`. It frames the project as a new Rust Postgres-compatible **unit-test server**, not as another Postgres fork.
+Below is a draft for `spec/001-overview.md`. It frames the project as a Rust-led Postgres-compatible **unit-test server**, not as a production Postgres distribution.
 
 # `spec/001-overview.md`
 
@@ -6,20 +6,26 @@ Below is a draft for `spec/001-overview.md`. It frames the project as a new Rust
 
 ## Summary
 
-Build a new Rust database server that is **Postgres-compatible enough for application unit tests**, but is not PostgreSQL internally.
+Build a Rust-led database server that is **Postgres-compatible enough for application unit tests** by reusing PostgreSQL's SQL semantics while replacing PostgreSQL's durable physical storage with in-memory test infrastructure.
 
-The server speaks the PostgreSQL wire protocol, accepts ordinary Postgres client drivers, runs in one process, uses Tokio for async networking and scheduling, and stores test data in an in-memory semantic engine optimized for fast fixture reset, per-test isolation, and parallel test execution.
+The server speaks the PostgreSQL wire protocol, accepts ordinary Postgres client drivers, runs in one process, uses Tokio for async networking and scheduling, and stores test data in an in-memory engine optimized for fast fixture reset, per-test isolation, and parallel test execution.
+
+SQL execution should reuse as much PostgreSQL C code as practical above the physical storage boundary. The initial target is to reuse PostgreSQL's parser, analyzer, rewriter, planner/optimizer, expression machinery, and substantial executor infrastructure, while replacing heap storage, catalog persistence, WAL, buffers, pagers, and vacuum.
 
 This project is separate from the existing fast-fork PostgreSQL work.
 
-The existing fast-fork direction optimizes inside PostgreSQL’s architecture. This project takes the more aggressive route:
+The existing fast-fork direction optimizes inside PostgreSQL's architecture. This project takes the more aggressive route:
 
 ```text
 keep:
   PostgreSQL wire protocol
   PostgreSQL SQL syntax where feasible
-  PostgreSQL parser, initially through libpg_query / pg_query.rs
+  PostgreSQL parser
+  PostgreSQL analyzer and rewriter
+  PostgreSQL planner/optimizer
+  PostgreSQL expression evaluation and executor nodes where storage-independent
   PostgreSQL-compatible type names, catalog views, errors, and client behavior
+  relcache/syscache-style caches when backed by in-memory catalog data
 
 replace:
   PostgreSQL process-per-connection model
@@ -33,9 +39,9 @@ replace:
   HOT updates
   TOAST tables
   vacuum
-  relcache/syscache
   physical pg_catalog storage
-  PostgreSQL executor hot path
+  physical relfilenodes
+  checkpointer/bgwriter/autovacuum background machinery
 ```
 
 The server is explicitly for disposable test databases. It does not attempt to be a production database.
@@ -97,8 +103,8 @@ The existing PostgreSQL fork removes many durability costs, but it still pays fo
 The core idea is:
 
 ```text
-Postgres-compatible surface,
-test-optimized Rust runtime.
+Postgres SQL semantics,
+test-optimized in-memory runtime.
 ```
 
 ## External Dependencies
@@ -122,7 +128,7 @@ Cancel handling
 Transaction state reporting
 ```
 
-The `pgwire` docs also emphasize that the wire protocol itself does not define SQL semantics; it transports startup, simple query, extended query, copy, replication, and response messages. That is important: this project can implement a custom Rust SQL engine while still speaking the Postgres wire protocol. ([GitHub][1])
+The `pgwire` docs also emphasize that the wire protocol itself does not define SQL semantics; it transports startup, simple query, extended query, copy, replication, and response messages. That is important: this project can speak the Postgres wire protocol while routing SQL semantics through a reused PostgreSQL core pipeline. ([GitHub][1])
 
 ### Tokio
 
@@ -144,26 +150,35 @@ Unix-domain socket listener on Unix platforms
 optional TLS only after basic protocol compatibility is working
 ```
 
-### PostgreSQL Parser Reuse
+### PostgreSQL Core Pipeline Reuse
 
-Use `pg_query.rs` / `libpg_query` for SQL parsing initially.
+Prefer direct reuse of PostgreSQL server code for the SQL semantic pipeline.
 
-`pg_query.rs` uses actual PostgreSQL server source to parse SQL and return PostgreSQL parse trees. Its docs say it can also normalize queries and that building the crate builds parts of PostgreSQL server source and statically links them into the Rust library. ([Docs.rs][3])
-
-`libpg_query` is a C library for accessing the PostgreSQL parser outside the server. Its README says it uses actual PostgreSQL server source to parse SQL and return PostgreSQL’s internal parse tree, and is the base library for Rust, Go, Ruby, Node, Python, and other bindings. ([GitHub][4])
-
-The initial parser stack should be:
+The initial core pipeline should be:
 
 ```text
 SQL string
-  -> pg_query.rs
-  -> PostgreSQL parse tree / protobuf AST
-  -> Rust binder
-  -> Rust logical plan
-  -> Rust executor
+  -> PostgreSQL raw parser
+  -> PostgreSQL analyzer
+  -> PostgreSQL rewriter
+  -> PostgreSQL planner/optimizer
+  -> PostgreSQL PlannedStmt
+  -> PostgreSQL executor infrastructure where possible
+  -> fastpg in-memory catalog and storage boundaries
 ```
 
-Do **not** initially reuse PostgreSQL analyzer, planner, or executor as the hot path. They are too entangled with PostgreSQL backend state, memory contexts, catalogs, snapshots, relation caches, and physical storage assumptions.
+`pg_query.rs` / `libpg_query` remain useful references or fallback tools for parse-only workflows. `pg_query.rs` uses actual PostgreSQL server source to parse SQL and return PostgreSQL parse trees, and `libpg_query` exposes PostgreSQL parser behavior outside the server. ([Docs.rs][3], [GitHub][4])
+
+The fast path should not translate PostgreSQL SQL into a separate Rust binder and planner unless the Postgres reuse path proves too expensive or too tightly coupled for a specific feature.
+
+The primary implementation boundary is not "Rust versus C"; it is:
+
+```text
+reuse PostgreSQL semantic machinery
+replace PostgreSQL physical storage machinery
+```
+
+Memory contexts, resource owners, relcache, syscache, typcache, snapshots, and executor state may be reused inside a scoped PostgreSQL-core execution context, but long-lived database state must remain owned by fastpg's in-memory catalog, storage, transaction, and fixture layers.
 
 ## Product Definition
 
@@ -191,7 +206,7 @@ disk efficiency
 long-running production workloads
 high write durability
 replication
-exact planner behavior
+production planner cost behavior
 exact physical storage behavior
 security boundary fidelity
 ```
@@ -233,22 +248,23 @@ pgwire + Tokio server
 session manager
         |
         v
-SQL parser: pg_query.rs / libpg_query
+PostgreSQL parser
         |
         v
-Rust binder / analyzer
+PostgreSQL analyzer + rewriter
         |
         v
-Rust planner
+PostgreSQL planner/optimizer
         |
         v
-Rust executor
+PostgreSQL executor bridge
         |
         +------------------------+
         |                        |
         v                        v
-semantic catalog          semantic storage engine
+in-memory catalog         in-memory storage engine
 virtual pg_catalog        row arenas
+relcache/syscache data    tableam callbacks
 information_schema        indexes
 types/operators           constraints
 functions                 epoch overlays
@@ -329,45 +345,51 @@ Tokio channels for session/server coordination
 
 ## Core Design Choice
 
-The hot path is Rust-native.
+The hot path is PostgreSQL-semantics-native and fastpg-storage-native.
 
-Reuse C PostgreSQL components selectively, but only where they do not force the project to recreate PostgreSQL’s slow runtime.
+Reuse C PostgreSQL components wherever they preserve compatibility without forcing the project to recreate PostgreSQL's durable physical storage or multi-process runtime.
 
 ### Reuse C PostgreSQL components for:
 
 ```text
 SQL parser
 scanner/tokenizer
+analyzer
+rewriter
+planner/optimizer
+PlannedStmt and plan node structures
+expression initialization/evaluation
+executor dispatcher and storage-independent executor nodes
+relcache/syscache/typcache machinery when backed by in-memory catalog data
 query normalization/fingerprinting
 possibly deparser
 possibly selected type input/output functions later
 possibly selected date/time/numeric/json routines later
 ```
 
-### Do not initially reuse C PostgreSQL components for:
+### Do not reuse C PostgreSQL physical-runtime components for fastpg storage:
 
 ```text
-executor
-planner
-analyzer
-relcache
-syscache
 heapam
-btree
+nbtree page storage
 WAL
-storage manager
-memory contexts
-resource owners
-ProcArray
-lock manager
-trigger manager as-is
-RI trigger implementation as-is
+shared buffers / bufmgr
+smgr/md storage manager
+CLOG/pg_xact durability machinery
+ProcArray as production concurrency machinery
+lock manager as production concurrency machinery
+vacuum/autovacuum
+checkpointer/bgwriter
+physical pg_catalog storage
+physical TOAST tables
+trigger manager as-is if it requires SPI over physical catalogs
+RI trigger implementation as-is if it requires physical catalog/storage behavior
 ```
 
 The long-term rule:
 
 ```text
-C reuse is allowed only if it improves compatibility without importing PostgreSQL’s physical storage or process architecture into the hot path.
+C reuse is allowed when it improves compatibility and its expensive dependencies can be redirected to fastpg's in-memory catalog, storage, transaction, and fixture systems.
 ```
 
 ## Repository Layout
@@ -386,12 +408,12 @@ fastpg/
     001-overview.md
     002-wire-protocol.md
     003-server-runtime.md
-    004-sql-parser-ffi.md
+    004-postgres-core-ffi.md
     005-catalog-and-schema.md
     006-type-system.md
-    007-binder-and-name-resolution.md
-    008-logical-plan.md
-    009-executor.md
+    007-analysis-and-rewrite.md
+    008-postgres-planning.md
+    009-executor-and-tableam.md
     010-semantic-storage.md
     011-semantic-indexes.md
     012-transactions-and-epochs.md
@@ -421,6 +443,9 @@ fastpg/
       src/lib.rs
 
     fastpg-parser/
+      src/lib.rs
+
+    fastpg-pgcore/
       src/lib.rs
 
     fastpg-catalog/
@@ -529,21 +554,40 @@ application_name
 
 ### `fastpg-parser`
 
-Parser boundary.
+Rust-facing parser facade.
 
 Responsibilities:
 
 ```text
-call pg_query.rs
+call PostgreSQL parser through fastpg-pgcore
 split multi-statement simple queries
 normalize/fingerprint SQL
-convert PostgreSQL AST/protobuf into fastpg AST
-own all unsafe parser FFI wrappers
+expose parse summaries needed by protocol and diagnostics
+own Rust-safe parser result handles
+optionally support pg_query.rs/libpg_query for parse-only tooling
+```
+
+### `fastpg-pgcore`
+
+Narrow C ABI around reused PostgreSQL backend components.
+
+Responsibilities:
+
+```text
+initialize scoped PostgreSQL-core execution contexts
+call raw parser
+call analyzer
+call rewriter
+call planner/optimizer
+own opaque handles for RawStmt, Query, PlannedStmt, Plan, and executor state
+convert PostgreSQL ereport/longjmp errors into Rust errors
+enforce MemoryContext and ResourceOwner lifetime boundaries
+mediate access to fastpg catalog/storage adapters
 ```
 
 ### `fastpg-catalog`
 
-Semantic catalog.
+In-memory semantic catalog and PostgreSQL catalog provider.
 
 Responsibilities:
 
@@ -560,6 +604,10 @@ types
 views
 virtual catalog data source
 schema generations
+OID assignment
+synthetic pg_catalog rows for PostgreSQL analyzer/planner/executor lookups
+relcache/syscache/typcache backing data
+DDL metadata changes without physical catalog tables
 ```
 
 ### `fastpg-types`
@@ -579,64 +627,61 @@ typmods
 collations where supported
 NULL semantics
 array/json/numeric/date/time basics
+Datum and TupleTableSlot conversion at the fastpg/PostgreSQL boundary
 ```
 
 ### `fastpg-bind`
 
-Binder/analyzer.
+PostgreSQL analyzer facade and Rust binding metadata.
 
 Responsibilities:
 
 ```text
-name resolution
-search_path resolution
-column resolution
-type inference
-parameter typing
-operator lookup
-function lookup
-INSERT target mapping
-UPDATE target mapping
-DDL semantic validation
+invoke PostgreSQL analyzer through fastpg-pgcore
+surface analyzed parameter types
+surface target list metadata
+surface relation/function/operator dependencies
+map PostgreSQL semantic errors to protocol errors
+coordinate search_path/session state with PostgreSQL analyzer state
+avoid maintaining an independent SQL analyzer unless a feature explicitly needs it
 ```
 
 ### `fastpg-plan`
 
-Logical planner.
+PostgreSQL planner facade.
 
 Responsibilities:
 
 ```text
-logical plan nodes
-simple cost model
-index selection
-join order for common cases
-projection/filter pushdown
-plan cache keys
+invoke PostgreSQL rewriter and planner through fastpg-pgcore
+own Rust-safe PlannedStmt handles
+summarize plan shapes for compatibility tests
+prepare plan cache keys
+track schema invalidation
+expose in-memory relation/index metadata to the planner
+keep cost model knobs biased toward predictable in-memory execution
 ```
 
 ### `fastpg-exec`
 
-Executor.
+Executor bridge.
 
 Responsibilities:
 
 ```text
-execute logical plans
-expression evaluation
-scan/filter/project
-joins
-aggregates
-sort/limit
-DML
-RETURNING
-trigger hooks if supported
-result materialization
+execute PostgreSQL PlannedStmt objects where possible
+drive PostgreSQL executor lifecycle
+stream TupleTableSlot results into pgwire rows
+support Result, scan, filter, project, join, aggregate, sort, limit, and ModifyTable nodes
+route table access through fastpg in-memory tableam/storage
+route expression evaluation through PostgreSQL expression machinery
+materialize results for protocol delivery
+detect unsupported executor nodes clearly
 ```
 
 ### `fastpg-storage`
 
-Semantic row storage.
+In-memory row storage and table access backing.
 
 Responsibilities:
 
@@ -649,11 +694,15 @@ insert/update/delete
 virtual CTIDs
 large varlena storage
 memory accounting
+table scan descriptors
+TupleTableSlot population/extraction
+tableam callback implementation support
+no heap pages, shared buffers, WAL, smgr, or vacuum
 ```
 
 ### `fastpg-index`
 
-Semantic indexes.
+In-memory semantic indexes.
 
 Responsibilities:
 
@@ -665,6 +714,8 @@ ordered indexes later
 index lookup
 index maintenance
 epoch-scoped uniqueness
+planner-visible index metadata
+no nbtree page storage
 ```
 
 ### `fastpg-tx`
@@ -857,7 +908,7 @@ struct Database {
 
 ## Catalog
 
-The catalog is semantic metadata, not physical pg_catalog tables.
+The catalog is semantic metadata, not physical pg_catalog tables. It is the source of truth for both Rust-side metadata and the synthetic catalog tuples exposed to PostgreSQL analyzer, planner, relcache, syscache, typcache, ORM introspection, and `information_schema`.
 
 ```rust
 struct Catalog {
@@ -895,6 +946,8 @@ struct Storage {
     active_epochs: EpochMap,
 }
 ```
+
+Storage backs PostgreSQL table access through fastpg tableam callbacks. It does not create heap pages, relation files, shared-buffer pages, WAL records, or vacuum work.
 
 A base table is immutable after fixture capture unless explicitly mutated outside test mode.
 
@@ -1005,28 +1058,34 @@ uncommitted writes are visible only to the owning transaction/session
 
 ## Principle
 
-Reuse C PostgreSQL code only where the boundary is clean.
+Reuse C PostgreSQL code where it gives compatibility leverage and where expensive physical-runtime dependencies can be replaced or redirected.
 
-A clean boundary has:
+A usable boundary has:
 
 ```text
-explicit inputs
-explicit outputs
-no dependence on PostgreSQL backend globals
-no dependence on MemoryContext lifetime
-no dependence on relcache/syscache
+explicit ownership
+scoped MemoryContext and ResourceOwner lifetime
+contained PostgreSQL backend globals
 no dependence on real heap pages
-no dependence on process-local backend identity
-safe or contained threading behavior
+no dependence on shared buffers
+no dependence on WAL for correctness
+no dependence on physical pg_catalog tables
+thread confinement or documented synchronization
+errors converted across the Rust/C boundary
 ```
 
 ## Allowed Initial Reuse
 
 ```text
-libpg_query parser
-libpg_query scanner
-pg_query.rs normalization/fingerprinting
-possibly deparser
+PostgreSQL raw parser
+PostgreSQL analyzer
+PostgreSQL rewriter
+PostgreSQL planner/optimizer
+PostgreSQL expression initialization/evaluation
+PostgreSQL executor nodes that can use fastpg tableam/storage
+MemoryContext and ResourceOwner inside scoped execution contexts
+relcache/syscache/typcache when backed by fastpg in-memory catalog rows
+pg_query.rs/libpg_query normalization/fingerprinting if useful
 ```
 
 ## Candidate Later Reuse
@@ -1034,6 +1093,8 @@ possibly deparser
 Each candidate requires its own spec and benchmark:
 
 ```text
+additional executor nodes
+selected DDL execution code
 numeric input/output
 date/time parsing and formatting
 interval parsing and formatting
@@ -1043,25 +1104,24 @@ selected operator implementations
 Postgres error message formatting conventions
 ```
 
-## Forbidden Hot-Path Reuse Initially
+## Forbidden Physical-Runtime Reuse
 
 ```text
-PostgreSQL executor
-PostgreSQL planner
 heapam
-nbtree
+nbtree page storage
 bufmgr
 smgr
 WAL
-CLOG
-ProcArray
-lock manager
-trigger manager
-RI trigger SPI queries
-relcache/syscache
+CLOG/pg_xact durability machinery
+ProcArray as production concurrency machinery
+lock manager as production concurrency machinery
+vacuum/autovacuum
+checkpointer/bgwriter
+physical pg_catalog storage
+physical TOAST tables
 ```
 
-These are not forbidden forever, but importing them early defeats the purpose of the project.
+These are not forbidden because they are C. They are forbidden because they recreate PostgreSQL's physical storage and production runtime costs.
 
 ## Safety Rules for FFI
 
@@ -1069,6 +1129,7 @@ All C calls live in one or more FFI crates.
 
 ```text
 fastpg-parser-ffi
+fastpg-pgcore-ffi
 fastpg-pgfunc-ffi, later if needed
 ```
 
@@ -1081,7 +1142,8 @@ C errors converted to Rust errors
 thread-safety documented for every FFI function
 parser calls protected by mutex if libpg_query is not proven thread-safe
 FFI outputs copied into Rust-owned structures before use
-no C-owned pointers stored in long-lived Rust database state
+C-owned pointers may live only inside scoped parser/analyzer/planner/executor handles
+no C-owned pointers stored in long-lived fastpg database state
 ```
 
 A future `024-c-ffi-policy.md` spec should define this fully.
@@ -1281,7 +1343,9 @@ The type system spec must define where Rust-native behavior is acceptable and wh
 
 The project does not physically store `pg_catalog`.
 
-Instead, it exposes virtual catalog tables and functions backed by semantic metadata.
+Instead, it keeps a full in-memory semantic catalog and exposes virtual catalog tables and functions backed by that metadata.
+
+The same in-memory catalog must also provide the synthetic catalog tuples needed by PostgreSQL analyzer, planner, relcache, syscache, typcache, executor initialization, and ORM introspection.
 
 Initial virtual catalog objects:
 
@@ -1317,6 +1381,8 @@ No WAL.
 No physical TOAST.
 
 No vacuum.
+
+No smgr/md relation files for fastpg table data.
 
 Use semantic in-memory storage:
 
@@ -1528,21 +1594,27 @@ shared database ownership
 metrics/tracing
 ```
 
-## `004-sql-parser-ffi.md`
+## `004-postgres-core-ffi.md`
 
-Define parser integration.
+Define the narrow C ABI around reused PostgreSQL backend components.
 
 Must cover:
 
 ```text
-pg_query.rs usage
+PostgreSQL version pinning
+raw parser entry points
+analyzer entry points
+rewriter entry points
+planner entry points
+executor lifecycle entry points
 multi-statement splitting
 normalization/fingerprinting
-AST conversion
-FFI safety
-parser thread-safety
-Postgres version pinning
+opaque handle ownership
+MemoryContext ownership
+ResourceOwner ownership
+thread confinement
 error conversion
+catalog/storage adapter boundaries
 ```
 
 ## `005-catalog-and-schema.md`
@@ -1588,52 +1660,55 @@ collations
 NULL behavior
 ```
 
-## `007-binder-and-name-resolution.md`
+## `007-analysis-and-rewrite.md`
 
-Define the analyzer/binder.
+Define PostgreSQL analyzer and rewriter reuse.
 
 Must cover:
 
 ```text
 search_path
-range table binding
-column resolution
-parameter typing
-operator lookup
-function lookup
-type coercion
-INSERT/UPDATE/DELETE binding
-DDL binding
+session state visible to PostgreSQL analyzer
+in-memory catalog data visible to analyzer
+range table metadata surfaced to Rust
+parameter typing surfaced to Rust
+target list metadata surfaced to Rust
+operator/function/type lookup through PostgreSQL catalogs
+rewrite rules supported or explicitly rejected
+DDL analysis
 error messages
 ```
 
-## `008-logical-plan.md`
+## `008-postgres-planning.md`
 
-Define planning.
+Define PostgreSQL planner/optimizer reuse.
 
 Must cover:
 
 ```text
-logical plan nodes
-scan planning
-index selection
+PlannedStmt ownership
+plan node support matrix
+scan planning against in-memory relations
+index metadata exposed to planner
 joins
 aggregates
 sort/limit
 DML plans
 prepared plan cache keys
 schema invalidation
-cost model
+in-memory cost model tuning
+unsupported plan behavior
 ```
 
-## `009-executor.md`
+## `009-executor-and-tableam.md`
 
-Define execution.
+Define execution through PostgreSQL executor infrastructure and fastpg table access.
 
 Must cover:
 
 ```text
-expression evaluator
+ExecutorStart/ExecutorRun/ExecutorFinish/ExecutorEnd ownership
+expression evaluator reuse
 projection
 filters
 joins
@@ -1642,8 +1717,12 @@ sort
 DML
 RETURNING
 result streaming
+in-memory TableAmRoutine
+TupleTableSlot conversion
+virtual CTIDs
 memory limits
 CPU worker interaction
+unsupported executor nodes
 ```
 
 ## `010-semantic-storage.md`
@@ -2075,10 +2154,11 @@ Reusing too much C PostgreSQL can accidentally recreate PostgreSQL.
 Mitigation:
 
 ```text
-parser first
-hot path Rust-native
-separate spec for every additional C component
-benchmark before and after reuse
+reuse SQL semantics first
+replace physical storage/runtime costs first
+draw explicit boundaries at catalog provider, table access method, transaction state, and fixture state
+benchmark every new reused subsystem against the in-memory goal
+fail clearly when a PostgreSQL component tries to require physical storage
 ```
 
 ### Async Runtime Risk
@@ -2127,9 +2207,14 @@ The following decisions define the project:
 one process
 multi-threaded Tokio runtime
 pgwire for protocol
-pg_query.rs/libpg_query for initial parser
-Rust-native binder/planner/executor/storage hot path
+direct PostgreSQL parser/analyzer/rewriter/planner reuse
+PostgreSQL executor infrastructure where it can run on fastpg storage
+in-memory catalog as source of truth
 semantic in-memory tables
+no heap pages
+no shared buffers for fastpg table data
+no WAL
+no vacuum
 epoch fixture isolation
 virtual catalog
 unit-test-only compatibility contract

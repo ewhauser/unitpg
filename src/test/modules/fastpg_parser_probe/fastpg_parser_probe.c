@@ -20,6 +20,8 @@ PG_MODULE_MAGIC;
 
 PG_FUNCTION_INFO_V1(fastpg_parse_summary);
 PG_FUNCTION_INFO_V1(fastpg_analyze_summary);
+PG_FUNCTION_INFO_V1(fastpg_rewrite_summary);
+PG_FUNCTION_INFO_V1(fastpg_plan_summary);
 
 static void
 fastpg_append_raw_stmt_summary(StringInfo buf,
@@ -125,6 +127,144 @@ fastpg_analyze_summary(PG_FUNCTION_ARGS)
 	if (analyze_result != NULL)
 		fastpg_analyze_result_free(analyze_result);
 	fastpg_parse_result_free(parse_result);
+	PG_FREE_IF_COPY(input, 0);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+static FastPgAnalyzeResult *
+fastpg_parse_and_analyze(const char *query_string,
+						 FastPgParseResult **parse_result,
+						 StringInfo buf)
+{
+	FastPgAnalyzeResult *analyze_result = NULL;
+
+	*parse_result = fastpg_parser_parse(query_string);
+	if (!fastpg_parse_result_ok(*parse_result))
+	{
+		appendStringInfo(buf, "parse_error sqlstate=%s",
+						 fastpg_parse_error_sqlstate(*parse_result));
+		return NULL;
+	}
+
+	analyze_result = fastpg_parser_analyze(*parse_result, 0);
+	if (!fastpg_analyze_result_ok(analyze_result))
+	{
+		appendStringInfo(buf, "analyze_error sqlstate=%s",
+						 fastpg_analyze_error_sqlstate(analyze_result));
+		return analyze_result;
+	}
+
+	return analyze_result;
+}
+
+Datum
+fastpg_rewrite_summary(PG_FUNCTION_ARGS)
+{
+	text	   *input = PG_GETARG_TEXT_PP(0);
+	char	   *query_string = text_to_cstring(input);
+	FastPgParseResult *parse_result = NULL;
+	FastPgAnalyzeResult *analyze_result;
+	FastPgRewriteResult *rewrite_result = NULL;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	analyze_result = fastpg_parse_and_analyze(query_string, &parse_result, &buf);
+
+	if (analyze_result != NULL && fastpg_analyze_result_ok(analyze_result))
+	{
+		rewrite_result = fastpg_parser_rewrite(analyze_result);
+
+		if (fastpg_rewrite_result_ok(rewrite_result))
+		{
+			int			query_count = fastpg_rewrite_query_count(rewrite_result);
+
+			appendStringInfo(&buf, "ok queries=%d", query_count);
+			for (int index = 0; index < query_count; index++)
+				appendStringInfo(&buf,
+								 " query[%d]={command=%s,utility=%s,utility_stmt=%s,targets=%d}",
+								 index,
+								 fastpg_rewrite_query_command_tag(rewrite_result, index),
+								 fastpg_rewrite_query_is_utility(rewrite_result, index) ? "true" : "false",
+								 fastpg_rewrite_query_utility_stmt_tag(rewrite_result, index),
+								 fastpg_rewrite_query_target_count(rewrite_result, index));
+		}
+		else
+		{
+			appendStringInfo(&buf, "rewrite_error sqlstate=%s",
+							 fastpg_rewrite_error_sqlstate(rewrite_result));
+		}
+	}
+
+	if (rewrite_result != NULL)
+		fastpg_rewrite_result_free(rewrite_result);
+	if (analyze_result != NULL)
+		fastpg_analyze_result_free(analyze_result);
+	if (parse_result != NULL)
+		fastpg_parse_result_free(parse_result);
+	PG_FREE_IF_COPY(input, 0);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fastpg_plan_summary(PG_FUNCTION_ARGS)
+{
+	text	   *input = PG_GETARG_TEXT_PP(0);
+	char	   *query_string = text_to_cstring(input);
+	FastPgParseResult *parse_result = NULL;
+	FastPgAnalyzeResult *analyze_result;
+	FastPgRewriteResult *rewrite_result = NULL;
+	FastPgPlanResult *plan_result = NULL;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	analyze_result = fastpg_parse_and_analyze(query_string, &parse_result, &buf);
+
+	if (analyze_result != NULL && fastpg_analyze_result_ok(analyze_result))
+	{
+		rewrite_result = fastpg_parser_rewrite(analyze_result);
+
+		if (!fastpg_rewrite_result_ok(rewrite_result))
+		{
+			appendStringInfo(&buf, "rewrite_error sqlstate=%s",
+							 fastpg_rewrite_error_sqlstate(rewrite_result));
+		}
+		else
+		{
+			plan_result = fastpg_parser_plan(rewrite_result);
+
+			if (fastpg_plan_result_ok(plan_result))
+			{
+				int			statement_count = fastpg_plan_statement_count(plan_result);
+
+				appendStringInfo(&buf, "ok statements=%d", statement_count);
+				for (int index = 0; index < statement_count; index++)
+					appendStringInfo(&buf,
+									 " stmt[%d]={command=%s,plan=%s,utility_stmt=%s,targets=%d,relations=%d}",
+									 index,
+									 fastpg_plan_statement_command_tag(plan_result, index),
+									 fastpg_plan_statement_plan_tree_tag(plan_result, index),
+									 fastpg_plan_statement_utility_stmt_tag(plan_result, index),
+									 fastpg_plan_statement_target_count(plan_result, index),
+									 fastpg_plan_statement_relation_count(plan_result, index));
+			}
+			else
+			{
+				appendStringInfo(&buf, "plan_error sqlstate=%s",
+								 fastpg_plan_error_sqlstate(plan_result));
+			}
+		}
+	}
+
+	if (plan_result != NULL)
+		fastpg_plan_result_free(plan_result);
+	if (rewrite_result != NULL)
+		fastpg_rewrite_result_free(rewrite_result);
+	if (analyze_result != NULL)
+		fastpg_analyze_result_free(analyze_result);
+	if (parse_result != NULL)
+		fastpg_parse_result_free(parse_result);
 	PG_FREE_IF_COPY(input, 0);
 
 	PG_RETURN_TEXT_P(cstring_to_text(buf.data));

@@ -41,3 +41,33 @@ SELECT fastpg_analyze_summary('SELECT * FROM fastpg_missing;');
  analyze_error sqlstate=42P01
 (1 row)
 
+SELECT fastpg_rewrite_summary('SELECT 1;');
+                                fastpg_rewrite_summary                                
+--------------------------------------------------------------------------------------
+ ok queries=1 query[0]={command=CMD_SELECT,utility=false,utility_stmt=NULL,targets=1}
+(1 row)
+
+SELECT fastpg_rewrite_summary('CREATE TABLE fastpg_rewritten(id int);');
+                                    fastpg_rewrite_summary                                    
+----------------------------------------------------------------------------------------------
+ ok queries=1 query[0]={command=CMD_UTILITY,utility=true,utility_stmt=T_CreateStmt,targets=0}
+(1 row)
+
+SELECT fastpg_plan_summary('SELECT 1;');
+                                        fastpg_plan_summary                                         
+----------------------------------------------------------------------------------------------------
+ ok statements=1 stmt[0]={command=CMD_SELECT,plan=T_Result,utility_stmt=NULL,targets=1,relations=1}
+(1 row)
+
+SELECT fastpg_plan_summary('SELECT $1::int4;');
+                                        fastpg_plan_summary                                         
+----------------------------------------------------------------------------------------------------
+ ok statements=1 stmt[0]={command=CMD_SELECT,plan=T_Result,utility_stmt=NULL,targets=1,relations=1}
+(1 row)
+
+SELECT fastpg_plan_summary('CREATE TABLE fastpg_planned(id int);');
+                                           fastpg_plan_summary                                           
+---------------------------------------------------------------------------------------------------------
+ ok statements=1 stmt[0]={command=CMD_UTILITY,plan=NULL,utility_stmt=T_CreateStmt,targets=0,relations=0}
+(1 row)
+
