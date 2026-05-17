@@ -71,3 +71,9 @@ SELECT fastpg_plan_summary('CREATE TABLE fastpg_planned(id int);');
  ok statements=1 stmt[0]={command=CMD_UTILITY,plan=NULL,utility_stmt=T_CreateStmt,targets=0,relations=0}
 (1 row)
 
+SELECT fastpg_execute_summary('SELECT 1;');
+                                                        fastpg_execute_summary                                                         
+---------------------------------------------------------------------------------------------------------------------------------------
+ ok statements=1 stmt[0]={command=CMD_SELECT,plan=T_Result,columns=1,rows=1,column[0]={name=?column?,type_oid=23},row[0]=[?column?=1]}
+(1 row)
+

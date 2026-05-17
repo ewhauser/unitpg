@@ -29,6 +29,7 @@ typedef struct FastPgRawStatement FastPgRawStatement;
 typedef struct FastPgAnalyzeResult FastPgAnalyzeResult;
 typedef struct FastPgRewriteResult FastPgRewriteResult;
 typedef struct FastPgPlanResult FastPgPlanResult;
+typedef struct FastPgExecuteResult FastPgExecuteResult;
 
 extern PGDLLEXPORT FastPgParseResult *fastpg_parser_parse(const char *query_string);
 extern PGDLLEXPORT void fastpg_parse_result_free(FastPgParseResult *result);
@@ -107,6 +108,38 @@ extern PGDLLEXPORT int fastpg_plan_statement_target_count(const FastPgPlanResult
 														  int index);
 extern PGDLLEXPORT int fastpg_plan_statement_relation_count(const FastPgPlanResult *result,
 															int index);
+
+extern PGDLLEXPORT FastPgExecuteResult *fastpg_parser_execute(FastPgPlanResult *plan_result);
+extern PGDLLEXPORT void fastpg_execute_result_free(FastPgExecuteResult *result);
+
+extern PGDLLEXPORT bool fastpg_execute_result_ok(const FastPgExecuteResult *result);
+extern PGDLLEXPORT const char *fastpg_execute_error_sqlstate(const FastPgExecuteResult *result);
+extern PGDLLEXPORT const char *fastpg_execute_error_message(const FastPgExecuteResult *result);
+extern PGDLLEXPORT int fastpg_execute_error_cursorpos(const FastPgExecuteResult *result);
+
+extern PGDLLEXPORT int fastpg_execute_statement_count(const FastPgExecuteResult *result);
+extern PGDLLEXPORT const char *fastpg_execute_statement_command_tag(const FastPgExecuteResult *result,
+																	int statement_index);
+extern PGDLLEXPORT const char *fastpg_execute_statement_plan_tree_tag(const FastPgExecuteResult *result,
+																	  int statement_index);
+extern PGDLLEXPORT int fastpg_execute_statement_column_count(const FastPgExecuteResult *result,
+															 int statement_index);
+extern PGDLLEXPORT int fastpg_execute_statement_row_count(const FastPgExecuteResult *result,
+														  int statement_index);
+extern PGDLLEXPORT const char *fastpg_execute_column_name(const FastPgExecuteResult *result,
+														  int statement_index,
+														  int column_index);
+extern PGDLLEXPORT unsigned int fastpg_execute_column_type_oid(const FastPgExecuteResult *result,
+															   int statement_index,
+															   int column_index);
+extern PGDLLEXPORT bool fastpg_execute_value_is_null(const FastPgExecuteResult *result,
+													 int statement_index,
+													 int row_index,
+													 int column_index);
+extern PGDLLEXPORT const char *fastpg_execute_value_text(const FastPgExecuteResult *result,
+														 int statement_index,
+														 int row_index,
+														 int column_index);
 
 #ifdef __cplusplus
 }

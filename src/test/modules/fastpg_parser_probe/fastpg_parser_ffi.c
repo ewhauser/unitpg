@@ -12,15 +12,24 @@
 
 #include "fastpg_parser_ffi.h"
 
+#include "access/tupdesc.h"
+#include "executor/execdesc.h"
+#include "executor/executor.h"
+#include "executor/tuptable.h"
+#include "fmgr.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/nodes.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
+#include "nodes/plannodes.h"
 #include "nodes/primnodes.h"
 #include "parser/analyze.h"
 #include "tcop/tcopprot.h"
 #include "utils/elog.h"
+#include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
+#include "utils/snapshot.h"
 
 struct FastPgParseResult
 {
@@ -57,11 +66,53 @@ struct FastPgRewriteResult
 struct FastPgPlanResult
 {
 	MemoryContext plan_context;
+	char	   *source_text;
 	List	   *planned_statements;
 	char		error_sqlstate[6];
 	char	   *error_message;
 	int			error_cursorpos;
 };
+
+typedef struct FastPgExecuteCell
+{
+	bool		is_null;
+	char	   *value_text;
+} FastPgExecuteCell;
+
+typedef struct FastPgExecuteRow
+{
+	FastPgExecuteCell *cells;
+} FastPgExecuteRow;
+
+typedef struct FastPgExecuteStatement
+{
+	CmdType		command_type;
+	bool		has_plan_tree;
+	NodeTag		plan_tree_tag;
+	int			column_count;
+	char	  **column_names;
+	Oid		   *column_type_oids;
+	Oid		   *column_output_oids;
+	int			row_count;
+	FastPgExecuteRow *rows;
+} FastPgExecuteStatement;
+
+struct FastPgExecuteResult
+{
+	MemoryContext execute_context;
+	int			statement_count;
+	FastPgExecuteStatement *statements;
+	char		error_sqlstate[6];
+	char	   *error_message;
+	int			error_cursorpos;
+};
+
+typedef struct FastPgCaptureDestReceiver
+{
+	DestReceiver pub;
+	FastPgExecuteStatement *statement;
+	MemoryContext context;
+} FastPgCaptureDestReceiver;
 
 static const char *
 fastpg_node_tag_name(NodeTag tag)
@@ -182,6 +233,111 @@ fastpg_plan_result_set_error(FastPgPlanResult *result,
 	strlcpy(result->error_sqlstate, sqlstate, sizeof(result->error_sqlstate));
 	result->error_message = pstrdup(message);
 	result->error_cursorpos = cursorpos;
+}
+
+static void
+fastpg_execute_result_set_error(FastPgExecuteResult *result,
+								const char *sqlstate,
+								const char *message,
+								int cursorpos)
+{
+	strlcpy(result->error_sqlstate, sqlstate, sizeof(result->error_sqlstate));
+	result->error_message = pstrdup(message);
+	result->error_cursorpos = cursorpos;
+}
+
+static void
+fastpg_capture_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	FastPgCaptureDestReceiver *receiver = (FastPgCaptureDestReceiver *) self;
+	FastPgExecuteStatement *statement = receiver->statement;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(receiver->context);
+
+	statement->column_count = typeinfo->natts;
+	statement->column_names = palloc0_array(char *, statement->column_count);
+	statement->column_type_oids = palloc0_array(Oid, statement->column_count);
+	statement->column_output_oids = palloc0_array(Oid, statement->column_count);
+
+	for (int index = 0; index < statement->column_count; index++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(typeinfo, index);
+		bool		type_is_varlena;
+
+		statement->column_names[index] = pstrdup(NameStr(attr->attname));
+		statement->column_type_oids[index] = attr->atttypid;
+		getTypeOutputInfo(attr->atttypid,
+						  &statement->column_output_oids[index],
+						  &type_is_varlena);
+	}
+
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static bool
+fastpg_capture_receive_slot(TupleTableSlot *slot, DestReceiver *self)
+{
+	FastPgCaptureDestReceiver *receiver = (FastPgCaptureDestReceiver *) self;
+	FastPgExecuteStatement *statement = receiver->statement;
+	FastPgExecuteRow *row;
+	MemoryContext oldcontext;
+
+	oldcontext = MemoryContextSwitchTo(receiver->context);
+
+	if (statement->rows == NULL)
+		statement->rows = palloc0_array(FastPgExecuteRow, 1);
+	else
+		statement->rows = repalloc_array(statement->rows,
+										 FastPgExecuteRow,
+										 statement->row_count + 1);
+	row = &statement->rows[statement->row_count];
+	row->cells = palloc0_array(FastPgExecuteCell, statement->column_count);
+
+	for (int index = 0; index < statement->column_count; index++)
+	{
+		bool		is_null;
+		Datum		value;
+
+		value = slot_getattr(slot, index + 1, &is_null);
+		row->cells[index].is_null = is_null;
+
+		if (!is_null)
+			row->cells[index].value_text =
+				OidOutputFunctionCall(statement->column_output_oids[index], value);
+	}
+
+	statement->row_count++;
+	MemoryContextSwitchTo(oldcontext);
+	return true;
+}
+
+static void
+fastpg_capture_shutdown(DestReceiver *self)
+{
+}
+
+static void
+fastpg_capture_destroy(DestReceiver *self)
+{
+	pfree(self);
+}
+
+static DestReceiver *
+fastpg_create_capture_receiver(FastPgExecuteStatement *statement,
+							   MemoryContext context)
+{
+	FastPgCaptureDestReceiver *receiver = palloc0_object(FastPgCaptureDestReceiver);
+
+	receiver->pub.receiveSlot = fastpg_capture_receive_slot;
+	receiver->pub.rStartup = fastpg_capture_startup;
+	receiver->pub.rShutdown = fastpg_capture_shutdown;
+	receiver->pub.rDestroy = fastpg_capture_destroy;
+	receiver->pub.mydest = DestNone;
+	receiver->statement = statement;
+	receiver->context = context;
+
+	return (DestReceiver *) receiver;
 }
 
 FastPgParseResult *
@@ -752,6 +908,7 @@ fastpg_parser_plan(FastPgRewriteResult *rewrite_result)
 		List	   *querytrees_copy;
 
 		MemoryContextSwitchTo(result->plan_context);
+		result->source_text = pstrdup(rewrite_result->source_text);
 		querytrees_copy = copyObject(rewrite_result->querytrees);
 		result->planned_statements = pg_plan_queries(querytrees_copy,
 													 rewrite_result->source_text,
@@ -908,4 +1065,295 @@ fastpg_plan_statement_relation_count(const FastPgPlanResult *result, int index)
 		return 0;
 
 	return list_length(statement->rtable);
+}
+
+FastPgExecuteResult *
+fastpg_parser_execute(FastPgPlanResult *plan_result)
+{
+	MemoryContext oldcontext = CurrentMemoryContext;
+	FastPgExecuteResult *result;
+	QueryDesc  *query_desc = NULL;
+	DestReceiver *dest = NULL;
+	bool		snapshot_pushed = false;
+
+	result = palloc0_object(FastPgExecuteResult);
+	result->execute_context = AllocSetContextCreate(CurrentMemoryContext,
+													"fastpg execute ffi",
+													ALLOCSET_DEFAULT_SIZES);
+
+	if (!fastpg_plan_result_ok(plan_result))
+	{
+		fastpg_execute_result_set_error(result, "XX000",
+										"plan result is not successful",
+										0);
+		return result;
+	}
+
+	PG_TRY();
+	{
+		List	   *planned_statements_copy;
+		ListCell   *lc;
+		int			statement_index = 0;
+
+		MemoryContextSwitchTo(result->execute_context);
+		planned_statements_copy = copyObject(plan_result->planned_statements);
+		result->statement_count = list_length(planned_statements_copy);
+		result->statements = palloc0_array(FastPgExecuteStatement,
+										   result->statement_count);
+
+		foreach(lc, planned_statements_copy)
+		{
+			PlannedStmt *statement = lfirst_node(PlannedStmt, lc);
+			FastPgExecuteStatement *summary = &result->statements[statement_index++];
+
+			summary->command_type = statement->commandType;
+			summary->has_plan_tree = statement->planTree != NULL;
+			if (summary->has_plan_tree)
+				summary->plan_tree_tag = nodeTag(statement->planTree);
+
+			if (statement->utilityStmt != NULL)
+				continue;
+
+			PushActiveSnapshot(GetTransactionSnapshot());
+			snapshot_pushed = true;
+
+			dest = fastpg_create_capture_receiver(summary,
+												  result->execute_context);
+			query_desc = CreateQueryDesc(statement,
+										 plan_result->source_text,
+										 GetActiveSnapshot(),
+										 InvalidSnapshot,
+										 dest,
+										 NULL,
+										 NULL,
+										 0);
+
+			ExecutorStart(query_desc, 0);
+			ExecutorRun(query_desc, ForwardScanDirection, 0);
+			ExecutorFinish(query_desc);
+			ExecutorEnd(query_desc);
+			FreeQueryDesc(query_desc);
+			query_desc = NULL;
+
+			dest->rDestroy(dest);
+			dest = NULL;
+
+			PopActiveSnapshot();
+			snapshot_pushed = false;
+		}
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		if (dest != NULL)
+			dest->rDestroy(dest);
+		if (snapshot_pushed)
+			PopActiveSnapshot();
+
+		edata = CopyErrorData();
+		FlushErrorState();
+
+		fastpg_execute_result_set_error(result,
+										unpack_sql_state(edata->sqlerrcode),
+										edata->message ? edata->message : "",
+										edata->cursorpos);
+		FreeErrorData(edata);
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcontext);
+	return result;
+}
+
+void
+fastpg_execute_result_free(FastPgExecuteResult *result)
+{
+	if (result == NULL)
+		return;
+
+	if (result->execute_context != NULL)
+		MemoryContextDelete(result->execute_context);
+	if (result->error_message != NULL)
+		pfree(result->error_message);
+
+	pfree(result);
+}
+
+bool
+fastpg_execute_result_ok(const FastPgExecuteResult *result)
+{
+	return result != NULL && result->error_sqlstate[0] == '\0';
+}
+
+const char *
+fastpg_execute_error_sqlstate(const FastPgExecuteResult *result)
+{
+	if (result == NULL || fastpg_execute_result_ok(result))
+		return NULL;
+
+	return result->error_sqlstate;
+}
+
+const char *
+fastpg_execute_error_message(const FastPgExecuteResult *result)
+{
+	if (result == NULL || fastpg_execute_result_ok(result))
+		return NULL;
+
+	return result->error_message;
+}
+
+int
+fastpg_execute_error_cursorpos(const FastPgExecuteResult *result)
+{
+	if (result == NULL || fastpg_execute_result_ok(result))
+		return 0;
+
+	return result->error_cursorpos;
+}
+
+static const FastPgExecuteStatement *
+fastpg_execute_statement_at(const FastPgExecuteResult *result,
+							int statement_index)
+{
+	if (!fastpg_execute_result_ok(result) ||
+		statement_index < 0 ||
+		statement_index >= result->statement_count)
+		return NULL;
+
+	return &result->statements[statement_index];
+}
+
+int
+fastpg_execute_statement_count(const FastPgExecuteResult *result)
+{
+	if (!fastpg_execute_result_ok(result))
+		return 0;
+
+	return result->statement_count;
+}
+
+const char *
+fastpg_execute_statement_command_tag(const FastPgExecuteResult *result,
+									 int statement_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL)
+		return "CMD_UNKNOWN";
+
+	return fastpg_command_tag_name(statement->command_type);
+}
+
+const char *
+fastpg_execute_statement_plan_tree_tag(const FastPgExecuteResult *result,
+									   int statement_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL || !statement->has_plan_tree)
+		return "NULL";
+
+	return fastpg_node_tag_name(statement->plan_tree_tag);
+}
+
+int
+fastpg_execute_statement_column_count(const FastPgExecuteResult *result,
+									  int statement_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL)
+		return 0;
+
+	return statement->column_count;
+}
+
+int
+fastpg_execute_statement_row_count(const FastPgExecuteResult *result,
+								   int statement_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL)
+		return 0;
+
+	return statement->row_count;
+}
+
+const char *
+fastpg_execute_column_name(const FastPgExecuteResult *result,
+						   int statement_index,
+						   int column_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL ||
+		column_index < 0 ||
+		column_index >= statement->column_count)
+		return NULL;
+
+	return statement->column_names[column_index];
+}
+
+unsigned int
+fastpg_execute_column_type_oid(const FastPgExecuteResult *result,
+							   int statement_index,
+							   int column_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL ||
+		column_index < 0 ||
+		column_index >= statement->column_count)
+		return 0;
+
+	return statement->column_type_oids[column_index];
+}
+
+bool
+fastpg_execute_value_is_null(const FastPgExecuteResult *result,
+							 int statement_index,
+							 int row_index,
+							 int column_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL ||
+		row_index < 0 ||
+		row_index >= statement->row_count ||
+		column_index < 0 ||
+		column_index >= statement->column_count)
+		return true;
+
+	return statement->rows[row_index].cells[column_index].is_null;
+}
+
+const char *
+fastpg_execute_value_text(const FastPgExecuteResult *result,
+						  int statement_index,
+						  int row_index,
+						  int column_index)
+{
+	const FastPgExecuteStatement *statement =
+		fastpg_execute_statement_at(result, statement_index);
+
+	if (statement == NULL ||
+		row_index < 0 ||
+		row_index >= statement->row_count ||
+		column_index < 0 ||
+		column_index >= statement->column_count ||
+		statement->rows[row_index].cells[column_index].is_null)
+		return NULL;
+
+	return statement->rows[row_index].cells[column_index].value_text;
 }

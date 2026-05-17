@@ -22,6 +22,7 @@ PG_FUNCTION_INFO_V1(fastpg_parse_summary);
 PG_FUNCTION_INFO_V1(fastpg_analyze_summary);
 PG_FUNCTION_INFO_V1(fastpg_rewrite_summary);
 PG_FUNCTION_INFO_V1(fastpg_plan_summary);
+PG_FUNCTION_INFO_V1(fastpg_execute_summary);
 
 static void
 fastpg_append_raw_stmt_summary(StringInfo buf,
@@ -158,6 +159,38 @@ fastpg_parse_and_analyze(const char *query_string,
 	return analyze_result;
 }
 
+static FastPgPlanResult *
+fastpg_parse_analyze_rewrite_plan(const char *query_string,
+								  FastPgParseResult **parse_result,
+								  FastPgAnalyzeResult **analyze_result,
+								  FastPgRewriteResult **rewrite_result,
+								  StringInfo buf)
+{
+	FastPgPlanResult *plan_result = NULL;
+
+	*analyze_result = fastpg_parse_and_analyze(query_string, parse_result, buf);
+	if (*analyze_result == NULL || !fastpg_analyze_result_ok(*analyze_result))
+		return NULL;
+
+	*rewrite_result = fastpg_parser_rewrite(*analyze_result);
+	if (!fastpg_rewrite_result_ok(*rewrite_result))
+	{
+		appendStringInfo(buf, "rewrite_error sqlstate=%s",
+						 fastpg_rewrite_error_sqlstate(*rewrite_result));
+		return NULL;
+	}
+
+	plan_result = fastpg_parser_plan(*rewrite_result);
+	if (!fastpg_plan_result_ok(plan_result))
+	{
+		appendStringInfo(buf, "plan_error sqlstate=%s",
+						 fastpg_plan_error_sqlstate(plan_result));
+		return plan_result;
+	}
+
+	return plan_result;
+}
+
 Datum
 fastpg_rewrite_summary(PG_FUNCTION_ARGS)
 {
@@ -257,6 +290,117 @@ fastpg_plan_summary(PG_FUNCTION_ARGS)
 		}
 	}
 
+	if (plan_result != NULL)
+		fastpg_plan_result_free(plan_result);
+	if (rewrite_result != NULL)
+		fastpg_rewrite_result_free(rewrite_result);
+	if (analyze_result != NULL)
+		fastpg_analyze_result_free(analyze_result);
+	if (parse_result != NULL)
+		fastpg_parse_result_free(parse_result);
+	PG_FREE_IF_COPY(input, 0);
+
+	PG_RETURN_TEXT_P(cstring_to_text(buf.data));
+}
+
+Datum
+fastpg_execute_summary(PG_FUNCTION_ARGS)
+{
+	text	   *input = PG_GETARG_TEXT_PP(0);
+	char	   *query_string = text_to_cstring(input);
+	FastPgParseResult *parse_result = NULL;
+	FastPgAnalyzeResult *analyze_result = NULL;
+	FastPgRewriteResult *rewrite_result = NULL;
+	FastPgPlanResult *plan_result = NULL;
+	FastPgExecuteResult *execute_result = NULL;
+	StringInfoData buf;
+
+	initStringInfo(&buf);
+	plan_result = fastpg_parse_analyze_rewrite_plan(query_string,
+													&parse_result,
+													&analyze_result,
+													&rewrite_result,
+													&buf);
+
+	if (plan_result != NULL && fastpg_plan_result_ok(plan_result))
+	{
+		execute_result = fastpg_parser_execute(plan_result);
+
+		if (fastpg_execute_result_ok(execute_result))
+		{
+			int			statement_count = fastpg_execute_statement_count(execute_result);
+
+			appendStringInfo(&buf, "ok statements=%d", statement_count);
+			for (int statement_index = 0; statement_index < statement_count; statement_index++)
+			{
+				int			column_count;
+				int			row_count;
+
+				column_count = fastpg_execute_statement_column_count(execute_result,
+																	 statement_index);
+				row_count = fastpg_execute_statement_row_count(execute_result,
+															  statement_index);
+				appendStringInfo(&buf,
+								 " stmt[%d]={command=%s,plan=%s,columns=%d,rows=%d",
+								 statement_index,
+								 fastpg_execute_statement_command_tag(execute_result,
+																	  statement_index),
+								 fastpg_execute_statement_plan_tree_tag(execute_result,
+																		statement_index),
+								 column_count,
+								 row_count);
+
+				for (int column_index = 0; column_index < column_count; column_index++)
+					appendStringInfo(&buf,
+									 ",column[%d]={name=%s,type_oid=%u}",
+									 column_index,
+									 fastpg_execute_column_name(execute_result,
+																statement_index,
+																column_index),
+									 fastpg_execute_column_type_oid(execute_result,
+																	statement_index,
+																	column_index));
+
+				for (int row_index = 0; row_index < row_count; row_index++)
+				{
+					appendStringInfo(&buf, ",row[%d]=[", row_index);
+					for (int column_index = 0; column_index < column_count; column_index++)
+					{
+						const char *column_name;
+						const char *value_text;
+
+						if (column_index > 0)
+							appendStringInfoChar(&buf, ',');
+
+						column_name = fastpg_execute_column_name(execute_result,
+																 statement_index,
+																 column_index);
+						value_text = fastpg_execute_value_text(execute_result,
+															  statement_index,
+															  row_index,
+															  column_index);
+						appendStringInfo(&buf, "%s=%s",
+										 column_name,
+										 fastpg_execute_value_is_null(execute_result,
+																	  statement_index,
+																	  row_index,
+																	  column_index) ? "NULL" : value_text);
+					}
+					appendStringInfoChar(&buf, ']');
+				}
+
+				appendStringInfoChar(&buf, '}');
+			}
+		}
+		else
+		{
+			appendStringInfo(&buf, "execute_error sqlstate=%s",
+							 fastpg_execute_error_sqlstate(execute_result));
+		}
+	}
+
+	if (execute_result != NULL)
+		fastpg_execute_result_free(execute_result);
 	if (plan_result != NULL)
 		fastpg_plan_result_free(plan_result);
 	if (rewrite_result != NULL)

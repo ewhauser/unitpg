@@ -15,3 +15,5 @@ SELECT fastpg_rewrite_summary('CREATE TABLE fastpg_rewritten(id int);');
 SELECT fastpg_plan_summary('SELECT 1;');
 SELECT fastpg_plan_summary('SELECT $1::int4;');
 SELECT fastpg_plan_summary('CREATE TABLE fastpg_planned(id int);');
+
+SELECT fastpg_execute_summary('SELECT 1;');
