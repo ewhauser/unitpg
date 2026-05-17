@@ -321,23 +321,10 @@ python3 bench/compare_pgbench.py \
   --output-dir bench/results/trusted-ddl
 ```
 
-Run the fixture snapshot benchmark:
-
-```sh
-python3 bench/compare_pgbench.py \
-  --fakewal-workload snapshot \
-  --rounds 3 \
-  --transactions 200 \
-  --rows 200 \
-  --reuse-builds \
-  --output-dir bench/results/trusted-ddl-snapshot
-```
-
 The implementation is successful if:
 
 - validation passes
 - the permanent-table rollback workload improves over the previous fast fork
-- snapshot restore still passes and remains faster than replaying fixture setup
 - disabling `test_trusted_ddl` shows the trusted DDL path contributes measurable
   speedup
 

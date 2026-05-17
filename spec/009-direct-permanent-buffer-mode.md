@@ -173,9 +173,9 @@ In test builds:
 ### `smgr` / `memsmgr`
 
 The storage manager remains the owner of relation page lifetime. The buffer
-manager may point at a page, but it must not free it. Snapshot restore,
-truncate, and unlink must invalidate or detach any buffer descriptors pointing
-at discarded pages before those pages are removed from the `memsmgr` hashes.
+manager may point at a page, but it must not free it. Truncate and unlink must
+invalidate or detach any buffer descriptors pointing at discarded pages before
+those pages are removed from the `memsmgr` hashes.
 
 ## Benchmark Update
 
@@ -186,8 +186,7 @@ at discarded pages before those pages are removed from the `memsmgr` hashes.
 - all setup and mutations inside one transaction
 - final `ROLLBACK` drops the created objects
 
-The snapshot workload already uses permanent tables and remains the benchmark
-for fixture restore.
+Use this permanent-table rollback workload for the direct permanent buffer path.
 
 ## Correctness Requirements
 
@@ -195,8 +194,8 @@ for fixture restore.
   buffers.
 - Rollback of permanent DDL and DML remains correct.
 - Index scans and constraint checks see the same page contents as heap scans.
-- Truncate/drop/snapshot restore cannot leave buffer descriptors pointing at
-  stale `memsmgr` pages.
+- Truncate/drop cannot leave buffer descriptors pointing at stale `memsmgr`
+  pages.
 - Dirty direct-backed pages are not copied back over newer `memsmgr` contents.
 - Non-eligible relations continue using ordinary shared buffer memory.
 
@@ -219,26 +218,12 @@ python3 bench/compare_pgbench.py \
   --output-dir bench/results/direct-permanent-buffers
 ```
 
-Run the fixture snapshot benchmark:
-
-```sh
-python3 bench/compare_pgbench.py \
-  --fakewal-workload snapshot \
-  --rounds 3 \
-  --transactions 200 \
-  --rows 200 \
-  --reuse-builds \
-  --output-dir bench/results/direct-permanent-buffers-snapshot
-```
-
 The implementation is successful if:
 
 - validation passes
 - the permanent-table rollback workload remains faster than stock Postgres
 - disabling `test_ephemeral_buffers` shows the direct permanent path contributes
   measurable speedup
-- snapshot restore still passes the smoke test and remains faster than replaying
-  setup DDL
 
 ## Risks
 

@@ -85,7 +85,6 @@ The validation script already:
 - builds or reuses the validation build
 - creates the temporary install
 - fixes macOS temporary-install library names
-- runs the fast-fork fixture snapshot smoke test
 - runs the seed-only dirty-restart smoke test
 - runs the no-data-directory startup smoke test, including DDL that mutates
   seed-backed catalogs through the in-memory overlay
@@ -110,18 +109,6 @@ python3 bench/compare_pgbench.py \
   --rows 200 \
   --reuse-builds \
   --output-dir bench/results/runtime-compare
-```
-
-Fixture snapshot workload:
-
-```sh
-python3 bench/compare_pgbench.py \
-  --fakewal-workload snapshot \
-  --rounds 3 \
-  --transactions 200 \
-  --rows 200 \
-  --reuse-builds \
-  --output-dir bench/results/runtime-snapshot-compare
 ```
 
 To compare against already-built installs:
@@ -271,7 +258,6 @@ Specs live in `spec/` and are intended to be implemented incrementally:
 - `012-conservative-fast-startup.md`
 - `013-seed-only-startup.md`
 - `014-no-data-directory-startup.md`
-- `015-epochal-test-transaction-overlay.md`
 
 When adding a new spec, use the next `NNN-name.md` prefix.
 
@@ -294,5 +280,4 @@ When reporting a performance change, include:
 - any known caveats, such as skipped TAP tests or incompatible recovery suites
 
 Keep claims tied to the benchmark that produced them. Do not generalize a
-startup result into a runtime result, or a snapshot result into the permanent
-rollback workload.
+startup result into a runtime result, or one runtime workload into another.

@@ -614,26 +614,6 @@ GetNewObjectId(void)
 	return result;
 }
 
-#ifdef USE_TEST_MEM_SMGR
-void
-TestFastForkGetOidState(Oid *nextOid, uint32 *oidCount)
-{
-	LWLockAcquire(OidGenLock, LW_SHARED);
-	*nextOid = TransamVariables->nextOid;
-	*oidCount = TransamVariables->oidCount;
-	LWLockRelease(OidGenLock);
-}
-
-void
-TestFastForkSetOidState(Oid nextOid, uint32 oidCount)
-{
-	LWLockAcquire(OidGenLock, LW_EXCLUSIVE);
-	TransamVariables->nextOid = nextOid;
-	TransamVariables->oidCount = oidCount;
-	LWLockRelease(OidGenLock);
-}
-#endif
-
 /*
  * SetNextObjectId
  *

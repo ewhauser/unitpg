@@ -68,10 +68,6 @@
    (--enable-test-mem-slru) */
 #undef USE_TEST_MEM_SLRU
 
-/* Define to 1 to enable rollback-only fast-fork epoch transactions.
-   (--enable-test-epoch-rollback) */
-#undef USE_TEST_EPOCH_ROLLBACK
-
 /* Define to 1 to skip ordinary WAL record assembly.
    (--enable-test-no-wal-assembly) */
 #undef USE_TEST_NO_WAL_ASSEMBLY

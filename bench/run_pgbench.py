@@ -19,14 +19,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WORKLOADS = {
-    "epoch-ddl": ROOT / "bench" / "unit-test-epoch-ddl.pgbench",
-    "epoch-named": ROOT / "bench" / "unit-test-epoch-named.pgbench",
-    "epoch-rollback": ROOT / "bench" / "unit-test-epoch-rollback.pgbench",
-    "epoch-session": ROOT / "bench" / "unit-test-epoch-session.pgbench",
-    "rollback": ROOT / "bench" / "unit-test-rollback.pgbench",
-    "snapshot": ROOT / "bench" / "unit-test-snapshot.pgbench",
-}
+WORKLOAD = ROOT / "bench" / "unit-test-rollback.pgbench"
 
 
 FAST_SETTINGS = {
@@ -45,20 +38,14 @@ FAST_SETTINGS = {
 
 
 def run(cmd: list[str], *, env: dict[str, str], capture: bool = True) -> subprocess.CompletedProcess[str]:
-    proc = subprocess.run(
+    return subprocess.run(
         cmd,
         env=env,
         text=True,
         stdout=subprocess.PIPE if capture else None,
         stderr=subprocess.PIPE if capture else None,
+        check=True,
     )
-    if proc.returncode != 0:
-        if proc.stdout:
-            print(proc.stdout, file=sys.stderr)
-        if proc.stderr:
-            print(proc.stderr, file=sys.stderr)
-        proc.check_returncode()
-    return proc
 
 
 def find_free_port() -> int:
@@ -134,23 +121,12 @@ def main() -> int:
     parser.add_argument("--warmup-transactions", type=int, default=10)
     parser.add_argument("--random-seed", default="1")
     parser.add_argument(
-        "--workload",
-        choices=sorted(WORKLOADS),
-        default="rollback",
-        help="pgbench workload to run",
-    )
-    parser.add_argument(
         "--config",
         action="append",
         default=[],
         help="extra postgresql.conf line, for example --config shared_buffers=256MB",
     )
     args = parser.parse_args()
-
-    setup_once_workloads = {"epoch-ddl", "epoch-named", "epoch-rollback", "epoch-session", "snapshot"}
-
-    if args.workload in setup_once_workloads and args.clients != 1:
-        raise SystemExit(f"the {args.workload} workload currently requires --clients 1")
 
     bin_dir = args.bin.resolve()
     initdb = bin_path(bin_dir, "initdb")
@@ -180,8 +156,6 @@ def main() -> int:
 
     started_at = dt.datetime.now(dt.UTC).isoformat()
     t0 = time.perf_counter()
-    workload = WORKLOADS[args.workload]
-    warmup_transactions = 0 if args.workload in setup_once_workloads else args.warmup_transactions
 
     try:
         run([initdb, "-D", str(data_dir), "--no-sync", "-A", "trust", "-U", "postgres"], env=base_env)
@@ -207,15 +181,13 @@ def main() -> int:
             "-j",
             str(args.jobs),
             "-f",
-            str(workload),
+            str(WORKLOAD),
         ]
-        if args.workload in setup_once_workloads:
-            common_pgbench.extend(["-D", "setup_done=0"])
 
         warmup = None
-        if warmup_transactions > 0:
+        if args.warmup_transactions > 0:
             warmup_proc = run(
-                [*common_pgbench, "-t", str(warmup_transactions)],
+                [*common_pgbench, "-t", str(args.warmup_transactions)],
                 env=base_env,
             )
             warmup = parse_pgbench_output(warmup_proc.stdout)
@@ -231,17 +203,15 @@ def main() -> int:
             "workdir": str(workdir),
             "postgres_version": run([postgres, "--version"], env=base_env).stdout.strip(),
             "pgbench_version": run([pgbench, "--version"], env=base_env).stdout.strip(),
-            "workload": str(workload),
-            "workload_name": args.workload,
-            "workload_sha256": sha256(workload),
+            "workload": str(WORKLOAD),
+            "workload_sha256": sha256(WORKLOAD),
             "settings": settings,
             "parameters": {
                 "clients": args.clients,
                 "jobs": args.jobs,
                 "transactions": args.transactions,
                 "rows": args.rows,
-                "warmup_transactions": warmup_transactions,
-                "requested_warmup_transactions": args.warmup_transactions,
+                "warmup_transactions": args.warmup_transactions,
                 "random_seed": args.random_seed,
             },
             "warmup": warmup,
