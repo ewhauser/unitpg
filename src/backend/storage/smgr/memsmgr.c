@@ -194,6 +194,8 @@ static void mem_epoch_join_or_start(const char *name,
 static void mem_epoch_detach_on_exit(void);
 static bool mem_epoch_leave(bool finish_on_last, Oid *next_oid,
 							uint32 *oid_count);
+static void mem_epoch_cleanup_finished(uint64 epoch_id, Oid next_oid,
+									   uint32 oid_count, bool reset_caches);
 static void mem_epoch_finish_named(const char *name);
 static void mem_epoch_validate_name(const char *name, const char *function_name);
 static void mem_epoch_discard_id(uint64 epoch_id);
@@ -229,7 +231,6 @@ static void mem_epoch_zeroextend_locked(SMgrRelation reln, ForkNumber forknum,
 										BlockNumber blocknum, int nblocks);
 static BlockNumber mem_epoch_nblocks_locked(SMgrRelation reln,
 											ForkNumber forknum);
-static void mem_epoch_discard(void);
 static void mem_epoch_require_participant(LWLock *lock);
 #endif
 
@@ -1260,10 +1261,7 @@ pg_fastfork_epoch_leave(PG_FUNCTION_ARGS)
 	last_participant = mem_epoch_leave(finish_on_last, &next_oid, &oid_count);
 	if (last_participant && finish_on_last)
 	{
-		FastForkEpochDropBuffers(MemSmgrEpochId);
-		TestFastForkSetOidState(next_oid, oid_count);
-		mem_epoch_discard();
-		mem_restore_reset_caches();
+		mem_epoch_cleanup_finished(MemSmgrEpochId, next_oid, oid_count, true);
 		cache_reset_done = true;
 	}
 
@@ -1557,10 +1555,7 @@ AtEOXact_FastForkEpoch(bool isCommit)
 	last_participant = mem_epoch_leave(true, &next_oid, &oid_count);
 	if (last_participant)
 	{
-		FastForkEpochDropBuffers(MemSmgrEpochId);
-		TestFastForkSetOidState(next_oid, oid_count);
-		mem_epoch_discard();
-		mem_restore_reset_caches();
+		mem_epoch_cleanup_finished(MemSmgrEpochId, next_oid, oid_count, true);
 		cache_reset_done = true;
 	}
 
@@ -2732,7 +2727,7 @@ mem_epoch_detach_on_exit(void)
 	uint64		epoch_id = 0;
 	Oid			next_oid = InvalidOid;
 	uint32		oid_count = 0;
-	bool		last_participant = false;
+	bool		finish_on_last = false;
 
 	if (!MemSmgrEpochActiveFlag || MemSmgrState == NULL)
 		return;
@@ -2742,22 +2737,24 @@ mem_epoch_detach_on_exit(void)
 	if (epoch != NULL &&
 		epoch->database_id == MyDatabaseId)
 	{
-		epoch->aborting = true;
+		bool		named_epoch = epoch->name[0] != '\0';
+
+		if (!named_epoch || epoch->aborting)
+			epoch->aborting = true;
 		epoch_id = epoch->epoch_id;
-		next_oid = epoch->next_oid;
-		oid_count = epoch->oid_count;
 		if (epoch->participants > 0)
 			epoch->participants--;
-		last_participant = epoch->participants == 0;
+		if (epoch->participants == 0 && (!named_epoch || epoch->aborting))
+		{
+			finish_on_last = true;
+			next_oid = epoch->next_oid;
+			oid_count = epoch->oid_count;
+		}
 	}
 	LWLockRelease(&MemSmgrState->lock);
 
-	if (last_participant)
-	{
-		FastForkEpochDropBuffers(epoch_id);
-		TestFastForkSetOidState(next_oid, oid_count);
-		mem_epoch_discard_id(epoch_id);
-	}
+	if (finish_on_last)
+		mem_epoch_cleanup_finished(epoch_id, next_oid, oid_count, false);
 
 	MemSmgrEpochActiveFlag = false;
 	MemSmgrEpochSessionBound = false;
@@ -2795,6 +2792,31 @@ mem_epoch_leave(bool finish_on_last, Oid *next_oid, uint32 *oid_count)
 
 	LWLockRelease(&MemSmgrState->lock);
 	return last_participant;
+}
+
+static void
+mem_epoch_cleanup_finished(uint64 epoch_id, Oid next_oid, uint32 oid_count,
+						   bool reset_caches)
+{
+	/*
+	 * Cache reset can still touch storage. Keep those writes routed into the
+	 * overlay being discarded until cleanup is complete, especially when other
+	 * named epochs remain active for this database.
+	 */
+	FastForkEpochSetWriteEpoch(epoch_id);
+	PG_TRY();
+	{
+		FastForkEpochDropBuffers(epoch_id);
+		TestFastForkSetOidState(next_oid, oid_count);
+		if (reset_caches)
+			mem_restore_reset_caches();
+		mem_epoch_discard_id(epoch_id);
+	}
+	PG_FINALLY();
+	{
+		FastForkEpochClearWriteEpoch();
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -2841,16 +2863,18 @@ mem_epoch_finish_named(const char *name)
 	MemSmgrEpochSessionBound = false;
 	MemSmgrEpochSnapshot = NULL;
 	MemSmgrEpochId = epoch_id;
-
-	FastForkEpochDropBuffers(epoch_id);
-	TestFastForkSetOidState(next_oid, oid_count);
-	mem_epoch_discard();
-	mem_restore_reset_caches();
-
-	MemSmgrEpochActiveFlag = save_active;
-	MemSmgrEpochSessionBound = save_session_bound;
-	MemSmgrEpochSnapshot = save_snapshot;
-	MemSmgrEpochId = save_epoch_id;
+	PG_TRY();
+	{
+		mem_epoch_cleanup_finished(epoch_id, next_oid, oid_count, true);
+	}
+	PG_FINALLY();
+	{
+		MemSmgrEpochActiveFlag = save_active;
+		MemSmgrEpochSessionBound = save_session_bound;
+		MemSmgrEpochSnapshot = save_snapshot;
+		MemSmgrEpochId = save_epoch_id;
+	}
+	PG_END_TRY();
 }
 
 static void
@@ -3194,11 +3218,6 @@ mem_epoch_discard_id(uint64 epoch_id)
 	LWLockRelease(&MemSmgrState->lock);
 }
 
-static void
-mem_epoch_discard(void)
-{
-	mem_epoch_discard_id(MemSmgrEpochId);
-}
 #endif
 
 static void

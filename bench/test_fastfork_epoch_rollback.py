@@ -494,10 +494,73 @@ def run(
     )
 
 
+class PsqlSession:
+    def __init__(self, psql: str, conn_args: list[str], env: dict[str, str], label: str):
+        self.label = label
+        self.counter = 0
+        self.proc = subprocess.Popen(
+            [psql, *conn_args, "-d", "bench", "-X", "-qAt", "-v", "ON_ERROR_STOP=1"],
+            env=env,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+    def execute(self, sql: str, label: str) -> str:
+        if self.proc.stdin is None or self.proc.stdout is None:
+            raise RuntimeError(f"{self.label} psql session is not open")
+        if self.proc.poll() is not None:
+            raise RuntimeError(f"{self.label} psql session exited before {label}")
+
+        self.counter += 1
+        sentinel = f"__fastfork_done_{self.counter}__"
+        self.proc.stdin.write(sql)
+        if not sql.endswith("\n"):
+            self.proc.stdin.write("\n")
+        self.proc.stdin.write(f"\\echo {sentinel}\n")
+        self.proc.stdin.flush()
+
+        output: list[str] = []
+        while True:
+            line = self.proc.stdout.readline()
+            if line == "":
+                if self.proc.poll() is not None:
+                    raise RuntimeError(
+                        f"{self.label} psql session exited during {label}:\n"
+                        + "".join(output)
+                    )
+                continue
+            if sentinel in line:
+                return "".join(output)
+            output.append(line)
+
+    def close(self) -> None:
+        if self.proc.poll() is None and self.proc.stdin is not None:
+            try:
+                self.proc.stdin.write("\\quit\n")
+                self.proc.stdin.flush()
+            except BrokenPipeError:
+                pass
+        try:
+            self.proc.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            self.proc.terminate()
+            try:
+                self.proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.proc.kill()
+
+
 def find_free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def quote_sql_literal(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
 
 
 def quote_conf_value(value: str) -> str:
@@ -664,6 +727,152 @@ def run_parallel_named_finish_while_active(psql: str, conn_args: list[str], env:
     run([psql, *conn_args, "-d", "bench"], env=env, input_text=PARALLEL_NAMED_ACTIVE_FINAL_SQL)
 
 
+def run_named_epoch_coordinator_connection(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
+    coordinator = PsqlSession(psql, conn_args, env, "named epoch coordinator")
+    worker = PsqlSession(psql, conn_args, env, "named epoch worker")
+    active = None
+
+    try:
+        coordinator.execute(CAPTURE_SQL, "capture coordinator fixture")
+
+        for i in range(6):
+            epoch = f"coordinator-reuse-{i}"
+            coordinator.execute(
+                f"SELECT pg_fastfork_epoch_start({quote_sql_literal(epoch)}, 'fixture');\n",
+                f"start {epoch}",
+            )
+            worker.execute(
+                f"""
+SET ROLE postgres;
+SELECT pg_fastfork_epoch_join({quote_sql_literal(epoch)});
+RESET ROLE;
+BEGIN;
+INSERT INTO epoch_child VALUES ({600000 + i}, 2, 44);
+ROLLBACK;
+SELECT pg_fastfork_epoch_leave();
+""",
+                f"worker join/leave {epoch}",
+            )
+            fresh = run(
+                [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1", "-c", "SELECT 1;"],
+                env=env,
+                check=False,
+            )
+            if fresh.returncode != 0:
+                raise RuntimeError(
+                    "fresh connection failed while coordinator-owned epoch existed:\n"
+                    f"{fresh.stdout or ''}{fresh.stderr or ''}"
+                )
+            coordinator.execute(
+                f"""
+SELECT pg_fastfork_epoch_finish({quote_sql_literal(epoch)});
+SELECT pg_fastfork_epoch_finish({quote_sql_literal(epoch)});
+""",
+                f"finish {epoch}",
+            )
+
+        coordinator.execute(
+            "SELECT pg_fastfork_epoch_start('coordinator-active-a', 'fixture');\n",
+            "start coordinator-active-a",
+        )
+        active = subprocess.Popen(
+            [
+                psql,
+                *conn_args,
+                "-d",
+                "bench",
+                "-X",
+                "-qAt",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                """
+SET ROLE postgres;
+SELECT pg_fastfork_epoch_join('coordinator-active-a');
+RESET ROLE;
+BEGIN;
+INSERT INTO epoch_child VALUES (600100, 2, 45);
+SELECT pg_sleep(1.0);
+ROLLBACK;
+SELECT pg_fastfork_epoch_leave();
+""",
+            ],
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
+        time.sleep(0.2)
+
+        fresh = run(
+            [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1", "-c", "SELECT 1;"],
+            env=env,
+            check=False,
+        )
+        if fresh.returncode != 0:
+            raise RuntimeError(
+                "fresh connection failed while another named epoch had an active participant:\n"
+                f"{fresh.stdout or ''}{fresh.stderr or ''}"
+            )
+
+        coordinator.execute(
+            "SELECT pg_fastfork_epoch_start('coordinator-active-b', 'fixture');\n",
+            "start coordinator-active-b while coordinator-active-a is active",
+        )
+        worker.execute(
+            """
+SET ROLE postgres;
+SELECT pg_fastfork_epoch_join('coordinator-active-b');
+RESET ROLE;
+BEGIN;
+INSERT INTO epoch_child VALUES (600101, 3, 46);
+COMMIT;
+SELECT pg_fastfork_epoch_leave();
+""",
+            "worker join/leave coordinator-active-b",
+        )
+        coordinator.execute(
+            "SELECT pg_fastfork_epoch_finish('coordinator-active-b');\n",
+            "finish coordinator-active-b while coordinator-active-a is active",
+        )
+
+        stdout, stderr = active.communicate(timeout=10)
+        if active.returncode != 0:
+            raise RuntimeError(
+                "active named epoch worker failed:\n"
+                f"{stdout or ''}{stderr or ''}"
+            )
+        active = None
+
+        coordinator.execute(
+            "SELECT pg_fastfork_epoch_finish('coordinator-active-a');\n",
+            "finish coordinator-active-a",
+        )
+
+        run(
+            [psql, *conn_args, "-d", "bench"],
+            env=env,
+            input_text=r"""
+\set ON_ERROR_STOP on
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_child WHERE id BETWEEN 600000 AND 600101) THEN
+    RAISE EXCEPTION 'coordinator named epoch cleanup leaked inserted row';
+  END IF;
+END $$;
+""",
+        )
+    finally:
+        if active is not None and active.poll() is None:
+            active.terminate()
+            try:
+                active.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                active.kill()
+        worker.close()
+        coordinator.close()
+
+
 def run_named_session_visibility(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
     run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + NAMED_SESSION_VISIBILITY_SETUP_SQL)
 
@@ -764,6 +973,7 @@ def main() -> int:
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + NAMED_SQL)
         run_parallel_named_epochs(psql, conn_args, env)
         run_parallel_named_finish_while_active(psql, conn_args, env)
+        run_named_epoch_coordinator_connection(psql, conn_args, env)
         run_named_session_visibility(psql, conn_args, env)
         run_named_epoch_cleanup_after_error(psql, conn_args, env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + REUSED_BACKEND_NAMED_SQL)
