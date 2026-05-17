@@ -30,10 +30,6 @@
 #include "utils/relcache.h"
 #include "utils/resowner.h"
 
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-extern uint64 FastForkEpochBufferTagId(const RelFileLocator *rlocator);
-#endif
-
 /*
  * Buffer state is a single 64-bit variable where following data is combined.
  *
@@ -169,9 +165,6 @@ typedef struct buftag
 	RelFileNumber relNumber;	/* relation file number */
 	ForkNumber	forkNum;		/* fork number */
 	BlockNumber blockNum;		/* blknum relative to begin of reln */
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	uint64		fastfork_epoch_id;	/* test-only epoch overlay identity */
-#endif
 } BufferTag;
 
 static inline RelFileNumber
@@ -209,28 +202,20 @@ BufTagGetRelFileLocator(const BufferTag *tag)
 static inline void
 ClearBufferTag(BufferTag *tag)
 {
-	memset(tag, 0, sizeof(*tag));
 	tag->spcOid = InvalidOid;
 	tag->dbOid = InvalidOid;
 	BufTagSetRelForkDetails(tag, InvalidRelFileNumber, InvalidForkNumber);
 	tag->blockNum = InvalidBlockNumber;
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	tag->fastfork_epoch_id = 0;
-#endif
 }
 
 static inline void
 InitBufferTag(BufferTag *tag, const RelFileLocator *rlocator,
 			  ForkNumber forkNum, BlockNumber blockNum)
 {
-	memset(tag, 0, sizeof(*tag));
 	tag->spcOid = rlocator->spcOid;
 	tag->dbOid = rlocator->dbOid;
 	BufTagSetRelForkDetails(tag, rlocator->relNumber, forkNum);
 	tag->blockNum = blockNum;
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	tag->fastfork_epoch_id = FastForkEpochBufferTagId(rlocator);
-#endif
 }
 
 static inline bool
@@ -240,11 +225,7 @@ BufferTagsEqual(const BufferTag *tag1, const BufferTag *tag2)
 		(tag1->dbOid == tag2->dbOid) &&
 		(tag1->relNumber == tag2->relNumber) &&
 		(tag1->blockNum == tag2->blockNum) &&
-		(tag1->forkNum == tag2->forkNum)
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-		&& (tag1->fastfork_epoch_id == tag2->fastfork_epoch_id)
-#endif
-		;
+		(tag1->forkNum == tag2->forkNum);
 }
 
 static inline bool

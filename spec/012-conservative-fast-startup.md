@@ -171,7 +171,6 @@ The error should explain that the fast fork does not support recovery startup.
 - A fresh postmaster starts and accepts connections.
 - `SELECT 1` works after startup.
 - Existing fast-fork validation passes.
-- Fixture snapshot/restore still works.
 - Runtime-created data does not need to survive restart.
 - Unsupported recovery modes fail clearly rather than silently ignoring user
   configuration.

@@ -150,7 +150,6 @@ considered part of the seed.
 - Seed catalogs and template databases remain readable.
 - `CREATE DATABASE` either works through seed-compatible rules or is clearly
   unsupported in fast-fork validation.
-- Fixture snapshot/restore works after seed-only startup.
 - Existing fast-fork validation passes.
 
 ## Validation

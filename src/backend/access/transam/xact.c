@@ -57,7 +57,6 @@
 #include "storage/fd.h"
 #include "storage/lmgr.h"
 #include "storage/md.h"
-#include "storage/memsmgr.h"
 #include "storage/predicate.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -2290,8 +2289,6 @@ CommitTransaction(void)
 			 TransStateAsString(s->state));
 	Assert(s->parent == NULL);
 
-	AtEOXact_FastForkEpoch(true);
-
 	/*
 	 * Do pre-commit processing that involves calling user-defined code, such
 	 * as triggers.  SECURITY_RESTRICTED_OPERATION contexts must not queue an
@@ -3031,13 +3028,7 @@ AbortTransaction(void)
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_AFTER_LOCKS,
 							 false, true);
-		if (FastForkEpochActive())
-		{
-			smgrForgetPendingDeletes();
-			AtEOXact_FastForkEpoch(false);
-		}
-		else
-			smgrDoPendingDeletes(false);
+		smgrDoPendingDeletes(false);
 
 		AtEOXact_GUC(false, 1);
 		AtEOXact_SPI(false);

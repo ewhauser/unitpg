@@ -58,7 +58,6 @@
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
-#include "storage/memsmgr.h"
 #include "storage/proc.h"
 #include "storage/proclist.h"
 #include "storage/procsignal.h"
@@ -4601,28 +4600,11 @@ FlushBuffer(BufferDesc *buf, SMgrRelation reln, IOObject io_object,
 
 	io_start = pgstat_prepare_io_time(track_io_timing);
 
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	FastForkEpochSetWriteEpoch(buf->tag.fastfork_epoch_id);
-	PG_TRY();
-	{
-		smgrwrite(reln,
-				  BufTagGetForkNum(&buf->tag),
-				  buf->tag.blockNum,
-				  bufBlock,
-				  false);
-	}
-	PG_FINALLY();
-	{
-		FastForkEpochClearWriteEpoch();
-	}
-	PG_END_TRY();
-#else
 	smgrwrite(reln,
 			  BufTagGetForkNum(&buf->tag),
 			  buf->tag.blockNum,
 			  bufBlock,
 			  false);
-#endif
 
 	/*
 	 * When a strategy is in use, only flushes of dirty buffers already in the
@@ -5183,105 +5165,6 @@ DropDatabaseBuffers(Oid dbid)
 			UnlockBufHdr(bufHdr);
 	}
 }
-
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-void
-FastForkEpochFlushBuffers(uint64 epoch_id)
-{
-	int			i;
-
-	if (epoch_id == 0)
-		return;
-
-	for (i = 0; i < NBuffers; i++)
-	{
-		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint64		buf_state;
-
-		/*
-		 * Session-bound named epochs use ordinary COMMIT, so make that
-		 * committed state independent of whether the modified page happens to
-		 * remain in shared buffers for the next joined backend.
-		 */
-		if (bufHdr->tag.fastfork_epoch_id != epoch_id)
-			continue;
-
-		ReservePrivateRefCountEntry();
-		ResourceOwnerEnlarge(CurrentResourceOwner);
-
-		buf_state = LockBufHdr(bufHdr);
-		if (bufHdr->tag.fastfork_epoch_id == epoch_id &&
-			(buf_state & (BM_VALID | BM_DIRTY)) == (BM_VALID | BM_DIRTY))
-		{
-			PinBuffer_Locked(bufHdr);
-			FlushUnlockedBuffer(bufHdr, NULL, IOOBJECT_RELATION, IOCONTEXT_NORMAL);
-			UnpinBuffer(bufHdr);
-		}
-		else
-			UnlockBufHdr(bufHdr);
-	}
-}
-
-void
-FastForkEpochDropBuffers(uint64 epoch_id)
-{
-	int			i;
-
-	if (epoch_id == 0)
-		return;
-
-	for (i = 0; i < NBuffers; i++)
-	{
-		BufferDesc *bufHdr = GetBufferDescriptor(i);
-
-		/*
-		 * Named epochs share relation identity but have distinct buffer tags.
-		 * When one epoch is discarded, do not drop dirty buffers that belong
-		 * to another still-running epoch.
-		 */
-		if (bufHdr->tag.fastfork_epoch_id != epoch_id)
-			continue;
-
-		LockBufHdr(bufHdr);
-		if (bufHdr->tag.fastfork_epoch_id == epoch_id)
-			InvalidateBuffer(bufHdr);	/* releases spinlock */
-		else
-			UnlockBufHdr(bufHdr);
-	}
-}
-
-void
-FastForkEpochCountBuffers(uint64 epoch_id, int64 *buffers,
-						  int64 *dirty_buffers)
-{
-	int			i;
-
-	*buffers = 0;
-	*dirty_buffers = 0;
-
-	if (epoch_id == 0)
-		return;
-
-	for (i = 0; i < NBuffers; i++)
-	{
-		BufferDesc *bufHdr = GetBufferDescriptor(i);
-		uint64		buf_state;
-
-		if (bufHdr->tag.fastfork_epoch_id != epoch_id)
-			continue;
-
-		buf_state = LockBufHdr(bufHdr);
-		if (bufHdr->tag.fastfork_epoch_id == epoch_id &&
-			(buf_state & BM_VALID) != 0)
-		{
-			(*buffers)++;
-			if ((buf_state & BM_DIRTY) != 0)
-				(*dirty_buffers)++;
-		}
-		UnlockBufHdr(bufHdr);
-	}
-}
-#endif
 
 /* ---------------------------------------------------------------------
  *		FlushRelationBuffers
@@ -7753,13 +7636,6 @@ buffertag_comparator(const BufferTag *ba, const BufferTag *bb)
 		return -1;
 	if (ba->blockNum > bb->blockNum)
 		return 1;
-
-#if defined(USE_TEST_EPOCH_ROLLBACK) && defined(USE_TEST_MEM_SMGR)
-	if (ba->fastfork_epoch_id < bb->fastfork_epoch_id)
-		return -1;
-	if (ba->fastfork_epoch_id > bb->fastfork_epoch_id)
-		return 1;
-#endif
 
 	return 0;
 }

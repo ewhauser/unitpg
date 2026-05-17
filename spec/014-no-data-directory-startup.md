@@ -116,7 +116,6 @@ Runtime pages:
 
 - allocated from shared memory or anonymous mmap
 - discarded on postmaster exit
-- included in fixture snapshots
 - never flushed to durable relation files
 
 The seed image is not a read-only database. It is a read-only base layer.
@@ -208,7 +207,6 @@ This lets us compare:
 - `SELECT 1` works.
 - Catalog lookups work.
 - Creating/querying/dropping supported tables works.
-- Fixture snapshot/restore works.
 - Postmaster restart returns to the original seed image.
 - Runtime-created data does not survive restart.
 - Unsupported features fail clearly.
