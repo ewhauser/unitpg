@@ -59,10 +59,25 @@ CREATE TABLE epoch_generated_claim(
     payload text NOT NULL
 );
 CREATE INDEX epoch_generated_claim_batch_idx ON epoch_generated_claim(batch_id, id);
+CREATE TABLE epoch_fk_parent(
+    id int PRIMARY KEY,
+    payload text NOT NULL
+);
+CREATE TABLE epoch_fk_child(
+    id int PRIMARY KEY,
+    parent_id int NOT NULL REFERENCES epoch_fk_parent(id),
+    payload text NOT NULL
+);
 INSERT INTO epoch_parent
 SELECT g, 'base-' || g::text, g % 4 FROM generate_series(1, 25) AS g;
 INSERT INTO epoch_child
 SELECT g, ((g - 1) % 25) + 1, g % 10 FROM generate_series(1, 80) AS g;
+INSERT INTO epoch_fk_parent
+SELECT g, repeat(md5(g::text), 16) FROM generate_series(1, 1500) AS g;
+INSERT INTO epoch_fk_child
+SELECT g, g, repeat(md5((g * 17)::text), 4) FROM generate_series(1, 250) AS g;
+ANALYZE epoch_fk_parent;
+ANALYZE epoch_fk_child;
 SELECT pg_fastfork_snapshot('fixture');
 """
 
@@ -422,6 +437,68 @@ BEGIN
 
   IF EXISTS (SELECT 1 FROM epoch_generated_claim WHERE batch_id = 1) THEN
     RAISE EXCEPTION 'named epoch finish leaked committed generated child rows';
+  END IF;
+END $$;
+"""
+
+
+NAMED_SESSION_FK_VISIBILITY_SETUP_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_restore('fixture');
+SELECT pg_fastfork_epoch_start('fk-visibility', 'fixture');
+"""
+
+
+NAMED_SESSION_FK_VISIBILITY_WAITING_CHILD_SQL = """
+SELECT pg_fastfork_epoch_join('fk-visibility');
+SET enable_seqscan = off;
+PREPARE fk_child_insert(int, int) AS
+    INSERT INTO epoch_fk_child VALUES ($1, $2, repeat(md5($2::text), 4));
+EXECUTE fk_child_insert(710000, 1);
+SELECT 1 / CASE WHEN NOT EXISTS (SELECT 1 FROM epoch_fk_parent WHERE id = 71001)
+           THEN 1 ELSE 0 END;
+SELECT pg_sleep(1.0);
+BEGIN;
+EXECUTE fk_child_insert(710011, 71001);
+COMMIT;
+SELECT 1 / CASE WHEN EXISTS (SELECT 1 FROM epoch_fk_parent WHERE id = 71001)
+           THEN 1 ELSE 0 END;
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+NAMED_SESSION_FK_VISIBILITY_PARENT_SQL = """
+SELECT pg_fastfork_epoch_join('fk-visibility');
+BEGIN;
+INSERT INTO epoch_fk_parent
+SELECT g, repeat(md5(g::text), 16) FROM generate_series(71001, 71256) AS g;
+COMMIT;
+SELECT pg_sleep(0.5);
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+NAMED_SESSION_FK_VISIBILITY_FRESH_CHILD_SQL = """
+SELECT pg_fastfork_epoch_join('fk-visibility');
+SET enable_seqscan = off;
+BEGIN;
+INSERT INTO epoch_fk_child VALUES (710012, 71002, repeat(md5('71002'), 4));
+COMMIT;
+SELECT pg_fastfork_epoch_leave();
+"""
+
+
+NAMED_SESSION_FK_VISIBILITY_FINISH_SQL = r"""
+\set ON_ERROR_STOP on
+SELECT pg_fastfork_epoch_finish('fk-visibility');
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM epoch_fk_parent WHERE id BETWEEN 71001 AND 71256) THEN
+    RAISE EXCEPTION 'named epoch finish leaked FK visibility parent row';
+  END IF;
+
+  IF EXISTS (SELECT 1 FROM epoch_fk_child WHERE id IN (710000, 710011, 710012)) THEN
+    RAISE EXCEPTION 'named epoch finish leaked FK visibility child rows';
   END IF;
 END $$;
 """
@@ -947,6 +1024,50 @@ def run_named_session_visibility(psql: str, conn_args: list[str], env: dict[str,
     run([psql, *conn_args, "-d", "bench"], env=env, input_text=NAMED_SESSION_VISIBILITY_FINISH_SQL)
 
 
+def run_named_session_fk_visibility(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + NAMED_SESSION_FK_VISIBILITY_SETUP_SQL)
+
+    cmd = [psql, *conn_args, "-d", "bench", "-v", "ON_ERROR_STOP=1"]
+    waiting_child = subprocess.Popen(
+        [*cmd, "-c", NAMED_SESSION_FK_VISIBILITY_WAITING_CHILD_SQL],
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    try:
+        time.sleep(0.2)
+        parent = run([*cmd, "-c", NAMED_SESSION_FK_VISIBILITY_PARENT_SQL], env=env, check=False)
+        if parent.returncode != 0:
+            raise RuntimeError(
+                "named epoch FK visibility parent writer failed:\n"
+                f"{parent.stdout or ''}{parent.stderr or ''}"
+            )
+
+        stdout, stderr = waiting_child.communicate(timeout=10)
+        if waiting_child.returncode != 0:
+            raise RuntimeError(
+                "named epoch FK visibility waiting child failed:\n"
+                f"{stdout or ''}{stderr or ''}"
+            )
+    finally:
+        if waiting_child.poll() is None:
+            waiting_child.terminate()
+            try:
+                waiting_child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                waiting_child.kill()
+
+    fresh_child = run([*cmd, "-c", NAMED_SESSION_FK_VISIBILITY_FRESH_CHILD_SQL], env=env, check=False)
+    if fresh_child.returncode != 0:
+        raise RuntimeError(
+            "named epoch FK visibility fresh child failed:\n"
+            f"{fresh_child.stdout or ''}{fresh_child.stderr or ''}"
+        )
+
+    run([psql, *conn_args, "-d", "bench"], env=env, input_text=NAMED_SESSION_FK_VISIBILITY_FINISH_SQL)
+
+
 def run_named_epoch_cleanup_after_error(psql: str, conn_args: list[str], env: dict[str, str]) -> None:
     setup_sql = (
         CAPTURE_SQL
@@ -1012,6 +1133,7 @@ def main() -> int:
         run_parallel_named_finish_while_active(psql, conn_args, env)
         run_named_epoch_coordinator_connection(psql, conn_args, env)
         run_named_session_visibility(psql, conn_args, env)
+        run_named_session_fk_visibility(psql, conn_args, env)
         run_named_epoch_cleanup_after_error(psql, conn_args, env)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + REUSED_BACKEND_NAMED_SQL)
         run([psql, *conn_args, "-d", "bench"], env=env, input_text=CAPTURE_SQL + "SELECT pg_fastfork_restore('fixture');\n")
