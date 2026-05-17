@@ -215,19 +215,22 @@ bench/.build/fastfork-validation/tmp_install/usr/local/pgsql/bin
 ## Precompiled Server Releases
 
 Merges to `main` or this repository's current `master` default branch publish a
-GitHub release containing minimal fast-fork server archives for:
+GitHub release containing minimal PostgreSQL server archives for:
 
 - `linux-x86_64`
 - `linux-aarch64`
 - `macos-aarch64`
 
 Each archive contains the server runtime needed to initialize, start, stop, and
-connect to a fast-fork cluster, plus `pg_dump` for one-database dumps: `initdb`,
-`pg_ctl`, `pg_dump`, `postgres`, `psql`, optional server-adjacent helpers such
-as `postmaster` and `pg_isready`, server runtime libraries, pgvector extension
-files, and `share` runtime data files. The release archives intentionally omit
-source code, benchmark outputs, headers, PGXS files, documentation, and backup
-or auxiliary client utilities other than `pg_dump`, such as `pg_basebackup`.
+connect to a standard PostgreSQL cluster, plus `pg_dump` for one-database dumps:
+`initdb`, `pg_ctl`, `pg_dump`, `postgres`, `psql`, optional server-adjacent
+helpers such as `postmaster` and `pg_isready`, server runtime libraries,
+pgvector extension files, and `share` runtime data files. Fast-fork experimental
+build flags are explicitly disabled for release builds, and the packaging script
+refuses to archive an install whose `pg_config.h` has any `USE_TEST_*` flag
+enabled. The release archives intentionally omit source code, benchmark outputs,
+headers, PGXS files, documentation, and backup or auxiliary client utilities
+other than `pg_dump`, such as `pg_basebackup`.
 
 ## Measure Runtime Performance
 
