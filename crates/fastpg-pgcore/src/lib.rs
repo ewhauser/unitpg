@@ -105,6 +105,12 @@ pub struct PreparedStatement {
     inner: inner::PreparedStatement,
 }
 
+// pgcore is backed by PostgreSQL backend globals, so every public operation is
+// serialized by the pgcore lane. That lets session-level Rust caches hold
+// prepared handles behind Arcs without allowing concurrent C backend access.
+unsafe impl Send for PreparedStatement {}
+unsafe impl Sync for PreparedStatement {}
+
 impl PreparedStatement {
     pub fn describe(&self) -> StatementDescription {
         self.inner.describe()
@@ -356,13 +362,16 @@ mod inner {
             };
             let prepared = PreparedStatement(prepared);
             if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
+                drop(_guard);
                 Ok(prepared)
             } else {
-                Err(PgCoreError::new(
+                let error = PgCoreError::new(
                     unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared.as_ptr())) },
                     unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
                     unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
-                ))
+                );
+                drop(_guard);
+                Err(error)
             }
         }
     }
@@ -479,6 +488,9 @@ mod inner {
 
     impl Drop for PreparedStatement {
         fn drop(&mut self) {
+            let _guard = PGCORE_LOCK
+                .lock()
+                .expect("fastpg pgcore prepared free mutex poisoned");
             unsafe {
                 fastpg_pgcore_prepared_free(self.0.as_ptr());
             }

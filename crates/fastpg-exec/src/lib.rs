@@ -2,7 +2,12 @@
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 use std::collections::BTreeMap;
-#[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+#[cfg(feature = "postgres-execution")]
+use std::collections::HashMap;
+#[cfg(any(
+    feature = "postgres-execution",
+    all(feature = "mini-sql-testkit", not(feature = "postgres-execution"))
+))]
 use std::sync::{Arc, Mutex};
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -12,7 +17,7 @@ use fastpg_parser::{ParseError, parse};
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
     ExecutionResult as PgCoreExecutionResult, INT4_OID, INT8_OID, PgCoreParam, PgCoreSession,
-    PgCoreValue, TEXT_OID, VARCHAR_OID,
+    PgCoreValue, PreparedStatement, TEXT_OID, VARCHAR_OID,
 };
 use fastpg_types::{Column, PgType, Value};
 
@@ -70,6 +75,15 @@ pub struct QueryExecutor {
     database: Arc<Mutex<DatabaseState>>,
     #[cfg(feature = "postgres-execution")]
     pgcore_session: PgCoreSession,
+    #[cfg(feature = "postgres-execution")]
+    prepared_cache: Arc<Mutex<HashMap<String, Arc<CachedPgCoreStatement>>>>,
+}
+
+#[cfg(feature = "postgres-execution")]
+#[derive(Debug)]
+struct CachedPgCoreStatement {
+    statement: PreparedStatement,
+    description: QueryDescription,
 }
 
 impl QueryExecutor {
@@ -79,6 +93,7 @@ impl QueryExecutor {
             let _ = server_version.into();
             Self {
                 pgcore_session: PgCoreSession::new(),
+                prepared_cache: Arc::new(Mutex::new(HashMap::new())),
             }
         }
         #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -173,27 +188,15 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn describe_pgcore(&self, sql: &str) -> Option<QueryDescription> {
-        let statement = self.pgcore_session.prepare(sql).ok()?;
-        let description = statement.describe();
-        Some(QueryDescription::new(
-            description
-                .parameter_type_oids
-                .iter()
-                .copied()
-                .map(pg_type_for_oid)
-                .collect(),
-            description
-                .fields
-                .into_iter()
-                .map(|field| Column::new(field.name, pg_type_for_oid(field.type_oid)))
-                .collect(),
-        ))
+        self.prepare_pgcore(sql)
+            .ok()
+            .map(|cached| cached.description.clone())
     }
 
     #[cfg(feature = "postgres-execution")]
     fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
-        let statement = match self.pgcore_session.prepare(sql) {
-            Ok(statement) => statement,
+        let cached = match self.prepare_pgcore(sql) {
+            Ok(cached) => cached,
             Err(error) => return pgcore_error_execution(error),
         };
         let parameters = parameters
@@ -201,10 +204,65 @@ impl QueryExecutor {
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
 
-        match statement.execute_with_params(&parameters) {
-            Ok(result) => pgcore_execution_to_query_execution(result),
+        match cached.statement.execute_with_params(&parameters) {
+            Ok(result) => {
+                let execution = pgcore_execution_to_query_execution(result);
+                if invalidates_pgcore_cache(&execution) {
+                    self.clear_pgcore_cache();
+                }
+                execution
+            }
             Err(error) => pgcore_error_execution(error),
         }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn prepare_pgcore(
+        &self,
+        sql: &str,
+    ) -> Result<Arc<CachedPgCoreStatement>, fastpg_pgcore::PgCoreError> {
+        if !should_cache_pgcore_statement(sql) {
+            return self.prepare_uncached_pgcore(sql);
+        }
+
+        let cache_key = pgcore_cache_key(sql);
+        if let Some(cached) = self
+            .prepared_cache
+            .lock()
+            .expect("fastpg prepared statement cache mutex poisoned")
+            .get(&cache_key)
+            .cloned()
+        {
+            return Ok(cached);
+        }
+
+        let cached = self.prepare_uncached_pgcore(sql)?;
+        self.prepared_cache
+            .lock()
+            .expect("fastpg prepared statement cache mutex poisoned")
+            .insert(cache_key, cached.clone());
+        Ok(cached)
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn prepare_uncached_pgcore(
+        &self,
+        sql: &str,
+    ) -> Result<Arc<CachedPgCoreStatement>, fastpg_pgcore::PgCoreError> {
+        let statement = self.pgcore_session.prepare(sql)?;
+        let description = query_description_from_pgcore(&statement);
+        Ok(Arc::new(CachedPgCoreStatement {
+            statement,
+            description,
+        }))
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn clear_pgcore_cache(&self) {
+        self.prepared_cache
+            .lock()
+            .expect("fastpg prepared statement cache mutex poisoned")
+            .clear();
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -590,6 +648,50 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
         sqlstate: error.sqlstate,
         message: error.message,
     }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn query_description_from_pgcore(statement: &PreparedStatement) -> QueryDescription {
+    let description = statement.describe();
+    QueryDescription::new(
+        description
+            .parameter_type_oids
+            .iter()
+            .copied()
+            .map(pg_type_for_oid)
+            .collect(),
+        description
+            .fields
+            .into_iter()
+            .map(|field| Column::new(field.name, pg_type_for_oid(field.type_oid)))
+            .collect(),
+    )
+}
+
+#[cfg(feature = "postgres-execution")]
+fn should_cache_pgcore_statement(sql: &str) -> bool {
+    let normalized = pgcore_cache_key(sql);
+    normalized.contains('$')
+        || matches!(
+            normalized.as_str(),
+            "begin" | "commit" | "end" | "rollback" | "begin transaction" | "commit transaction"
+        )
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_cache_key(sql: &str) -> String {
+    sql.trim().trim_end_matches(';').trim().to_ascii_lowercase()
+}
+
+#[cfg(feature = "postgres-execution")]
+fn invalidates_pgcore_cache(execution: &QueryExecution) -> bool {
+    let QueryExecution::Command { tag, .. } = execution else {
+        return false;
+    };
+    matches!(
+        tag.split_whitespace().next(),
+        Some("ALTER" | "CREATE" | "DROP" | "TRUNCATE" | "VACUUM")
+    )
 }
 
 #[cfg(feature = "postgres-execution")]
