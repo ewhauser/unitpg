@@ -522,23 +522,41 @@ impl StorageState {
     }
 
     fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
-        for (relid, deleted_row_ids) in &overlay.deleted_row_ids {
+        let TransactionOverlay {
+            relations,
+            deleted_row_ids,
+        } = overlay;
+        let mut unchanged_primary_key_updates: HashMap<u32, BTreeSet<u64>> = HashMap::new();
+
+        for (relid, deleted_row_ids) in &deleted_row_ids {
             if deleted_row_ids.is_empty() {
                 continue;
             }
             let primary_key_spec = self.primary_key_spec(*relid);
-            self.remove_committed_entries(*relid, primary_key_spec.as_ref(), deleted_row_ids);
+            let unchanged_row_ids = self.remove_committed_entries(
+                *relid,
+                primary_key_spec.as_ref(),
+                deleted_row_ids,
+                relations.get(relid),
+            );
+            if !unchanged_row_ids.is_empty() {
+                unchanged_primary_key_updates.insert(*relid, unchanged_row_ids);
+            }
         }
 
-        for (relid, mut segment) in overlay.relations {
+        for (relid, mut segment) in relations {
             if segment.rows.is_empty() {
                 continue;
             }
             let primary_key_spec = self.primary_key_spec(relid);
+            let unchanged_row_ids = unchanged_primary_key_updates.get(&relid);
             let relation = self.relations.entry(relid).or_default();
             for row in &segment.rows {
                 relation.committed_row_ids.insert(row.row_id);
                 relation.committed_row_index.insert(row.row_id, row.clone());
+                if unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&row.row_id)) {
+                    continue;
+                }
                 if let Some(primary_key_spec) = &primary_key_spec
                     && let Some(key) = primary_key_for_row(primary_key_spec, row)
                 {
@@ -554,22 +572,35 @@ impl StorageState {
         relid: u32,
         primary_key_spec: Option<&PrimaryKeySpec>,
         deleted_row_ids: &BTreeSet<u64>,
-    ) {
+        replacement_segment: Option<&RowSegment>,
+    ) -> BTreeSet<u64> {
+        let mut unchanged_primary_key_row_ids = BTreeSet::new();
         if deleted_row_ids.is_empty() {
-            return;
+            return unchanged_primary_key_row_ids;
         }
 
         if let Some(relation) = self.relations.get_mut(&relid) {
             for row_id in deleted_row_ids {
                 relation.committed_row_ids.remove(row_id);
-                if let Some(row) = relation.committed_row_index.remove(row_id)
-                    && let Some(primary_key_spec) = primary_key_spec
-                    && let Some(key) = primary_key_for_row(primary_key_spec, &row)
+                let Some(row) = relation.committed_row_index.remove(row_id) else {
+                    continue;
+                };
+                let Some(primary_key_spec) = primary_key_spec else {
+                    continue;
+                };
+                if let Some(replacement) =
+                    replacement_segment.and_then(|segment| find_row_in_segment(segment, *row_id))
+                    && primary_key_unchanged(primary_key_spec, &row, replacement)
                 {
+                    unchanged_primary_key_row_ids.insert(*row_id);
+                    continue;
+                }
+                if let Some(key) = primary_key_for_row(primary_key_spec, &row) {
                     relation.primary_key_index.remove(&key);
                 }
             }
         }
+        unchanged_primary_key_row_ids
     }
 }
 
@@ -610,6 +641,29 @@ fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet
     segment
         .rows
         .retain(|row| !deleted_row_ids.contains(&row.row_id));
+}
+
+fn find_row_in_segment(segment: &RowSegment, row_id: u64) -> Option<&Row> {
+    segment.rows.iter().find(|row| row.row_id == row_id)
+}
+
+fn primary_key_unchanged(primary_key_spec: &PrimaryKeySpec, old_row: &Row, new_row: &Row) -> bool {
+    primary_key_spec.columns.iter().all(|column| {
+        let Some(old_cell) = old_row.cells.get(column.column_index) else {
+            return false;
+        };
+        let Some(new_cell) = new_row.cells.get(column.column_index) else {
+            return false;
+        };
+        if old_cell.is_null || new_cell.is_null {
+            return old_cell.is_null == new_cell.is_null;
+        }
+        if column.typbyval {
+            return old_cell.value == new_cell.value;
+        }
+        byref_key_bytes(old_cell.value, column.typlen)
+            == byref_key_bytes(new_cell.value, column.typlen)
+    })
 }
 
 static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
