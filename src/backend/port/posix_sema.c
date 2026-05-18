@@ -35,6 +35,9 @@
 #include "storage/ipc.h"
 #include "storage/pg_sema.h"
 #include "storage/shmem.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 
 
 /* see file header comment */
@@ -199,6 +202,10 @@ PGSemaphoreInit(int maxSemas)
 {
 	struct stat statbuf;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreInit");
+#endif
+
 	/*
 	 * We use the data directory's inode number to seed the search for free
 	 * semaphore keys.  This minimizes the odds of collision with other
@@ -257,6 +264,10 @@ PGSemaphoreCreate(void)
 	PGSemaphore sema;
 	sem_t	   *newsem;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreCreate");
+#endif
+
 	/* Can't do this in a backend, because static state is postmaster's */
 	Assert(!IsUnderPostmaster);
 
@@ -287,6 +298,10 @@ PGSemaphoreCreate(void)
 void
 PGSemaphoreReset(PGSemaphore sema)
 {
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreReset");
+#endif
+
 	/*
 	 * There's no direct API for this in POSIX, so we have to ratchet the
 	 * semaphore down to 0 with repeated trywait's.
@@ -314,6 +329,10 @@ PGSemaphoreLock(PGSemaphore sema)
 {
 	int			errStatus;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreLock");
+#endif
+
 	/* See notes in sysv_sema.c's implementation of PGSemaphoreLock. */
 	do
 	{
@@ -333,6 +352,10 @@ void
 PGSemaphoreUnlock(PGSemaphore sema)
 {
 	int			errStatus;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreUnlock");
+#endif
 
 	/*
 	 * Note: if errStatus is -1 and errno == EINTR then it means we returned
@@ -358,6 +381,10 @@ bool
 PGSemaphoreTryLock(PGSemaphore sema)
 {
 	int			errStatus;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreTryLock");
+#endif
 
 	/*
 	 * Note: if errStatus is -1 and errno == EINTR then it means we returned

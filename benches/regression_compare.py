@@ -21,6 +21,7 @@ from pgbench_compare import (
     CommandResult,
     PgBenchCompare,
     Variant,
+    classify_failure,
     free_port,
     postgres_env,
     rust_server_pgbench_env,
@@ -79,6 +80,7 @@ class RegressionCompare:
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "rust_pgcore": args.rust_pgcore,
+                "fastpg_no_internal_ipc": args.fastpg_no_internal_ipc,
             },
             "cases": [{"name": case.name, "path": str(case.path)} for case in self.cases],
             "variants": {},
@@ -404,6 +406,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         profile_phase="run",
         profile_open=False,
         profile_warmup_seconds=0.0,
+        fastpg_no_internal_ipc=args.fastpg_no_internal_ipc,
     )
 
 
@@ -480,6 +483,7 @@ def failure_as_json(failure: RegressionFailure) -> dict[str, Any]:
         "variant": failure.variant,
         "phase": failure.phase,
         "case": failure.case,
+        "classification": classify_failure(failure.result),
         "exit_code": failure.result.returncode,
         "command": failure.result.command,
         "stdout_tail": tail(failure.result.stdout),
@@ -496,6 +500,8 @@ def failure_as_json(failure: RegressionFailure) -> dict[str, Any]:
 def print_failure(failure: RegressionFailure, result_root: Path) -> None:
     data = failure_as_json(failure)
     print(f"phase: {data['phase']}", file=sys.stderr)
+    if data["classification"] is not None:
+        print(f"classification: {data['classification']}", file=sys.stderr)
     if data["case"] is not None:
         print(f"case: {data['case']}", file=sys.stderr)
     print(f"command: {data['command']}", file=sys.stderr)
@@ -540,6 +546,7 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
                 "",
                 f"- variant: `{failure['variant']}`",
                 f"- phase: `{failure['phase']}`",
+                f"- classification: `{failure.get('classification')}`",
                 f"- case: `{failure.get('case')}`",
                 f"- exit code: `{failure['exit_code']}`",
                 f"- command: `{failure['command']}`",
@@ -621,6 +628,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--allow-fastpg-failures",
         action="store_true",
         help="record fastpg failures and stdout mismatches without returning nonzero",
+    )
+    parser.add_argument(
+        "--fastpg-no-internal-ipc",
+        action="store_true",
+        help="set FASTPG_NO_INTERNAL_IPC=1 for the fastpg Rust server process",
     )
     return parser.parse_args(argv)
 

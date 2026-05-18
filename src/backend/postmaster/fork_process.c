@@ -21,6 +21,9 @@
 #include "libpq/pqsignal.h"
 #include "miscadmin.h"
 #include "postmaster/fork_process.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 
 #ifndef WIN32
 /*
@@ -35,6 +38,10 @@ fork_process(void)
 	pid_t		result;
 	const char *oomfilename;
 	sigset_t	save_mask;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("fork_process");
+#endif
 
 #ifdef LINUX_PROFILE
 	struct itimerval prof_itimer;

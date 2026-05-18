@@ -45,6 +45,9 @@
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 #include "utils/freepage.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 
@@ -189,6 +192,10 @@ dsm_postmaster_startup(PGShmemHeader *shim)
 	void	   *dsm_control_address = NULL;
 	uint32		maxitems;
 	Size		segsize;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("dsm_postmaster_startup");
+#endif
 
 	Assert(!IsUnderPostmaster);
 
@@ -531,6 +538,10 @@ dsm_create(Size size, int flags)
 	FreePageManager *dsm_main_space_fpm = dsm_main_space_begin;
 	bool		using_main_dsm_region = false;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("dsm_create");
+#endif
+
 	/*
 	 * Unsafe in postmaster. It might seem pointless to allow use of dsm in
 	 * single user mode, but otherwise some subsystems will need dedicated
@@ -676,6 +687,10 @@ dsm_attach(dsm_handle h)
 	dlist_iter	iter;
 	uint32		i;
 	uint32		nitems;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("dsm_attach");
+#endif
 
 	/* Unsafe in postmaster (and pointless in a stand-alone backend). */
 	Assert(IsUnderPostmaster);

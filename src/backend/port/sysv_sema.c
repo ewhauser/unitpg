@@ -25,6 +25,9 @@
 #include "storage/ipc.h"
 #include "storage/pg_sema.h"
 #include "storage/shmem.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 
 
 typedef struct PGSemaphoreData
@@ -335,6 +338,10 @@ PGSemaphoreInit(int maxSemas)
 {
 	struct stat statbuf;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreInit");
+#endif
+
 	/*
 	 * We use the data directory's inode number to seed the search for free
 	 * semaphore keys.  This minimizes the odds of collision with other
@@ -387,6 +394,10 @@ PGSemaphoreCreate(void)
 {
 	PGSemaphore sema;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreCreate");
+#endif
+
 	/* Can't do this in a backend, because static state is postmaster's */
 	Assert(!IsUnderPostmaster);
 
@@ -420,6 +431,10 @@ PGSemaphoreCreate(void)
 void
 PGSemaphoreReset(PGSemaphore sema)
 {
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreReset");
+#endif
+
 	IpcSemaphoreInitialize(sema->semId, sema->semNum, 0);
 }
 
@@ -433,6 +448,10 @@ PGSemaphoreLock(PGSemaphore sema)
 {
 	int			errStatus;
 	struct sembuf sops;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreLock");
+#endif
 
 	sops.sem_op = -1;			/* decrement */
 	sops.sem_flg = 0;
@@ -467,6 +486,10 @@ PGSemaphoreUnlock(PGSemaphore sema)
 	int			errStatus;
 	struct sembuf sops;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreUnlock");
+#endif
+
 	sops.sem_op = 1;			/* increment */
 	sops.sem_flg = 0;
 	sops.sem_num = sema->semNum;
@@ -496,6 +519,10 @@ PGSemaphoreTryLock(PGSemaphore sema)
 {
 	int			errStatus;
 	struct sembuf sops;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSemaphoreTryLock");
+#endif
 
 	sops.sem_op = -1;			/* decrement */
 	sops.sem_flg = IPC_NOWAIT;	/* but don't block */

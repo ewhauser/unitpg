@@ -20,6 +20,10 @@ backend_sources += files(
   'tzparser.c',
 )
 
+if get_option('fastpg')
+  backend_sources += files('fastpg_ipc_guard.c')
+endif
+
 guc_scan = custom_target('guc_scan',
   input: 'guc-file.l',
   output: 'guc-file.c',

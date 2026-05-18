@@ -25,7 +25,7 @@ PROFILE_WARMUP_SECONDS ?= 1.0
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 REGRESSION_CASES_ARG := $(if $(REGRESSION_CASES_DIR),--cases-dir "$(REGRESSION_CASES_DIR)",)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph regression-compare-rust-server regression-compare-rust-server-inventory validate-rust-server
+.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-compare-rust-server-strict-no-ipc pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph regression-compare-rust-server regression-compare-rust-server-no-ipc regression-compare-rust-server-inventory validate-rust-server validate-rust-server-no-ipc
 
 pgbench-compare:
 	$(PYTHON) pgbench_compare.py \
@@ -81,6 +81,22 @@ pgbench-compare-rust-server-strict:
 		--rust-build-profile "release" \
 		--rust-pgcore "full"
 
+pgbench-compare-rust-server-strict-no-ipc:
+	$(PYTHON) pgbench_compare.py \
+		--builtin "tpcb-like" \
+		--init-steps "default" \
+		--scale "$(SCALE)" \
+		--transactions "$(TRANSACTIONS)" \
+		--clients "$(CLIENTS)" \
+		--jobs "$(JOBS)" \
+		--runs "$(RUNS)" \
+		--protocol "$(PROTOCOL)" \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--fastpg-engine "rust-server" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full" \
+		--fastpg-no-internal-ipc
+
 pgbench-profile-rust-server:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "$(BUILTIN)" \
@@ -134,6 +150,15 @@ regression-compare-rust-server:
 		--rust-build-profile "release" \
 		--rust-pgcore "full"
 
+regression-compare-rust-server-no-ipc:
+	$(PYTHON) regression_compare.py \
+		--suite "$(REGRESSION_SUITE)" \
+		$(REGRESSION_CASES_ARG) \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full" \
+		--fastpg-no-internal-ipc
+
 regression-compare-rust-server-inventory:
 	$(PYTHON) regression_compare.py \
 		--suite "$(REGRESSION_INVENTORY_SUITE)" \
@@ -148,3 +173,9 @@ validate-rust-server:
 	cargo test -p fastpg-storage
 	$(MAKE) pgbench-compare-rust-server-strict
 	$(MAKE) regression-compare-rust-server
+
+validate-rust-server-no-ipc:
+	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py
+	cargo test -p fastpg-storage
+	$(MAKE) pgbench-compare-rust-server-strict-no-ipc
+	$(MAKE) regression-compare-rust-server-no-ipc

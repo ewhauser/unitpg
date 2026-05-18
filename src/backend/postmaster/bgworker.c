@@ -34,6 +34,9 @@
 #include "storage/subsystems.h"
 #include "tcop/tcopprot.h"
 #include "utils/ascii.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/ps_status.h"
 #include "utils/timeout.h"
@@ -1072,6 +1075,10 @@ RegisterDynamicBackgroundWorker(BackgroundWorker *worker,
 	bool		success = false;
 	bool		parallel;
 	uint64		generation = 0;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("RegisterDynamicBackgroundWorker");
+#endif
 
 	/*
 	 * We can't register dynamic background workers from the postmaster. If

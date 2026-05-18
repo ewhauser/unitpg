@@ -41,6 +41,9 @@
 #include "tcop/tcopprot.h"
 #include "utils/combocid.h"
 #include "utils/guc.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/relmapper.h"
@@ -590,6 +593,10 @@ LaunchParallelWorkers(ParallelContext *pcxt)
 	/* Skip this if we have no workers. */
 	if (pcxt->nworkers == 0 || pcxt->nworkers_to_launch == 0)
 		return;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("LaunchParallelWorkers");
+#endif
 
 	/* We need to be a lock group leader. */
 	BecomeLockGroupLeader();

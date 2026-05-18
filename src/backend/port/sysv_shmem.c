@@ -37,6 +37,9 @@
 #include "storage/shmem.h"
 #include "utils/guc.h"
 #include "utils/guc_hooks.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/pidfile.h"
 
 
@@ -124,6 +127,10 @@ InternalIpcMemoryCreate(IpcMemoryKey memKey, Size size)
 	IpcMemoryId shmid;
 	void	   *requestedAddress = NULL;
 	void	   *memAddress;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("InternalIpcMemoryCreate");
+#endif
 
 	/*
 	 * Normally we just pass requestedAddress = NULL to shmat(), allowing the
@@ -352,6 +359,10 @@ PGSharedMemoryAttach(IpcMemoryId shmId,
 	struct shmid_ds shmStat;
 	struct stat statbuf;
 	PGShmemHeader *hdr;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSharedMemoryAttach");
+#endif
 
 	*addr = NULL;
 
@@ -708,6 +719,10 @@ PGSharedMemoryCreate(Size size,
 	struct stat statbuf;
 	Size		sysvsize;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSharedMemoryCreate");
+#endif
+
 	/*
 	 * We use the data directory's ID info (inode and device numbers) to
 	 * positively identify shmem segments associated with this data dir, and
@@ -898,6 +913,10 @@ PGSharedMemoryReAttach(void)
 
 	Assert(UsedShmemSegAddr != NULL);
 	Assert(IsUnderPostmaster);
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("PGSharedMemoryReAttach");
+#endif
 
 #ifdef __CYGWIN__
 	/* cygipc (currently) appears to not detach on exec. */

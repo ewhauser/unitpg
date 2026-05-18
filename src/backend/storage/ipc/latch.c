@@ -22,6 +22,9 @@
 #include "port/atomics.h"
 #include "storage/latch.h"
 #include "storage/waiteventset.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/resowner.h"
 
 /* A common WaitEventSet used to implement WaitLatch() */
@@ -35,6 +38,10 @@ void
 InitializeLatchWaitSet(void)
 {
 	int			latch_pos PG_USED_FOR_ASSERTS_ONLY;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("InitializeLatchWaitSet");
+#endif
 
 	Assert(LatchWaitSet == NULL);
 
@@ -174,6 +181,10 @@ WaitLatch(Latch *latch, int wakeEvents, long timeout,
 {
 	WaitEvent	event;
 
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("WaitLatch");
+#endif
+
 	/* Postmaster-managed callers must handle postmaster death somehow. */
 	Assert(!IsUnderPostmaster ||
 		   (wakeEvents & WL_EXIT_ON_PM_DEATH) ||
@@ -226,7 +237,13 @@ WaitLatchOrSocket(Latch *latch, int wakeEvents, pgsocket sock,
 	int			ret = 0;
 	int			rc;
 	WaitEvent	event;
-	WaitEventSet *set = CreateWaitEventSet(CurrentResourceOwner, 3);
+	WaitEventSet *set;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("WaitLatchOrSocket");
+#endif
+
+	set = CreateWaitEventSet(CurrentResourceOwner, 3);
 
 	if (wakeEvents & WL_TIMEOUT)
 		Assert(timeout >= 0);

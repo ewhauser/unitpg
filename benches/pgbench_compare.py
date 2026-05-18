@@ -93,6 +93,7 @@ class PgBenchCompare:
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "rust_pgcore": args.rust_pgcore,
+                "fastpg_no_internal_ipc": args.fastpg_no_internal_ipc,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
                 "profile_normal_postgres": args.profile_normal_postgres,
                 "profile_tool": args.profile_tool,
@@ -561,6 +562,7 @@ class PgBenchCompare:
         process = subprocess.Popen(
             command,
             cwd=self.source_root,
+            env=self.rust_server_process_env(),
             text=True,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -638,6 +640,13 @@ class PgBenchCompare:
             json.dumps(result.as_json(), indent=2) + "\n"
         )
         return result
+
+    def rust_server_process_env(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env.pop("FASTPG_NO_INTERNAL_IPC", None)
+        if self.args.fastpg_no_internal_ipc:
+            env["FASTPG_NO_INTERNAL_IPC"] = "1"
+        return env
 
     def should_profile_rust_server(self, variant: Variant) -> bool:
         return self.should_profile_rust_server_name(variant.name) and variant.engine == "rust-server"
@@ -1029,6 +1038,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="run fastpg as the Rust single-process server or as the Postgres tableam wrapper",
     )
     parser.add_argument(
+        "--fastpg-no-internal-ipc",
+        action="store_true",
+        help="set FASTPG_NO_INTERNAL_IPC=1 for the fastpg Rust server process",
+    )
+    parser.add_argument(
         "--profile-fastpg-rust-server",
         action="store_true",
         help="profile the fastpg Rust server during the pgbench run",
@@ -1066,6 +1080,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--runs must be at least 1")
     if args.profile_fastpg_rust_server and args.fastpg_engine != "rust-server":
         parser.error("--profile-fastpg-rust-server requires --fastpg-engine=rust-server")
+    if args.fastpg_no_internal_ipc and args.fastpg_engine != "rust-server":
+        parser.error("--fastpg-no-internal-ipc requires --fastpg-engine=rust-server")
     if args.profile_normal_postgres and args.clients != 1:
         parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:
@@ -1369,6 +1385,7 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
                 "",
                 f"- variant: `{failure['variant']}`",
                 f"- phase: `{failure['phase']}`",
+                f"- classification: `{failure.get('classification')}`",
                 f"- exit code: `{failure['exit_code']}`",
                 f"- command: `{failure['command']}`",
                 "",
@@ -1490,6 +1507,20 @@ def tail(text: str, limit: int = 4000) -> str:
     return text[-limit:]
 
 
+def classify_failure(result: CommandResult) -> str | None:
+    text = result.stdout + "\n" + result.stderr
+    marker = "FASTPG_INTERNAL_IPC_FORBIDDEN"
+    if marker not in text:
+        return None
+    match = re.search(
+        r"FASTPG_INTERNAL_IPC_FORBIDDEN: fastpg internal IPC path reached: ([^\n\r]+)",
+        text,
+    )
+    if match is None:
+        return "fastpg-internal-ipc"
+    return f"fastpg-internal-ipc:{match.group(1).strip()}"
+
+
 def main(argv: list[str]) -> int:
     runner = PgBenchCompare(parse_args(argv))
     try:
@@ -1499,6 +1530,7 @@ def main(argv: list[str]) -> int:
         runner.results["failure"] = {
             "variant": failure.variant,
             "phase": failure.phase,
+            "classification": classify_failure(failure.result),
             "exit_code": failure.result.returncode,
             "command": " ".join(failure.result.command),
             "stdout_tail": tail(failure.result.stdout),
@@ -1513,6 +1545,9 @@ def main(argv: list[str]) -> int:
         else:
             print("fastpg failed; this is a benchmark-driven implementation target.", file=sys.stderr)
         print(f"phase: {failure.phase}", file=sys.stderr)
+        classification = classify_failure(failure.result)
+        if classification is not None:
+            print(f"classification: {classification}", file=sys.stderr)
         print(f"command: {' '.join(failure.result.command)}", file=sys.stderr)
         print(f"exit code: {failure.result.returncode}", file=sys.stderr)
         print(f"stdout tail:\n{tail(failure.result.stdout)}", file=sys.stderr)

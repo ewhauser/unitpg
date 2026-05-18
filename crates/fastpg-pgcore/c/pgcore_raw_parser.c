@@ -1065,6 +1065,7 @@ fastpg_pgcore_prepare(const char *query)
 	PG_TRY();
 	{
 		RawStmt    *rawstmt;
+		int			cursor_options;
 
 		MemoryContextSwitchTo(result->context);
 		result->source_text = pstrdup(query);
@@ -1075,6 +1076,11 @@ fastpg_pgcore_prepare(const char *query)
 					 errmsg("fastpg pgcore currently prepares exactly one statement at a time")));
 
 		rawstmt = linitial_node(RawStmt, result->raw_parsetrees);
+#ifdef USE_FASTPG
+		cursor_options = 0;
+#else
+		cursor_options = CURSOR_OPT_PARALLEL_OK;
+#endif
 		result->query = parse_analyze_varparams(rawstmt,
 												result->source_text,
 												&result->parameter_type_oids,
@@ -1084,7 +1090,7 @@ fastpg_pgcore_prepare(const char *query)
 		result->querytrees = pg_rewrite_query(copyObject(result->query));
 		result->planned_statements = pg_plan_queries(copyObject(result->querytrees),
 													 result->source_text,
-													 CURSOR_OPT_PARALLEL_OK,
+													 cursor_options,
 													 NULL);
 		result->ok = true;
 		MemoryContextSwitchTo(oldcontext);

@@ -66,6 +66,9 @@
 #include "postmaster/postmaster.h"
 #include "storage/dsm_impl.h"
 #include "storage/fd.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/guc.h"
 #include "utils/memutils.h"
 #include "utils/wait_event.h"
@@ -80,6 +83,25 @@ static int	dsm_impl_posix_resize(int fd, off_t size);
 static bool dsm_impl_sysv(dsm_op op, dsm_handle handle, Size request_size,
 						  void **impl_private, void **mapped_address,
 						  Size *mapped_size, int elevel);
+#endif
+
+#ifdef USE_FASTPG
+static const char *
+fastpg_dsm_op_name(dsm_op op)
+{
+	switch (op)
+	{
+		case DSM_OP_CREATE:
+			return "dsm_impl_op(DSM_OP_CREATE)";
+		case DSM_OP_ATTACH:
+			return "dsm_impl_op(DSM_OP_ATTACH)";
+		case DSM_OP_DETACH:
+			return "dsm_impl_op(DSM_OP_DETACH)";
+		case DSM_OP_DESTROY:
+			return "dsm_impl_op(DSM_OP_DESTROY)";
+	}
+	return "dsm_impl_op(unknown)";
+}
 #endif
 #ifdef USE_DSM_WINDOWS
 static bool dsm_impl_windows(dsm_op op, dsm_handle handle, Size request_size,
@@ -164,6 +186,10 @@ dsm_impl_op(dsm_op op, dsm_handle handle, Size request_size,
 	Assert(op == DSM_OP_CREATE || request_size == 0);
 	Assert((op != DSM_OP_CREATE && op != DSM_OP_ATTACH) ||
 		   (*mapped_address == NULL && *mapped_size == 0));
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC(fastpg_dsm_op_name(op));
+#endif
 
 	switch (dynamic_shared_memory_type)
 	{

@@ -75,6 +75,9 @@
 #include "storage/pmsignal.h"
 #include "storage/latch.h"
 #include "storage/waiteventset.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/memutils.h"
 #include "utils/resowner.h"
 #include "utils/wait_event.h"
@@ -367,6 +370,10 @@ CreateWaitEventSet(ResourceOwner resowner, int nevents)
 	WaitEventSet *set;
 	char	   *data;
 	Size		sz = 0;
+
+#ifdef USE_FASTPG
+	FASTPG_FORBID_INTERNAL_IPC("CreateWaitEventSet");
+#endif
 
 	/*
 	 * Use MAXALIGN size/alignment to guarantee that later uses of memory are
