@@ -667,9 +667,17 @@ fn primary_key_unchanged(primary_key_spec: &PrimaryKeySpec, old_row: &Row, new_r
 }
 
 static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
+static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<
+    Mutex<HashMap<u32, Option<FastPgRustPrimaryKeyIndexInfo>>>,
+> = OnceLock::new();
 
 fn storage() -> &'static Mutex<StorageState> {
     STORAGE.get_or_init(|| Mutex::new(StorageState::default()))
+}
+
+fn primary_key_index_info_cache()
+-> &'static Mutex<HashMap<u32, Option<FastPgRustPrimaryKeyIndexInfo>>> {
+    PRIMARY_KEY_INDEX_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn with_storage<R>(f: impl FnOnce(&mut StorageState) -> R) -> R {
@@ -680,6 +688,35 @@ fn with_storage<R>(f: impl FnOnce(&mut StorageState) -> R) -> R {
             f(&mut state)
         }
     }
+}
+
+fn clear_primary_key_index_info_cache() {
+    match primary_key_index_info_cache().lock() {
+        Ok(mut cache) => cache.clear(),
+        Err(poisoned) => poisoned.into_inner().clear(),
+    }
+}
+
+fn cached_primary_key_index_info(index_oid: Oid) -> Option<FastPgRustPrimaryKeyIndexInfo> {
+    let cached = match primary_key_index_info_cache().lock() {
+        Ok(cache) => cache.get(&index_oid.0).copied(),
+        Err(poisoned) => poisoned.into_inner().get(&index_oid.0).copied(),
+    };
+    if let Some(index_info) = cached {
+        return index_info;
+    }
+
+    let index_info = primary_key_index_relation(index_oid)
+        .and_then(|relation| primary_key_index_info(&relation, index_oid));
+    match primary_key_index_info_cache().lock() {
+        Ok(mut cache) => {
+            cache.insert(index_oid.0, index_info);
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().insert(index_oid.0, index_info);
+        }
+    }
+    index_info
 }
 
 unsafe fn c_str_to_string(value: *const c_char) -> Result<String, String> {
@@ -1517,10 +1554,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_info(
     if out.is_null() {
         return false;
     }
-    let Some(relation) = primary_key_index_relation(Oid(index_oid)) else {
-        return false;
-    };
-    let Some(index_info) = primary_key_index_info(&relation, Oid(index_oid)) else {
+    let Some(index_info) = cached_primary_key_index_info(Oid(index_oid)) else {
         return false;
     };
     unsafe {
@@ -1787,7 +1821,11 @@ pub unsafe extern "C" fn fastpg_rust_catalog_create_relation(
                 )
             })
             .collect::<Vec<_>>();
-        create_relation(&name, columns, if_not_exists).map(|_| ())
+        let created = create_relation(&name, columns, if_not_exists)?;
+        if created.is_some() {
+            clear_primary_key_index_info_cache();
+        }
+        Ok::<(), CatalogError>(())
     })();
 
     match result {
@@ -1821,6 +1859,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_drop_relation(
         let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
         let dropped = drop_relation(&name, missing_ok)?;
         if let Some(relation) = dropped {
+            clear_primary_key_index_info_cache();
             with_storage(|state| state.clear_relation(relation.oid.0));
         }
         Ok::<(), fastpg_catalog::CatalogError>(())
@@ -1934,6 +1973,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
         let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
             .map_err(invalid_ffi_argument)?;
         add_primary_key(&name, column_names)?;
+        clear_primary_key_index_info_cache();
         if let Some(relation) = relation_by_name(&name) {
             with_storage(|state| state.rebuild_primary_key_index(relation.oid.0));
         }
@@ -2597,6 +2637,7 @@ mod tests {
     fn test_guard() -> TestGuard {
         let guard = TEST_LOCK.lock().expect("test lock poisoned");
         fastpg_rust_xact_abort();
+        clear_primary_key_index_info_cache();
         TestGuard { _guard: guard }
     }
 
