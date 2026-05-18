@@ -2134,6 +2134,80 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok,
 		recomputeNamespacePath();
 	}
 
+#ifdef USE_FASTPG
+	{
+		size_t		operator_count =
+			fastpg_rust_catalog_operator_count_by_name(opername);
+
+		if (operator_count > 0)
+		{
+			FuncCandidateList *tail = &resultList;
+
+			if (OidIsValid(namespaceId) && namespaceId != PG_CATALOG_NAMESPACE)
+				return NULL;
+
+			for (size_t fastpg_index = 0; fastpg_index < operator_count; fastpg_index++)
+			{
+				FastPgRustCatalogOperator oper;
+				FuncCandidateList newResult;
+				int			pathpos = 0;
+
+				if (!fastpg_rust_catalog_operator_by_name_index(opername,
+																fastpg_index,
+																&oper))
+					continue;
+				if (oprkind && oper.kind != (uint8_t) oprkind)
+					continue;
+
+				*fgc_flags |= FGC_NAME_EXISTS;
+
+				if (OidIsValid(namespaceId))
+				{
+					if (oper.namespace_oid != (uint32_t) namespaceId)
+						continue;
+				}
+				else
+				{
+					ListCell   *nsp;
+
+					foreach(nsp, activeSearchPath)
+					{
+						if ((Oid) oper.namespace_oid == lfirst_oid(nsp) &&
+							(Oid) oper.namespace_oid != myTempNamespace)
+							break;
+						pathpos++;
+					}
+					if (nsp == NULL)
+						continue;
+				}
+
+				*fgc_flags |= FGC_NAME_VISIBLE;
+
+				newResult = (FuncCandidateList)
+					palloc0(offsetof(struct _FuncCandidateList, args) +
+							2 * sizeof(Oid));
+				newResult->pathpos = pathpos;
+				newResult->oid = (Oid) oper.oid;
+				newResult->nominalnargs = 2;
+				newResult->nargs = 2;
+				newResult->nvargs = 0;
+				newResult->ndargs = 0;
+				newResult->argnumbers = NULL;
+				newResult->args[0] = (Oid) oper.left_type_oid;
+				newResult->args[1] = (Oid) oper.right_type_oid;
+
+				*tail = newResult;
+				tail = &newResult->next;
+			}
+
+			if (resultList != NULL || !IsUnderPostmaster)
+				return resultList;
+		}
+		else if (!IsUnderPostmaster)
+			return NULL;
+	}
+#endif
+
 	/* Search syscache by name only */
 	catlist = SearchSysCacheList1(OPERNAMENSP, CStringGetDatum(opername));
 

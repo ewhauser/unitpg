@@ -115,6 +115,15 @@ static struct pg_locale_struct c_locale = {
 	.ctype_is_c = true,
 };
 
+#ifdef USE_FASTPG
+static struct pg_locale_struct fastpg_default_locale = {
+	.deterministic = true,
+	.collate_is_c = true,
+	.ctype_is_c = true,
+	.is_default = true,
+};
+#endif
+
 /* Cache for collation-related knowledge */
 
 typedef struct
@@ -1192,7 +1201,13 @@ pg_newlocale_from_collation(Oid collid)
 	bool		found;
 
 	if (collid == DEFAULT_COLLATION_OID)
+	{
+#ifdef USE_FASTPG
+		if (default_locale == NULL)
+			return &fastpg_default_locale;
+#endif
 		return default_locale;
+	}
 
 	/*
 	 * Some callers expect C_COLLATION_OID to succeed even without catalog

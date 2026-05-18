@@ -10,16 +10,20 @@
 
 #include <unistd.h>
 
+#include "access/session.h"
 #include "access/fastpg_catalog.h"
+#include "access/transam.h"
 #include "access/tupdesc.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_type_d.h"
+#include "catalog/pg_namespace.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/bitmapset.h"
 #include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
@@ -27,6 +31,7 @@
 #include "nodes/primnodes.h"
 #include "nodes/value.h"
 #include "parser/analyze.h"
+#include "parser/parsetree.h"
 #include "parser/parser.h"
 #include "pgtime.h"
 #include "postmaster/postmaster.h"
@@ -35,6 +40,7 @@
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/portal.h"
 #include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
@@ -155,6 +161,8 @@ fastpg_pgcore_init_once(void)
 	pg_timezone_initialize();
 	RelationCacheInitialize();
 	InitCatalogCache();
+	InitializeSession();
+	EnablePortalManager();
 	namespace_search_path = pstrdup("pg_catalog, public");
 	InitializeSearchPath();
 
@@ -382,6 +390,28 @@ fastpg_pgcore_type_name_leaf(const TypeName *type_name)
 }
 
 static Oid
+fastpg_pgcore_type_name_namespace_oid(const TypeName *type_name)
+{
+	const Node *schema;
+
+	if (type_name == NULL || type_name->names == NIL)
+		return InvalidOid;
+	if (list_length(type_name->names) == 1)
+		return InvalidOid;
+	if (list_length(type_name->names) != 2)
+		return InvalidOid;
+
+	schema = linitial(type_name->names);
+	if (!IsA(schema, String))
+		return InvalidOid;
+	if (pg_strcasecmp(strVal(schema), "pg_catalog") == 0)
+		return PG_CATALOG_NAMESPACE;
+	if (pg_strcasecmp(strVal(schema), "public") == 0)
+		return PG_PUBLIC_NAMESPACE;
+	return InvalidOid;
+}
+
+static Oid
 fastpg_pgcore_type_name_oid(const TypeName *type_name)
 {
 	const char *name;
@@ -395,37 +425,34 @@ fastpg_pgcore_type_name_oid(const TypeName *type_name)
 	if (name == NULL)
 		return InvalidOid;
 
-	if (pg_strcasecmp(name, "bool") == 0 ||
-		pg_strcasecmp(name, "boolean") == 0)
-		return BOOLOID;
-	if (pg_strcasecmp(name, "char") == 0)
-		return CHAROID;
-	if (pg_strcasecmp(name, "name") == 0)
-		return NAMEOID;
-	if (pg_strcasecmp(name, "int2") == 0 ||
-		pg_strcasecmp(name, "smallint") == 0)
-		return INT2OID;
-	if (pg_strcasecmp(name, "int4") == 0 ||
-		pg_strcasecmp(name, "int") == 0 ||
-		pg_strcasecmp(name, "integer") == 0)
-		return INT4OID;
-	if (pg_strcasecmp(name, "int8") == 0 ||
-		pg_strcasecmp(name, "bigint") == 0)
-		return INT8OID;
-	if (pg_strcasecmp(name, "text") == 0)
-		return TEXTOID;
-	if (pg_strcasecmp(name, "oid") == 0)
-		return OIDOID;
-	if (pg_strcasecmp(name, "bpchar") == 0 ||
-		pg_strcasecmp(name, "character") == 0)
-		return BPCHAROID;
-	if (pg_strcasecmp(name, "varchar") == 0 ||
-		pg_strcasecmp(name, "character varying") == 0)
-		return VARCHAROID;
-	if (pg_strcasecmp(name, "timestamp") == 0)
-		return TIMESTAMPOID;
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogType type_record;
+		Oid			namespace_oid =
+			fastpg_pgcore_type_name_namespace_oid(type_name);
 
+		if (OidIsValid(namespace_oid))
+		{
+			if (fastpg_rust_catalog_type_by_name(name,
+												 (uint32_t) namespace_oid,
+												 &type_record))
+				return (Oid) type_record.oid;
+			return InvalidOid;
+		}
+
+		if (fastpg_rust_catalog_type_by_name(name,
+											 (uint32_t) PG_CATALOG_NAMESPACE,
+											 &type_record))
+			return (Oid) type_record.oid;
+		if (fastpg_rust_catalog_type_by_name(name,
+											 (uint32_t) PG_PUBLIC_NAMESPACE,
+											 &type_record))
+			return (Oid) type_record.oid;
+		return InvalidOid;
+	}
+#else
 	return InvalidOid;
+#endif
 }
 
 static void
@@ -675,6 +702,13 @@ fastpg_pgcore_execute_vacuum_stmt(const VacuumStmt *stmt,
 }
 
 static void
+fastpg_pgcore_execute_noop_utility(const char *command_tag,
+								   FastPgPgCoreExecuteStatement *summary)
+{
+	summary->command_tag = pstrdup(command_tag);
+}
+
+static void
 fastpg_pgcore_execute_alter_table_stmt(const AlterTableStmt *stmt,
 									   FastPgPgCoreExecuteStatement *summary)
 {
@@ -699,13 +733,14 @@ fastpg_pgcore_execute_alter_table_stmt(const AlterTableStmt *stmt,
 			!IsA(cmd->def, Constraint))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports ALTER TABLE ADD PRIMARY KEY")));
+					 errmsg("fastpg pgcore only supports ALTER TABLE ADD PRIMARY KEY or UNIQUE")));
 
 		constraint = (Constraint *) cmd->def;
-		if (constraint->contype != CONSTR_PRIMARY)
+		if (constraint->contype != CONSTR_PRIMARY &&
+			constraint->contype != CONSTR_UNIQUE)
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports ALTER TABLE ADD PRIMARY KEY")));
+					 errmsg("fastpg pgcore only supports ALTER TABLE ADD PRIMARY KEY or UNIQUE")));
 
 		column_names = palloc0_array(const char *, list_length(constraint->keys));
 		foreach(key_lc, constraint->keys)
@@ -714,15 +749,53 @@ fastpg_pgcore_execute_alter_table_stmt(const AlterTableStmt *stmt,
 
 			if (!IsA(key, String))
 				ereport(ERROR,
-						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						 errmsg("fastpg pgcore only supports column primary keys")));
+							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+							 errmsg("fastpg pgcore only supports column primary or unique keys")));
 			column_names[column_index++] = strVal(key);
 		}
-		fastpg_pgcore_call_add_primary_key(relation_name,
-										   column_names,
-										   (size_t) column_index);
+		if (constraint->contype == CONSTR_PRIMARY)
+			fastpg_pgcore_call_add_primary_key(relation_name,
+											   column_names,
+											   (size_t) column_index);
 	}
 	summary->command_tag = pstrdup("ALTER TABLE");
+}
+
+static bool
+fastpg_pgcore_is_builtin_index_access_method(const char *access_method)
+{
+	return pg_strcasecmp(access_method, DEFAULT_INDEX_TYPE) == 0 ||
+		pg_strcasecmp(access_method, "hash") == 0 ||
+		pg_strcasecmp(access_method, "gist") == 0 ||
+		pg_strcasecmp(access_method, "spgist") == 0 ||
+		pg_strcasecmp(access_method, "gin") == 0 ||
+		pg_strcasecmp(access_method, "brin") == 0;
+}
+
+static void
+fastpg_pgcore_execute_index_stmt(const IndexStmt *stmt,
+								 FastPgPgCoreExecuteStatement *summary)
+{
+	const char *access_method =
+		stmt->accessMethod != NULL ? stmt->accessMethod : DEFAULT_INDEX_TYPE;
+	const char *relation_name;
+
+	if (!fastpg_pgcore_is_builtin_index_access_method(access_method))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fastpg pgcore only accepts CREATE INDEX for built-in PostgreSQL index access methods")));
+	if (stmt->excludeOpNames != NIL)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fastpg pgcore does not support exclusion indexes")));
+	if (stmt->concurrent)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fastpg pgcore does not support CREATE INDEX CONCURRENTLY")));
+
+	relation_name = fastpg_pgcore_rangevar_name(stmt->relation);
+	(void) fastpg_pgcore_call_relation_column_count(relation_name);
+	summary->command_tag = pstrdup("CREATE INDEX");
 }
 
 static void
@@ -825,9 +898,28 @@ fastpg_pgcore_execute_utility(Node *utility_stmt,
 			fastpg_pgcore_execute_vacuum_stmt((const VacuumStmt *) utility_stmt,
 											  summary);
 			break;
+		case T_VariableSetStmt:
+			fastpg_pgcore_execute_noop_utility("SET", summary);
+			break;
+		case T_GrantStmt:
+			fastpg_pgcore_execute_noop_utility("GRANT", summary);
+			break;
+		case T_CreateTableSpaceStmt:
+			fastpg_pgcore_execute_noop_utility("CREATE TABLESPACE", summary);
+			break;
+		case T_DropTableSpaceStmt:
+			fastpg_pgcore_execute_noop_utility("DROP TABLESPACE", summary);
+			break;
+		case T_CommentStmt:
+			fastpg_pgcore_execute_noop_utility("COMMENT", summary);
+			break;
 		case T_AlterTableStmt:
 			fastpg_pgcore_execute_alter_table_stmt((const AlterTableStmt *) utility_stmt,
 												   summary);
+			break;
+		case T_IndexStmt:
+			fastpg_pgcore_execute_index_stmt((const IndexStmt *) utility_stmt,
+											 summary);
 			break;
 		case T_TransactionStmt:
 			fastpg_pgcore_execute_transaction_stmt((const TransactionStmt *) utility_stmt,
@@ -845,6 +937,47 @@ fastpg_pgcore_execute_utility(Node *utility_stmt,
 			break;
 	}
 }
+
+#ifdef USE_FASTPG
+static bool
+fastpg_pgcore_statement_targets_system_catalog(const PlannedStmt *statement)
+{
+	int			rtindex = -1;
+
+	if (statement == NULL || statement->resultRelationRelids == NULL)
+		return false;
+
+	while ((rtindex = bms_next_member(statement->resultRelationRelids,
+									  rtindex)) >= 0)
+	{
+		RangeTblEntry *rte;
+
+		if (rtindex <= 0 || rtindex > list_length(statement->rtable))
+			continue;
+
+		rte = rt_fetch(rtindex, statement->rtable);
+		if (rte->rtekind == RTE_RELATION && rte->relid < FirstNormalObjectId)
+			return true;
+	}
+
+	return false;
+}
+
+static bool
+fastpg_pgcore_should_noop_system_catalog_write(const PlannedStmt *statement)
+{
+	switch (statement->commandType)
+	{
+		case CMD_INSERT:
+		case CMD_UPDATE:
+		case CMD_DELETE:
+		case CMD_MERGE:
+			return fastpg_pgcore_statement_targets_system_catalog(statement);
+		default:
+			return false;
+	}
+}
+#endif
 
 static void
 fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
@@ -1091,35 +1224,46 @@ fastpg_pgcore_prepare(const char *query)
 	PG_TRY();
 	{
 		RawStmt    *rawstmt;
+		int			raw_count;
 		int			cursor_options;
 
 		MemoryContextSwitchTo(result->context);
 		result->source_text = pstrdup(query);
 		result->raw_parsetrees = raw_parser(query, RAW_PARSE_DEFAULT);
-		if (list_length(result->raw_parsetrees) != 1)
+		raw_count = list_length(result->raw_parsetrees);
+		if (raw_count == 0)
+		{
+			result->ok = true;
+			MemoryContextSwitchTo(oldcontext);
+		}
+		else if (raw_count != 1)
+		{
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("fastpg pgcore currently prepares exactly one statement at a time")));
-
-		rawstmt = linitial_node(RawStmt, result->raw_parsetrees);
+		}
+		else
+		{
+			rawstmt = linitial_node(RawStmt, result->raw_parsetrees);
 #ifdef USE_FASTPG
-		cursor_options = 0;
+			cursor_options = 0;
 #else
-		cursor_options = CURSOR_OPT_PARALLEL_OK;
+			cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif
-		result->query = parse_analyze_varparams(rawstmt,
-												result->source_text,
-												&result->parameter_type_oids,
-												&result->parameter_count,
-												NULL);
-		fastpg_pgcore_capture_analyze_fields(result);
-		result->querytrees = pg_rewrite_query(copyObject(result->query));
-		result->planned_statements = pg_plan_queries(copyObject(result->querytrees),
-													 result->source_text,
-													 cursor_options,
-													 NULL);
-		result->ok = true;
-		MemoryContextSwitchTo(oldcontext);
+			result->query = parse_analyze_varparams(rawstmt,
+													result->source_text,
+													&result->parameter_type_oids,
+													&result->parameter_count,
+													NULL);
+			fastpg_pgcore_capture_analyze_fields(result);
+			result->querytrees = pg_rewrite_query(copyObject(result->query));
+			result->planned_statements = pg_plan_queries(copyObject(result->querytrees),
+														 result->source_text,
+														 cursor_options,
+														 NULL);
+			result->ok = true;
+			MemoryContextSwitchTo(oldcontext);
+		}
 	}
 	PG_CATCH();
 	{
@@ -1374,6 +1518,15 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 				fastpg_pgcore_execute_utility(statement->utilityStmt, summary);
 				continue;
 			}
+
+#ifdef USE_FASTPG
+			if (fastpg_pgcore_should_noop_system_catalog_write(statement))
+			{
+				summary->command_tag =
+					pstrdup(fastpg_pgcore_command_tag_name(statement->commandType));
+				continue;
+			}
+#endif
 
 			fastpg_pgcore_ensure_execution_owner();
 			dest = fastpg_pgcore_create_capture_receiver(summary,

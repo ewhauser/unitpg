@@ -8,48 +8,24 @@ use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    BPCHAR_OID, CID_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID,
-    PG_CATALOG_NAMESPACE_OID, TEXT_OID, TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
-    add_primary_key, builtin_aggregate_by_proc_oid, builtin_cast_by_source_target,
-    builtin_namespace_by_name, builtin_namespace_by_oid, builtin_operator_by_oid,
-    builtin_operator_by_signature, builtin_proc_by_oid, builtin_procs_by_name,
-    builtin_type_by_name, create_relation, drop_relation, lookup_builtin_type, relation_by_name,
-    relation_by_oid, relation_column_count, relations, truncate_relation, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid, virtual_catalogs,
+    BPCHAR_OID, CatalogError, CatalogValue, ColumnRecord, INT2_OID, INT2VECTOR_OID, INT4_OID,
+    INT8_OID, NAME_OID, OID_OID, OIDVECTOR_OID, PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID,
+    TEXT_OID, TIMESTAMP_OID, VARCHAR_OID, add_primary_key,
+    btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
+    builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
+    builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
+    builtin_proc_by_oid, builtin_procs_by_name, builtin_type_by_name, catalog_row_value,
+    catalog_rows, create_relation, drop_relation, lookup_builtin_type, relation_by_name,
+    relation_by_oid, relation_column_count, static_catalog_by_name, static_catalog_by_relation_oid,
+    truncate_relation, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
 const NAMEDATALEN: usize = 64;
 const FASTPG_PROC_MAX_ARGS: usize = 8;
 const FASTPG_PROC_SOURCE_LEN: usize = 64;
-const PG_CLASS_RELATION_ID: u32 = 1259;
-const PG_ATTRIBUTE_RELATION_ID: u32 = 1249;
-const PG_CLASS_ATTRIBUTE_COUNT: u16 = 34;
-const PG_ATTRIBUTE_ATTRIBUTE_COUNT: u16 = 25;
-const PG_PROC_ATTRIBUTE_COUNT: u16 = 30;
-const PG_TYPE_ATTRIBUTE_COUNT: u16 = 32;
-const PG_INDEX_ATTRIBUTE_COUNT: u16 = 21;
-const PG_NAMESPACE_ATTRIBUTE_COUNT: u16 = 4;
-const PG_CONSTRAINT_ATTRIBUTE_COUNT: u16 = 28;
-const PG_OPCLASS_ATTRIBUTE_COUNT: u16 = 9;
-const PG_INDEX_RELATION_ID: u32 = 2610;
-const PG_CONSTRAINT_RELATION_ID: u32 = 2606;
-const PG_OPCLASS_RELATION_ID: u32 = 2616;
-const HEAP_TABLE_AM_OID: u32 = 2;
-const BTREE_INDEX_AM_OID: u32 = 403;
-const BOOTSTRAP_SUPERUSER_OID: u32 = 10;
-const FIRST_NORMAL_TRANSACTION_ID: u32 = 3;
-const FIRST_MULTI_XACT_ID: u32 = 1;
 const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
 const FASTPG_MAX_INDEX_KEYS: usize = 32;
-const INT2_BTREE_OPS_OID: u32 = 1979;
-const INT4_BTREE_OPS_OID: u32 = 1978;
-const INT8_BTREE_OPS_OID: u32 = 3124;
-const OID_BTREE_OPS_OID: u32 = 1981;
-const TEXT_BTREE_OPS_OID: u32 = 3126;
-const INTEGER_BTREE_FAMILY_OID: u32 = 1976;
-const OID_BTREE_FAMILY_OID: u32 = 1989;
-const TEXT_BTREE_FAMILY_OID: u32 = 1994;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -210,6 +186,21 @@ pub struct FastPgRustCatalogCast {
     pub context: u8,
     pub method: u8,
     pub _padding: [u8; 2],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogOpclass {
+    pub oid: u32,
+    pub method_oid: u32,
+    pub namespace_oid: u32,
+    pub owner_oid: u32,
+    pub family_oid: u32,
+    pub input_type_oid: u32,
+    pub key_type_oid: u32,
+    pub is_default: u8,
+    pub _padding: [u8; 3],
+    pub name: [c_char; NAMEDATALEN],
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -972,17 +963,9 @@ fn primary_key_index_to_ffi(
 }
 
 fn virtual_catalog_column_count(relation_oid: Oid) -> u16 {
-    match relation_oid.0 {
-        PG_CLASS_RELATION_ID => PG_CLASS_ATTRIBUTE_COUNT,
-        PG_ATTRIBUTE_RELATION_ID => PG_ATTRIBUTE_ATTRIBUTE_COUNT,
-        1255 => PG_PROC_ATTRIBUTE_COUNT,
-        1247 => PG_TYPE_ATTRIBUTE_COUNT,
-        PG_INDEX_RELATION_ID => PG_INDEX_ATTRIBUTE_COUNT,
-        2615 => PG_NAMESPACE_ATTRIBUTE_COUNT,
-        PG_CONSTRAINT_RELATION_ID => PG_CONSTRAINT_ATTRIBUTE_COUNT,
-        PG_OPCLASS_RELATION_ID => PG_OPCLASS_ATTRIBUTE_COUNT,
-        _ => 0,
-    }
+    static_catalog_by_relation_oid(relation_oid)
+        .map(|table| table.columns.len().min(u16::MAX as usize) as u16)
+        .unwrap_or(0)
 }
 
 fn virtual_catalog_relation_to_ffi(
@@ -1004,6 +987,18 @@ fn column_to_ffi(column: &ColumnRecord) -> FastPgRustCatalogColumn {
         type_oid: column.type_oid.0,
         type_mod: column.type_mod,
         is_not_null: u8::from(column.is_not_null),
+        _padding: [0; 3],
+    }
+}
+
+fn static_catalog_column_to_ffi(
+    column: &fastpg_catalog::StaticCatalogColumn,
+) -> FastPgRustCatalogColumn {
+    FastPgRustCatalogColumn {
+        name: fixed_c_name(column.name),
+        type_oid: column.type_oid.0,
+        type_mod: -1,
+        is_not_null: u8::from(column.attnotnull),
         _padding: [0; 3],
     }
 }
@@ -1109,6 +1104,103 @@ fn cast_to_ffi(record: &fastpg_catalog::PgCastRecord) -> FastPgRustCatalogCast {
         method: record.method,
         _padding: [0; 2],
     }
+}
+
+fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
+    match value {
+        CatalogValue::Oid(value) => Some(*value),
+        CatalogValue::Int32(value) => u32::try_from(*value).ok().map(Oid),
+        CatalogValue::Int16(value) => u32::try_from(*value).ok().map(Oid),
+        CatalogValue::Raw(value) => value.parse::<u32>().ok().map(Oid),
+        _ => None,
+    }
+}
+
+fn catalog_value_bool(value: &CatalogValue) -> Option<bool> {
+    match value {
+        CatalogValue::Bool(value) => Some(*value),
+        CatalogValue::Raw(value) => match value.as_str() {
+            "t" | "true" => Some(true),
+            "f" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn catalog_value_name(value: &CatalogValue) -> Option<&str> {
+    match value {
+        CatalogValue::Name(value) | CatalogValue::Text(value) | CatalogValue::Raw(value) => {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+fn opclass_to_ffi(row: &fastpg_catalog::CatalogRow) -> Option<FastPgRustCatalogOpclass> {
+    let table = static_catalog_by_name("pg_opclass")?;
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let method_oid = catalog_row_value(table, row, "opcmethod").and_then(catalog_value_oid)?;
+    let name = catalog_row_value(table, row, "opcname").and_then(catalog_value_name)?;
+    let namespace_oid =
+        catalog_row_value(table, row, "opcnamespace").and_then(catalog_value_oid)?;
+    let owner_oid = catalog_row_value(table, row, "opcowner").and_then(catalog_value_oid)?;
+    let family_oid = catalog_row_value(table, row, "opcfamily").and_then(catalog_value_oid)?;
+    let input_type_oid = catalog_row_value(table, row, "opcintype").and_then(catalog_value_oid)?;
+    let is_default = catalog_row_value(table, row, "opcdefault").and_then(catalog_value_bool)?;
+    let key_type_oid = catalog_row_value(table, row, "opckeytype").and_then(catalog_value_oid)?;
+
+    Some(FastPgRustCatalogOpclass {
+        oid: oid.0,
+        method_oid: method_oid.0,
+        namespace_oid: namespace_oid.0,
+        owner_oid: owner_oid.0,
+        family_oid: family_oid.0,
+        input_type_oid: input_type_oid.0,
+        key_type_oid: key_type_oid.0,
+        is_default: u8::from(is_default),
+        _padding: [0; 3],
+        name: fixed_c_name(name),
+    })
+}
+
+fn opclass_by_oid(oid: Oid) -> Option<FastPgRustCatalogOpclass> {
+    catalog_rows(static_catalog_by_name("pg_opclass")?.oid)
+        .into_iter()
+        .find_map(|row| {
+            let record = opclass_to_ffi(&row)?;
+            (record.oid == oid.0).then_some(record)
+        })
+}
+
+fn opclass_by_name(
+    method_oid: Oid,
+    name: &str,
+    namespace_oid: Oid,
+) -> Option<FastPgRustCatalogOpclass> {
+    let name = name.trim().to_ascii_lowercase();
+    catalog_rows(static_catalog_by_name("pg_opclass")?.oid)
+        .into_iter()
+        .find_map(|row| {
+            let record = opclass_to_ffi(&row)?;
+            let record_name = c_name_to_string(&record.name);
+            (record.method_oid == method_oid.0
+                && record.namespace_oid == namespace_oid.0
+                && record_name == name)
+                .then_some(record)
+        })
+}
+
+fn c_name_to_string(name: &[c_char; NAMEDATALEN]) -> String {
+    let len = name
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(NAMEDATALEN);
+    let bytes = name[..len]
+        .iter()
+        .map(|byte| *byte as u8)
+        .collect::<Vec<_>>();
+    String::from_utf8_lossy(&bytes).into_owned()
 }
 
 fn invalid_ffi_argument(message: String) -> CatalogError {
@@ -1684,6 +1776,14 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
             *out = column_to_ffi(column);
         }
         return true;
+    } else if let Some(table) = static_catalog_by_relation_oid(Oid(relation_oid)) {
+        let Some(column) = table.columns.get(column_index) else {
+            return false;
+        };
+        unsafe {
+            *out = static_catalog_column_to_ffi(column);
+        }
+        return true;
     } else {
         return false;
     };
@@ -1963,8 +2063,44 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_signature(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
+/// C callers must pass a valid, null-terminated string pointer for `name`.
+pub unsafe extern "C" fn fastpg_rust_catalog_operator_count_by_name(name: *const c_char) -> usize {
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return 0;
+    };
+    builtin_operators_by_name(&name).count()
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid, null-terminated string pointer for `name` and a
+/// valid output pointer for `out`.
+pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_name_index(
+    name: *const c_char,
+    index: usize,
+    out: *mut FastPgRustCatalogOperator,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let Some(record) = builtin_operators_by_name(&name).nth(index) else {
+        return false;
+    };
+
+    unsafe {
+        *out = operator_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer for `out`.
 pub unsafe extern "C" fn fastpg_rust_catalog_cast_by_source_target(
     source_type_oid: u32,
     target_type_oid: u32,
@@ -1980,6 +2116,72 @@ pub unsafe extern "C" fn fastpg_rust_catalog_cast_by_source_target(
 
     unsafe {
         *out = cast_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer for `out`.
+pub unsafe extern "C" fn fastpg_rust_catalog_opclass_by_oid(
+    oid: u32,
+    out: *mut FastPgRustCatalogOpclass,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(record) = opclass_by_oid(Oid(oid)) else {
+        return false;
+    };
+    unsafe {
+        *out = record;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid, null-terminated string pointer for `name` and a
+/// valid output pointer for `out`.
+pub unsafe extern "C" fn fastpg_rust_catalog_opclass_by_name(
+    method_oid: u32,
+    name: *const c_char,
+    namespace_oid: u32,
+    out: *mut FastPgRustCatalogOpclass,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let Some(record) = opclass_by_name(Oid(method_oid), &name, Oid(namespace_oid)) else {
+        return false;
+    };
+    unsafe {
+        *out = record;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer for `oid_out`.
+pub unsafe extern "C" fn fastpg_rust_catalog_btree_opclass_for_type(
+    type_oid: u32,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let Some(opclass_oid) = catalog_btree_opclass_for_type(Oid(type_oid)) else {
+        return false;
+    };
+    unsafe {
+        *oid_out = opclass_oid.0;
     }
     true
 }
@@ -2696,405 +2898,96 @@ fn oidvector_datum(values: &[u32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
 }
 
-fn pg_attribute_scan_row(
-    relation_oid: Oid,
-    attnum: i16,
-    name: &str,
-    type_oid: Oid,
-    type_mod: i32,
-    is_not_null: bool,
-    payloads: &mut Vec<Box<[u8]>>,
-) -> Option<Row> {
-    let type_record = lookup_builtin_type(type_oid)?;
-    Some(Row {
-        row_id: ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
-        cells: vec![
-            datum(relation_oid.0 as usize),
-            name_datum(name, payloads),
-            datum(type_oid.0 as usize),
-            int2_datum(type_record.typlen),
-            int2_datum(attnum),
-            int4_datum(type_mod),
-            int2_datum(0),
-            bool_datum(type_record.typbyval),
-            char_datum(type_record.typalign),
-            char_datum(type_record.typstorage),
-            char_datum(0),
-            bool_datum(is_not_null),
-            bool_datum(false),
-            bool_datum(false),
-            char_datum(0),
-            char_datum(0),
-            bool_datum(false),
-            bool_datum(true),
-            int2_datum(0),
-            datum(type_record.typcollation.0 as usize),
-            int2_datum(-1),
-            null_datum(),
-            null_datum(),
-            null_datum(),
-            null_datum(),
-        ],
-    })
+fn text_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
+    payloads.push(postgres_text_payload(value.as_bytes()));
+    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
 }
 
-fn push_system_attribute_rows(
-    rows: &mut Vec<Row>,
+fn catalog_value_to_cell(
+    column: &fastpg_catalog::StaticCatalogColumn,
+    value: &CatalogValue,
     payloads: &mut Vec<Box<[u8]>>,
-    relation_oid: Oid,
-) {
-    let system_attributes = [
-        ("ctid", -1, TID_OID),
-        ("xmin", -2, XID_OID),
-        ("cmin", -3, CID_OID),
-        ("xmax", -4, XID_OID),
-        ("cmax", -5, CID_OID),
-        ("tableoid", -6, OID_OID),
-    ];
-    for (name, attnum, type_oid) in system_attributes {
-        if let Some(row) =
-            pg_attribute_scan_row(relation_oid, attnum, name, type_oid, -1, true, payloads)
-        {
-            rows.push(row);
+) -> Cell {
+    match value {
+        CatalogValue::Null => null_datum(),
+        CatalogValue::Bool(value) => bool_datum(*value),
+        CatalogValue::Char(value) => char_datum(*value),
+        CatalogValue::Int16(value) => int2_datum(*value),
+        CatalogValue::Int32(value) => int4_datum(*value),
+        CatalogValue::Float32(value) => float4_datum(*value),
+        CatalogValue::Oid(value) => datum(value.0 as usize),
+        CatalogValue::Name(value) => name_datum(value, payloads),
+        CatalogValue::Text(value) => text_datum(value, payloads),
+        CatalogValue::OidVector(values) => {
+            let values = values.iter().map(|oid| oid.0).collect::<Vec<_>>();
+            oidvector_datum(&values, payloads)
         }
+        CatalogValue::Int2Vector(values) => int2vector_datum(values, payloads),
+        CatalogValue::Raw(value) => match column.type_oid {
+            NAME_OID => name_datum(value, payloads),
+            TEXT_OID | PG_NODE_TREE_OID => text_datum(value, payloads),
+            OID_OID => value
+                .parse::<u32>()
+                .map(|value| datum(value as usize))
+                .unwrap_or_else(|_| datum(0)),
+            INT2_OID => value
+                .parse::<i16>()
+                .map(int2_datum)
+                .unwrap_or_else(|_| int2_datum(0)),
+            INT4_OID => value
+                .parse::<i32>()
+                .map(int4_datum)
+                .unwrap_or_else(|_| int4_datum(0)),
+            OIDVECTOR_OID => {
+                let values = value
+                    .split_whitespace()
+                    .filter_map(|part| part.parse::<u32>().ok())
+                    .collect::<Vec<_>>();
+                oidvector_datum(&values, payloads)
+            }
+            INT2VECTOR_OID => {
+                let values = value
+                    .split_whitespace()
+                    .filter_map(|part| part.parse::<i16>().ok())
+                    .collect::<Vec<_>>();
+                int2vector_datum(&values, payloads)
+            }
+            _ => null_datum(),
+        },
     }
 }
 
-fn push_user_attribute_rows(
-    rows: &mut Vec<Row>,
-    payloads: &mut Vec<Box<[u8]>>,
-    relation_oid: Oid,
-    columns: &[ColumnRecord],
-) {
-    for (index, column) in columns.iter().enumerate() {
-        let Some(attnum) = i16::try_from(index + 1).ok() else {
-            continue;
-        };
-        if let Some(row) = pg_attribute_scan_row(
-            relation_oid,
-            attnum,
-            &column.name,
-            column.type_oid,
-            column.type_mod,
-            column.is_not_null,
-            payloads,
-        ) {
-            rows.push(row);
-        }
-    }
-}
-
-fn pg_attribute_scan_state() -> ScanState {
+fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
+    let table = static_catalog_by_relation_oid(relation_oid)?;
     let mut payloads = Vec::new();
-    let mut rows = Vec::new();
-
-    for relation in relations() {
-        push_system_attribute_rows(&mut rows, &mut payloads, relation.oid);
-        push_user_attribute_rows(&mut rows, &mut payloads, relation.oid, &relation.columns);
-
-        let Some(index_oid) = primary_key_index_oid(&relation) else {
-            continue;
-        };
-        let index_columns = relation
-            .primary_key
-            .iter()
-            .filter_map(|primary_key_column| {
-                relation
+    let rows = catalog_rows(relation_oid)
+        .into_iter()
+        .filter_map(|catalog_row| {
+            if catalog_row.values.len() != table.columns.len() {
+                return None;
+            }
+            Some(Row {
+                row_id: catalog_row.row_id,
+                cells: table
                     .columns
                     .iter()
-                    .find(|column| &column.name == primary_key_column)
-                    .cloned()
+                    .zip(catalog_row.values.iter())
+                    .map(|(column, value)| catalog_value_to_cell(column, value, &mut payloads))
+                    .collect(),
             })
-            .collect::<Vec<_>>();
-        push_system_attribute_rows(&mut rows, &mut payloads, index_oid);
-        push_user_attribute_rows(&mut rows, &mut payloads, index_oid, &index_columns);
-    }
-
-    ScanState {
-        rows,
-        payloads,
-        next_index: 0,
-    }
-}
-
-fn btree_opclass_for_type(type_oid: u32) -> Option<u32> {
-    match Oid(type_oid) {
-        INT2_OID => Some(INT2_BTREE_OPS_OID),
-        INT4_OID => Some(INT4_BTREE_OPS_OID),
-        INT8_OID => Some(INT8_BTREE_OPS_OID),
-        OID_OID => Some(OID_BTREE_OPS_OID),
-        TEXT_OID | VARCHAR_OID => Some(TEXT_BTREE_OPS_OID),
-        _ => None,
-    }
-}
-
-fn pg_index_scan_row(
-    index_info: FastPgRustPrimaryKeyIndexInfo,
-    payloads: &mut Vec<Box<[u8]>>,
-) -> Option<Row> {
-    let key_count = usize::from(index_info.key_count);
-    if key_count == 0 || key_count > FASTPG_MAX_INDEX_KEYS {
-        return None;
-    }
-
-    let attnums = &index_info.attnums[..key_count];
-    let collations = &index_info.collation_oids[..key_count];
-    let opclasses = index_info.type_oids[..key_count]
-        .iter()
-        .copied()
-        .map(btree_opclass_for_type)
-        .collect::<Option<Vec<_>>>()?;
-    let options = vec![0i16; key_count];
-
-    Some(Row {
-        row_id: index_info.index_oid as u64,
-        cells: vec![
-            datum(index_info.index_oid as usize),
-            datum(index_info.heap_oid as usize),
-            int2_datum(index_info.key_count as i16),
-            int2_datum(index_info.key_count as i16),
-            bool_datum(true),
-            bool_datum(false),
-            bool_datum(true),
-            bool_datum(false),
-            bool_datum(true),
-            bool_datum(false),
-            bool_datum(true),
-            bool_datum(false),
-            bool_datum(true),
-            bool_datum(true),
-            bool_datum(false),
-            int2vector_datum(attnums, payloads),
-            oidvector_datum(collations, payloads),
-            oidvector_datum(&opclasses, payloads),
-            int2vector_datum(&options, payloads),
-            null_datum(),
-            null_datum(),
-        ],
-    })
-}
-
-fn pg_index_scan_state() -> ScanState {
-    let mut payloads = Vec::new();
-    let mut rows = Vec::new();
-
-    for relation in relations() {
-        let Some(index_oid) = primary_key_index_oid(&relation) else {
-            continue;
-        };
-        let Some(index_info) = primary_key_index_info(&relation, index_oid) else {
-            continue;
-        };
-        if let Some(row) = pg_index_scan_row(index_info, &mut payloads) {
-            rows.push(row);
-        }
-    }
-
-    ScanState {
-        rows,
-        payloads,
-        next_index: 0,
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PgOpclassScanRow {
-    oid: u32,
-    name: &'static str,
-    family_oid: u32,
-    input_type_oid: Oid,
-}
-
-fn pg_opclass_scan_row(record: PgOpclassScanRow, payloads: &mut Vec<Box<[u8]>>) -> Row {
-    Row {
-        row_id: record.oid as u64,
-        cells: vec![
-            datum(record.oid as usize),
-            datum(BTREE_INDEX_AM_OID as usize),
-            name_datum(record.name, payloads),
-            datum(PG_CATALOG_NAMESPACE_OID.0 as usize),
-            datum(BOOTSTRAP_SUPERUSER_OID as usize),
-            datum(record.family_oid as usize),
-            datum(record.input_type_oid.0 as usize),
-            bool_datum(true),
-            datum(0),
-        ],
-    }
-}
-
-fn pg_opclass_scan_state() -> ScanState {
-    let mut payloads = Vec::new();
-    let opclasses = [
-        PgOpclassScanRow {
-            oid: INT2_BTREE_OPS_OID,
-            name: "int2_ops",
-            family_oid: INTEGER_BTREE_FAMILY_OID,
-            input_type_oid: INT2_OID,
-        },
-        PgOpclassScanRow {
-            oid: INT4_BTREE_OPS_OID,
-            name: "int4_ops",
-            family_oid: INTEGER_BTREE_FAMILY_OID,
-            input_type_oid: INT4_OID,
-        },
-        PgOpclassScanRow {
-            oid: INT8_BTREE_OPS_OID,
-            name: "int8_ops",
-            family_oid: INTEGER_BTREE_FAMILY_OID,
-            input_type_oid: INT8_OID,
-        },
-        PgOpclassScanRow {
-            oid: OID_BTREE_OPS_OID,
-            name: "oid_ops",
-            family_oid: OID_BTREE_FAMILY_OID,
-            input_type_oid: OID_OID,
-        },
-        PgOpclassScanRow {
-            oid: TEXT_BTREE_OPS_OID,
-            name: "text_ops",
-            family_oid: TEXT_BTREE_FAMILY_OID,
-            input_type_oid: TEXT_OID,
-        },
-    ];
-    let rows = opclasses
-        .into_iter()
-        .map(|opclass| pg_opclass_scan_row(opclass, &mut payloads))
+        })
         .collect();
-
-    ScanState {
+    Some(ScanState {
         rows,
         payloads,
         next_index: 0,
-    }
-}
-
-fn empty_scan_state() -> ScanState {
-    ScanState {
-        rows: Vec::new(),
-        payloads: Vec::new(),
-        next_index: 0,
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PgClassScanRelation {
-    oid: u32,
-    namespace_oid: u32,
-    name: String,
-    column_count: u16,
-    relkind: u8,
-    has_index: bool,
-}
-
-fn pg_class_scan_row(relation: PgClassScanRelation, payloads: &mut Vec<Box<[u8]>>) -> Row {
-    Row {
-        row_id: relation.oid as u64,
-        cells: vec![
-            datum(relation.oid as usize),
-            name_datum(&relation.name, payloads),
-            datum(relation.namespace_oid as usize),
-            datum(0),
-            datum(0),
-            datum(BOOTSTRAP_SUPERUSER_OID as usize),
-            datum(if relation.relkind == b'i' {
-                BTREE_INDEX_AM_OID
-            } else {
-                HEAP_TABLE_AM_OID
-            } as usize),
-            datum(relation.oid as usize),
-            datum(0),
-            datum(0),
-            float4_datum(-1.0),
-            datum(0),
-            datum(0),
-            datum(0),
-            bool_datum(relation.has_index),
-            bool_datum(false),
-            char_datum(b'p'),
-            char_datum(relation.relkind),
-            datum(relation.column_count as usize),
-            datum(0),
-            bool_datum(false),
-            bool_datum(false),
-            bool_datum(false),
-            bool_datum(false),
-            bool_datum(false),
-            bool_datum(true),
-            char_datum(b'n'),
-            bool_datum(false),
-            datum(0),
-            datum(FIRST_NORMAL_TRANSACTION_ID as usize),
-            datum(FIRST_MULTI_XACT_ID as usize),
-            null_datum(),
-            null_datum(),
-            null_datum(),
-        ],
-    }
-}
-
-fn pg_class_scan_state() -> ScanState {
-    let mut payloads = Vec::new();
-    let mut rows = Vec::new();
-
-    rows.extend(virtual_catalogs().iter().map(|relation| {
-        pg_class_scan_row(
-            PgClassScanRelation {
-                oid: relation.relation_oid.0,
-                namespace_oid: PG_CATALOG_NAMESPACE_OID.0,
-                name: relation.name.to_owned(),
-                column_count: virtual_catalog_column_count(relation.relation_oid),
-                relkind: b'r',
-                has_index: false,
-            },
-            &mut payloads,
-        )
-    }));
-    for relation in relations() {
-        let has_primary_key = !relation.primary_key.is_empty();
-        rows.push(pg_class_scan_row(
-            PgClassScanRelation {
-                oid: relation.oid.0,
-                namespace_oid: relation.namespace.0,
-                name: relation.name.clone(),
-                column_count: relation.columns.len().min(u16::MAX as usize) as u16,
-                relkind: b'r',
-                has_index: has_primary_key,
-            },
-            &mut payloads,
-        ));
-        if has_primary_key && let Some(index_oid) = primary_key_index_oid(&relation) {
-            rows.push(pg_class_scan_row(
-                PgClassScanRelation {
-                    oid: index_oid.0,
-                    namespace_oid: relation.namespace.0,
-                    name: primary_key_index_name(&relation),
-                    column_count: relation.primary_key.len().min(u16::MAX as usize) as u16,
-                    relkind: b'i',
-                    has_index: false,
-                },
-                &mut payloads,
-            ));
-        }
-    }
-
-    ScanState {
-        rows,
-        payloads,
-        next_index: 0,
-    }
+    })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
-    let virtual_scan = match relid {
-        PG_CLASS_RELATION_ID => Some(pg_class_scan_state()),
-        PG_ATTRIBUTE_RELATION_ID => Some(pg_attribute_scan_state()),
-        PG_INDEX_RELATION_ID => Some(pg_index_scan_state()),
-        PG_OPCLASS_RELATION_ID => Some(pg_opclass_scan_state()),
-        PG_CONSTRAINT_RELATION_ID => Some(empty_scan_state()),
-        _ if virtual_catalog_by_relation_oid(Oid(relid)).is_some() => Some(empty_scan_state()),
-        _ => None,
-    };
+    let virtual_scan =
+        virtual_catalog_by_relation_oid(Oid(relid)).and_then(|_| catalog_scan_state(Oid(relid)));
 
     with_storage(|state, session| {
         let scan = virtual_scan.unwrap_or_else(|| {
@@ -3238,6 +3131,7 @@ unsafe fn copy_row_to_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fastpg_catalog::builtin_namespaces;
     use std::ptr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -3437,6 +3331,55 @@ mod tests {
                 0,
             ));
         }
+    }
+
+    #[test]
+    fn pg_namespace_scan_exposes_builtin_namespaces() {
+        const PG_NAMESPACE_RELATION_ID: u32 = 2615;
+        const PG_NAMESPACE_ATTRIBUTE_COUNT: usize = 4;
+
+        let _guard = test_guard();
+        let scan = fastpg_rust_scan_begin(PG_NAMESPACE_RELATION_ID);
+        let mut rows = Vec::new();
+
+        loop {
+            let mut values = [0usize; PG_NAMESPACE_ATTRIBUTE_COUNT];
+            let mut nulls = [0u8; PG_NAMESPACE_ATTRIBUTE_COUNT];
+            let mut row_id = 0;
+            let found = unsafe {
+                fastpg_rust_scan_next(
+                    scan,
+                    1,
+                    values.as_mut_ptr(),
+                    nulls.as_mut_ptr(),
+                    values.len(),
+                    &mut row_id,
+                )
+            };
+            if !found {
+                break;
+            }
+
+            let name = unsafe { CStr::from_ptr(values[1] as *const c_char) }
+                .to_string_lossy()
+                .into_owned();
+            rows.push((row_id, values[0] as u32, name, values[2] as u32, nulls[3]));
+        }
+        fastpg_rust_scan_end(scan);
+
+        let expected = builtin_namespaces()
+            .iter()
+            .map(|record| {
+                (
+                    record.oid.0 as u64,
+                    record.oid.0,
+                    record.name.to_owned(),
+                    record.owner.0,
+                    1,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(rows, expected);
     }
 
     #[test]

@@ -69,7 +69,7 @@ outside the fastpg test-server scope.
 | SQL parser | [x] | Reuses PostgreSQL parser |
 | Analyzer, rewriter, planner, optimizer | [x] | Reuses PostgreSQL pipeline for supported statements |
 | Executor and expression evaluation | [x] | Reuses PostgreSQL executor infrastructure where it can run on fastpg storage |
-| DDL | [ ] | Basic table create/drop/truncate and primary-key creation are supported; broader schema coverage is planned |
+| DDL | [ ] | Basic table create/drop/truncate and primary-key creation are supported; selected regression-setup utilities such as `SET`, `GRANT`, tablespaces, and `COMMENT ON` are accepted as compatibility no-ops |
 | `VACUUM` and `ANALYZE` | [x] | Accepted as no-op or lightweight test-compatibility hooks |
 | `INSERT`, `SELECT`, `UPDATE`, `DELETE` | [x] | Current in-memory table and planner-node coverage |
 | `COPY FROM STDIN` | [x] | Relation text input; file/program/query variants are not supported today |
@@ -78,7 +78,7 @@ outside the fastpg test-server scope.
 | Catalog and schema introspection | [x] | Partial in-memory `pg_catalog` support for current analyzer/planner/client needs |
 | Types, operators, functions, casts | [x] | Partial built-in support; more are added as tests and pgbench paths need them |
 | Primary keys | [x] | Catalog visibility, uniqueness, and primary-key lookup support |
-| Secondary indexes | [x] | Partial support; broader index coverage is ongoing |
+| Secondary index DDL | [x] | `CREATE INDEX` accepts built-in access methods (`btree`, `hash`, `gist`, `spgist`, `gin`, `brin`) and unique indexes so schema setup succeeds; indexes are not used for accelerated execution |
 | Joins and aggregation | [x] | Partial support; simple joins and `GROUP BY` are covered |
 | WAL, durability, crash recovery | Not supported | Replaced by disposable in-memory state |
 | Shared buffers, heap files, pagers | Not supported | Replaced by Rust in-memory storage |
@@ -93,8 +93,9 @@ outside the fastpg test-server scope.
 - Tests that need ordinary Postgres clients and SQL behavior.
 - Test workloads that create schema, load fixtures, run transactions, and reset
   state quickly.
-- Compatibility work where unsupported Postgres features fail clearly instead
-  of pretending to work.
+- Compatibility work where unsupported Postgres features either fail clearly or
+  are deliberately accepted as no-op shims so upstream regression SQL can be
+  reused.
 
 ## What This Is Not For
 

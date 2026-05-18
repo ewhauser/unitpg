@@ -183,6 +183,20 @@ typedef struct FastPgRustCatalogCast
 	uint8_t		_padding[2];
 } FastPgRustCatalogCast;
 
+typedef struct FastPgRustCatalogOpclass
+{
+	uint32_t	oid;
+	uint32_t	method_oid;
+	uint32_t	namespace_oid;
+	uint32_t	owner_oid;
+	uint32_t	family_oid;
+	uint32_t	input_type_oid;
+	uint32_t	key_type_oid;
+	uint8_t		is_default;
+	uint8_t		_padding[3];
+	char		name[NAMEDATALEN];
+} FastPgRustCatalogOpclass;
+
 extern bool fastpg_rust_catalog_type_by_oid(uint32_t oid,
 											FastPgRustCatalogType *out);
 extern bool fastpg_rust_catalog_type_by_name(const char *name,
@@ -224,9 +238,21 @@ extern bool fastpg_rust_catalog_operator_by_signature(const char *name,
 													  uint32_t right_type_oid,
 													  uint32_t namespace_oid,
 													  FastPgRustCatalogOperator *out);
+extern size_t fastpg_rust_catalog_operator_count_by_name(const char *name);
+extern bool fastpg_rust_catalog_operator_by_name_index(const char *name,
+													   size_t index,
+													   FastPgRustCatalogOperator *out);
 extern bool fastpg_rust_catalog_cast_by_source_target(uint32_t source_type_oid,
 													  uint32_t target_type_oid,
 													  FastPgRustCatalogCast *out);
+extern bool fastpg_rust_catalog_opclass_by_oid(uint32_t oid,
+											   FastPgRustCatalogOpclass *out);
+extern bool fastpg_rust_catalog_opclass_by_name(uint32_t method_oid,
+												const char *name,
+												uint32_t namespace_oid,
+												FastPgRustCatalogOpclass *out);
+extern bool fastpg_rust_catalog_btree_opclass_for_type(uint32_t type_oid,
+													   uint32_t *oid_out);
 extern bool fastpg_rust_catalog_create_relation(const char *name,
 												const char **column_names,
 												const uint32_t *type_oids,

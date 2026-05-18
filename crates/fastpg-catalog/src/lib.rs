@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
-use std::collections::BTreeMap;
-use std::sync::{Mutex, OnceLock};
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, OnceLock, RwLock};
 
 use fastpg_types::Oid;
 
@@ -19,7 +19,10 @@ pub const XID_OID: Oid = Oid(28);
 pub const CID_OID: Oid = Oid(29);
 pub const OIDVECTOR_OID: Oid = Oid(30);
 pub const PG_NODE_TREE_OID: Oid = Oid(194);
+pub const FLOAT4_OID: Oid = Oid(700);
 pub const FLOAT8_OID: Oid = Oid(701);
+pub const UNKNOWN_OID: Oid = Oid(705);
+pub const CHAR_ARRAY_OID: Oid = Oid(1002);
 pub const INT2_ARRAY_OID: Oid = Oid(1005);
 pub const INT4_ARRAY_OID: Oid = Oid(1007);
 pub const TEXT_ARRAY_OID: Oid = Oid(1009);
@@ -38,182 +41,85 @@ pub const INTERNAL_OID: Oid = Oid(2281);
 pub const DEFAULT_COLLATION_OID: Oid = Oid(100);
 pub const C_COLLATION_OID: Oid = Oid(950);
 
-const F_CHAROUT: Oid = Oid(33);
-const F_NAMEIN: Oid = Oid(34);
-const F_NAMEOUT: Oid = Oid(35);
-const F_INT2IN: Oid = Oid(38);
-const F_INT2OUT: Oid = Oid(39);
-const F_INT2VECTORIN: Oid = Oid(40);
-const F_INT2VECTOROUT: Oid = Oid(41);
-const F_INT4IN: Oid = Oid(42);
-const F_INT4OUT: Oid = Oid(43);
-const F_TEXTIN: Oid = Oid(46);
-const F_TEXTOUT: Oid = Oid(47);
-const F_OIDVECTORIN: Oid = Oid(54);
-const F_OIDVECTOROUT: Oid = Oid(55);
-const F_PG_NODE_TREE_IN: Oid = Oid(195);
-const F_PG_NODE_TREE_OUT: Oid = Oid(196);
-const F_PG_NODE_TREE_RECV: Oid = Oid(197);
-const F_PG_NODE_TREE_SEND: Oid = Oid(198);
-const F_INT8IN: Oid = Oid(460);
-const F_INT8OUT: Oid = Oid(461);
-const F_FLOAT8IN: Oid = Oid(214);
-const F_FLOAT8OUT: Oid = Oid(215);
-const F_ARRAY_IN: Oid = Oid(750);
-const F_ARRAY_OUT: Oid = Oid(751);
-const F_ACLITEMIN: Oid = Oid(1031);
-const F_ACLITEMOUT: Oid = Oid(1032);
-const F_BPCHARIN: Oid = Oid(1044);
-const F_BPCHAROUT: Oid = Oid(1045);
-const F_VARCHARIN: Oid = Oid(1046);
-const F_VARCHAROUT: Oid = Oid(1047);
-const F_BOOLIN: Oid = Oid(1242);
-const F_BOOLOUT: Oid = Oid(1243);
-const F_CHARIN: Oid = Oid(1245);
-const F_OIDIN: Oid = Oid(1798);
-const F_OIDOUT: Oid = Oid(1799);
-const F_TIDIN: Oid = Oid(48);
-const F_TIDOUT: Oid = Oid(49);
-const F_XIDIN: Oid = Oid(50);
-const F_XIDOUT: Oid = Oid(51);
-const F_CIDIN: Oid = Oid(52);
-const F_CIDOUT: Oid = Oid(53);
-const F_OIDEQ: Oid = Oid(184);
-const F_INT4EQ: Oid = Oid(65);
-const F_INT4LT: Oid = Oid(66);
-const F_INT4GT: Oid = Oid(147);
-const F_BTINT4CMP: Oid = Oid(351);
-const F_EQSEL: Oid = Oid(101);
-const F_EQJOINSEL: Oid = Oid(105);
-const F_INT4PL: Oid = Oid(177);
-const F_INT2RECV: Oid = Oid(2404);
-const F_INT2SEND: Oid = Oid(2405);
-const F_INT4RECV: Oid = Oid(2406);
-const F_INT4SEND: Oid = Oid(2407);
-const F_INT8RECV: Oid = Oid(2408);
-const F_INT8SEND: Oid = Oid(2409);
-const F_TEXTRECV: Oid = Oid(2414);
-const F_TEXTSEND: Oid = Oid(2415);
-const F_OIDRECV: Oid = Oid(2418);
-const F_OIDSEND: Oid = Oid(2419);
-const F_NAMERECV: Oid = Oid(2422);
-const F_NAMESEND: Oid = Oid(2423);
-const F_REGCLASSIN: Oid = Oid(2218);
-const F_REGCLASSOUT: Oid = Oid(2219);
-const F_ANYARRAYIN: Oid = Oid(2296);
-const F_ANYARRAYOUT: Oid = Oid(2297);
-const F_ARRAY_RECV: Oid = Oid(2400);
-const F_ARRAY_SEND: Oid = Oid(2401);
-const F_REGCLASSRECV: Oid = Oid(2452);
-const F_REGCLASSSEND: Oid = Oid(2453);
-const F_TIDRECV: Oid = Oid(2438);
-const F_TIDSEND: Oid = Oid(2439);
-const F_XIDRECV: Oid = Oid(2440);
-const F_XIDSEND: Oid = Oid(2441);
-const F_CIDRECV: Oid = Oid(2442);
-const F_CIDSEND: Oid = Oid(2443);
-const F_INT2VECTORRECV: Oid = Oid(2410);
-const F_INT2VECTORSEND: Oid = Oid(2411);
-const F_OIDVECTORRECV: Oid = Oid(2420);
-const F_OIDVECTORSEND: Oid = Oid(2421);
-const F_FLOAT8RECV: Oid = Oid(2426);
-const F_FLOAT8SEND: Oid = Oid(2427);
-const F_BPCHARRECV: Oid = Oid(2430);
-const F_BPCHARSEND: Oid = Oid(2431);
-const F_VARCHARRECV: Oid = Oid(2432);
-const F_VARCHARSEND: Oid = Oid(2433);
-const F_BOOLRECV: Oid = Oid(2436);
-const F_BOOLSEND: Oid = Oid(2437);
-const F_TIMESTAMPRECV: Oid = Oid(2474);
-const F_TIMESTAMPSEND: Oid = Oid(2475);
-const F_TIMESTAMPTZIN: Oid = Oid(1150);
-const F_TIMESTAMPTZOUT: Oid = Oid(1151);
-const F_TIMESTAMPTZRECV: Oid = Oid(2476);
-const F_TIMESTAMPTZSEND: Oid = Oid(2477);
-const F_BPCHARTYPMODIN: Oid = Oid(2913);
-const F_BPCHARTYPMODOUT: Oid = Oid(2914);
-const F_VARCHARTYPMODIN: Oid = Oid(2915);
-const F_VARCHARTYPMODOUT: Oid = Oid(2916);
-const F_TIMESTAMPIN: Oid = Oid(1312);
-const F_TIMESTAMPOUT: Oid = Oid(1313);
-const F_TIMESTAMPTZ_TIMESTAMP: Oid = Oid(2027);
-const F_TIMESTAMP_TIMESTAMPTZ: Oid = Oid(2028);
-const F_TIMESTAMPTYPMODIN: Oid = Oid(2905);
-const F_TIMESTAMPTYPMODOUT: Oid = Oid(2906);
-const F_TIMESTAMPTZTYPMODIN: Oid = Oid(2907);
-const F_TIMESTAMPTZTYPMODOUT: Oid = Oid(2908);
-const F_ANYARRAYRECV: Oid = Oid(2502);
-const F_ANYARRAYSEND: Oid = Oid(2503);
-const F_ARRAY_SUBSCRIPT_HANDLER: Oid = Oid(6179);
-const F_INT8PL: Oid = Oid(463);
-const F_INT8EQ: Oid = Oid(467);
-const F_INT8INC: Oid = Oid(1219);
-const F_INT8DEC: Oid = Oid(3546);
-const F_COUNT_ANY: Oid = Oid(2147);
-const F_COUNT: Oid = Oid(2803);
-const F_INT8INC_ANY: Oid = Oid(2804);
-const F_INT8DEC_ANY: Oid = Oid(3547);
-const F_INT8INC_SUPPORT: Oid = Oid(6236);
-
-const O_INT4EQ: Oid = Oid(96);
-const O_INT4LT: Oid = Oid(97);
-const O_OIDEQ: Oid = Oid(607);
-const O_INT8EQ: Oid = Oid(410);
-const O_INT4GT: Oid = Oid(521);
-const O_INT4PL: Oid = Oid(551);
-const O_INT8PL: Oid = Oid(684);
-const O_OID_REGCLASS_EQ: Oid = Oid(10184);
-const O_REGCLASS_OID_EQ: Oid = Oid(10185);
-
-const C_TIMESTAMP_TIMESTAMPTZ: Oid = Oid(10178);
-const C_TIMESTAMPTZ_TIMESTAMP: Oid = Oid(10181);
-const C_OID_REGCLASS: Oid = Oid(10182);
-const C_REGCLASS_OID: Oid = Oid(10183);
-
 const INVALID_OID: Oid = Oid(0);
 const BOOTSTRAP_SUPERUSER_OID: Oid = Oid(10);
-const INTERNAL_LANGUAGE_OID: Oid = Oid(12);
-
-const TYPALIGN_CHAR: u8 = b'c';
-const TYPALIGN_SHORT: u8 = b's';
-const TYPALIGN_INT: u8 = b'i';
-const TYPALIGN_DOUBLE: u8 = b'd';
-
-const TYPDELIM_COMMA: u8 = b',';
-const TYPSTORAGE_PLAIN: u8 = b'p';
-const TYPSTORAGE_EXTENDED: u8 = b'x';
-const TYPTYPE_BASE: u8 = b'b';
-const TYPTYPE_PSEUDO: u8 = b'p';
-
-const TYPCATEGORY_ARRAY: u8 = b'A';
-const TYPCATEGORY_BOOLEAN: u8 = b'B';
-const TYPCATEGORY_DATETIME: u8 = b'D';
-const TYPCATEGORY_NUMERIC: u8 = b'N';
-const TYPCATEGORY_PSEUDO: u8 = b'P';
-const TYPCATEGORY_STRING: u8 = b'S';
-const TYPCATEGORY_INTERNAL: u8 = b'Z';
-const TYPCATEGORY_USER_DEFINED: u8 = b'U';
-
-const PROKIND_FUNCTION: u8 = b'f';
-const PROKIND_AGGREGATE: u8 = b'a';
-const PROVOLATILE_IMMUTABLE: u8 = b'i';
-const PROVOLATILE_STABLE: u8 = b's';
-const PROPARALLEL_SAFE: u8 = b's';
-const AGGKIND_NORMAL: u8 = b'n';
-const AGGMODIFY_READ_ONLY: u8 = b'r';
-
-const COERCION_CODE_ASSIGNMENT: u8 = b'a';
-const COERCION_CODE_IMPLICIT: u8 = b'i';
-const COERCION_METHOD_BINARY: u8 = b'b';
-const COERCION_METHOD_FUNCTION: u8 = b'f';
 
 pub const PG_CATALOG_NAMESPACE_OID: Oid = Oid(11);
 pub const PUBLIC_NAMESPACE_OID: Oid = Oid(2200);
 const FIRST_DYNAMIC_RELATION_OID: u32 = 16_384;
+const PG_CLASS_RELATION_OID: Oid = Oid(1259);
+const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
+const PG_TYPE_RELATION_OID: Oid = Oid(1247);
+const PG_INDEX_RELATION_OID: Oid = Oid(2610);
+const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
+const HEAP_TABLE_AM_OID: Oid = Oid(2);
+const BTREE_INDEX_AM_OID: Oid = Oid(403);
+const FIRST_NORMAL_TRANSACTION_ID: i32 = 3;
+const FIRST_MULTI_XACT_ID: i32 = 1;
+const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
 pub const VIRTUAL_CATALOG_DYNAMIC: u8 = 2;
 pub const VIRTUAL_CATALOG_EMPTY: u8 = 3;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StaticCatalogValue {
+    Null,
+    Raw(&'static str),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticCatalogColumn {
+    pub name: &'static str,
+    pub type_name: &'static str,
+    pub type_oid: Oid,
+    pub attlen: i16,
+    pub attnum: i16,
+    pub attndims: i32,
+    pub attbyval: bool,
+    pub attalign: u8,
+    pub attstorage: u8,
+    pub attnotnull: bool,
+    pub attcollation: Oid,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticCatalogRow {
+    pub row_id: u64,
+    pub values: &'static [StaticCatalogValue],
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StaticCatalogTable {
+    pub oid: Oid,
+    pub name: &'static str,
+    pub rowtype_oid: Oid,
+    pub columns: &'static [StaticCatalogColumn],
+    pub rows: &'static [StaticCatalogRow],
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum CatalogValue {
+    Null,
+    Bool(bool),
+    Char(u8),
+    Int16(i16),
+    Int32(i32),
+    Float32(f32),
+    Oid(Oid),
+    Name(String),
+    Text(String),
+    OidVector(Vec<Oid>),
+    Int2Vector(Vec<i16>),
+    Raw(String),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CatalogRow {
+    pub relation_oid: Oid,
+    pub row_id: u64,
+    pub values: Vec<CatalogValue>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum VirtualCatalogPolicy {
@@ -239,310 +145,12 @@ pub struct VirtualCatalogRecord {
     pub policy: VirtualCatalogPolicy,
 }
 
-const VIRTUAL_CATALOGS: &[VirtualCatalogRecord] = &[
-    VirtualCatalogRecord {
-        relation_oid: Oid(1247),
-        name: "pg_type",
-        policy: VirtualCatalogPolicy::Static,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1255),
-        name: "pg_proc",
-        policy: VirtualCatalogPolicy::Static,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2600),
-        name: "pg_aggregate",
-        policy: VirtualCatalogPolicy::Static,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2615),
-        name: "pg_namespace",
-        policy: VirtualCatalogPolicy::Static,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2617),
-        name: "pg_operator",
-        policy: VirtualCatalogPolicy::Static,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1259),
-        name: "pg_class",
-        policy: VirtualCatalogPolicy::Dynamic,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1249),
-        name: "pg_attribute",
-        policy: VirtualCatalogPolicy::Dynamic,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2610),
-        name: "pg_index",
-        policy: VirtualCatalogPolicy::Dynamic,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2606),
-        name: "pg_constraint",
-        policy: VirtualCatalogPolicy::Dynamic,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1260),
-        name: "pg_authid",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1261),
-        name: "pg_auth_members",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2619),
-        name: "pg_statistic",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3381),
-        name: "pg_statistic_ext",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3429),
-        name: "pg_statistic_ext_data",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2605),
-        name: "pg_cast",
-        policy: VirtualCatalogPolicy::Static,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3456),
-        name: "pg_collation",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2601),
-        name: "pg_am",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2602),
-        name: "pg_amop",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2603),
-        name: "pg_amproc",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2616),
-        name: "pg_opclass",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2753),
-        name: "pg_opfamily",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2611),
-        name: "pg_inherits",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2618),
-        name: "pg_rewrite",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3256),
-        name: "pg_policy",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2224),
-        name: "pg_sequence",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3350),
-        name: "pg_partitioned_table",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3541),
-        name: "pg_range",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2612),
-        name: "pg_language",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6243),
-        name: "pg_parameter_acl",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1213),
-        name: "pg_tablespace",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1262),
-        name: "pg_database",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(826),
-        name: "pg_default_acl",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1417),
-        name: "pg_foreign_server",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(1418),
-        name: "pg_user_mapping",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2328),
-        name: "pg_foreign_data_wrapper",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(2607),
-        name: "pg_conversion",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3079),
-        name: "pg_extension",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3118),
-        name: "pg_foreign_table",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3466),
-        name: "pg_event_trigger",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3501),
-        name: "pg_enum",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3576),
-        name: "pg_transform",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3592),
-        name: "pg_shseclabel",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3596),
-        name: "pg_seclabel",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3600),
-        name: "pg_ts_dict",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3601),
-        name: "pg_ts_parser",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3602),
-        name: "pg_ts_config",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3603),
-        name: "pg_ts_config_map",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(3764),
-        name: "pg_ts_template",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6000),
-        name: "pg_replication_origin",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6100),
-        name: "pg_subscription",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6102),
-        name: "pg_subscription_rel",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6104),
-        name: "pg_publication",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6106),
-        name: "pg_publication_rel",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6237),
-        name: "pg_publication_namespace",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6466),
-        name: "pg_propgraph_element",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6470),
-        name: "pg_propgraph_label",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6472),
-        name: "pg_propgraph_element_label",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6473),
-        name: "pg_propgraph_property",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-    VirtualCatalogRecord {
-        relation_oid: Oid(6482),
-        name: "pg_propgraph_label_property",
-        policy: VirtualCatalogPolicy::Empty,
-    },
-];
-
 pub fn virtual_catalogs() -> &'static [VirtualCatalogRecord] {
-    VIRTUAL_CATALOGS
+    generated_catalog::STATIC_VIRTUAL_CATALOGS
 }
 
 pub fn virtual_catalog_by_relation_oid(relation_oid: Oid) -> Option<VirtualCatalogRecord> {
-    VIRTUAL_CATALOGS
+    generated_catalog::STATIC_VIRTUAL_CATALOGS
         .iter()
         .copied()
         .find(|record| record.relation_oid == relation_oid)
@@ -553,7 +161,7 @@ pub fn virtual_catalog_by_name(name: &str, namespace: Oid) -> Option<VirtualCata
         return None;
     }
     let name = normalize_identifier(name);
-    VIRTUAL_CATALOGS
+    generated_catalog::STATIC_VIRTUAL_CATALOGS
         .iter()
         .copied()
         .find(|record| record.name == name.as_str())
@@ -585,69 +193,10 @@ pub struct PgOperatorRecord {
     pub join: Oid,
 }
 
-impl PgOperatorRecord {
-    const fn binary(
-        oid: Oid,
-        name: &'static str,
-        left_type: Oid,
-        right_type: Oid,
-        result_type: Oid,
-        code: Oid,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            kind: b'b',
-            can_merge: false,
-            can_hash: false,
-            left_type,
-            right_type,
-            result_type,
-            commutator: oid,
-            negator: INVALID_OID,
-            code,
-            rest: INVALID_OID,
-            join: INVALID_OID,
-        }
-    }
-
-    const fn equality(oid: Oid, left_type: Oid, right_type: Oid, code: Oid) -> Self {
-        Self {
-            oid,
-            name: "=",
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            kind: b'b',
-            can_merge: false,
-            can_hash: false,
-            left_type,
-            right_type,
-            result_type: BOOL_OID,
-            commutator: oid,
-            negator: INVALID_OID,
-            code,
-            rest: F_EQSEL,
-            join: F_EQJOINSEL,
-        }
-    }
-}
-
-const BUILTIN_OPERATORS: &[PgOperatorRecord] = &[
-    PgOperatorRecord::equality(O_INT4EQ, INT4_OID, INT4_OID, F_INT4EQ),
-    PgOperatorRecord::binary(O_INT4LT, "<", INT4_OID, INT4_OID, BOOL_OID, F_INT4LT),
-    PgOperatorRecord::binary(O_INT4GT, ">", INT4_OID, INT4_OID, BOOL_OID, F_INT4GT),
-    PgOperatorRecord::equality(O_OIDEQ, OID_OID, OID_OID, F_OIDEQ),
-    PgOperatorRecord::equality(O_INT8EQ, INT8_OID, INT8_OID, F_INT8EQ),
-    PgOperatorRecord::equality(O_OID_REGCLASS_EQ, OID_OID, REGCLASS_OID, F_OIDEQ),
-    PgOperatorRecord::equality(O_REGCLASS_OID_EQ, REGCLASS_OID, OID_OID, F_OIDEQ),
-    PgOperatorRecord::binary(O_INT4PL, "+", INT4_OID, INT4_OID, INT4_OID, F_INT4PL),
-    PgOperatorRecord::binary(O_INT8PL, "+", INT8_OID, INT8_OID, INT8_OID, F_INT8PL),
-];
-
 pub fn builtin_operator_by_oid(oid: Oid) -> Option<&'static PgOperatorRecord> {
-    BUILTIN_OPERATORS.iter().find(|record| record.oid == oid)
+    generated_catalog::STATIC_OPERATORS
+        .iter()
+        .find(|record| record.oid == oid)
 }
 
 pub fn builtin_operator_by_signature(
@@ -657,12 +206,19 @@ pub fn builtin_operator_by_signature(
     namespace: Oid,
 ) -> Option<&'static PgOperatorRecord> {
     let name = normalize_identifier(name);
-    BUILTIN_OPERATORS.iter().find(|record| {
+    generated_catalog::STATIC_OPERATORS.iter().find(|record| {
         record.name == name.as_str()
             && record.left_type == left_type
             && record.right_type == right_type
             && record.namespace == namespace
     })
+}
+
+pub fn builtin_operators_by_name(name: &str) -> impl Iterator<Item = &'static PgOperatorRecord> {
+    let name = normalize_identifier(name);
+    generated_catalog::STATIC_OPERATORS
+        .iter()
+        .filter(move |record| record.name == name.as_str())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -675,70 +231,28 @@ pub struct PgCastRecord {
     pub method: u8,
 }
 
-const BUILTIN_CASTS: &[PgCastRecord] = &[
-    PgCastRecord {
-        oid: C_TIMESTAMP_TIMESTAMPTZ,
-        source_type: TIMESTAMP_OID,
-        target_type: TIMESTAMPTZ_OID,
-        function: F_TIMESTAMP_TIMESTAMPTZ,
-        context: COERCION_CODE_IMPLICIT,
-        method: COERCION_METHOD_FUNCTION,
-    },
-    PgCastRecord {
-        oid: C_TIMESTAMPTZ_TIMESTAMP,
-        source_type: TIMESTAMPTZ_OID,
-        target_type: TIMESTAMP_OID,
-        function: F_TIMESTAMPTZ_TIMESTAMP,
-        context: COERCION_CODE_ASSIGNMENT,
-        method: COERCION_METHOD_FUNCTION,
-    },
-    PgCastRecord {
-        oid: C_OID_REGCLASS,
-        source_type: OID_OID,
-        target_type: REGCLASS_OID,
-        function: INVALID_OID,
-        context: COERCION_CODE_IMPLICIT,
-        method: COERCION_METHOD_BINARY,
-    },
-    PgCastRecord {
-        oid: C_REGCLASS_OID,
-        source_type: REGCLASS_OID,
-        target_type: OID_OID,
-        function: INVALID_OID,
-        context: COERCION_CODE_IMPLICIT,
-        method: COERCION_METHOD_BINARY,
-    },
-];
-
 pub fn builtin_cast_by_source_target(
     source_type: Oid,
     target_type: Oid,
 ) -> Option<&'static PgCastRecord> {
-    BUILTIN_CASTS
+    generated_catalog::STATIC_CASTS
         .iter()
         .find(|record| record.source_type == source_type && record.target_type == target_type)
 }
 
-const BUILTIN_NAMESPACES: &[PgNamespaceRecord] = &[
-    PgNamespaceRecord {
-        oid: PG_CATALOG_NAMESPACE_OID,
-        name: "pg_catalog",
-        owner: BOOTSTRAP_SUPERUSER_OID,
-    },
-    PgNamespaceRecord {
-        oid: PUBLIC_NAMESPACE_OID,
-        name: "public",
-        owner: BOOTSTRAP_SUPERUSER_OID,
-    },
-];
+pub fn builtin_namespaces() -> &'static [PgNamespaceRecord] {
+    generated_catalog::STATIC_NAMESPACES
+}
 
 pub fn builtin_namespace_by_oid(oid: Oid) -> Option<&'static PgNamespaceRecord> {
-    BUILTIN_NAMESPACES.iter().find(|record| record.oid == oid)
+    generated_catalog::STATIC_NAMESPACES
+        .iter()
+        .find(|record| record.oid == oid)
 }
 
 pub fn builtin_namespace_by_name(name: &str) -> Option<&'static PgNamespaceRecord> {
     let name = normalize_identifier(name);
-    BUILTIN_NAMESPACES
+    generated_catalog::STATIC_NAMESPACES
         .iter()
         .find(|record| record.name == name.as_str())
 }
@@ -771,10 +285,12 @@ impl ColumnRecord {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationRecord {
     pub oid: Oid,
+    pub type_oid: Oid,
     pub namespace: Oid,
     pub name: String,
     pub columns: Vec<ColumnRecord>,
     pub primary_key: Vec<String>,
+    pub primary_key_constraint_oid: Option<Oid>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -792,33 +308,65 @@ impl CatalogError {
     }
 }
 
+#[derive(Debug, Default)]
+struct CatalogOverlay {
+    rows: BTreeMap<u32, BTreeMap<u64, Arc<CatalogRow>>>,
+    tombstones: BTreeMap<u32, BTreeSet<u64>>,
+}
+
+impl CatalogOverlay {
+    fn insert(&mut self, row: CatalogRow) {
+        self.tombstones
+            .entry(row.relation_oid.0)
+            .or_default()
+            .remove(&row.row_id);
+        self.rows
+            .entry(row.relation_oid.0)
+            .or_default()
+            .insert(row.row_id, Arc::new(row));
+    }
+
+    fn delete(&mut self, relation_oid: Oid, row_id: u64) {
+        self.rows.entry(relation_oid.0).or_default().remove(&row_id);
+        self.tombstones
+            .entry(relation_oid.0)
+            .or_default()
+            .insert(row_id);
+    }
+}
+
 #[derive(Debug)]
 struct CatalogState {
     next_relation_oid: u32,
+    next_object_oid: u32,
     relations_by_name: BTreeMap<String, RelationRecord>,
     relation_names_by_oid: BTreeMap<u32, String>,
+    overlay: CatalogOverlay,
     generation: u64,
 }
 
 impl Default for CatalogState {
     fn default() -> Self {
+        let first_dynamic_oid = FIRST_DYNAMIC_RELATION_OID.max(max_static_oid().saturating_add(1));
         Self {
-            next_relation_oid: FIRST_DYNAMIC_RELATION_OID,
+            next_relation_oid: first_dynamic_oid,
+            next_object_oid: first_dynamic_oid,
             relations_by_name: BTreeMap::new(),
             relation_names_by_oid: BTreeMap::new(),
+            overlay: CatalogOverlay::default(),
             generation: 1,
         }
     }
 }
 
-static CATALOG: OnceLock<Mutex<CatalogState>> = OnceLock::new();
+static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
 
-fn catalog() -> &'static Mutex<CatalogState> {
-    CATALOG.get_or_init(|| Mutex::new(CatalogState::default()))
+fn catalog() -> &'static RwLock<CatalogState> {
+    CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
 }
 
 fn with_catalog<R>(f: impl FnOnce(&mut CatalogState) -> R) -> R {
-    match catalog().lock() {
+    match catalog().write() {
         Ok(mut state) => f(&mut state),
         Err(poisoned) => {
             let mut state = poisoned.into_inner();
@@ -827,8 +375,740 @@ fn with_catalog<R>(f: impl FnOnce(&mut CatalogState) -> R) -> R {
     }
 }
 
+fn with_catalog_read<R>(f: impl FnOnce(&CatalogState) -> R) -> R {
+    match catalog().read() {
+        Ok(state) => f(&state),
+        Err(poisoned) => {
+            let state = poisoned.into_inner();
+            f(&state)
+        }
+    }
+}
+
 fn normalize_identifier(value: &str) -> String {
     value.trim().to_ascii_lowercase()
+}
+
+pub fn static_catalogs() -> &'static [StaticCatalogTable] {
+    generated_catalog::STATIC_CATALOG_TABLES
+}
+
+pub fn static_catalog_by_relation_oid(relation_oid: Oid) -> Option<&'static StaticCatalogTable> {
+    generated_catalog::STATIC_CATALOG_TABLES
+        .iter()
+        .find(|table| table.oid == relation_oid)
+}
+
+pub fn static_catalog_by_name(name: &str) -> Option<&'static StaticCatalogTable> {
+    let name = normalize_identifier(name);
+    generated_catalog::STATIC_CATALOG_TABLES
+        .iter()
+        .find(|table| table.name == name.as_str())
+}
+
+fn max_static_oid() -> u32 {
+    generated_catalog::STATIC_CATALOG_TABLES
+        .iter()
+        .flat_map(|table| {
+            let oid_column = table.columns.iter().position(|column| column.name == "oid");
+            table
+                .rows
+                .iter()
+                .filter_map(move |row| {
+                    oid_column
+                        .and_then(|index| row.values.get(index))
+                        .and_then(|value| static_value_as_u32(*value))
+                })
+                .chain(std::iter::once(table.oid.0))
+                .chain(std::iter::once(table.rowtype_oid.0))
+        })
+        .max()
+        .unwrap_or(FIRST_DYNAMIC_RELATION_OID)
+}
+
+fn static_value_as_u32(value: StaticCatalogValue) -> Option<u32> {
+    match value {
+        StaticCatalogValue::Raw("-") => Some(0),
+        StaticCatalogValue::Raw("NAMEDATALEN") => Some(64),
+        StaticCatalogValue::Raw(value) => value.parse::<u32>().ok(),
+        StaticCatalogValue::Null => None,
+    }
+}
+
+fn static_value_as_i32(value: StaticCatalogValue) -> Option<i32> {
+    match value {
+        StaticCatalogValue::Raw("-") => Some(0),
+        StaticCatalogValue::Raw("NAMEDATALEN") => Some(64),
+        StaticCatalogValue::Raw(value) => value.parse::<i32>().ok(),
+        StaticCatalogValue::Null => None,
+    }
+}
+
+fn static_value_as_f32(value: StaticCatalogValue) -> Option<f32> {
+    match value {
+        StaticCatalogValue::Raw(value) => value.parse::<f32>().ok(),
+        StaticCatalogValue::Null => None,
+    }
+}
+
+fn static_value_as_bool(value: StaticCatalogValue) -> Option<bool> {
+    match value {
+        StaticCatalogValue::Raw("t") => Some(true),
+        StaticCatalogValue::Raw("f") => Some(false),
+        StaticCatalogValue::Raw("true") => Some(true),
+        StaticCatalogValue::Raw("false") => Some(false),
+        StaticCatalogValue::Null => None,
+        StaticCatalogValue::Raw(_) => None,
+    }
+}
+
+fn static_value_as_char(value: StaticCatalogValue) -> Option<u8> {
+    match value {
+        StaticCatalogValue::Raw("\\0") => Some(0),
+        StaticCatalogValue::Raw(value) => value.as_bytes().first().copied().or(Some(0)),
+        StaticCatalogValue::Null => None,
+    }
+}
+
+fn parse_oid_vector(value: &str) -> Vec<Oid> {
+    value
+        .split_whitespace()
+        .filter_map(|part| part.parse::<u32>().ok())
+        .map(Oid)
+        .collect()
+}
+
+fn parse_int2_vector(value: &str) -> Vec<i16> {
+    value
+        .split_whitespace()
+        .filter_map(|part| part.parse::<i16>().ok())
+        .collect()
+}
+
+fn static_value_to_catalog_value(
+    column: &StaticCatalogColumn,
+    value: StaticCatalogValue,
+) -> CatalogValue {
+    match value {
+        StaticCatalogValue::Null => CatalogValue::Null,
+        StaticCatalogValue::Raw(raw) => match column.type_oid {
+            BOOL_OID => CatalogValue::Bool(static_value_as_bool(value).unwrap_or(false)),
+            CHAR_OID => CatalogValue::Char(static_value_as_char(value).unwrap_or(0)),
+            INT2_OID => CatalogValue::Int16(static_value_as_i32(value).unwrap_or(0) as i16),
+            INT4_OID => CatalogValue::Int32(static_value_as_i32(value).unwrap_or(0)),
+            FLOAT4_OID => CatalogValue::Float32(static_value_as_f32(value).unwrap_or(0.0)),
+            NAME_OID => CatalogValue::Name(raw.to_owned()),
+            TEXT_OID | PG_NODE_TREE_OID => CatalogValue::Text(raw.to_owned()),
+            OIDVECTOR_OID => CatalogValue::OidVector(parse_oid_vector(raw)),
+            INT2VECTOR_OID => CatalogValue::Int2Vector(parse_int2_vector(raw)),
+            OID_OID | REGCLASS_OID => {
+                CatalogValue::Oid(Oid(static_value_as_u32(value).unwrap_or(0)))
+            }
+            _ if column.type_name.starts_with("reg") || column.type_name == "oid" => {
+                CatalogValue::Oid(Oid(static_value_as_u32(value).unwrap_or(0)))
+            }
+            _ if column.type_name.starts_with('_') => CatalogValue::Raw(raw.to_owned()),
+            _ => CatalogValue::Raw(raw.to_owned()),
+        },
+    }
+}
+
+fn static_row_to_catalog_row(table: &StaticCatalogTable, row: &StaticCatalogRow) -> CatalogRow {
+    CatalogRow {
+        relation_oid: table.oid,
+        row_id: row.row_id,
+        values: row
+            .values
+            .iter()
+            .copied()
+            .zip(table.columns.iter())
+            .map(|(value, column)| static_value_to_catalog_value(column, value))
+            .collect(),
+    }
+}
+
+pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
+    let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
+        return Vec::new();
+    };
+    with_catalog_read(|state| {
+        let tombstones = state.overlay.tombstones.get(&relation_oid.0);
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+        for row in table.rows {
+            if tombstones.is_some_and(|tombstones| tombstones.contains(&row.row_id)) {
+                continue;
+            }
+            rows.insert(row.row_id, static_row_to_catalog_row(table, row));
+        }
+        if let Some(overlay_rows) = state.overlay.rows.get(&relation_oid.0) {
+            for (row_id, row) in overlay_rows {
+                rows.insert(*row_id, row.as_ref().clone());
+            }
+        }
+        rows.into_values().collect()
+    })
+}
+
+pub fn catalog_row_value<'a>(
+    table: &'a StaticCatalogTable,
+    row: &'a CatalogRow,
+    column_name: &str,
+) -> Option<&'a CatalogValue> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.name == column_name)
+        .and_then(|index| row.values.get(index))
+}
+
+fn default_catalog_value(column: &StaticCatalogColumn) -> CatalogValue {
+    if !column.attnotnull {
+        return CatalogValue::Null;
+    }
+    match column.type_oid {
+        BOOL_OID => CatalogValue::Bool(false),
+        CHAR_OID => CatalogValue::Char(0),
+        INT2_OID => CatalogValue::Int16(0),
+        INT4_OID => CatalogValue::Int32(0),
+        FLOAT4_OID => CatalogValue::Float32(0.0),
+        NAME_OID => CatalogValue::Name(String::new()),
+        TEXT_OID | PG_NODE_TREE_OID => CatalogValue::Text(String::new()),
+        OIDVECTOR_OID => CatalogValue::OidVector(Vec::new()),
+        INT2VECTOR_OID => CatalogValue::Int2Vector(Vec::new()),
+        OID_OID | REGCLASS_OID => CatalogValue::Oid(INVALID_OID),
+        _ if column.type_name.starts_with("reg") => CatalogValue::Oid(INVALID_OID),
+        _ if column.type_name.starts_with('_') => CatalogValue::Null,
+        _ => CatalogValue::Raw(String::new()),
+    }
+}
+
+fn catalog_row_from_named_values(
+    relation_oid: Oid,
+    row_id: u64,
+    named_values: Vec<(&'static str, CatalogValue)>,
+) -> CatalogRow {
+    let table = static_catalog_by_relation_oid(relation_oid)
+        .unwrap_or_else(|| panic!("missing generated catalog table {}", relation_oid.0));
+    let named_values = named_values.into_iter().collect::<BTreeMap<_, _>>();
+    CatalogRow {
+        relation_oid,
+        row_id,
+        values: table
+            .columns
+            .iter()
+            .map(|column| {
+                named_values
+                    .get(column.name)
+                    .cloned()
+                    .unwrap_or_else(|| default_catalog_value(column))
+            })
+            .collect(),
+    }
+}
+
+fn relation_primary_key_index_oid(relation: &RelationRecord) -> Option<Oid> {
+    if relation.primary_key.is_empty() {
+        return None;
+    }
+    relation
+        .oid
+        .0
+        .checked_add(PRIMARY_KEY_INDEX_OID_OFFSET)
+        .map(Oid)
+}
+
+fn primary_key_index_name(relation: &RelationRecord) -> String {
+    format!("{}_pkey", relation.name)
+}
+
+fn relation_column_attnums(
+    relation: &RelationRecord,
+    columns: &[String],
+) -> Result<Vec<i16>, CatalogError> {
+    columns
+        .iter()
+        .map(|column_name| {
+            relation
+                .columns
+                .iter()
+                .position(|column| &column.name == column_name)
+                .and_then(|index| i16::try_from(index + 1).ok())
+                .ok_or_else(|| {
+                    CatalogError::new("42703", format!("column \"{column_name}\" does not exist"))
+                })
+        })
+        .collect()
+}
+
+struct PgClassOverlayInput<'a> {
+    oid: Oid,
+    namespace: Oid,
+    name: &'a str,
+    reltype: Oid,
+    relkind: u8,
+    relam: Oid,
+    column_count: usize,
+    has_index: bool,
+}
+
+fn pg_class_overlay_row(input: PgClassOverlayInput<'_>) -> CatalogRow {
+    catalog_row_from_named_values(
+        PG_CLASS_RELATION_OID,
+        input.oid.0 as u64,
+        vec![
+            ("oid", CatalogValue::Oid(input.oid)),
+            ("relname", CatalogValue::Name(input.name.to_owned())),
+            ("relnamespace", CatalogValue::Oid(input.namespace)),
+            ("reltype", CatalogValue::Oid(input.reltype)),
+            ("reloftype", CatalogValue::Oid(INVALID_OID)),
+            ("relowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
+            ("relam", CatalogValue::Oid(input.relam)),
+            ("relfilenode", CatalogValue::Oid(input.oid)),
+            ("reltablespace", CatalogValue::Oid(INVALID_OID)),
+            ("relpages", CatalogValue::Int32(0)),
+            ("reltuples", CatalogValue::Float32(-1.0)),
+            ("relallvisible", CatalogValue::Int32(0)),
+            ("relallfrozen", CatalogValue::Int32(0)),
+            ("reltoastrelid", CatalogValue::Oid(INVALID_OID)),
+            ("relhasindex", CatalogValue::Bool(input.has_index)),
+            ("relisshared", CatalogValue::Bool(false)),
+            ("relpersistence", CatalogValue::Char(b'p')),
+            ("relkind", CatalogValue::Char(input.relkind)),
+            (
+                "relnatts",
+                CatalogValue::Int16(input.column_count.min(i16::MAX as usize) as i16),
+            ),
+            ("relchecks", CatalogValue::Int16(0)),
+            ("relhasrules", CatalogValue::Bool(false)),
+            ("relhastriggers", CatalogValue::Bool(false)),
+            ("relhassubclass", CatalogValue::Bool(false)),
+            ("relrowsecurity", CatalogValue::Bool(false)),
+            ("relforcerowsecurity", CatalogValue::Bool(false)),
+            ("relispopulated", CatalogValue::Bool(true)),
+            ("relreplident", CatalogValue::Char(b'n')),
+            ("relispartition", CatalogValue::Bool(false)),
+            ("relrewrite", CatalogValue::Oid(INVALID_OID)),
+            (
+                "relfrozenxid",
+                CatalogValue::Int32(FIRST_NORMAL_TRANSACTION_ID),
+            ),
+            ("relminmxid", CatalogValue::Int32(FIRST_MULTI_XACT_ID)),
+        ],
+    )
+}
+
+fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
+    let record_type = lookup_builtin_type(Oid(2249));
+    catalog_row_from_named_values(
+        PG_TYPE_RELATION_OID,
+        relation.type_oid.0 as u64,
+        vec![
+            ("oid", CatalogValue::Oid(relation.type_oid)),
+            ("typname", CatalogValue::Name(relation.name.clone())),
+            ("typnamespace", CatalogValue::Oid(relation.namespace)),
+            ("typowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
+            ("typlen", CatalogValue::Int16(-1)),
+            ("typbyval", CatalogValue::Bool(false)),
+            ("typtype", CatalogValue::Char(b'c')),
+            ("typcategory", CatalogValue::Char(b'C')),
+            ("typispreferred", CatalogValue::Bool(false)),
+            ("typisdefined", CatalogValue::Bool(true)),
+            ("typdelim", CatalogValue::Char(b',')),
+            ("typrelid", CatalogValue::Oid(relation.oid)),
+            ("typsubscript", CatalogValue::Oid(INVALID_OID)),
+            ("typelem", CatalogValue::Oid(INVALID_OID)),
+            ("typarray", CatalogValue::Oid(INVALID_OID)),
+            (
+                "typinput",
+                CatalogValue::Oid(
+                    record_type
+                        .map(|record| record.typinput)
+                        .unwrap_or(INVALID_OID),
+                ),
+            ),
+            (
+                "typoutput",
+                CatalogValue::Oid(
+                    record_type
+                        .map(|record| record.typoutput)
+                        .unwrap_or(INVALID_OID),
+                ),
+            ),
+            (
+                "typreceive",
+                CatalogValue::Oid(
+                    record_type
+                        .map(|record| record.typreceive)
+                        .unwrap_or(INVALID_OID),
+                ),
+            ),
+            (
+                "typsend",
+                CatalogValue::Oid(
+                    record_type
+                        .map(|record| record.typsend)
+                        .unwrap_or(INVALID_OID),
+                ),
+            ),
+            ("typmodin", CatalogValue::Oid(INVALID_OID)),
+            ("typmodout", CatalogValue::Oid(INVALID_OID)),
+            ("typanalyze", CatalogValue::Oid(INVALID_OID)),
+            ("typalign", CatalogValue::Char(b'd')),
+            ("typstorage", CatalogValue::Char(b'x')),
+            ("typnotnull", CatalogValue::Bool(false)),
+            ("typbasetype", CatalogValue::Oid(INVALID_OID)),
+            ("typtypmod", CatalogValue::Int32(-1)),
+            ("typndims", CatalogValue::Int32(0)),
+            ("typcollation", CatalogValue::Oid(INVALID_OID)),
+        ],
+    )
+}
+
+const SYSTEM_ATTRIBUTE_COLUMNS: &[(&str, i16, Oid)] = &[
+    ("ctid", -1, TID_OID),
+    ("xmin", -2, XID_OID),
+    ("cmin", -3, CID_OID),
+    ("xmax", -4, XID_OID),
+    ("cmax", -5, CID_OID),
+    ("tableoid", -6, OID_OID),
+];
+
+fn pg_attribute_overlay_row_for_column(
+    relation_oid: Oid,
+    attnum: i16,
+    name: &str,
+    type_oid: Oid,
+    type_mod: i32,
+    is_not_null: bool,
+) -> Option<CatalogRow> {
+    let type_record = lookup_builtin_type(type_oid)?;
+    Some(catalog_row_from_named_values(
+        PG_ATTRIBUTE_RELATION_OID,
+        ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
+        vec![
+            ("attrelid", CatalogValue::Oid(relation_oid)),
+            ("attname", CatalogValue::Name(name.to_owned())),
+            ("atttypid", CatalogValue::Oid(type_oid)),
+            ("attlen", CatalogValue::Int16(type_record.typlen)),
+            ("attnum", CatalogValue::Int16(attnum)),
+            ("atttypmod", CatalogValue::Int32(type_mod)),
+            ("attndims", CatalogValue::Int16(0)),
+            ("attbyval", CatalogValue::Bool(type_record.typbyval)),
+            ("attalign", CatalogValue::Char(type_record.typalign)),
+            ("attstorage", CatalogValue::Char(type_record.typstorage)),
+            ("attcompression", CatalogValue::Char(0)),
+            ("attnotnull", CatalogValue::Bool(is_not_null)),
+            ("atthasdef", CatalogValue::Bool(false)),
+            ("atthasmissing", CatalogValue::Bool(false)),
+            ("attidentity", CatalogValue::Char(0)),
+            ("attgenerated", CatalogValue::Char(0)),
+            ("attisdropped", CatalogValue::Bool(false)),
+            ("attislocal", CatalogValue::Bool(true)),
+            ("attinhcount", CatalogValue::Int16(0)),
+            ("attcollation", CatalogValue::Oid(type_record.typcollation)),
+            ("attstattarget", CatalogValue::Int16(-1)),
+        ],
+    ))
+}
+
+fn pg_attribute_overlay_row(
+    relation_oid: Oid,
+    attnum: i16,
+    column: &ColumnRecord,
+) -> Option<CatalogRow> {
+    pg_attribute_overlay_row_for_column(
+        relation_oid,
+        attnum,
+        &column.name,
+        column.type_oid,
+        column.type_mod,
+        column.is_not_null,
+    )
+}
+
+fn insert_system_attribute_overlay_rows(state: &mut CatalogState, relation_oid: Oid) {
+    for (name, attnum, type_oid) in SYSTEM_ATTRIBUTE_COLUMNS {
+        if let Some(row) =
+            pg_attribute_overlay_row_for_column(relation_oid, *attnum, name, *type_oid, -1, true)
+        {
+            state.overlay.insert(row);
+        }
+    }
+}
+
+fn insert_relation_attribute_overlay_rows(state: &mut CatalogState, relation: &RelationRecord) {
+    insert_system_attribute_overlay_rows(state, relation.oid);
+    for (index, column) in relation.columns.iter().enumerate() {
+        let Some(attnum) = i16::try_from(index + 1).ok() else {
+            continue;
+        };
+        if let Some(row) = pg_attribute_overlay_row(relation.oid, attnum, column) {
+            state.overlay.insert(row);
+        }
+    }
+}
+
+fn insert_index_attribute_overlay_rows(
+    state: &mut CatalogState,
+    relation: &RelationRecord,
+    index_oid: Oid,
+) {
+    insert_system_attribute_overlay_rows(state, index_oid);
+    for (index, primary_key_column) in relation.primary_key.iter().enumerate() {
+        let Some(attnum) = i16::try_from(index + 1).ok() else {
+            continue;
+        };
+        let Some(column) = relation
+            .columns
+            .iter()
+            .find(|column| &column.name == primary_key_column)
+        else {
+            continue;
+        };
+        if let Some(row) = pg_attribute_overlay_row(index_oid, attnum, column) {
+            state.overlay.insert(row);
+        }
+    }
+}
+
+fn delete_attribute_overlay_rows(state: &mut CatalogState, relation_oid: Oid, column_count: usize) {
+    for (_name, attnum, _type_oid) in SYSTEM_ATTRIBUTE_COLUMNS {
+        state.overlay.delete(
+            PG_ATTRIBUTE_RELATION_OID,
+            ((relation_oid.0 as u64) << 16) | u64::from(*attnum as u16),
+        );
+    }
+    for index in 0..column_count {
+        let Some(attnum) = i16::try_from(index + 1).ok() else {
+            continue;
+        };
+        state.overlay.delete(
+            PG_ATTRIBUTE_RELATION_OID,
+            ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
+        );
+    }
+}
+
+fn insert_relation_overlay_rows(state: &mut CatalogState, relation: &RelationRecord) {
+    state
+        .overlay
+        .insert(pg_class_overlay_row(PgClassOverlayInput {
+            oid: relation.oid,
+            namespace: relation.namespace,
+            name: &relation.name,
+            reltype: relation.type_oid,
+            relkind: b'r',
+            relam: HEAP_TABLE_AM_OID,
+            column_count: relation.columns.len(),
+            has_index: !relation.primary_key.is_empty(),
+        }));
+    state.overlay.insert(pg_type_overlay_row(relation));
+    insert_relation_attribute_overlay_rows(state, relation);
+}
+
+fn delete_relation_overlay_rows(state: &mut CatalogState, relation: &RelationRecord) {
+    state
+        .overlay
+        .delete(PG_CLASS_RELATION_OID, relation.oid.0 as u64);
+    state
+        .overlay
+        .delete(PG_TYPE_RELATION_OID, relation.type_oid.0 as u64);
+    delete_attribute_overlay_rows(state, relation.oid, relation.columns.len());
+    if let Some(index_oid) = relation_primary_key_index_oid(relation) {
+        state
+            .overlay
+            .delete(PG_CLASS_RELATION_OID, index_oid.0 as u64);
+        state
+            .overlay
+            .delete(PG_INDEX_RELATION_OID, index_oid.0 as u64);
+        delete_attribute_overlay_rows(state, index_oid, relation.primary_key.len());
+        if let Some(constraint_oid) = relation.primary_key_constraint_oid {
+            state
+                .overlay
+                .delete(PG_CONSTRAINT_RELATION_OID, constraint_oid.0 as u64);
+        }
+    }
+}
+
+fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
+    match value {
+        CatalogValue::Oid(oid) => Some(*oid),
+        CatalogValue::Int32(value) => u32::try_from(*value).ok().map(Oid),
+        CatalogValue::Int16(value) => u32::try_from(*value).ok().map(Oid),
+        _ => None,
+    }
+}
+
+fn catalog_value_bool(value: &CatalogValue) -> Option<bool> {
+    match value {
+        CatalogValue::Bool(value) => Some(*value),
+        _ => None,
+    }
+}
+
+pub fn btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
+    static_btree_opclass_for_type(type_oid)
+}
+
+fn static_btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
+    let table = static_catalog_by_name("pg_opclass")?;
+    table.rows.iter().find_map(|static_row| {
+        let row = static_row_to_catalog_row(table, static_row);
+        let opcmethod = catalog_row_value(table, &row, "opcmethod").and_then(catalog_value_oid)?;
+        let opcintype = catalog_row_value(table, &row, "opcintype").and_then(catalog_value_oid)?;
+        let opcdefault =
+            catalog_row_value(table, &row, "opcdefault").and_then(catalog_value_bool)?;
+        let oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
+        (opcmethod == BTREE_INDEX_AM_OID && opcintype == type_oid && opcdefault).then_some(oid)
+    })
+}
+
+fn pg_index_overlay_row(
+    relation: &RelationRecord,
+    index_oid: Oid,
+    key_attnums: Vec<i16>,
+) -> Result<CatalogRow, CatalogError> {
+    let mut collations = Vec::with_capacity(key_attnums.len());
+    let mut opclasses = Vec::with_capacity(key_attnums.len());
+    for attnum in &key_attnums {
+        let column = relation
+            .columns
+            .get((*attnum as usize).saturating_sub(1))
+            .ok_or_else(|| CatalogError::new("42703", "primary key column does not exist"))?;
+        let type_record = lookup_builtin_type(column.type_oid).ok_or_else(|| {
+            CatalogError::new(
+                "42704",
+                format!("type OID {} does not exist", column.type_oid.0),
+            )
+        })?;
+        let opclass = static_btree_opclass_for_type(column.type_oid).ok_or_else(|| {
+            CatalogError::new(
+                "0A000",
+                format!(
+                    "fastpg does not have a btree opclass for type OID {}",
+                    column.type_oid.0
+                ),
+            )
+        })?;
+        collations.push(type_record.typcollation);
+        opclasses.push(opclass);
+    }
+    let key_count = key_attnums.len().min(i16::MAX as usize) as i16;
+    Ok(catalog_row_from_named_values(
+        PG_INDEX_RELATION_OID,
+        index_oid.0 as u64,
+        vec![
+            ("indexrelid", CatalogValue::Oid(index_oid)),
+            ("indrelid", CatalogValue::Oid(relation.oid)),
+            ("indnatts", CatalogValue::Int16(key_count)),
+            ("indnkeyatts", CatalogValue::Int16(key_count)),
+            ("indisunique", CatalogValue::Bool(true)),
+            ("indnullsnotdistinct", CatalogValue::Bool(false)),
+            ("indisprimary", CatalogValue::Bool(true)),
+            ("indisexclusion", CatalogValue::Bool(false)),
+            ("indimmediate", CatalogValue::Bool(true)),
+            ("indisclustered", CatalogValue::Bool(false)),
+            ("indisvalid", CatalogValue::Bool(true)),
+            ("indcheckxmin", CatalogValue::Bool(false)),
+            ("indisready", CatalogValue::Bool(true)),
+            ("indislive", CatalogValue::Bool(true)),
+            ("indisreplident", CatalogValue::Bool(false)),
+            ("indkey", CatalogValue::Int2Vector(key_attnums)),
+            ("indcollation", CatalogValue::OidVector(collations)),
+            ("indclass", CatalogValue::OidVector(opclasses)),
+            (
+                "indoption",
+                CatalogValue::Int2Vector(vec![0; key_count as usize]),
+            ),
+        ],
+    ))
+}
+
+fn pg_constraint_overlay_row(
+    relation: &RelationRecord,
+    constraint_oid: Oid,
+    index_oid: Oid,
+    key_attnums: Vec<i16>,
+) -> CatalogRow {
+    catalog_row_from_named_values(
+        PG_CONSTRAINT_RELATION_OID,
+        constraint_oid.0 as u64,
+        vec![
+            ("oid", CatalogValue::Oid(constraint_oid)),
+            (
+                "conname",
+                CatalogValue::Name(primary_key_index_name(relation)),
+            ),
+            ("connamespace", CatalogValue::Oid(relation.namespace)),
+            ("contype", CatalogValue::Char(b'p')),
+            ("condeferrable", CatalogValue::Bool(false)),
+            ("condeferred", CatalogValue::Bool(false)),
+            ("conenforced", CatalogValue::Bool(true)),
+            ("convalidated", CatalogValue::Bool(true)),
+            ("conrelid", CatalogValue::Oid(relation.oid)),
+            ("contypid", CatalogValue::Oid(INVALID_OID)),
+            ("conindid", CatalogValue::Oid(index_oid)),
+            ("conparentid", CatalogValue::Oid(INVALID_OID)),
+            ("confrelid", CatalogValue::Oid(INVALID_OID)),
+            ("confupdtype", CatalogValue::Char(b' ')),
+            ("confdeltype", CatalogValue::Char(b' ')),
+            ("confmatchtype", CatalogValue::Char(b' ')),
+            ("conislocal", CatalogValue::Bool(true)),
+            ("coninhcount", CatalogValue::Int16(0)),
+            ("connoinherit", CatalogValue::Bool(true)),
+            ("conperiod", CatalogValue::Bool(false)),
+            ("conkey", CatalogValue::Int2Vector(key_attnums)),
+        ],
+    )
+}
+
+fn insert_primary_key_overlay_rows(
+    state: &mut CatalogState,
+    relation: &RelationRecord,
+    key_attnums: Vec<i16>,
+) -> Result<(), CatalogError> {
+    let Some(index_oid) = relation_primary_key_index_oid(relation) else {
+        return Ok(());
+    };
+    state
+        .overlay
+        .insert(pg_class_overlay_row(PgClassOverlayInput {
+            oid: relation.oid,
+            namespace: relation.namespace,
+            name: &relation.name,
+            reltype: relation.type_oid,
+            relkind: b'r',
+            relam: HEAP_TABLE_AM_OID,
+            column_count: relation.columns.len(),
+            has_index: true,
+        }));
+    state
+        .overlay
+        .insert(pg_class_overlay_row(PgClassOverlayInput {
+            oid: index_oid,
+            namespace: relation.namespace,
+            name: &primary_key_index_name(relation),
+            reltype: INVALID_OID,
+            relkind: b'i',
+            relam: BTREE_INDEX_AM_OID,
+            column_count: key_attnums.len(),
+            has_index: false,
+        }));
+    state.overlay.insert(pg_index_overlay_row(
+        relation,
+        index_oid,
+        key_attnums.clone(),
+    )?);
+    insert_index_attribute_overlay_rows(state, relation, index_oid);
+    if let Some(constraint_oid) = relation.primary_key_constraint_oid {
+        state.overlay.insert(pg_constraint_overlay_row(
+            relation,
+            constraint_oid,
+            index_oid,
+            key_attnums,
+        ));
+    }
+    Ok(())
 }
 
 fn next_relation_oid(state: &mut CatalogState) -> Result<Oid, CatalogError> {
@@ -843,6 +1123,22 @@ fn next_relation_oid(state: &mut CatalogState) -> Result<Oid, CatalogError> {
         .next_relation_oid
         .checked_add(1)
         .ok_or_else(|| CatalogError::new("54000", "fastpg relation OID space is exhausted"))?;
+    state.next_object_oid = state.next_object_oid.max(state.next_relation_oid);
+    Ok(Oid(oid))
+}
+
+fn next_object_oid(state: &mut CatalogState) -> Result<Oid, CatalogError> {
+    let oid = state.next_object_oid;
+    if oid == 0 {
+        return Err(CatalogError::new(
+            "54000",
+            "fastpg object OID space is exhausted",
+        ));
+    }
+    state.next_object_oid = state
+        .next_object_oid
+        .checked_add(1)
+        .ok_or_else(|| CatalogError::new("54000", "fastpg object OID space is exhausted"))?;
     Ok(Oid(oid))
 }
 
@@ -851,7 +1147,7 @@ fn bump_generation(state: &mut CatalogState) {
 }
 
 pub fn current_generation() -> u64 {
-    with_catalog(|state| state.generation)
+    with_catalog_read(|state| state.generation)
 }
 
 pub fn create_relation(
@@ -878,13 +1174,18 @@ pub fn create_relation(
             ));
         }
 
+        let relation_oid = next_relation_oid(state)?;
+        let type_oid = next_object_oid(state)?;
         let relation = RelationRecord {
-            oid: next_relation_oid(state)?,
+            oid: relation_oid,
+            type_oid,
             namespace: PUBLIC_NAMESPACE_OID,
             name: name.clone(),
             columns,
             primary_key: Vec::new(),
+            primary_key_constraint_oid: None,
         };
+        insert_relation_overlay_rows(state, &relation);
         state
             .relation_names_by_oid
             .insert(relation.oid.0, name.clone());
@@ -898,6 +1199,7 @@ pub fn drop_relation(name: &str, missing_ok: bool) -> Result<Option<RelationReco
     let name = normalize_identifier(name);
     with_catalog(|state| match state.relations_by_name.remove(&name) {
         Some(relation) => {
+            delete_relation_overlay_rows(state, &relation);
             state.relation_names_by_oid.remove(&relation.oid.0);
             bump_generation(state);
             Ok(Some(relation))
@@ -923,15 +1225,15 @@ pub fn truncate_relation(name: &str) -> Result<RelationRecord, CatalogError> {
 
 pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
-    with_catalog(|state| state.relations_by_name.get(&name).cloned())
+    with_catalog_read(|state| state.relations_by_name.get(&name).cloned())
 }
 
 pub fn relations() -> Vec<RelationRecord> {
-    with_catalog(|state| state.relations_by_name.values().cloned().collect())
+    with_catalog_read(|state| state.relations_by_name.values().cloned().collect())
 }
 
 pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
-    with_catalog(|state| {
+    with_catalog_read(|state| {
         state
             .relation_names_by_oid
             .get(&oid.0)
@@ -965,30 +1267,36 @@ pub fn add_primary_key(name: &str, columns: Vec<String>) -> Result<(), CatalogEr
     }
 
     with_catalog(|state| {
-        let relation = state.relations_by_name.get_mut(&name).ok_or_else(|| {
-            CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
-        })?;
-        for column in &columns {
-            if !relation
-                .columns
-                .iter()
-                .any(|existing| &existing.name == column)
-            {
-                return Err(CatalogError::new(
-                    "42703",
-                    format!("column \"{column}\" does not exist"),
-                ));
+        let key_attnums = {
+            let relation = state.relations_by_name.get(&name).ok_or_else(|| {
+                CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
+            })?;
+            relation_column_attnums(relation, &columns)?
+        };
+        let constraint_oid = state
+            .relations_by_name
+            .get(&name)
+            .and_then(|relation| relation.primary_key_constraint_oid)
+            .map(Ok)
+            .unwrap_or_else(|| next_object_oid(state))?;
+        let relation_snapshot = {
+            let relation = state.relations_by_name.get_mut(&name).ok_or_else(|| {
+                CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
+            })?;
+            for column in &mut relation.columns {
+                if columns
+                    .iter()
+                    .any(|primary_key_column| primary_key_column == &column.name)
+                {
+                    column.is_not_null = true;
+                }
             }
-        }
-        for column in &mut relation.columns {
-            if columns
-                .iter()
-                .any(|primary_key_column| primary_key_column == &column.name)
-            {
-                column.is_not_null = true;
-            }
-        }
-        relation.primary_key = columns;
+            relation.primary_key = columns;
+            relation.primary_key_constraint_oid = Some(constraint_oid);
+            relation.clone()
+        };
+        insert_relation_attribute_overlay_rows(state, &relation_snapshot);
+        insert_primary_key_overlay_rows(state, &relation_snapshot, key_attnums)?;
         bump_generation(state);
         Ok(())
     })
@@ -1029,604 +1337,12 @@ pub struct PgTypeRecord {
     pub typstorage: u8,
 }
 
-impl PgTypeRecord {
-    #[allow(clippy::too_many_arguments)]
-    const fn fixed(
-        oid: Oid,
-        name: &'static str,
-        typlen: i16,
-        typalign: u8,
-        typinput: Oid,
-        typoutput: Oid,
-        typreceive: Oid,
-        typsend: Oid,
-        typarray: Oid,
-        typcategory: u8,
-        typispreferred: bool,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            typlen,
-            typbyval: true,
-            typalign,
-            typdelim: TYPDELIM_COMMA,
-            typinput,
-            typoutput,
-            typreceive,
-            typsend,
-            typmodin: INVALID_OID,
-            typmodout: INVALID_OID,
-            typisdefined: true,
-            typtype: TYPTYPE_BASE,
-            typcategory,
-            typispreferred,
-            typrelid: INVALID_OID,
-            typelem: INVALID_OID,
-            typarray,
-            typbasetype: INVALID_OID,
-            typtypmod: -1,
-            typcollation: INVALID_OID,
-            typsubscript: INVALID_OID,
-            typstorage: TYPSTORAGE_PLAIN,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    const fn fixed_custom(
-        oid: Oid,
-        name: &'static str,
-        typlen: i16,
-        typbyval: bool,
-        typalign: u8,
-        typinput: Oid,
-        typoutput: Oid,
-        typreceive: Oid,
-        typsend: Oid,
-        typarray: Oid,
-        typcategory: u8,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            typlen,
-            typbyval,
-            typalign,
-            typdelim: TYPDELIM_COMMA,
-            typinput,
-            typoutput,
-            typreceive,
-            typsend,
-            typmodin: INVALID_OID,
-            typmodout: INVALID_OID,
-            typisdefined: true,
-            typtype: TYPTYPE_BASE,
-            typcategory,
-            typispreferred: false,
-            typrelid: INVALID_OID,
-            typelem: INVALID_OID,
-            typarray,
-            typbasetype: INVALID_OID,
-            typtypmod: -1,
-            typcollation: INVALID_OID,
-            typsubscript: INVALID_OID,
-            typstorage: TYPSTORAGE_PLAIN,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    const fn varlena_string(
-        oid: Oid,
-        name: &'static str,
-        typinput: Oid,
-        typoutput: Oid,
-        typreceive: Oid,
-        typsend: Oid,
-        typmodin: Oid,
-        typmodout: Oid,
-        typarray: Oid,
-        typispreferred: bool,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            typlen: -1,
-            typbyval: false,
-            typalign: TYPALIGN_INT,
-            typdelim: TYPDELIM_COMMA,
-            typinput,
-            typoutput,
-            typreceive,
-            typsend,
-            typmodin,
-            typmodout,
-            typisdefined: true,
-            typtype: TYPTYPE_BASE,
-            typcategory: TYPCATEGORY_STRING,
-            typispreferred,
-            typrelid: INVALID_OID,
-            typelem: INVALID_OID,
-            typarray,
-            typbasetype: INVALID_OID,
-            typtypmod: -1,
-            typcollation: DEFAULT_COLLATION_OID,
-            typsubscript: INVALID_OID,
-            typstorage: TYPSTORAGE_EXTENDED,
-        }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    const fn varlena_catalog(
-        oid: Oid,
-        name: &'static str,
-        typinput: Oid,
-        typoutput: Oid,
-        typreceive: Oid,
-        typsend: Oid,
-        typarray: Oid,
-        typcategory: u8,
-        typelem: Oid,
-        typcollation: Oid,
-        typstorage: u8,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            typlen: -1,
-            typbyval: false,
-            typalign: TYPALIGN_INT,
-            typdelim: TYPDELIM_COMMA,
-            typinput,
-            typoutput,
-            typreceive,
-            typsend,
-            typmodin: INVALID_OID,
-            typmodout: INVALID_OID,
-            typisdefined: true,
-            typtype: TYPTYPE_BASE,
-            typcategory,
-            typispreferred: false,
-            typrelid: INVALID_OID,
-            typelem,
-            typarray,
-            typbasetype: INVALID_OID,
-            typtypmod: -1,
-            typcollation,
-            typsubscript: if typelem.0 == 0 {
-                INVALID_OID
-            } else {
-                F_ARRAY_SUBSCRIPT_HANDLER
-            },
-            typstorage,
-        }
-    }
-
-    const fn varlena_array(
-        oid: Oid,
-        name: &'static str,
-        typelem: Oid,
-        typalign: u8,
-        typcollation: Oid,
-    ) -> Self {
-        Self {
-            typalign,
-            typstorage: TYPSTORAGE_EXTENDED,
-            ..Self::varlena_catalog(
-                oid,
-                name,
-                F_ARRAY_IN,
-                F_ARRAY_OUT,
-                F_ARRAY_RECV,
-                F_ARRAY_SEND,
-                INVALID_OID,
-                TYPCATEGORY_ARRAY,
-                typelem,
-                typcollation,
-                TYPSTORAGE_EXTENDED,
-            )
-        }
-    }
-
-    const fn pseudo_array(oid: Oid, name: &'static str) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            typlen: -1,
-            typbyval: false,
-            typalign: TYPALIGN_DOUBLE,
-            typdelim: TYPDELIM_COMMA,
-            typinput: F_ANYARRAYIN,
-            typoutput: F_ANYARRAYOUT,
-            typreceive: F_ANYARRAYRECV,
-            typsend: F_ANYARRAYSEND,
-            typmodin: INVALID_OID,
-            typmodout: INVALID_OID,
-            typisdefined: true,
-            typtype: TYPTYPE_PSEUDO,
-            typcategory: TYPCATEGORY_PSEUDO,
-            typispreferred: false,
-            typrelid: INVALID_OID,
-            typelem: INVALID_OID,
-            typarray: INVALID_OID,
-            typbasetype: INVALID_OID,
-            typtypmod: -1,
-            typcollation: INVALID_OID,
-            typsubscript: INVALID_OID,
-            typstorage: TYPSTORAGE_EXTENDED,
-        }
-    }
-}
-
 pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
-    match oid {
-        BOOL_OID => Some(PgTypeRecord::fixed(
-            BOOL_OID,
-            "bool",
-            1,
-            TYPALIGN_CHAR,
-            F_BOOLIN,
-            F_BOOLOUT,
-            F_BOOLRECV,
-            F_BOOLSEND,
-            Oid(1000),
-            TYPCATEGORY_BOOLEAN,
-            true,
-        )),
-        CHAR_OID => Some(PgTypeRecord::fixed(
-            CHAR_OID,
-            "char",
-            1,
-            TYPALIGN_CHAR,
-            F_CHARIN,
-            F_CHAROUT,
-            INVALID_OID,
-            INVALID_OID,
-            Oid(1002),
-            TYPCATEGORY_INTERNAL,
-            false,
-        )),
-        NAME_OID => {
-            let mut record = PgTypeRecord {
-                typbyval: false,
-                typelem: CHAR_OID,
-                typcollation: C_COLLATION_OID,
-                ..PgTypeRecord::fixed(
-                    NAME_OID,
-                    "name",
-                    64,
-                    TYPALIGN_CHAR,
-                    F_NAMEIN,
-                    F_NAMEOUT,
-                    F_NAMERECV,
-                    F_NAMESEND,
-                    Oid(1003),
-                    TYPCATEGORY_STRING,
-                    false,
-                )
-            };
-            record.typsubscript = INVALID_OID;
-            Some(record)
-        }
-        INT8_OID => Some(PgTypeRecord::fixed(
-            INT8_OID,
-            "int8",
-            8,
-            TYPALIGN_DOUBLE,
-            F_INT8IN,
-            F_INT8OUT,
-            F_INT8RECV,
-            F_INT8SEND,
-            Oid(1016),
-            TYPCATEGORY_NUMERIC,
-            false,
-        )),
-        INT2_OID => Some(PgTypeRecord::fixed(
-            INT2_OID,
-            "int2",
-            2,
-            TYPALIGN_SHORT,
-            F_INT2IN,
-            F_INT2OUT,
-            F_INT2RECV,
-            F_INT2SEND,
-            Oid(1005),
-            TYPCATEGORY_NUMERIC,
-            false,
-        )),
-        INT2VECTOR_OID => Some(PgTypeRecord::varlena_catalog(
-            INT2VECTOR_OID,
-            "int2vector",
-            F_INT2VECTORIN,
-            F_INT2VECTOROUT,
-            F_INT2VECTORRECV,
-            F_INT2VECTORSEND,
-            Oid(1006),
-            TYPCATEGORY_ARRAY,
-            INT2_OID,
-            INVALID_OID,
-            TYPSTORAGE_PLAIN,
-        )),
-        INT4_OID => Some(PgTypeRecord::fixed(
-            INT4_OID,
-            "int4",
-            4,
-            TYPALIGN_INT,
-            F_INT4IN,
-            F_INT4OUT,
-            F_INT4RECV,
-            F_INT4SEND,
-            Oid(1007),
-            TYPCATEGORY_NUMERIC,
-            false,
-        )),
-        FLOAT8_OID => Some(PgTypeRecord::fixed(
-            FLOAT8_OID,
-            "float8",
-            8,
-            TYPALIGN_DOUBLE,
-            F_FLOAT8IN,
-            F_FLOAT8OUT,
-            F_FLOAT8RECV,
-            F_FLOAT8SEND,
-            Oid(1022),
-            TYPCATEGORY_NUMERIC,
-            true,
-        )),
-        TEXT_OID => Some(PgTypeRecord::varlena_string(
-            TEXT_OID,
-            "text",
-            F_TEXTIN,
-            F_TEXTOUT,
-            F_TEXTRECV,
-            F_TEXTSEND,
-            INVALID_OID,
-            INVALID_OID,
-            Oid(1009),
-            true,
-        )),
-        OID_OID => Some(PgTypeRecord::fixed(
-            OID_OID,
-            "oid",
-            4,
-            TYPALIGN_INT,
-            F_OIDIN,
-            F_OIDOUT,
-            F_OIDRECV,
-            F_OIDSEND,
-            Oid(1028),
-            TYPCATEGORY_NUMERIC,
-            true,
-        )),
-        TID_OID => Some(PgTypeRecord::fixed_custom(
-            TID_OID,
-            "tid",
-            6,
-            false,
-            TYPALIGN_SHORT,
-            F_TIDIN,
-            F_TIDOUT,
-            F_TIDRECV,
-            F_TIDSEND,
-            Oid(1010),
-            TYPCATEGORY_USER_DEFINED,
-        )),
-        XID_OID => Some(PgTypeRecord::fixed_custom(
-            XID_OID,
-            "xid",
-            4,
-            true,
-            TYPALIGN_INT,
-            F_XIDIN,
-            F_XIDOUT,
-            F_XIDRECV,
-            F_XIDSEND,
-            Oid(1011),
-            TYPCATEGORY_USER_DEFINED,
-        )),
-        CID_OID => Some(PgTypeRecord::fixed_custom(
-            CID_OID,
-            "cid",
-            4,
-            true,
-            TYPALIGN_INT,
-            F_CIDIN,
-            F_CIDOUT,
-            F_CIDRECV,
-            F_CIDSEND,
-            Oid(1012),
-            TYPCATEGORY_USER_DEFINED,
-        )),
-        OIDVECTOR_OID => Some(PgTypeRecord::varlena_catalog(
-            OIDVECTOR_OID,
-            "oidvector",
-            F_OIDVECTORIN,
-            F_OIDVECTOROUT,
-            F_OIDVECTORRECV,
-            F_OIDVECTORSEND,
-            Oid(1013),
-            TYPCATEGORY_ARRAY,
-            OID_OID,
-            INVALID_OID,
-            TYPSTORAGE_PLAIN,
-        )),
-        PG_NODE_TREE_OID => Some(PgTypeRecord::varlena_catalog(
-            PG_NODE_TREE_OID,
-            "pg_node_tree",
-            F_PG_NODE_TREE_IN,
-            F_PG_NODE_TREE_OUT,
-            F_PG_NODE_TREE_RECV,
-            F_PG_NODE_TREE_SEND,
-            INVALID_OID,
-            TYPCATEGORY_INTERNAL,
-            INVALID_OID,
-            DEFAULT_COLLATION_OID,
-            TYPSTORAGE_EXTENDED,
-        )),
-        INT2_ARRAY_OID => Some(PgTypeRecord::varlena_array(
-            INT2_ARRAY_OID,
-            "_int2",
-            INT2_OID,
-            TYPALIGN_INT,
-            INVALID_OID,
-        )),
-        INT4_ARRAY_OID => Some(PgTypeRecord::varlena_array(
-            INT4_ARRAY_OID,
-            "_int4",
-            INT4_OID,
-            TYPALIGN_INT,
-            INVALID_OID,
-        )),
-        TEXT_ARRAY_OID => Some(PgTypeRecord::varlena_array(
-            TEXT_ARRAY_OID,
-            "_text",
-            TEXT_OID,
-            TYPALIGN_INT,
-            DEFAULT_COLLATION_OID,
-        )),
-        OID_ARRAY_OID => Some(PgTypeRecord::varlena_array(
-            OID_ARRAY_OID,
-            "_oid",
-            OID_OID,
-            TYPALIGN_INT,
-            INVALID_OID,
-        )),
-        ACLITEM_OID => Some(PgTypeRecord::fixed_custom(
-            ACLITEM_OID,
-            "aclitem",
-            16,
-            false,
-            TYPALIGN_DOUBLE,
-            F_ACLITEMIN,
-            F_ACLITEMOUT,
-            INVALID_OID,
-            INVALID_OID,
-            ACLITEM_ARRAY_OID,
-            TYPCATEGORY_USER_DEFINED,
-        )),
-        ACLITEM_ARRAY_OID => Some(PgTypeRecord::varlena_array(
-            ACLITEM_ARRAY_OID,
-            "_aclitem",
-            ACLITEM_OID,
-            TYPALIGN_DOUBLE,
-            INVALID_OID,
-        )),
-        BPCHAR_OID => Some(PgTypeRecord::varlena_string(
-            BPCHAR_OID,
-            "bpchar",
-            F_BPCHARIN,
-            F_BPCHAROUT,
-            F_BPCHARRECV,
-            F_BPCHARSEND,
-            F_BPCHARTYPMODIN,
-            F_BPCHARTYPMODOUT,
-            Oid(1014),
-            false,
-        )),
-        VARCHAR_OID => Some(PgTypeRecord::varlena_string(
-            VARCHAR_OID,
-            "varchar",
-            F_VARCHARIN,
-            F_VARCHAROUT,
-            F_VARCHARRECV,
-            F_VARCHARSEND,
-            F_VARCHARTYPMODIN,
-            F_VARCHARTYPMODOUT,
-            Oid(1015),
-            false,
-        )),
-        TIMESTAMP_OID => {
-            let mut record = PgTypeRecord::fixed(
-                TIMESTAMP_OID,
-                "timestamp",
-                8,
-                TYPALIGN_DOUBLE,
-                F_TIMESTAMPIN,
-                F_TIMESTAMPOUT,
-                F_TIMESTAMPRECV,
-                F_TIMESTAMPSEND,
-                Oid(1115),
-                TYPCATEGORY_DATETIME,
-                false,
-            );
-            record.typmodin = F_TIMESTAMPTYPMODIN;
-            record.typmodout = F_TIMESTAMPTYPMODOUT;
-            Some(record)
-        }
-        TIMESTAMPTZ_OID => {
-            let mut record = PgTypeRecord::fixed(
-                TIMESTAMPTZ_OID,
-                "timestamptz",
-                8,
-                TYPALIGN_DOUBLE,
-                F_TIMESTAMPTZIN,
-                F_TIMESTAMPTZOUT,
-                F_TIMESTAMPTZRECV,
-                F_TIMESTAMPTZSEND,
-                Oid(1185),
-                TYPCATEGORY_DATETIME,
-                true,
-            );
-            record.typmodin = F_TIMESTAMPTZTYPMODIN;
-            record.typmodout = F_TIMESTAMPTZTYPMODOUT;
-            Some(record)
-        }
-        REGCLASS_OID => Some(PgTypeRecord::fixed(
-            REGCLASS_OID,
-            "regclass",
-            4,
-            TYPALIGN_INT,
-            F_REGCLASSIN,
-            F_REGCLASSOUT,
-            F_REGCLASSRECV,
-            F_REGCLASSSEND,
-            Oid(2210),
-            TYPCATEGORY_NUMERIC,
-            false,
-        )),
-        ANYARRAY_OID => Some(PgTypeRecord::pseudo_array(ANYARRAY_OID, "anyarray")),
-        _ => None,
-    }
+    generated_catalog::STATIC_TYPES
+        .iter()
+        .find(|record| record.oid == oid)
+        .copied()
 }
-
-const BUILTIN_TYPE_OIDS: &[Oid] = &[
-    BOOL_OID,
-    CHAR_OID,
-    NAME_OID,
-    INT8_OID,
-    INT2_OID,
-    INT2VECTOR_OID,
-    INT4_OID,
-    FLOAT8_OID,
-    TEXT_OID,
-    OID_OID,
-    TID_OID,
-    XID_OID,
-    CID_OID,
-    OIDVECTOR_OID,
-    PG_NODE_TREE_OID,
-    INT2_ARRAY_OID,
-    INT4_ARRAY_OID,
-    TEXT_ARRAY_OID,
-    OID_ARRAY_OID,
-    ACLITEM_OID,
-    ACLITEM_ARRAY_OID,
-    BPCHAR_OID,
-    VARCHAR_OID,
-    TIMESTAMP_OID,
-    TIMESTAMPTZ_OID,
-    REGCLASS_OID,
-    ANYARRAY_OID,
-];
 
 pub fn builtin_type_by_name(name: &str, namespace: Oid) -> Option<PgTypeRecord> {
     if namespace != PG_CATALOG_NAMESPACE_OID {
@@ -1647,9 +1363,9 @@ pub fn builtin_type_by_name(name: &str, namespace: Oid) -> Option<PgTypeRecord> 
         other => other,
     };
 
-    BUILTIN_TYPE_OIDS
+    generated_catalog::STATIC_TYPES
         .iter()
-        .filter_map(|oid| lookup_builtin_type(*oid))
+        .copied()
         .find(|record| record.name == canonical_name)
 }
 
@@ -1675,100 +1391,6 @@ pub struct PgProcRecord {
     pub arg_types: &'static [Oid],
     pub arg_defaults: u16,
     pub source: &'static str,
-}
-
-impl PgProcRecord {
-    const fn internal_function(
-        oid: Oid,
-        name: &'static str,
-        return_type: Oid,
-        arg_types: &'static [Oid],
-        source: &'static str,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            language: INTERNAL_LANGUAGE_OID,
-            cost: 1,
-            rows: 0,
-            variadic: INVALID_OID,
-            support: INVALID_OID,
-            kind: PROKIND_FUNCTION,
-            security_definer: false,
-            leakproof: false,
-            strict: true,
-            returns_set: false,
-            volatility: PROVOLATILE_IMMUTABLE,
-            parallel: PROPARALLEL_SAFE,
-            return_type,
-            arg_types,
-            arg_defaults: 0,
-            source,
-        }
-    }
-
-    const fn stable_function(
-        oid: Oid,
-        name: &'static str,
-        return_type: Oid,
-        arg_types: &'static [Oid],
-        source: &'static str,
-    ) -> Self {
-        Self {
-            oid,
-            name,
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            language: INTERNAL_LANGUAGE_OID,
-            cost: 1,
-            rows: 0,
-            variadic: INVALID_OID,
-            support: INVALID_OID,
-            kind: PROKIND_FUNCTION,
-            security_definer: false,
-            leakproof: false,
-            strict: true,
-            returns_set: false,
-            volatility: PROVOLATILE_STABLE,
-            parallel: PROPARALLEL_SAFE,
-            return_type,
-            arg_types,
-            arg_defaults: 0,
-            source,
-        }
-    }
-
-    const fn aggregate(
-        oid: Oid,
-        return_type: Oid,
-        arg_types: &'static [Oid],
-        support: Oid,
-    ) -> Self {
-        Self {
-            oid,
-            name: "count",
-            namespace: PG_CATALOG_NAMESPACE_OID,
-            owner: BOOTSTRAP_SUPERUSER_OID,
-            language: INTERNAL_LANGUAGE_OID,
-            cost: 1,
-            rows: 0,
-            variadic: INVALID_OID,
-            support,
-            kind: PROKIND_AGGREGATE,
-            security_definer: false,
-            leakproof: false,
-            strict: false,
-            returns_set: false,
-            volatility: PROVOLATILE_IMMUTABLE,
-            parallel: PROPARALLEL_SAFE,
-            return_type,
-            arg_types,
-            arg_defaults: 0,
-            source: "aggregate_dummy",
-        }
-    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1797,149 +1419,27 @@ pub struct PgAggregateRecord {
     pub moving_init_value: Option<&'static str>,
 }
 
-const COUNT_ANY_ARGS: [Oid; 1] = [ANY_OID];
-const INT8_ARGS: [Oid; 1] = [INT8_OID];
-const INT8_ANY_ARGS: [Oid; 2] = [INT8_OID, ANY_OID];
-const INT8_INT8_ARGS: [Oid; 2] = [INT8_OID, INT8_OID];
-const INT4_INT4_ARGS: [Oid; 2] = [INT4_OID, INT4_OID];
-const OID_OID_ARGS: [Oid; 2] = [OID_OID, OID_OID];
-const TIMESTAMP_ARGS: [Oid; 1] = [TIMESTAMP_OID];
-const TIMESTAMPTZ_ARGS: [Oid; 1] = [TIMESTAMPTZ_OID];
-const EQSEL_ARGS: [Oid; 4] = [INTERNAL_OID, OID_OID, INTERNAL_OID, INT4_OID];
-const EQJOINSEL_ARGS: [Oid; 5] = [INTERNAL_OID, OID_OID, INTERNAL_OID, INT2_OID, INTERNAL_OID];
-const INTERNAL_ARGS: [Oid; 1] = [INTERNAL_OID];
-const NO_ARGS: [Oid; 0] = [];
-
-const BUILTIN_PROCS: &[PgProcRecord] = &[
-    PgProcRecord::internal_function(F_INT4EQ, "int4eq", BOOL_OID, &INT4_INT4_ARGS, "int4eq"),
-    PgProcRecord::internal_function(F_INT4LT, "int4lt", BOOL_OID, &INT4_INT4_ARGS, "int4lt"),
-    PgProcRecord::internal_function(F_INT4GT, "int4gt", BOOL_OID, &INT4_INT4_ARGS, "int4gt"),
-    PgProcRecord::internal_function(
-        F_BTINT4CMP,
-        "btint4cmp",
-        INT4_OID,
-        &INT4_INT4_ARGS,
-        "btint4cmp",
-    ),
-    PgProcRecord::internal_function(F_OIDEQ, "oideq", BOOL_OID, &OID_OID_ARGS, "oideq"),
-    PgProcRecord::internal_function(F_INT4PL, "int4pl", INT4_OID, &INT4_INT4_ARGS, "int4pl"),
-    PgProcRecord::internal_function(F_INT8PL, "int8pl", INT8_OID, &INT8_INT8_ARGS, "int8pl"),
-    PgProcRecord::internal_function(F_INT8EQ, "int8eq", BOOL_OID, &INT8_INT8_ARGS, "int8eq"),
-    PgProcRecord::internal_function(F_EQSEL, "eqsel", FLOAT8_OID, &EQSEL_ARGS, "eqsel"),
-    PgProcRecord::internal_function(
-        F_EQJOINSEL,
-        "eqjoinsel",
-        FLOAT8_OID,
-        &EQJOINSEL_ARGS,
-        "eqjoinsel",
-    ),
-    PgProcRecord::internal_function(F_INT8INC, "int8inc", INT8_OID, &INT8_ARGS, "int8inc"),
-    PgProcRecord::internal_function(F_INT8DEC, "int8dec", INT8_OID, &INT8_ARGS, "int8dec"),
-    PgProcRecord::internal_function(
-        F_INT8INC_ANY,
-        "int8inc_any",
-        INT8_OID,
-        &INT8_ANY_ARGS,
-        "int8inc_any",
-    ),
-    PgProcRecord::internal_function(
-        F_INT8DEC_ANY,
-        "int8dec_any",
-        INT8_OID,
-        &INT8_ANY_ARGS,
-        "int8dec_any",
-    ),
-    PgProcRecord::aggregate(F_COUNT_ANY, INT8_OID, &COUNT_ANY_ARGS, F_INT8INC_SUPPORT),
-    PgProcRecord::aggregate(F_COUNT, INT8_OID, &NO_ARGS, F_INT8INC_SUPPORT),
-    PgProcRecord::internal_function(
-        F_INT8INC_SUPPORT,
-        "int8inc_support",
-        INTERNAL_OID,
-        &INTERNAL_ARGS,
-        "int8inc_support",
-    ),
-    PgProcRecord::stable_function(
-        F_TIMESTAMPTZ_TIMESTAMP,
-        "timestamp",
-        TIMESTAMP_OID,
-        &TIMESTAMPTZ_ARGS,
-        "timestamptz_timestamp",
-    ),
-    PgProcRecord::stable_function(
-        F_TIMESTAMP_TIMESTAMPTZ,
-        "timestamptz",
-        TIMESTAMPTZ_OID,
-        &TIMESTAMP_ARGS,
-        "timestamp_timestamptz",
-    ),
-];
-
-const BUILTIN_AGGREGATES: &[PgAggregateRecord] = &[
-    PgAggregateRecord {
-        function_oid: F_COUNT_ANY,
-        kind: AGGKIND_NORMAL,
-        direct_arg_count: 0,
-        transition_fn: F_INT8INC_ANY,
-        final_fn: INVALID_OID,
-        combine_fn: F_INT8PL,
-        serial_fn: INVALID_OID,
-        deserial_fn: INVALID_OID,
-        moving_transition_fn: F_INT8INC_ANY,
-        moving_inverse_fn: F_INT8DEC_ANY,
-        moving_final_fn: INVALID_OID,
-        final_extra: false,
-        moving_final_extra: false,
-        final_modify: AGGMODIFY_READ_ONLY,
-        moving_final_modify: AGGMODIFY_READ_ONLY,
-        sort_operator: INVALID_OID,
-        transition_type: INT8_OID,
-        transition_space: 0,
-        moving_transition_type: INT8_OID,
-        moving_transition_space: 0,
-        init_value: Some("0"),
-        moving_init_value: Some("0"),
-    },
-    PgAggregateRecord {
-        function_oid: F_COUNT,
-        kind: AGGKIND_NORMAL,
-        direct_arg_count: 0,
-        transition_fn: F_INT8INC,
-        final_fn: INVALID_OID,
-        combine_fn: F_INT8PL,
-        serial_fn: INVALID_OID,
-        deserial_fn: INVALID_OID,
-        moving_transition_fn: F_INT8INC,
-        moving_inverse_fn: F_INT8DEC,
-        moving_final_fn: INVALID_OID,
-        final_extra: false,
-        moving_final_extra: false,
-        final_modify: AGGMODIFY_READ_ONLY,
-        moving_final_modify: AGGMODIFY_READ_ONLY,
-        sort_operator: INVALID_OID,
-        transition_type: INT8_OID,
-        transition_space: 0,
-        moving_transition_type: INT8_OID,
-        moving_transition_space: 0,
-        init_value: Some("0"),
-        moving_init_value: Some("0"),
-    },
-];
-
 pub fn builtin_proc_by_oid(oid: Oid) -> Option<&'static PgProcRecord> {
-    BUILTIN_PROCS.iter().find(|record| record.oid == oid)
+    generated_catalog::STATIC_PROCS
+        .iter()
+        .find(|record| record.oid == oid)
 }
 
 pub fn builtin_procs_by_name(name: &str) -> impl Iterator<Item = &'static PgProcRecord> {
     let name = normalize_identifier(name);
-    BUILTIN_PROCS
+    generated_catalog::STATIC_PROCS
         .iter()
         .filter(move |record| record.name == name.as_str())
 }
 
 pub fn builtin_aggregate_by_proc_oid(function_oid: Oid) -> Option<&'static PgAggregateRecord> {
-    BUILTIN_AGGREGATES
+    generated_catalog::STATIC_AGGREGATES
         .iter()
         .find(|record| record.function_oid == function_oid)
+}
+
+mod generated_catalog {
+    include!(concat!(env!("OUT_DIR"), "/generated_static_catalog.rs"));
 }
 
 #[cfg(test)]
@@ -1995,20 +1495,67 @@ mod tests {
     fn has_timestamp_assignment_casts() {
         let cast = builtin_cast_by_source_target(TIMESTAMPTZ_OID, TIMESTAMP_OID)
             .expect("timestamptz to timestamp cast");
-        assert_eq!(cast.function, F_TIMESTAMPTZ_TIMESTAMP);
-        assert_eq!(cast.context, COERCION_CODE_ASSIGNMENT);
-        assert_eq!(cast.method, COERCION_METHOD_FUNCTION);
+        assert_eq!(cast.function, Oid(2027));
+        assert_eq!(cast.context, b'a');
+        assert_eq!(cast.method, b'f');
 
         let proc = builtin_proc_by_oid(cast.function).expect("cast function proc");
         assert_eq!(proc.return_type, TIMESTAMP_OID);
         assert_eq!(proc.arg_types, [TIMESTAMPTZ_OID]);
-        assert_eq!(proc.volatility, PROVOLATILE_STABLE);
+        assert_eq!(proc.volatility, b's');
+    }
+
+    fn row_value<'a>(table_name: &str, row: &'a CatalogRow, column_name: &str) -> &'a CatalogValue {
+        let table = static_catalog_by_name(table_name).expect("catalog table");
+        catalog_row_value(table, row, column_name).expect("catalog column")
+    }
+
+    fn value_name(value: &CatalogValue) -> Option<&str> {
+        match value {
+            CatalogValue::Name(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    fn value_oid(value: &CatalogValue) -> Option<Oid> {
+        match value {
+            CatalogValue::Oid(value) => Some(*value),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn generated_static_catalog_has_core_rows() {
+        assert!(static_catalog_by_name("pg_type").is_some());
+        assert!(static_catalog_by_name("pg_proc").is_some());
+        assert!(static_catalog_by_name("pg_am").is_some());
+        assert!(static_catalog_by_name("pg_opclass").is_some());
+
+        assert_eq!(
+            builtin_type_by_name("float8", PG_CATALOG_NAMESPACE_OID)
+                .expect("float8")
+                .oid,
+            FLOAT8_OID
+        );
+        assert!(builtin_procs_by_name("generate_series").count() > 0);
+        assert!(
+            catalog_rows(Oid(2601))
+                .iter()
+                .any(|row| { value_name(row_value("pg_am", row, "amname")) == Some("btree") })
+        );
+        assert!(
+            catalog_rows(Oid(2601))
+                .iter()
+                .any(|row| { value_name(row_value("pg_am", row, "amname")) == Some("hash") })
+        );
+        assert!(btree_opclass_for_type(INT4_OID).is_some());
+        assert!(builtin_cast_by_source_target(INT4_OID, OID_OID).is_some());
     }
 
     #[test]
     fn classifies_pgbench_critical_virtual_catalogs() {
         let required = [
-            ("pg_type", VirtualCatalogPolicy::Static),
+            ("pg_type", VirtualCatalogPolicy::Dynamic),
             ("pg_proc", VirtualCatalogPolicy::Static),
             ("pg_operator", VirtualCatalogPolicy::Static),
             ("pg_aggregate", VirtualCatalogPolicy::Static),
@@ -2081,6 +1628,24 @@ mod tests {
             relation_by_name("pgbench_accounts").unwrap().primary_key,
             vec!["aid"]
         );
+        assert!(catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
+            value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")
+        }));
+        assert!(catalog_rows(PG_TYPE_RELATION_OID).iter().any(|row| {
+            value_name(row_value("pg_type", row, "typname")) == Some("pgbench_accounts")
+        }));
+        assert!(catalog_rows(PG_ATTRIBUTE_RELATION_OID).iter().any(|row| {
+            value_oid(row_value("pg_attribute", row, "attrelid")) == Some(relation.oid)
+                && value_name(row_value("pg_attribute", row, "attname")) == Some("aid")
+        }));
+        assert!(catalog_rows(PG_INDEX_RELATION_OID).iter().any(|row| {
+            value_oid(row_value("pg_index", row, "indrelid")) == Some(relation.oid)
+        }));
+        assert!(catalog_rows(PG_CONSTRAINT_RELATION_OID).iter().any(|row| {
+            value_oid(row_value("pg_constraint", row, "conrelid")) == Some(relation.oid)
+                && value_name(row_value("pg_constraint", row, "conname"))
+                    == Some("pgbench_accounts_pkey")
+        }));
         assert_eq!(
             drop_relation("pgbench_accounts", false)
                 .unwrap()
@@ -2090,5 +1655,8 @@ mod tests {
         );
         assert!(current_generation() > after_primary_key_generation);
         assert!(relation_by_name("pgbench_accounts").is_none());
+        assert!(!catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
+            value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")
+        }));
     }
 }

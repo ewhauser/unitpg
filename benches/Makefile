@@ -16,6 +16,8 @@ RUST_PGCORE ?= raw-parser
 REGRESSION_SUITE ?= core
 REGRESSION_INVENTORY_SUITE ?= inventory
 REGRESSION_CASES_DIR ?=
+UPSTREAM_REGRESSION_LIMIT ?=
+UPSTREAM_REGRESSION_CASE ?=
 PROFILE_TRANSACTIONS ?= 500
 PROFILE_RUNS ?= 1
 PROFILE_TOOL ?= flamegraph
@@ -24,8 +26,10 @@ PROFILE_OPEN ?= 0
 PROFILE_WARMUP_SECONDS ?= 1.0
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 REGRESSION_CASES_ARG := $(if $(REGRESSION_CASES_DIR),--cases-dir "$(REGRESSION_CASES_DIR)",)
+UPSTREAM_REGRESSION_LIMIT_ARG := $(if $(UPSTREAM_REGRESSION_LIMIT),--limit "$(UPSTREAM_REGRESSION_LIMIT)",)
+UPSTREAM_REGRESSION_CASE_ARG := $(if $(UPSTREAM_REGRESSION_CASE),--case "$(UPSTREAM_REGRESSION_CASE)",)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-compare-rust-server-strict-no-ipc pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph regression-compare-rust-server regression-compare-rust-server-no-ipc regression-compare-rust-server-inventory validate-rust-server validate-rust-server-no-ipc
+.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-compare-rust-server-strict-no-ipc pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph regression-compare-rust-server regression-compare-rust-server-no-ipc regression-compare-rust-server-inventory upstream-regression-inventory-rust-server validate-rust-server validate-rust-server-no-ipc
 
 pgbench-compare:
 	$(PYTHON) pgbench_compare.py \
@@ -168,14 +172,22 @@ regression-compare-rust-server-inventory:
 		--rust-pgcore "full" \
 		--allow-fastpg-failures
 
+upstream-regression-inventory-rust-server:
+	$(PYTHON) upstream_regression_inventory.py \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full" \
+		$(UPSTREAM_REGRESSION_LIMIT_ARG) \
+		$(UPSTREAM_REGRESSION_CASE_ARG)
+
 validate-rust-server:
-	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py
+	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py upstream_regression_inventory.py
 	cargo test -p fastpg-storage
 	$(MAKE) pgbench-compare-rust-server-strict
 	$(MAKE) regression-compare-rust-server
 
 validate-rust-server-no-ipc:
-	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py
+	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py upstream_regression_inventory.py
 	cargo test -p fastpg-storage
 	$(MAKE) pgbench-compare-rust-server-strict-no-ipc
 	$(MAKE) regression-compare-rust-server-no-ipc

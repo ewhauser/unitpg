@@ -834,6 +834,17 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_comment_only_query_is_empty() {
+        let session = PgCoreSession::new();
+        let statement = session
+            .prepare("/* comment-only query should be an empty query */")
+            .unwrap();
+        let result = statement.execute().unwrap();
+        assert!(result.statements.is_empty());
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_parameterized_select_through_executor_params() {
         let session = PgCoreSession::new();
         let statement = session.prepare("select $1::int4").unwrap();
@@ -1000,6 +1011,28 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_create_table_uses_generated_catalog_types() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_generated_types_{}", std::process::id());
+
+        let create = session
+            .prepare(&format!(
+                "create table {table}(value float8, location point, route path)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create.statements[0].command_tag, "CREATE TABLE");
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_alter_table_add_primary_key() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_pk_{}", std::process::id());
@@ -1015,6 +1048,88 @@ mod tests {
             .execute()
             .unwrap();
         assert_eq!(result.statements[0].command_tag, "ALTER TABLE");
+
+        let unique = session
+            .prepare(&format!("alter table {table} add unique (id)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(unique.statements[0].command_tag, "ALTER TABLE");
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_regress_compatibility_noop_utilities() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_noop_{}", std::process::id());
+
+        let set = session
+            .prepare("set synchronous_commit = on")
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(set.statements[0].command_tag, "SET");
+
+        let grant = session
+            .prepare("grant all on schema public to public")
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(grant.statements[0].command_tag, "GRANT");
+
+        let tablespace = session
+            .prepare("create tablespace fastpg_regress_tblspace location ''")
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(tablespace.statements[0].command_tag, "CREATE TABLESPACE");
+
+        session
+            .prepare(&format!("create table {table}(id int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        let comment = session
+            .prepare(&format!("comment on table {table} is 'regress shim'"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(comment.statements[0].command_tag, "COMMENT");
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_system_catalog_write_is_noop() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_catalog_noop_{}", std::process::id());
+
+        session
+            .prepare(&format!("create table {table}(id int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let update = session
+            .prepare(&format!(
+                "update pg_class set reloptions = '{{fillfactor=13}}' where oid = '{table}'::regclass"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(update.statements[0].command_tag, "UPDATE");
+        assert!(update.statements[0].rows.is_empty());
 
         session
             .prepare(&format!("drop table if exists {table}"))
