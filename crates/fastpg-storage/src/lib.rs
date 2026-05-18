@@ -222,6 +222,18 @@ enum IndexKeyPart {
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 struct IndexKey(Vec<IndexKeyPart>);
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryKeyColumnSpec {
+    column_index: usize,
+    typbyval: bool,
+    typlen: i16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PrimaryKeySpec {
+    columns: Vec<PrimaryKeyColumnSpec>,
+}
+
 #[derive(Default, Debug)]
 struct RowSegment {
     rows: Vec<Row>,
@@ -230,8 +242,9 @@ struct RowSegment {
 
 #[derive(Debug)]
 struct RelationRows {
-    committed: Vec<RowSegment>,
+    committed_row_ids: BTreeSet<u64>,
     committed_row_index: HashMap<u64, Row>,
+    committed_payloads: Vec<Box<[u8]>>,
     primary_key_index: BTreeMap<IndexKey, u64>,
     next_row_id: u64,
 }
@@ -239,8 +252,9 @@ struct RelationRows {
 impl Default for RelationRows {
     fn default() -> Self {
         Self {
-            committed: Vec::new(),
+            committed_row_ids: BTreeSet::new(),
             committed_row_index: HashMap::new(),
+            committed_payloads: Vec::new(),
             primary_key_index: BTreeMap::new(),
             next_row_id: 1,
         }
@@ -274,6 +288,7 @@ struct ScanState {
 #[derive(Debug)]
 struct StorageState {
     relations: HashMap<u32, RelationRows>,
+    primary_key_specs: HashMap<u32, Option<PrimaryKeySpec>>,
     transaction_stack: Vec<TransactionOverlay>,
     scans: HashMap<u64, ScanState>,
     next_scan_handle: u64,
@@ -283,6 +298,7 @@ impl Default for StorageState {
     fn default() -> Self {
         Self {
             relations: HashMap::new(),
+            primary_key_specs: HashMap::new(),
             transaction_stack: Vec::new(),
             scans: HashMap::new(),
             next_scan_handle: 1,
@@ -349,9 +365,9 @@ impl StorageState {
     fn visible_rows(&self, relid: u32) -> Vec<Row> {
         let mut rows = BTreeMap::new();
         if let Some(relation) = self.relations.get(&relid) {
-            for segment in &relation.committed {
-                for row in &segment.rows {
-                    rows.insert(row.row_id, row.clone());
+            for row_id in &relation.committed_row_ids {
+                if let Some(row) = relation.committed_row_index.get(row_id) {
+                    rows.insert(*row_id, row.clone());
                 }
             }
         }
@@ -399,7 +415,12 @@ impl StorageState {
             .and_then(|relation| relation.committed_row_index.get(&row_id).cloned())
     }
 
-    fn find_visible_row_by_primary_key(&self, relid: u32, key: &IndexKey) -> Option<Row> {
+    fn find_visible_row_by_primary_key(
+        &self,
+        relid: u32,
+        primary_key_spec: &PrimaryKeySpec,
+        key: &IndexKey,
+    ) -> Option<Row> {
         let mut committed_candidate = self
             .relations
             .get(&relid)
@@ -410,7 +431,7 @@ impl StorageState {
                 && let Some(row) = segment
                     .rows
                     .iter()
-                    .find(|row| primary_key_for_row(relid, row).as_ref() == Some(key))
+                    .find(|row| primary_key_for_row(primary_key_spec, row).as_ref() == Some(key))
             {
                 return Some(row.clone());
             }
@@ -429,35 +450,58 @@ impl StorageState {
     }
 
     fn has_primary_key_conflict(
-        &self,
+        &mut self,
         relid: u32,
         row: &Row,
         replacing_row_id: Option<u64>,
     ) -> bool {
-        let Some(key) = primary_key_for_row(relid, row) else {
+        let Some(primary_key_spec) = self.primary_key_spec(relid) else {
+            return false;
+        };
+        let Some(key) = primary_key_for_row(&primary_key_spec, row) else {
             return false;
         };
 
-        self.find_visible_row_by_primary_key(relid, &key)
+        self.find_visible_row_by_primary_key(relid, &primary_key_spec, &key)
             .is_some_and(|existing| Some(existing.row_id) != replacing_row_id)
     }
 
+    fn primary_key_spec(&mut self, relid: u32) -> Option<PrimaryKeySpec> {
+        if let Some(spec) = self.primary_key_specs.get(&relid) {
+            return spec.clone();
+        }
+
+        let spec = relation_by_oid(Oid(relid)).and_then(|relation| primary_key_spec(&relation));
+        self.primary_key_specs.insert(relid, spec.clone());
+        spec
+    }
+
+    fn invalidate_primary_key_spec(&mut self, relid: u32) {
+        self.primary_key_specs.remove(&relid);
+    }
+
     fn rebuild_primary_key_index(&mut self, relid: u32) {
+        self.invalidate_primary_key_spec(relid);
+        let primary_key_spec = self.primary_key_spec(relid);
         let Some(relation) = self.relations.get_mut(&relid) else {
             return;
         };
 
-        relation.committed_row_index.clear();
         relation.primary_key_index.clear();
-        for row in relation.committed.iter().flat_map(|segment| &segment.rows) {
-            relation.committed_row_index.insert(row.row_id, row.clone());
-            if let Some(key) = primary_key_for_row(relid, row) {
-                relation.primary_key_index.insert(key, row.row_id);
+        for row_id in &relation.committed_row_ids {
+            let Some(row) = relation.committed_row_index.get(row_id) else {
+                continue;
+            };
+            if let Some(primary_key_spec) = &primary_key_spec
+                && let Some(key) = primary_key_for_row(primary_key_spec, row)
+            {
+                relation.primary_key_index.insert(key, *row_id);
             }
         }
     }
 
     fn clear_relation(&mut self, relid: u32) {
+        self.invalidate_primary_key_spec(relid);
         self.relations.insert(relid, RelationRows::default());
         for overlay in &mut self.transaction_stack {
             overlay.relations.remove(&relid);
@@ -482,29 +526,33 @@ impl StorageState {
             if deleted_row_ids.is_empty() {
                 continue;
             }
-            self.remove_committed_primary_key_entries(*relid, deleted_row_ids);
-            let relation = self.relations.entry(*relid).or_default();
-            remove_rows_from_segments(&mut relation.committed, deleted_row_ids);
+            let primary_key_spec = self.primary_key_spec(*relid);
+            self.remove_committed_entries(*relid, primary_key_spec.as_ref(), deleted_row_ids);
         }
 
-        for (relid, segment) in overlay.relations {
+        for (relid, mut segment) in overlay.relations {
             if segment.rows.is_empty() {
                 continue;
             }
+            let primary_key_spec = self.primary_key_spec(relid);
             let relation = self.relations.entry(relid).or_default();
             for row in &segment.rows {
+                relation.committed_row_ids.insert(row.row_id);
                 relation.committed_row_index.insert(row.row_id, row.clone());
-                if let Some(key) = primary_key_for_row(relid, row) {
+                if let Some(primary_key_spec) = &primary_key_spec
+                    && let Some(key) = primary_key_for_row(primary_key_spec, row)
+                {
                     relation.primary_key_index.insert(key, row.row_id);
                 }
             }
-            relation.committed.push(segment);
+            relation.committed_payloads.append(&mut segment.payloads);
         }
     }
 
-    fn remove_committed_primary_key_entries(
+    fn remove_committed_entries(
         &mut self,
         relid: u32,
+        primary_key_spec: Option<&PrimaryKeySpec>,
         deleted_row_ids: &BTreeSet<u64>,
     ) {
         if deleted_row_ids.is_empty() {
@@ -513,8 +561,10 @@ impl StorageState {
 
         if let Some(relation) = self.relations.get_mut(&relid) {
             for row_id in deleted_row_ids {
+                relation.committed_row_ids.remove(row_id);
                 if let Some(row) = relation.committed_row_index.remove(row_id)
-                    && let Some(key) = primary_key_for_row(relid, &row)
+                    && let Some(primary_key_spec) = primary_key_spec
+                    && let Some(key) = primary_key_for_row(primary_key_spec, &row)
                 {
                     relation.primary_key_index.remove(&key);
                 }
@@ -554,13 +604,6 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
         parent_segment.rows.append(&mut segment.rows);
         parent_segment.payloads.append(&mut segment.payloads);
     }
-}
-
-fn remove_rows_from_segments(segments: &mut Vec<RowSegment>, deleted_row_ids: &BTreeSet<u64>) {
-    for segment in segments.iter_mut() {
-        remove_rows_from_segment(segment, deleted_row_ids);
-    }
-    segments.retain(|segment| !segment.rows.is_empty());
 }
 
 fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet<u64>) {
@@ -850,21 +893,27 @@ fn invalid_ffi_argument(message: String) -> CatalogError {
     CatalogError::new("22023", message)
 }
 
-fn primary_key_column_indexes(relation: &fastpg_catalog::RelationRecord) -> Option<Vec<usize>> {
+fn primary_key_spec(relation: &fastpg_catalog::RelationRecord) -> Option<PrimaryKeySpec> {
     if relation.primary_key.is_empty() {
         return None;
     }
 
-    relation
-        .primary_key
-        .iter()
-        .map(|primary_key_column| {
-            relation
-                .columns
-                .iter()
-                .position(|column| &column.name == primary_key_column)
-        })
-        .collect()
+    let mut columns = Vec::with_capacity(relation.primary_key.len());
+    for primary_key_column in &relation.primary_key {
+        let column_index = relation
+            .columns
+            .iter()
+            .position(|column| &column.name == primary_key_column)?;
+        let column = relation.columns.get(column_index)?;
+        let pg_type = lookup_builtin_type(column.type_oid)?;
+        columns.push(PrimaryKeyColumnSpec {
+            column_index,
+            typbyval: pg_type.typbyval,
+            typlen: pg_type.typlen,
+        });
+    }
+
+    Some(PrimaryKeySpec { columns })
 }
 
 fn primary_key_index_oid(relation: &fastpg_catalog::RelationRecord) -> Option<Oid> {
@@ -943,14 +992,11 @@ fn primary_key_index_info(
     })
 }
 
-fn primary_key_for_row(relid: u32, row: &Row) -> Option<IndexKey> {
-    let relation = relation_by_oid(Oid(relid))?;
-    let column_indexes = primary_key_column_indexes(&relation)?;
-    let mut parts = Vec::with_capacity(column_indexes.len());
+fn primary_key_for_row(primary_key_spec: &PrimaryKeySpec, row: &Row) -> Option<IndexKey> {
+    let mut parts = Vec::with_capacity(primary_key_spec.columns.len());
 
-    for column_index in column_indexes {
-        let column = relation.columns.get(column_index)?;
-        let cell = row.cells.get(column_index)?;
+    for column in &primary_key_spec.columns {
+        let cell = row.cells.get(column.column_index)?;
         parts.push(index_key_part(column, cell)?);
     }
 
@@ -958,18 +1004,16 @@ fn primary_key_for_row(relid: u32, row: &Row) -> Option<IndexKey> {
 }
 
 fn primary_key_for_datums(
-    relation: &fastpg_catalog::RelationRecord,
+    primary_key_spec: &PrimaryKeySpec,
     values: &[usize],
     is_null: &[u8],
 ) -> Option<IndexKey> {
-    let column_indexes = primary_key_column_indexes(relation)?;
-    if column_indexes.len() != values.len() || values.len() != is_null.len() {
+    if primary_key_spec.columns.len() != values.len() || values.len() != is_null.len() {
         return None;
     }
 
-    let mut parts = Vec::with_capacity(column_indexes.len());
-    for (key_index, column_index) in column_indexes.into_iter().enumerate() {
-        let column = relation.columns.get(column_index)?;
+    let mut parts = Vec::with_capacity(primary_key_spec.columns.len());
+    for (key_index, column) in primary_key_spec.columns.iter().enumerate() {
         let cell = Cell {
             value: values[key_index],
             is_null: is_null[key_index] != 0,
@@ -980,17 +1024,16 @@ fn primary_key_for_datums(
     Some(IndexKey(parts))
 }
 
-fn index_key_part(column: &ColumnRecord, cell: &Cell) -> Option<IndexKeyPart> {
+fn index_key_part(column: &PrimaryKeyColumnSpec, cell: &Cell) -> Option<IndexKeyPart> {
     if cell.is_null {
         return Some(IndexKeyPart::Null);
     }
 
-    let pg_type = lookup_builtin_type(column.type_oid)?;
-    if pg_type.typbyval {
+    if column.typbyval {
         return Some(IndexKeyPart::ByValue(cell.value));
     }
 
-    let bytes = byref_key_bytes(cell.value, pg_type.typlen)?;
+    let bytes = byref_key_bytes(cell.value, column.typlen)?;
     Some(IndexKeyPart::Bytes(bytes))
 }
 
@@ -1949,11 +1992,12 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     } else {
         unsafe { slice::from_raw_parts(is_null, nkeys) }
     };
-    let Some(key) = primary_key_for_datums(&relation, values, is_null) else {
-        return false;
-    };
-
-    let row = with_storage(|state| state.find_visible_row_by_primary_key(relation.oid.0, &key));
+    let row = with_storage(|state| {
+        let primary_key_spec = state.primary_key_spec(relation.oid.0)?;
+        let key = primary_key_for_datums(&primary_key_spec, values, is_null)?;
+        Some(state.find_visible_row_by_primary_key(relation.oid.0, &primary_key_spec, &key))
+    })
+    .flatten();
     let Some(row) = row else {
         return false;
     };
