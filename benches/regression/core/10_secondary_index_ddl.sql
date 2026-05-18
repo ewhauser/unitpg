@@ -1,0 +1,16 @@
+DROP TABLE IF EXISTS fastpg_reg_secondary_index;
+CREATE TABLE fastpg_reg_secondary_index (id int NOT NULL, code text, body text, amount int);
+INSERT INTO fastpg_reg_secondary_index VALUES (1, 'alpha', 'alpha one', 10);
+INSERT INTO fastpg_reg_secondary_index VALUES (2, 'beta', 'beta two', 20);
+INSERT INTO fastpg_reg_secondary_index VALUES (3, 'gamma', 'gamma three', 30);
+CREATE INDEX fastpg_reg_secondary_index_btree ON fastpg_reg_secondary_index USING btree (id);
+CREATE UNIQUE INDEX fastpg_reg_secondary_index_code_unique ON fastpg_reg_secondary_index USING btree (code);
+CREATE INDEX fastpg_reg_secondary_index_hash ON fastpg_reg_secondary_index USING hash (code);
+CREATE INDEX fastpg_reg_secondary_index_gist ON fastpg_reg_secondary_index USING gist (to_tsvector('english', body));
+CREATE INDEX fastpg_reg_secondary_index_spgist ON fastpg_reg_secondary_index USING spgist (code);
+CREATE INDEX fastpg_reg_secondary_index_gin ON fastpg_reg_secondary_index USING gin (to_tsvector('english', body));
+CREATE INDEX fastpg_reg_secondary_index_brin ON fastpg_reg_secondary_index USING brin (amount);
+ALTER TABLE fastpg_reg_secondary_index ADD UNIQUE (amount);
+SELECT 'secondary_lookup', id, amount FROM fastpg_reg_secondary_index WHERE id = 2;
+SELECT 'secondary_count', count(*) FROM fastpg_reg_secondary_index WHERE amount > 10;
+DROP TABLE fastpg_reg_secondary_index;

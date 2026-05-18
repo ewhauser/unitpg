@@ -331,6 +331,7 @@ fn decode_parameters(
 
 fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWireResult<Response> {
     match execution {
+        QueryExecution::Empty => Ok(Response::EmptyQuery),
         QueryExecution::Rows(result) => query_result_response(result, format),
         QueryExecution::Command { tag, rows } => Ok(command_complete(&tag, rows)),
         QueryExecution::CopyIn(target) => Ok(Response::CopyIn(CopyResponse::new(

@@ -432,912 +432,46 @@ GetCCHashEqFuncs(Oid keytype, CCHashFN *hashfunc, RegProcedure *eqfunc, CCFastEq
 
 #ifdef USE_FASTPG
 static void
-FastPgTupleDescInitEntry(TupleDesc tupdesc, AttrNumber attrNumber,
-						 const char *attributeName, Oid oidtypeid,
-						 bool notnull)
+FastPgTupleDescInitEntryWithTypmod(TupleDesc tupdesc, AttrNumber attrNumber,
+								   const char *attributeName, Oid oidtypeid,
+								   int32 typmod, bool notnull)
 {
-	TupleDescInitBuiltinEntry(tupdesc, attrNumber, attributeName, oidtypeid, -1, 0);
+	TupleDescInitBuiltinEntry(tupdesc, attrNumber, attributeName, oidtypeid, typmod, 0);
 	TupleDescAttr(tupdesc, attrNumber - 1)->attnotnull = notnull;
 }
 
-static void
-FastPgTupleDescInitUnusedEntries(TupleDesc tupdesc)
-{
-	for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
-		FastPgTupleDescInitEntry(tupdesc, attnum, "fastpg_unused", OIDOID, true);
-}
-
-static bool
-FastPgVirtualCatalogKeyType(Oid relation_oid, AttrNumber attnum, Oid *type_oid)
-{
-	switch (relation_oid)
-	{
-		case AccessMethodOperatorRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_amop_amopfamily:
-				case Anum_pg_amop_amoplefttype:
-				case Anum_pg_amop_amoprighttype:
-				case Anum_pg_amop_amopopr:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_amop_amoppurpose:
-					*type_oid = CHAROID;
-					return true;
-				case Anum_pg_amop_amopstrategy:
-					*type_oid = INT2OID;
-					return true;
-			}
-			break;
-		case AccessMethodProcedureRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_amproc_amprocfamily:
-				case Anum_pg_amproc_amproclefttype:
-				case Anum_pg_amproc_amprocrighttype:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_amproc_amprocnum:
-					*type_oid = INT2OID;
-					return true;
-			}
-			break;
-		case AccessMethodRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_am_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_am_amname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case AuthIdRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_authid_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_authid_rolname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case AuthMemRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_auth_members_roleid:
-				case Anum_pg_auth_members_member:
-				case Anum_pg_auth_members_grantor:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case CastRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_cast_castsource:
-				case Anum_pg_cast_casttarget:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case CollationRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_collation_oid:
-				case Anum_pg_collation_collnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_collation_collname:
-					*type_oid = NAMEOID;
-					return true;
-				case Anum_pg_collation_collencoding:
-					*type_oid = INT4OID;
-					return true;
-			}
-			break;
-		case ConversionRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_conversion_oid:
-				case Anum_pg_conversion_connamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_conversion_conname:
-					*type_oid = NAMEOID;
-					return true;
-				case Anum_pg_conversion_conforencoding:
-				case Anum_pg_conversion_contoencoding:
-					*type_oid = INT4OID;
-					return true;
-			}
-			break;
-		case ConstraintRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_constraint_oid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case DatabaseRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_database_oid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case DefaultAclRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_default_acl_defaclrole:
-				case Anum_pg_default_acl_defaclnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_default_acl_defaclobjtype:
-					*type_oid = CHAROID;
-					return true;
-			}
-			break;
-		case EnumRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_enum_oid:
-				case Anum_pg_enum_enumtypid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_enum_enumlabel:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case EventTriggerRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_event_trigger_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_event_trigger_evtname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case ExtensionRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_extension_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_extension_extname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case ForeignDataWrapperRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_foreign_data_wrapper_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_foreign_data_wrapper_fdwname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case ForeignServerRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_foreign_server_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_foreign_server_srvname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case ForeignTableRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_foreign_table_ftrelid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case IndexRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_index_indexrelid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case LanguageRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_language_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_language_lanname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case OperatorClassRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_opclass_oid:
-				case Anum_pg_opclass_opcmethod:
-				case Anum_pg_opclass_opcnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_opclass_opcname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case OperatorFamilyRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_opfamily_oid:
-				case Anum_pg_opfamily_opfmethod:
-				case Anum_pg_opfamily_opfnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_opfamily_opfname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case ParameterAclRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_parameter_acl_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_parameter_acl_parname:
-					*type_oid = TEXTOID;
-					return true;
-			}
-			break;
-		case PartitionedRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_partitioned_table_partrelid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case PropgraphElementRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_propgraph_element_oid:
-				case Anum_pg_propgraph_element_pgepgid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_propgraph_element_pgealias:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case PropgraphElementLabelRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_propgraph_element_label_pgelelid:
-				case Anum_pg_propgraph_element_label_pgellabelid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case PropgraphLabelRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_propgraph_label_oid:
-				case Anum_pg_propgraph_label_pglpgid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_propgraph_label_pgllabel:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case PropgraphLabelPropertyRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_propgraph_label_property_plpellabelid:
-				case Anum_pg_propgraph_label_property_plppropid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case PropgraphPropertyRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_propgraph_property_oid:
-				case Anum_pg_propgraph_property_pgppgid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_propgraph_property_pgpname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case PublicationNamespaceRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_publication_namespace_oid:
-				case Anum_pg_publication_namespace_pnnspid:
-				case Anum_pg_publication_namespace_pnpubid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case PublicationRelRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_publication_rel_oid:
-				case Anum_pg_publication_rel_prrelid:
-				case Anum_pg_publication_rel_prpubid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case PublicationRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_publication_oid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_publication_pubname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case RangeRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_range_rngtypid:
-				case Anum_pg_range_rngmultitypid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case RelationRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_class_oid:
-				case Anum_pg_class_relnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_class_relname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case ReplicationOriginRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_replication_origin_roident:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_replication_origin_roname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case RewriteRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_rewrite_ev_class:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_rewrite_rulename:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case SequenceRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_sequence_seqrelid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case StatisticExtDataRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_statistic_ext_data_stxoid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_statistic_ext_data_stxdinherit:
-					*type_oid = BOOLOID;
-					return true;
-			}
-			break;
-		case StatisticExtRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_statistic_ext_oid:
-				case Anum_pg_statistic_ext_stxnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_statistic_ext_stxname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case SubscriptionRelRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_subscription_rel_srrelid:
-				case Anum_pg_subscription_rel_srsubid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case SubscriptionRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_subscription_oid:
-				case Anum_pg_subscription_subdbid:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_subscription_subname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case TableSpaceRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_tablespace_oid:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case TransformRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_transform_oid:
-				case Anum_pg_transform_trftype:
-				case Anum_pg_transform_trflang:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-		case TypeRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_type_oid:
-				case Anum_pg_type_typnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_type_typname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case TSConfigMapRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_ts_config_map_mapcfg:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_ts_config_map_maptokentype:
-				case Anum_pg_ts_config_map_mapseqno:
-					*type_oid = INT4OID;
-					return true;
-			}
-			break;
-		case TSConfigRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_ts_config_oid:
-				case Anum_pg_ts_config_cfgnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_ts_config_cfgname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case TSDictionaryRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_ts_dict_oid:
-				case Anum_pg_ts_dict_dictnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_ts_dict_dictname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case TSParserRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_ts_parser_oid:
-				case Anum_pg_ts_parser_prsnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_ts_parser_prsname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case TSTemplateRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_ts_template_oid:
-				case Anum_pg_ts_template_tmplnamespace:
-					*type_oid = OIDOID;
-					return true;
-				case Anum_pg_ts_template_tmplname:
-					*type_oid = NAMEOID;
-					return true;
-			}
-			break;
-		case UserMappingRelationId:
-			switch (attnum)
-			{
-				case Anum_pg_user_mapping_oid:
-				case Anum_pg_user_mapping_umuser:
-				case Anum_pg_user_mapping_umserver:
-					*type_oid = OIDOID;
-					return true;
-			}
-			break;
-	}
-
-	return false;
-}
-
 static TupleDesc
-FastPgBuildVirtualKeyTupleDesc(CatCache *cache)
+FastPgBuildRustCatalogTupleDesc(Oid relation_oid)
 {
-	AttrNumber	max_attnum = 0;
+	FastPgRustCatalogRelation relation;
 	TupleDesc	tupdesc;
 
-	for (int i = 0; i < cache->cc_nkeys; i++)
+	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) relation_oid, &relation))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("fastpg generated catalog has no tuple descriptor for relation %u",
+						relation_oid)));
+
+	tupdesc = CreateTemplateTupleDesc(relation.column_count);
+	for (uint16_t index = 0; index < relation.column_count; index++)
 	{
-		if (cache->cc_keyno[i] <= 0)
-			elog(FATAL, "fastpg virtual catalogs do not support system cache keys");
-		max_attnum = Max(max_attnum, cache->cc_keyno[i]);
-	}
+		FastPgRustCatalogColumn column;
 
-	tupdesc = CreateTemplateTupleDesc(max_attnum);
-	FastPgTupleDescInitUnusedEntries(tupdesc);
-
-	for (int i = 0; i < cache->cc_nkeys; i++)
-	{
-		Oid			keytype;
-
-		if (!FastPgVirtualCatalogKeyType(cache->cc_reloid,
-										 cache->cc_keyno[i],
-										 &keytype))
+		if (!fastpg_rust_catalog_relation_column_by_index((uint32_t) relation_oid,
+														  (size_t) index,
+														  &column))
 			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg virtual catalog %u has no key type for attribute %d",
-							cache->cc_reloid, cache->cc_keyno[i])));
-		FastPgTupleDescInitEntry(tupdesc,
-								 cache->cc_keyno[i],
-								 "fastpg_key",
-								 keytype,
-								 true);
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("fastpg virtual catalog %u is missing generated column %u",
+							relation_oid, index + 1)));
+
+		FastPgTupleDescInitEntryWithTypmod(tupdesc,
+										   (AttrNumber) (index + 1),
+										   column.name,
+										   (Oid) column.type_oid,
+										   column.type_mod,
+										   column.is_not_null != 0);
 	}
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildClassTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_class);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_oid, "oid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relname, "relname", NAMEOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relnamespace, "relnamespace", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_reltype, "reltype", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_reloftype, "reloftype", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relowner, "relowner", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relam, "relam", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relfilenode, "relfilenode", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_reltablespace, "reltablespace", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relpages, "relpages", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_reltuples, "reltuples", FLOAT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relallvisible, "relallvisible", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relallfrozen, "relallfrozen", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_reltoastrelid, "reltoastrelid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relhasindex, "relhasindex", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relisshared, "relisshared", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relpersistence, "relpersistence", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relkind, "relkind", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relnatts, "relnatts", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relchecks, "relchecks", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relhasrules, "relhasrules", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relhastriggers, "relhastriggers", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relhassubclass, "relhassubclass", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relrowsecurity, "relrowsecurity", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relforcerowsecurity, "relforcerowsecurity", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relispopulated, "relispopulated", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relreplident, "relreplident", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relispartition, "relispartition", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relrewrite, "relrewrite", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relfrozenxid, "relfrozenxid", XIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relminmxid, "relminmxid", XIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relacl, "relacl", ACLITEMARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_reloptions, "reloptions", TEXTARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_class_relpartbound, "relpartbound", PG_NODE_TREEOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildIndexTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_index);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indexrelid, "indexrelid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indrelid, "indrelid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indnatts, "indnatts", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indnkeyatts, "indnkeyatts", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisunique, "indisunique", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indnullsnotdistinct, "indnullsnotdistinct", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisprimary, "indisprimary", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisexclusion, "indisexclusion", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indimmediate, "indimmediate", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisclustered, "indisclustered", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisvalid, "indisvalid", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indcheckxmin, "indcheckxmin", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisready, "indisready", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indislive, "indislive", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indisreplident, "indisreplident", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indkey, "indkey", INT2VECTOROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indcollation, "indcollation", OIDVECTOROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indclass, "indclass", OIDVECTOROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indoption, "indoption", INT2VECTOROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indexprs, "indexprs", PG_NODE_TREEOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_index_indpred, "indpred", PG_NODE_TREEOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildAttributeTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_attribute);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attrelid, "attrelid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attname, "attname", NAMEOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_atttypid, "atttypid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attlen, "attlen", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attnum, "attnum", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_atttypmod, "atttypmod", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attndims, "attndims", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attbyval, "attbyval", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attalign, "attalign", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attstorage, "attstorage", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attcompression, "attcompression", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attnotnull, "attnotnull", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_atthasdef, "atthasdef", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_atthasmissing, "atthasmissing", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attidentity, "attidentity", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attgenerated, "attgenerated", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attisdropped, "attisdropped", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attislocal, "attislocal", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attinhcount, "attinhcount", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attcollation, "attcollation", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attstattarget, "attstattarget", INT2OID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attacl, "attacl", ACLITEMARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attoptions, "attoptions", TEXTARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attfdwoptions, "attfdwoptions", TEXTARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_attribute_attmissingval, "attmissingval", ANYARRAYOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildNamespaceTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_namespace);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_namespace_oid, "oid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_namespace_nspname, "nspname", NAMEOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_namespace_nspowner, "nspowner", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_namespace_nspacl, "nspacl", ACLITEMARRAYOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildProcTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_proc);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_oid, "oid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proname, "proname", NAMEOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_pronamespace, "pronamespace", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proowner, "proowner", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prolang, "prolang", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_procost, "procost", FLOAT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prorows, "prorows", FLOAT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_provariadic, "provariadic", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prosupport, "prosupport", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prokind, "prokind", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prosecdef, "prosecdef", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proleakproof, "proleakproof", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proisstrict, "proisstrict", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proretset, "proretset", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_provolatile, "provolatile", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proparallel, "proparallel", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_pronargs, "pronargs", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_pronargdefaults, "pronargdefaults", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prorettype, "prorettype", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proargtypes, "proargtypes", OIDVECTOROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proallargtypes, "proallargtypes", OIDARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proargmodes, "proargmodes", CHARARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proargnames, "proargnames", TEXTARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proargdefaults, "proargdefaults", PG_NODE_TREEOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_protrftypes, "protrftypes", OIDARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prosrc, "prosrc", TEXTOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_probin, "probin", TEXTOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_prosqlbody, "prosqlbody", PG_NODE_TREEOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proconfig, "proconfig", TEXTARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_proc_proacl, "proacl", ACLITEMARRAYOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildAggregateTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_aggregate);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggfnoid, "aggfnoid", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggkind, "aggkind", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggnumdirectargs, "aggnumdirectargs", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggtransfn, "aggtransfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggfinalfn, "aggfinalfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggcombinefn, "aggcombinefn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggserialfn, "aggserialfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggdeserialfn, "aggdeserialfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggmtransfn, "aggmtransfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggminvtransfn, "aggminvtransfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggmfinalfn, "aggmfinalfn", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggfinalextra, "aggfinalextra", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggmfinalextra, "aggmfinalextra", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggfinalmodify, "aggfinalmodify", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggmfinalmodify, "aggmfinalmodify", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggsortop, "aggsortop", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggtranstype, "aggtranstype", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggtransspace, "aggtransspace", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggmtranstype, "aggmtranstype", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggmtransspace, "aggmtransspace", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_agginitval, "agginitval", TEXTOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_aggregate_aggminitval, "aggminitval", TEXTOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildOperatorTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_operator);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oid, "oid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprname, "oprname", NAMEOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprnamespace, "oprnamespace", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprowner, "oprowner", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprkind, "oprkind", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprcanmerge, "oprcanmerge", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprcanhash, "oprcanhash", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprleft, "oprleft", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprright, "oprright", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprresult, "oprresult", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprcom, "oprcom", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprnegate, "oprnegate", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprcode, "oprcode", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprrest, "oprrest", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_operator_oprjoin, "oprjoin", REGPROCOID, true);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildCastTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_cast);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_cast_oid, "oid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_cast_castsource, "castsource", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_cast_casttarget, "casttarget", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_cast_castfunc, "castfunc", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_cast_castcontext, "castcontext", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_cast_castmethod, "castmethod", CHAROID, true);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildStatisticTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_statistic);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_starelid, "starelid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_staattnum, "staattnum", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stainherit, "stainherit", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stanullfrac, "stanullfrac", FLOAT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stawidth, "stawidth", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stadistinct, "stadistinct", FLOAT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stakind1, "stakind1", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stakind2, "stakind2", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stakind3, "stakind3", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stakind4, "stakind4", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stakind5, "stakind5", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_staop1, "staop1", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_staop2, "staop2", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_staop3, "staop3", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_staop4, "staop4", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_staop5, "staop5", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stacoll1, "stacoll1", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stacoll2, "stacoll2", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stacoll3, "stacoll3", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stacoll4, "stacoll4", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stacoll5, "stacoll5", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stanumbers1, "stanumbers1", FLOAT4ARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stanumbers2, "stanumbers2", FLOAT4ARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stanumbers3, "stanumbers3", FLOAT4ARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stanumbers4, "stanumbers4", FLOAT4ARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stanumbers5, "stanumbers5", FLOAT4ARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stavalues1, "stavalues1", ANYARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stavalues2, "stavalues2", ANYARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stavalues3, "stavalues3", ANYARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stavalues4, "stavalues4", ANYARRAYOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_statistic_stavalues5, "stavalues5", ANYARRAYOID, false);
-
-	return tupdesc;
-}
-
-static TupleDesc
-FastPgBuildTypeTupleDesc(void)
-{
-	TupleDesc	tupdesc = CreateTemplateTupleDesc(Natts_pg_type);
-
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_oid, "oid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typname, "typname", NAMEOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typnamespace, "typnamespace", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typowner, "typowner", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typlen, "typlen", INT2OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typbyval, "typbyval", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typtype, "typtype", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typcategory, "typcategory", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typispreferred, "typispreferred", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typisdefined, "typisdefined", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typdelim, "typdelim", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typrelid, "typrelid", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typsubscript, "typsubscript", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typelem, "typelem", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typarray, "typarray", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typinput, "typinput", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typoutput, "typoutput", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typreceive, "typreceive", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typsend, "typsend", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typmodin, "typmodin", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typmodout, "typmodout", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typanalyze, "typanalyze", REGPROCOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typalign, "typalign", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typstorage, "typstorage", CHAROID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typnotnull, "typnotnull", BOOLOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typbasetype, "typbasetype", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typtypmod, "typtypmod", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typndims, "typndims", INT4OID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typcollation, "typcollation", OIDOID, true);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typdefaultbin, "typdefaultbin", PG_NODE_TREEOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typdefault, "typdefault", TEXTOID, false);
-	FastPgTupleDescInitEntry(tupdesc, Anum_pg_type_typacl, "typacl", ACLITEMARRAYOID, false);
 
 	return tupdesc;
 }
@@ -1348,66 +482,17 @@ FastPgCatalogCacheInitializeCache(CatCache *cache)
 	MemoryContext oldcxt;
 	TupleDesc	tupdesc = NULL;
 	const char *relname = NULL;
+	FastPgRustCatalogRelation relation;
 	int			i;
 
 	Assert(CacheMemoryContext != NULL);
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 
-	if (cache->cc_reloid == RelationRelationId)
+	if (fastpg_rust_catalog_relation_by_oid((uint32_t) cache->cc_reloid,
+											&relation))
 	{
-		relname = "pg_class";
-		tupdesc = FastPgBuildClassTupleDesc();
-	}
-	else if (cache->cc_reloid == AttributeRelationId)
-	{
-		relname = "pg_attribute";
-		tupdesc = FastPgBuildAttributeTupleDesc();
-	}
-	else if (cache->cc_reloid == IndexRelationId)
-	{
-		relname = "pg_index";
-		tupdesc = FastPgBuildIndexTupleDesc();
-	}
-	else if (cache->cc_reloid == ProcedureRelationId)
-	{
-		relname = "pg_proc";
-		tupdesc = FastPgBuildProcTupleDesc();
-	}
-	else if (cache->cc_reloid == NamespaceRelationId)
-	{
-		relname = "pg_namespace";
-		tupdesc = FastPgBuildNamespaceTupleDesc();
-	}
-	else if (cache->cc_reloid == AggregateRelationId)
-	{
-		relname = "pg_aggregate";
-		tupdesc = FastPgBuildAggregateTupleDesc();
-	}
-	else if (cache->cc_reloid == OperatorRelationId)
-	{
-		relname = "pg_operator";
-		tupdesc = FastPgBuildOperatorTupleDesc();
-	}
-	else if (cache->cc_reloid == CastRelationId)
-	{
-		relname = "pg_cast";
-		tupdesc = FastPgBuildCastTupleDesc();
-	}
-	else if (cache->cc_reloid == StatisticRelationId)
-	{
-		relname = "pg_statistic";
-		tupdesc = FastPgBuildStatisticTupleDesc();
-	}
-	else if (cache->cc_reloid == TypeRelationId)
-	{
-		relname = "pg_type";
-		tupdesc = FastPgBuildTypeTupleDesc();
-	}
-	else if (FastPgCatalogCacheIsEmpty(cache) ||
-			 cache->cc_reloid == ConstraintRelationId)
-	{
-		relname = "fastpg_virtual_sparse";
-		tupdesc = FastPgBuildVirtualKeyTupleDesc(cache);
+		relname = relation.name;
+		tupdesc = FastPgBuildRustCatalogTupleDesc(cache->cc_reloid);
 	}
 	else
 	{
@@ -1598,74 +683,17 @@ FastPgBuildClassTuple(TupleDesc tupdesc,
 static bool
 FastPgOpclassForType(Oid type_oid, Oid *opclass_oid)
 {
-	switch (type_oid)
-	{
-		case INT2OID:
-			*opclass_oid = INT2_BTREE_OPS_OID;
-			return true;
-		case INT4OID:
-			*opclass_oid = INT4_BTREE_OPS_OID;
-			return true;
-		case INT8OID:
-			*opclass_oid = INT8_BTREE_OPS_OID;
-			return true;
-		case OIDOID:
-			*opclass_oid = OID_BTREE_OPS_OID;
-			return true;
-		case TEXTOID:
-		case VARCHAROID:
-			*opclass_oid = TEXT_BTREE_OPS_OID;
-			return true;
-		default:
-			return false;
-	}
-}
+	uint32_t	fastpg_oid;
 
-typedef struct FastPgOpclassRecord
-{
-	Oid			oid;
-	const char *name;
-	Oid			opfamily;
-	Oid			opcintype;
-} FastPgOpclassRecord;
-
-static const FastPgOpclassRecord FastPgOpclassRecords[] = {
-	{INT2_BTREE_OPS_OID, "int2_ops", INTEGER_BTREE_FAM_OID, INT2OID},
-	{INT4_BTREE_OPS_OID, "int4_ops", INTEGER_BTREE_FAM_OID, INT4OID},
-	{INT8_BTREE_OPS_OID, "int8_ops", INTEGER_BTREE_FAM_OID, INT8OID},
-	{OID_BTREE_OPS_OID, "oid_ops", OID_BTREE_FAM_OID, OIDOID},
-	{TEXT_BTREE_OPS_OID, "text_ops", TEXT_BTREE_FAM_OID, TEXTOID},
-};
-
-static const FastPgOpclassRecord *
-FastPgOpclassByOid(Oid opclass_oid)
-{
-	for (int index = 0; index < lengthof(FastPgOpclassRecords); index++)
-	{
-		if (FastPgOpclassRecords[index].oid == opclass_oid)
-			return &FastPgOpclassRecords[index];
-	}
-
-	return NULL;
-}
-
-static const FastPgOpclassRecord *
-FastPgOpclassByName(Oid opcmethod, const char *name, Oid namespace_oid)
-{
-	if (opcmethod != BTREE_AM_OID || namespace_oid != PG_CATALOG_NAMESPACE)
-		return NULL;
-
-	for (int index = 0; index < lengthof(FastPgOpclassRecords); index++)
-	{
-		if (strcmp(FastPgOpclassRecords[index].name, name) == 0)
-			return &FastPgOpclassRecords[index];
-	}
-
-	return NULL;
+	if (!fastpg_rust_catalog_btree_opclass_for_type((uint32_t) type_oid,
+													&fastpg_oid))
+		return false;
+	*opclass_oid = (Oid) fastpg_oid;
+	return true;
 }
 
 static HeapTuple
-FastPgBuildOpclassTuple(TupleDesc tupdesc, const FastPgOpclassRecord *record)
+FastPgBuildOpclassTuple(TupleDesc tupdesc, const FastPgRustCatalogOpclass *record)
 {
 	Datum		values[Natts_pg_opclass] = {0};
 	bool		nulls[Natts_pg_opclass] = {false};
@@ -1674,14 +702,14 @@ FastPgBuildOpclassTuple(TupleDesc tupdesc, const FastPgOpclassRecord *record)
 	namestrcpy(&opcname, record->name);
 
 	values[Anum_pg_opclass_oid - 1] = ObjectIdGetDatum(record->oid);
-	values[Anum_pg_opclass_opcmethod - 1] = ObjectIdGetDatum(BTREE_AM_OID);
+	values[Anum_pg_opclass_opcmethod - 1] = ObjectIdGetDatum(record->method_oid);
 	values[Anum_pg_opclass_opcname - 1] = NameGetDatum(&opcname);
-	values[Anum_pg_opclass_opcnamespace - 1] = ObjectIdGetDatum(PG_CATALOG_NAMESPACE);
-	values[Anum_pg_opclass_opcowner - 1] = ObjectIdGetDatum(BOOTSTRAP_SUPERUSERID);
-	values[Anum_pg_opclass_opcfamily - 1] = ObjectIdGetDatum(record->opfamily);
-	values[Anum_pg_opclass_opcintype - 1] = ObjectIdGetDatum(record->opcintype);
-	values[Anum_pg_opclass_opcdefault - 1] = BoolGetDatum(true);
-	values[Anum_pg_opclass_opckeytype - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_opclass_opcnamespace - 1] = ObjectIdGetDatum(record->namespace_oid);
+	values[Anum_pg_opclass_opcowner - 1] = ObjectIdGetDatum(record->owner_oid);
+	values[Anum_pg_opclass_opcfamily - 1] = ObjectIdGetDatum(record->family_oid);
+	values[Anum_pg_opclass_opcintype - 1] = ObjectIdGetDatum(record->input_type_oid);
+	values[Anum_pg_opclass_opcdefault - 1] = BoolGetDatum(record->is_default != 0);
+	values[Anum_pg_opclass_opckeytype - 1] = ObjectIdGetDatum(record->key_type_oid);
 
 	return heap_form_tuple(tupdesc, values, nulls);
 }
@@ -2065,24 +1093,27 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 	}
 	else if (cache->cc_reloid == OperatorClassRelationId)
 	{
-		const FastPgOpclassRecord *opclass = NULL;
+		FastPgRustCatalogOpclass opclass;
+		bool		found = false;
 
 		if (nkeys == 1 && cache->cc_keyno[0] == Anum_pg_opclass_oid)
 		{
-			opclass = FastPgOpclassByOid(DatumGetObjectId(arguments[0]));
+			found = fastpg_rust_catalog_opclass_by_oid((uint32_t) DatumGetObjectId(arguments[0]),
+													   &opclass);
 		}
 		else if (nkeys == 3 &&
 				 cache->cc_keyno[0] == Anum_pg_opclass_opcmethod &&
 				 cache->cc_keyno[1] == Anum_pg_opclass_opcname &&
 				 cache->cc_keyno[2] == Anum_pg_opclass_opcnamespace)
 		{
-			opclass = FastPgOpclassByName(DatumGetObjectId(arguments[0]),
-										  DatumGetCString(arguments[1]),
-										  DatumGetObjectId(arguments[2]));
+			found = fastpg_rust_catalog_opclass_by_name((uint32_t) DatumGetObjectId(arguments[0]),
+														DatumGetCString(arguments[1]),
+														(uint32_t) DatumGetObjectId(arguments[2]),
+														&opclass);
 		}
 
-		if (opclass != NULL)
-			return FastPgBuildOpclassTuple(cache->cc_tupdesc, opclass);
+		if (found)
+			return FastPgBuildOpclassTuple(cache->cc_tupdesc, &opclass);
 	}
 	else if (cache->cc_reloid == ProcedureRelationId)
 	{

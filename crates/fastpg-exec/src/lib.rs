@@ -60,6 +60,7 @@ pub struct CopyTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryExecution {
+    Empty,
     Rows(QueryResult),
     Command { tag: String, rows: usize },
     CopyIn(CopyTarget),
@@ -943,10 +944,7 @@ fn parse_i32_token(token: &str) -> Option<i32> {
 #[cfg(feature = "postgres-execution")]
 fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryExecution {
     let Some(statement) = result.statements.into_iter().next() else {
-        return QueryExecution::Command {
-            tag: "OK".to_owned(),
-            rows: 0,
-        };
+        return QueryExecution::Empty;
     };
 
     if let Some(copy_in) = statement.copy_in {
@@ -1429,6 +1427,17 @@ mod tests {
                 vec![Column::new("?column?", PgType::Int4)],
                 vec![vec![Value::Int4(1)]]
             ))
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn executes_comment_only_query_as_empty_query() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        assert_eq!(
+            executor.execute("/* comment-only query should be empty */", &[]),
+            QueryExecution::Empty
         );
     }
 
