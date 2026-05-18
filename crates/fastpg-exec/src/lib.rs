@@ -733,80 +733,127 @@ fn rewrite_pgbench_simple_query(sql: &str, parameters: &[Value]) -> Option<Rewri
 
 #[cfg(feature = "postgres-execution")]
 fn rewrite_pgbench_update_or_select(sql: &str) -> Option<RewrittenPgCoreQuery> {
-    let tokens = sql.split_whitespace().collect::<Vec<_>>();
-    let lowered = tokens
-        .iter()
-        .map(|token| token.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let mut tokens = sql.split_ascii_whitespace();
+    let first = tokens.next()?;
 
-    if lowered.len() == 8
-        && lowered[0] == "select"
-        && lowered[1] == "abalance"
-        && lowered[2] == "from"
-        && lowered[3] == "pgbench_accounts"
-        && lowered[4] == "where"
-        && lowered[5] == "aid"
-        && lowered[6] == "="
-    {
-        let aid = parse_i32_token(tokens[7])?;
+    if first.eq_ignore_ascii_case("select") {
+        if !tokens.next()?.eq_ignore_ascii_case("abalance")
+            || !tokens.next()?.eq_ignore_ascii_case("from")
+            || !tokens.next()?.eq_ignore_ascii_case("pgbench_accounts")
+            || !tokens.next()?.eq_ignore_ascii_case("where")
+            || !tokens.next()?.eq_ignore_ascii_case("aid")
+            || tokens.next()? != "="
+        {
+            return None;
+        }
+        let aid = parse_i32_token(tokens.next()?)?;
+        if tokens.next().is_some() {
+            return None;
+        }
         return Some(RewrittenPgCoreQuery {
             sql: PGBENCH_SELECT_ACCOUNT,
             parameters: vec![Value::Int4(aid)],
         });
     }
 
-    if lowered.len() == 12
-        && lowered[0] == "update"
-        && lowered[2] == "set"
-        && lowered[4] == "="
-        && lowered[6] == "+"
-        && lowered[8] == "where"
-        && lowered[10] == "="
-    {
-        let delta = parse_i32_token(tokens[7])?;
-        let key = parse_i32_token(tokens[11])?;
-        let template = match (
-            lowered[1].as_str(),
-            lowered[3].as_str(),
-            lowered[5].as_str(),
-            lowered[9].as_str(),
-        ) {
-            ("pgbench_accounts", "abalance", "abalance", "aid") => PGBENCH_UPDATE_ACCOUNT,
-            ("pgbench_tellers", "tbalance", "tbalance", "tid") => PGBENCH_UPDATE_TELLER,
-            ("pgbench_branches", "bbalance", "bbalance", "bid") => PGBENCH_UPDATE_BRANCH,
-            _ => return None,
-        };
-        return Some(RewrittenPgCoreQuery {
-            sql: template,
-            parameters: vec![Value::Int4(delta), Value::Int4(key)],
-        });
+    if !first.eq_ignore_ascii_case("update") {
+        return None;
     }
 
-    None
+    let table = tokens.next()?;
+    if !tokens.next()?.eq_ignore_ascii_case("set") {
+        return None;
+    }
+    let target_column = tokens.next()?;
+    if tokens.next()? != "=" {
+        return None;
+    }
+    let source_column = tokens.next()?;
+    if tokens.next()? != "+" {
+        return None;
+    }
+    let delta = parse_i32_token(tokens.next()?)?;
+    if !tokens.next()?.eq_ignore_ascii_case("where") {
+        return None;
+    }
+    let key_column = tokens.next()?;
+    if tokens.next()? != "=" {
+        return None;
+    }
+    let key = parse_i32_token(tokens.next()?)?;
+    if tokens.next().is_some() {
+        return None;
+    }
+
+    let template = if table.eq_ignore_ascii_case("pgbench_accounts")
+        && target_column.eq_ignore_ascii_case("abalance")
+        && source_column.eq_ignore_ascii_case("abalance")
+        && key_column.eq_ignore_ascii_case("aid")
+    {
+        PGBENCH_UPDATE_ACCOUNT
+    } else if table.eq_ignore_ascii_case("pgbench_tellers")
+        && target_column.eq_ignore_ascii_case("tbalance")
+        && source_column.eq_ignore_ascii_case("tbalance")
+        && key_column.eq_ignore_ascii_case("tid")
+    {
+        PGBENCH_UPDATE_TELLER
+    } else if table.eq_ignore_ascii_case("pgbench_branches")
+        && target_column.eq_ignore_ascii_case("bbalance")
+        && source_column.eq_ignore_ascii_case("bbalance")
+        && key_column.eq_ignore_ascii_case("bid")
+    {
+        PGBENCH_UPDATE_BRANCH
+    } else {
+        return None;
+    };
+
+    Some(RewrittenPgCoreQuery {
+        sql: template,
+        parameters: vec![Value::Int4(delta), Value::Int4(key)],
+    })
 }
 
 #[cfg(feature = "postgres-execution")]
 fn rewrite_pgbench_insert_history(sql: &str) -> Option<RewrittenPgCoreQuery> {
-    let lower = sql.to_ascii_lowercase();
-    if !lower.starts_with("insert into pgbench_history") {
+    if !starts_with_ignore_ascii_case(sql, "insert into pgbench_history") {
         return None;
     }
-    let values_index = lower.find("values")?;
+    let values_index = find_ignore_ascii_case(sql, "values")?;
     let values = sql[values_index + "values".len()..].trim();
     let values = values.strip_prefix('(')?.strip_suffix(')')?;
-    let fields = values.split(',').map(str::trim).collect::<Vec<_>>();
-    if fields.len() != 5 || !fields[4].eq_ignore_ascii_case("current_timestamp") {
+    let mut fields = values.split(',').map(str::trim);
+    let tid = fields.next()?;
+    let bid = fields.next()?;
+    let aid = fields.next()?;
+    let delta = fields.next()?;
+    let mtime = fields.next()?;
+    if fields.next().is_some() || !mtime.eq_ignore_ascii_case("current_timestamp") {
         return None;
     }
     Some(RewrittenPgCoreQuery {
         sql: PGBENCH_INSERT_HISTORY,
         parameters: vec![
-            Value::Int4(parse_i32_token(fields[0])?),
-            Value::Int4(parse_i32_token(fields[1])?),
-            Value::Int4(parse_i32_token(fields[2])?),
-            Value::Int4(parse_i32_token(fields[3])?),
+            Value::Int4(parse_i32_token(tid)?),
+            Value::Int4(parse_i32_token(bid)?),
+            Value::Int4(parse_i32_token(aid)?),
+            Value::Int4(parse_i32_token(delta)?),
         ],
     })
+}
+
+#[cfg(feature = "postgres-execution")]
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
+}
+
+#[cfg(feature = "postgres-execution")]
+fn find_ignore_ascii_case(value: &str, needle: &str) -> Option<usize> {
+    value
+        .as_bytes()
+        .windows(needle.len())
+        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
 }
 
 #[cfg(feature = "postgres-execution")]
