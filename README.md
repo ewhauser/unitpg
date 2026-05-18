@@ -54,6 +54,39 @@ Long-lived database state belongs to Rust:
 The boundary is not "Rust versus C". The boundary is "reuse Postgres semantics,
 replace Postgres physical storage".
 
+## Feature Matrix
+
+Status legend: `[x]` implemented, `[ ]` planned, `Not supported` intentionally
+outside the fastpg test-server scope.
+
+| Feature | fastpg | Notes |
+| --- | --- | --- |
+| TCP Postgres wire protocol | [x] | Through `pgwire` |
+| Unix socket wire protocol | [x] | Available on Unix platforms |
+| Simple query protocol | [x] | Used by `psql` and pgbench smoke paths |
+| Extended query protocol and parameters | [x] | Supported for common driver query paths |
+| Authentication, SSL, GSS, and roles | Not supported | fastpg is intended to be single-user/trust-style |
+| SQL parser | [x] | Reuses PostgreSQL parser |
+| Analyzer, rewriter, planner, optimizer | [x] | Reuses PostgreSQL pipeline for supported statements |
+| Executor and expression evaluation | [x] | Reuses PostgreSQL executor infrastructure where it can run on fastpg storage |
+| DDL | [ ] | Basic table create/drop/truncate and primary-key creation are supported; broader schema coverage is planned |
+| `VACUUM` and `ANALYZE` | [x] | Accepted as no-op or lightweight test-compatibility hooks |
+| `INSERT`, `SELECT`, `UPDATE`, `DELETE` | [x] | Current in-memory table and planner-node coverage |
+| `COPY FROM STDIN` | [x] | Relation text input; file/program/query variants are not supported today |
+| Transactions | [x] | In-memory commit, rollback, and subtransaction overlays |
+| Concurrent clients | [x] | Multiple Tokio clients; one PostgreSQL-core execution lane for now |
+| Catalog and schema introspection | [x] | Partial in-memory `pg_catalog` support for current analyzer/planner/client needs |
+| Types, operators, functions, casts | [x] | Partial built-in support; more are added as tests and pgbench paths need them |
+| Primary keys | [x] | Catalog visibility, uniqueness, and primary-key lookup support |
+| Secondary indexes | [x] | Partial support; broader index coverage is ongoing |
+| Joins and aggregation | [x] | Partial support; simple joins and `GROUP BY` are covered |
+| WAL, durability, crash recovery | Not supported | Replaced by disposable in-memory state |
+| Shared buffers, heap files, pagers | Not supported | Replaced by Rust in-memory storage |
+| Vacuum/autovacuum maintenance | Not supported | Production maintenance is out of scope |
+| Replication, logical decoding, PITR, backups | Not supported | Durable production workflows are out of scope |
+| Extensions and custom access methods | Not supported | Out of scope today |
+| ACLs and security boundary fidelity | Not supported | Intended to be disabled for fast single-user tests |
+
 ## What This Is For
 
 - Fast local and CI unit-test databases.
