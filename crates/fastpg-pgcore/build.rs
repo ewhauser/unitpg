@@ -1,6 +1,7 @@
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -76,26 +77,31 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
     let mut objects = Vec::new();
     collect_backend_objects(build_dir, &mut objects);
     extract_archive_objects(
+        build_dir,
         &build_dir.join("src/backend/parser/parser.a"),
         &object_dir.join("parser"),
         &mut objects,
     );
     extract_archive_objects(
+        build_dir,
         &build_dir.join("src/common/libpgcommon_srv.a"),
         &object_dir.join("pgcommon_srv"),
         &mut objects,
     );
     extract_archive_objects(
+        build_dir,
         &build_dir.join("src/common/libpgcommon_srv_config_info.a"),
         &object_dir.join("pgcommon_srv_config_info"),
         &mut objects,
     );
     extract_archive_objects(
+        build_dir,
         &build_dir.join("src/common/libpgcommon_srv_ryu.a"),
         &object_dir.join("pgcommon_srv_ryu"),
         &mut objects,
     );
     extract_archive_objects(
+        build_dir,
         &build_dir.join("src/port/libpgport_srv.a"),
         &object_dir.join("pgport_srv"),
         &mut objects,
@@ -164,10 +170,28 @@ fn should_link_backend_object(path: &Path) -> bool {
     name != "main_main.c.o"
 }
 
-fn extract_archive_objects(archive: &Path, output_dir: &Path, objects: &mut Vec<PathBuf>) {
+fn extract_archive_objects(
+    build_dir: &Path,
+    archive: &Path,
+    output_dir: &Path,
+    objects: &mut Vec<PathBuf>,
+) {
     if !archive.exists() {
         panic!("missing required Postgres archive: {}", archive.display());
     }
+
+    if is_thin_archive(archive) {
+        for member in archive_members(archive) {
+            if Path::new(&member).extension() != Some(OsStr::new("o")) {
+                continue;
+            }
+            let path = resolve_thin_archive_member(build_dir, archive, &member);
+            println!("cargo:rerun-if-changed={}", path.display());
+            objects.push(path);
+        }
+        return;
+    }
+
     fs::create_dir_all(output_dir).unwrap_or_else(|error| {
         panic!("failed to create {}: {error}", output_dir.display());
     });
@@ -194,11 +218,60 @@ fn extract_archive_objects(archive: &Path, output_dir: &Path, objects: &mut Vec<
     }
 }
 
+fn is_thin_archive(archive: &Path) -> bool {
+    let mut file = fs::File::open(archive).unwrap_or_else(|error| {
+        panic!("failed to open {}: {error}", archive.display());
+    });
+    let mut header = [0; 8];
+    let read = file.read(&mut header).unwrap_or_else(|error| {
+        panic!("failed to read {}: {error}", archive.display());
+    });
+    read == header.len() && header == *b"!<thin>\n"
+}
+
+fn archive_members(archive: &Path) -> Vec<String> {
+    let output = run_command_output(
+        Command::new(ar_program()).arg("t").arg(archive),
+        "list Postgres archive members",
+    );
+    String::from_utf8_lossy(&output)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn resolve_thin_archive_member(build_dir: &Path, archive: &Path, member: &str) -> PathBuf {
+    let member_path = Path::new(member);
+    if member_path.is_absolute() {
+        return member_path.to_path_buf();
+    }
+
+    let archive_dir = archive.parent().unwrap_or_else(|| Path::new("."));
+    for candidate in [archive_dir.join(member_path), build_dir.join(member_path)] {
+        if candidate.exists() {
+            return candidate;
+        }
+    }
+
+    panic!(
+        "thin archive member {member:?} from {} was not found relative to {} or {}",
+        archive.display(),
+        archive_dir.display(),
+        build_dir.display()
+    );
+}
+
 fn ar_program() -> String {
     env::var("AR").unwrap_or_else(|_| "ar".to_owned())
 }
 
 fn run_command(command: &mut Command, label: &str) {
+    let _ = run_command_output(command, label);
+}
+
+fn run_command_output(command: &mut Command, label: &str) -> Vec<u8> {
     let output = command.output().unwrap_or_else(|error| {
         panic!("failed to {label}: {error}");
     });
@@ -210,4 +283,5 @@ fn run_command(command: &mut Command, label: &str) {
             String::from_utf8_lossy(&output.stderr)
         );
     }
+    output.stdout
 }
