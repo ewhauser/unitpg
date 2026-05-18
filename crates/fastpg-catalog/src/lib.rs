@@ -1030,6 +1030,7 @@ pub struct PgTypeRecord {
 }
 
 impl PgTypeRecord {
+    #[allow(clippy::too_many_arguments)]
     const fn fixed(
         oid: Oid,
         name: &'static str,
@@ -1073,6 +1074,7 @@ impl PgTypeRecord {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     const fn fixed_custom(
         oid: Oid,
         name: &'static str,
@@ -1116,6 +1118,7 @@ impl PgTypeRecord {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     const fn varlena_string(
         oid: Oid,
         name: &'static str,
@@ -1158,6 +1161,7 @@ impl PgTypeRecord {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     const fn varlena_catalog(
         oid: Oid,
         name: &'static str,

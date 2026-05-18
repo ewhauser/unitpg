@@ -1469,6 +1469,10 @@ fn decode_copy_text_field(field: &str) -> String {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
     oid: u32,
     out: *mut FastPgRustCatalogType,
@@ -1517,6 +1521,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_type_by_name(
     name: *const c_char,
     namespace_oid: u32,
@@ -1575,6 +1583,10 @@ pub extern "C" fn fastpg_rust_catalog_policy_by_relation_oid(relation_oid: u32) 
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
     name: *const c_char,
     namespace_oid: u32,
@@ -1618,6 +1630,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_oid(
     oid: u32,
     out: *mut FastPgRustCatalogRelation,
@@ -1646,6 +1662,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
     relation_oid: u32,
     column_index: usize,
@@ -1678,6 +1698,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_info(
     index_oid: u32,
     out: *mut FastPgRustPrimaryKeyIndexInfo,
@@ -1695,6 +1719,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_info(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_oid(
     relation_oid: u32,
     oid_out: *mut u32,
@@ -1715,6 +1743,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_namespace_by_oid(
     oid: u32,
     out: *mut FastPgRustCatalogNamespace,
@@ -1733,6 +1765,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_namespace_by_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_namespace_by_name(
     name: *const c_char,
     out: *mut FastPgRustCatalogNamespace,
@@ -1754,6 +1790,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_namespace_by_name(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_oid(
     oid: u32,
     out: *mut FastPgRustCatalogProc,
@@ -1775,6 +1815,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_proc_count_by_name(name: *const c_char) -> usize {
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return 0;
@@ -1783,6 +1827,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_proc_count_by_name(name: *const c_c
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_name_index(
     name: *const c_char,
     index: usize,
@@ -1808,6 +1856,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_name_index(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_aggregate_by_proc_oid(
     function_oid: u32,
     out: *mut FastPgRustCatalogAggregate,
@@ -1826,6 +1878,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_aggregate_by_proc_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_aggregate_init_value(
     function_oid: u32,
     moving: bool,
@@ -1850,6 +1906,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_aggregate_init_value(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_oid(
     oid: u32,
     out: *mut FastPgRustCatalogOperator,
@@ -1868,6 +1928,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_oid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_signature(
     name: *const c_char,
     left_type_oid: u32,
@@ -1897,6 +1961,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_signature(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_cast_by_source_target(
     source_type_oid: u32,
     target_type_oid: u32,
@@ -1917,6 +1985,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_cast_by_source_target(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_create_relation(
     name: *const c_char,
     column_names: *const *const c_char,
@@ -1978,6 +2050,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_create_relation(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_drop_relation(
     name: *const c_char,
     missing_ok: bool,
@@ -2015,6 +2091,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_drop_relation(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_truncate_relation(
     name: *const c_char,
     sqlstate_out: *mut c_char,
@@ -2048,6 +2128,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_truncate_relation(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_count(
     name: *const c_char,
     count_out: *mut usize,
@@ -2090,6 +2174,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_count(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
     name: *const c_char,
     column_names: *const *const c_char,
@@ -2216,6 +2304,10 @@ pub extern "C" fn fastpg_rust_relation_contains_row(relid: u32, row_id: u64) -> 
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     index_relid: u32,
     values: *const usize,
@@ -2263,6 +2355,10 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_relation_insert(
     relid: u32,
     values: *const usize,
@@ -2323,6 +2419,10 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_relation_update(
     relid: u32,
     row_id: u64,
@@ -2407,13 +2507,15 @@ pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
     })
 }
 
+type RowInputArrays<'a> = (&'a [usize], &'a [u8], &'a [u8], &'a [usize]);
+
 unsafe fn row_input_arrays<'a>(
     values: *const usize,
     is_null: *const u8,
     byval: *const u8,
     value_lens: *const usize,
     natts: usize,
-) -> Option<(&'a [usize], &'a [u8], &'a [u8], &'a [usize])> {
+) -> Option<RowInputArrays<'a>> {
     if natts > 0
         && (values.is_null() || is_null.is_null() || byval.is_null() || value_lens.is_null())
     {
@@ -2563,7 +2665,7 @@ fn push_i16_ne(bytes: &mut Vec<u8>, value: i16) {
 }
 
 fn int2vector_datum(values: &[i16], payloads: &mut Vec<Box<[u8]>>) -> Cell {
-    let total_len = 24 + values.len() * std::mem::size_of::<i16>();
+    let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
     push_u32_ne(&mut bytes, varlena_4b_header(total_len));
     push_i32_ne(&mut bytes, 1);
@@ -3026,6 +3128,10 @@ pub extern "C" fn fastpg_rust_scan_end(scan_handle: u64) {
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_scan_next(
     scan_handle: u64,
     forward: u8,
@@ -3071,6 +3177,10 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_fetch_row(
     relid: u32,
     row_id: u64,

@@ -1,23 +1,66 @@
-name: Release server binaries
+name: PR validation
 
 on:
-  push:
+  pull_request:
     branches:
       - main
       - master
       - rusty
-  workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
-  group: release-server-binaries-${{ github.ref }}
-  cancel-in-progress: false
+  group: pr-validation-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
 
 jobs:
-  build:
-    name: Build ${{ matrix.target }}
+  clippy:
+    name: Rust clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    env:
+      PGCORE_BUILD_DIR: benches/.build/ci-clippy-pgcore
+      RELEASE_JOBS: 4
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            flex \
+            libipc-run-perl \
+            meson \
+            ninja-build \
+            patchelf \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Build fastpg PostgreSQL core
+        run: |
+          set -euo pipefail
+          rm -rf "$PGCORE_BUILD_DIR"
+          meson setup "$PGCORE_BUILD_DIR" . \
+            --buildtype=release \
+            --auto-features=disabled \
+            -Dtap_tests=disabled \
+            -Dfastpg=true
+          meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
+
+      - name: Run clippy
+        env:
+          FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  validate:
+    name: Validate ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
     strategy:
@@ -153,51 +196,9 @@ jobs:
       - name: Upload binary archive
         uses: actions/upload-artifact@v4
         with:
-          name: server-dist-${{ matrix.target }}
+          name: pr-server-dist-${{ matrix.target }}
           path: |
             ${{ runner.temp }}/server-dist/*.tar.gz
             ${{ runner.temp }}/server-dist/*.tar.gz.sha256
           if-no-files-found: error
-
-  publish:
-    name: Publish GitHub release
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    runs-on: ubuntu-24.04
-    needs: build
-    timeout-minutes: 15
-
-    steps:
-      - name: Download binary archives
-        uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
-
-      - name: Publish release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          short_sha="${GITHUB_SHA::12}"
-          tag="postgres-server-${short_sha}"
-          title="PostgreSQL Rust server binaries ${short_sha}"
-          notes="$RUNNER_TEMP/release-notes.md"
-
-          {
-            echo "fastpg Rust single-process server binary distributions for ${GITHUB_SHA}."
-            echo
-            echo "Assets:"
-            for archive in dist/*.tar.gz; do
-              echo "- $(basename "$archive")"
-            done
-          } > "$notes"
-
-          if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* \
-              --target "$GITHUB_SHA" \
-              --title "$title" \
-              --notes-file "$notes"
-          fi
+          retention-days: 7
