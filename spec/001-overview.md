@@ -2028,6 +2028,71 @@ full app-test milestone
 future compatibility expansions
 ```
 
+## `027-session-state-per-client.md`
+
+Define per-client Rust session ownership.
+
+Must cover:
+
+```text
+SessionState lifecycle
+ServerState vs SessionState ownership
+pgwire client metadata
+prepared statement and portal isolation
+COPY state isolation
+transaction state ownership
+session GUC/search_path isolation
+disconnect cleanup
+```
+
+## `028-transaction-owned-storage-state.md`
+
+Define session-owned storage transaction overlays.
+
+Must cover:
+
+```text
+shared committed storage
+session transaction overlays
+subtransaction overlays
+rollback as drop
+commit merge
+transaction arenas
+tableam callback execution context
+index delta ownership
+```
+
+## `029-single-pgcore-execution-lane.md`
+
+Define the serialized PostgreSQL C execution lane.
+
+Must cover:
+
+```text
+pgcore lane API
+C global serialization
+lane-affine prepared handles
+active catalog/storage context
+metrics for queue and execution time
+multi-lane prerequisites
+```
+
+## `030-catalog-generation-invalidation.md`
+
+Define Rust catalog generation invalidation.
+
+Must cover:
+
+```text
+catalog generation counter
+DDL commit publication
+rollback behavior
+prepared statement invalidation
+plan invalidation
+virtual pg_catalog snapshots
+replacement for no-op shared invalidation
+```
+
 ## MVP Milestone
 
 The first end-to-end milestone should be intentionally small:
