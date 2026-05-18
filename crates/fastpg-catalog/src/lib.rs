@@ -52,11 +52,17 @@ const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
 const PG_TYPE_RELATION_OID: Oid = Oid(1247);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
+const PG_PROC_RELATION_OID: Oid = Oid(1255);
 const HEAP_TABLE_AM_OID: Oid = Oid(2);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
 const FIRST_NORMAL_TRANSACTION_ID: i32 = 3;
 const FIRST_MULTI_XACT_ID: i32 = 1;
 const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
+const ARRAY_IN_PROC_OID: Oid = Oid(750);
+const ARRAY_OUT_PROC_OID: Oid = Oid(751);
+const ARRAY_RECV_PROC_OID: Oid = Oid(2400);
+const ARRAY_SEND_PROC_OID: Oid = Oid(2401);
+const ARRAY_SUBSCRIPT_HANDLER_PROC_OID: Oid = Oid(6179);
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
 pub const VIRTUAL_CATALOG_DYNAMIC: u8 = 2;
@@ -406,6 +412,10 @@ pub fn static_catalog_by_name(name: &str) -> Option<&'static StaticCatalogTable>
         .find(|table| table.name == name.as_str())
 }
 
+fn catalog_relation_oid(name: &str) -> Option<Oid> {
+    static_catalog_by_name(name).map(|table| table.oid)
+}
+
 fn max_static_oid() -> u32 {
     generated_catalog::STATIC_CATALOG_TABLES
         .iter()
@@ -698,7 +708,7 @@ fn pg_class_overlay_row(input: PgClassOverlayInput<'_>) -> CatalogRow {
 }
 
 fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
-    let record_type = lookup_builtin_type(Oid(2249));
+    let record_type = lookup_type(Oid(2249));
     catalog_row_from_named_values(
         PG_TYPE_RELATION_OID,
         relation.type_oid.0 as u64,
@@ -722,6 +732,7 @@ fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
                 "typinput",
                 CatalogValue::Oid(
                     record_type
+                        .as_ref()
                         .map(|record| record.typinput)
                         .unwrap_or(INVALID_OID),
                 ),
@@ -730,6 +741,7 @@ fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
                 "typoutput",
                 CatalogValue::Oid(
                     record_type
+                        .as_ref()
                         .map(|record| record.typoutput)
                         .unwrap_or(INVALID_OID),
                 ),
@@ -738,6 +750,7 @@ fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
                 "typreceive",
                 CatalogValue::Oid(
                     record_type
+                        .as_ref()
                         .map(|record| record.typreceive)
                         .unwrap_or(INVALID_OID),
                 ),
@@ -746,6 +759,7 @@ fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
                 "typsend",
                 CatalogValue::Oid(
                     record_type
+                        .as_ref()
                         .map(|record| record.typsend)
                         .unwrap_or(INVALID_OID),
                 ),
@@ -781,7 +795,7 @@ fn pg_attribute_overlay_row_for_column(
     type_mod: i32,
     is_not_null: bool,
 ) -> Option<CatalogRow> {
-    let type_record = lookup_builtin_type(type_oid)?;
+    let type_record = lookup_type(type_oid)?;
     Some(catalog_row_from_named_values(
         PG_ATTRIBUTE_RELATION_OID,
         ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
@@ -935,6 +949,7 @@ fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
         CatalogValue::Oid(oid) => Some(*oid),
         CatalogValue::Int32(value) => u32::try_from(*value).ok().map(Oid),
         CatalogValue::Int16(value) => u32::try_from(*value).ok().map(Oid),
+        CatalogValue::Raw(value) => value.parse::<u32>().ok().map(Oid),
         _ => None,
     }
 }
@@ -942,6 +957,46 @@ fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
 fn catalog_value_bool(value: &CatalogValue) -> Option<bool> {
     match value {
         CatalogValue::Bool(value) => Some(*value),
+        CatalogValue::Raw(value) => match value.as_str() {
+            "t" | "true" => Some(true),
+            "f" | "false" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn catalog_value_i16(value: &CatalogValue) -> Option<i16> {
+    match value {
+        CatalogValue::Int16(value) => Some(*value),
+        CatalogValue::Int32(value) => i16::try_from(*value).ok(),
+        CatalogValue::Raw(value) => value.parse::<i16>().ok(),
+        _ => None,
+    }
+}
+
+fn catalog_value_i32(value: &CatalogValue) -> Option<i32> {
+    match value {
+        CatalogValue::Int16(value) => Some(i32::from(*value)),
+        CatalogValue::Int32(value) => Some(*value),
+        CatalogValue::Raw(value) => value.parse::<i32>().ok(),
+        _ => None,
+    }
+}
+
+fn catalog_value_u8(value: &CatalogValue) -> Option<u8> {
+    match value {
+        CatalogValue::Char(value) => Some(*value),
+        CatalogValue::Raw(value) => value.as_bytes().first().copied(),
+        _ => None,
+    }
+}
+
+fn catalog_value_string(value: &CatalogValue) -> Option<String> {
+    match value {
+        CatalogValue::Name(value) | CatalogValue::Text(value) | CatalogValue::Raw(value) => {
+            Some(value.clone())
+        }
         _ => None,
     }
 }
@@ -975,7 +1030,7 @@ fn pg_index_overlay_row(
             .columns
             .get((*attnum as usize).saturating_sub(1))
             .ok_or_else(|| CatalogError::new("42703", "primary key column does not exist"))?;
-        let type_record = lookup_builtin_type(column.type_oid).ok_or_else(|| {
+        let type_record = lookup_type(column.type_oid).ok_or_else(|| {
             CatalogError::new(
                 "42704",
                 format!("type OID {} does not exist", column.type_oid.0),
@@ -1302,6 +1357,535 @@ pub fn add_primary_key(name: &str, columns: Vec<String>) -> Result<(), CatalogEr
     })
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateTypeColumn {
+    pub name: String,
+    pub type_oid: Oid,
+    pub type_mod: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CreateTypeKind {
+    Shell,
+    Base,
+    Composite { columns: Vec<CreateTypeColumn> },
+    Enum { labels: Vec<String> },
+    Range { subtype: Oid, collation: Oid },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreateFunctionSpec {
+    pub name: String,
+    pub return_type: Oid,
+    pub arg_types: Vec<Oid>,
+    pub language: Oid,
+    pub strict: bool,
+    pub leakproof: bool,
+    pub returns_set: bool,
+    pub volatility: u8,
+    pub parallel: u8,
+    pub source: String,
+}
+
+fn pg_type_row_for_created_type(input: CreatedTypeInput<'_>) -> CatalogRow {
+    catalog_row_from_named_values(
+        PG_TYPE_RELATION_OID,
+        input.oid.0 as u64,
+        vec![
+            ("oid", CatalogValue::Oid(input.oid)),
+            ("typname", CatalogValue::Name(input.name.to_owned())),
+            ("typnamespace", CatalogValue::Oid(input.namespace)),
+            ("typowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
+            ("typlen", CatalogValue::Int16(input.typlen)),
+            ("typbyval", CatalogValue::Bool(input.typbyval)),
+            ("typtype", CatalogValue::Char(input.typtype)),
+            ("typcategory", CatalogValue::Char(input.typcategory)),
+            ("typispreferred", CatalogValue::Bool(false)),
+            ("typisdefined", CatalogValue::Bool(input.typisdefined)),
+            ("typdelim", CatalogValue::Char(b',')),
+            ("typrelid", CatalogValue::Oid(input.typrelid)),
+            ("typsubscript", CatalogValue::Oid(input.typsubscript)),
+            ("typelem", CatalogValue::Oid(input.typelem)),
+            ("typarray", CatalogValue::Oid(input.typarray)),
+            ("typinput", CatalogValue::Oid(input.typinput)),
+            ("typoutput", CatalogValue::Oid(input.typoutput)),
+            ("typreceive", CatalogValue::Oid(input.typreceive)),
+            ("typsend", CatalogValue::Oid(input.typsend)),
+            ("typmodin", CatalogValue::Oid(INVALID_OID)),
+            ("typmodout", CatalogValue::Oid(INVALID_OID)),
+            ("typanalyze", CatalogValue::Oid(INVALID_OID)),
+            ("typalign", CatalogValue::Char(input.typalign)),
+            ("typstorage", CatalogValue::Char(input.typstorage)),
+            ("typnotnull", CatalogValue::Bool(false)),
+            ("typbasetype", CatalogValue::Oid(input.typbasetype)),
+            ("typtypmod", CatalogValue::Int32(-1)),
+            ("typndims", CatalogValue::Int32(0)),
+            ("typcollation", CatalogValue::Oid(input.typcollation)),
+        ],
+    )
+}
+
+struct CreatedTypeInput<'a> {
+    oid: Oid,
+    namespace: Oid,
+    name: &'a str,
+    typlen: i16,
+    typbyval: bool,
+    typtype: u8,
+    typcategory: u8,
+    typisdefined: bool,
+    typrelid: Oid,
+    typelem: Oid,
+    typarray: Oid,
+    typbasetype: Oid,
+    typcollation: Oid,
+    typsubscript: Oid,
+    typinput: Oid,
+    typoutput: Oid,
+    typreceive: Oid,
+    typsend: Oid,
+    typalign: u8,
+    typstorage: u8,
+}
+
+fn pg_array_type_row(type_oid: Oid, array_oid: Oid, namespace: Oid, name: &str) -> CatalogRow {
+    pg_type_row_for_created_type(CreatedTypeInput {
+        oid: array_oid,
+        namespace,
+        name,
+        typlen: -1,
+        typbyval: false,
+        typtype: b'b',
+        typcategory: b'A',
+        typisdefined: true,
+        typrelid: INVALID_OID,
+        typelem: type_oid,
+        typarray: INVALID_OID,
+        typbasetype: INVALID_OID,
+        typcollation: INVALID_OID,
+        typsubscript: ARRAY_SUBSCRIPT_HANDLER_PROC_OID,
+        typinput: ARRAY_IN_PROC_OID,
+        typoutput: ARRAY_OUT_PROC_OID,
+        typreceive: ARRAY_RECV_PROC_OID,
+        typsend: ARRAY_SEND_PROC_OID,
+        typalign: b'd',
+        typstorage: b'x',
+    })
+}
+
+fn pg_enum_row(enum_oid: Oid, type_oid: Oid, label: &str, sort_order: f32) -> CatalogRow {
+    let relation_oid = catalog_relation_oid("pg_enum").expect("generated pg_enum catalog");
+    catalog_row_from_named_values(
+        relation_oid,
+        enum_oid.0 as u64,
+        vec![
+            ("oid", CatalogValue::Oid(enum_oid)),
+            ("enumtypid", CatalogValue::Oid(type_oid)),
+            ("enumsortorder", CatalogValue::Float32(sort_order)),
+            ("enumlabel", CatalogValue::Name(label.to_owned())),
+        ],
+    )
+}
+
+fn pg_range_row(range_oid: Oid, subtype: Oid, collation: Oid) -> CatalogRow {
+    let relation_oid = catalog_relation_oid("pg_range").expect("generated pg_range catalog");
+    let subtype_opclass = static_btree_opclass_for_type(subtype).unwrap_or(INVALID_OID);
+    catalog_row_from_named_values(
+        relation_oid,
+        range_oid.0 as u64,
+        vec![
+            ("rngtypid", CatalogValue::Oid(range_oid)),
+            ("rngsubtype", CatalogValue::Oid(subtype)),
+            ("rngmultitypid", CatalogValue::Oid(INVALID_OID)),
+            ("rngcollation", CatalogValue::Oid(collation)),
+            ("rngsubopc", CatalogValue::Oid(subtype_opclass)),
+            ("rngcanonical", CatalogValue::Oid(INVALID_OID)),
+            ("rngsubdiff", CatalogValue::Oid(INVALID_OID)),
+        ],
+    )
+}
+
+fn insert_array_type_row(
+    state: &mut CatalogState,
+    type_oid: Oid,
+    namespace: Oid,
+    name: &str,
+) -> Result<Oid, CatalogError> {
+    let array_name = format!("_{name}");
+    if overlay_type_by_name(state, &array_name, namespace).is_some() {
+        return Ok(INVALID_OID);
+    }
+    let array_oid = next_object_oid(state)?;
+    state.overlay.insert(pg_array_type_row(
+        type_oid,
+        array_oid,
+        namespace,
+        &array_name,
+    ));
+    Ok(array_oid)
+}
+
+pub fn create_type(name: &str, kind: CreateTypeKind) -> Result<Oid, CatalogError> {
+    let name = normalize_identifier(name);
+    if name.is_empty() {
+        return Err(CatalogError::new("42602", "type name cannot be empty"));
+    }
+
+    with_catalog(|state| {
+        let namespace = PUBLIC_NAMESPACE_OID;
+        let existing = overlay_type_by_name(state, &name, namespace);
+        if let Some(existing) = existing.as_ref().filter(|record| record.typisdefined) {
+            return Ok(existing.oid);
+        }
+
+        let type_oid = existing
+            .as_ref()
+            .map(|record| record.oid)
+            .map(Ok)
+            .unwrap_or_else(|| next_object_oid(state))?;
+        let array_oid = match kind {
+            CreateTypeKind::Shell => INVALID_OID,
+            _ => insert_array_type_row(state, type_oid, namespace, &name)?,
+        };
+
+        match kind {
+            CreateTypeKind::Shell => {
+                state
+                    .overlay
+                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
+                        oid: type_oid,
+                        namespace,
+                        name: &name,
+                        typlen: -1,
+                        typbyval: false,
+                        typtype: b'p',
+                        typcategory: b'P',
+                        typisdefined: false,
+                        typrelid: INVALID_OID,
+                        typelem: INVALID_OID,
+                        typarray: INVALID_OID,
+                        typbasetype: INVALID_OID,
+                        typcollation: INVALID_OID,
+                        typsubscript: INVALID_OID,
+                        typinput: INVALID_OID,
+                        typoutput: INVALID_OID,
+                        typreceive: INVALID_OID,
+                        typsend: INVALID_OID,
+                        typalign: b'i',
+                        typstorage: b'x',
+                    }));
+            }
+            CreateTypeKind::Base => {
+                state
+                    .overlay
+                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
+                        oid: type_oid,
+                        namespace,
+                        name: &name,
+                        typlen: -1,
+                        typbyval: false,
+                        typtype: b'b',
+                        typcategory: b'U',
+                        typisdefined: true,
+                        typrelid: INVALID_OID,
+                        typelem: INVALID_OID,
+                        typarray: array_oid,
+                        typbasetype: INVALID_OID,
+                        typcollation: INVALID_OID,
+                        typsubscript: INVALID_OID,
+                        typinput: INVALID_OID,
+                        typoutput: INVALID_OID,
+                        typreceive: INVALID_OID,
+                        typsend: INVALID_OID,
+                        typalign: b'i',
+                        typstorage: b'x',
+                    }));
+            }
+            CreateTypeKind::Enum { labels } => {
+                state
+                    .overlay
+                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
+                        oid: type_oid,
+                        namespace,
+                        name: &name,
+                        typlen: 4,
+                        typbyval: true,
+                        typtype: b'e',
+                        typcategory: b'E',
+                        typisdefined: true,
+                        typrelid: INVALID_OID,
+                        typelem: INVALID_OID,
+                        typarray: array_oid,
+                        typbasetype: INVALID_OID,
+                        typcollation: INVALID_OID,
+                        typsubscript: INVALID_OID,
+                        typinput: INVALID_OID,
+                        typoutput: INVALID_OID,
+                        typreceive: INVALID_OID,
+                        typsend: INVALID_OID,
+                        typalign: b'i',
+                        typstorage: b'p',
+                    }));
+                for (index, label) in labels.iter().enumerate() {
+                    let enum_oid = next_object_oid(state)?;
+                    state.overlay.insert(pg_enum_row(
+                        enum_oid,
+                        type_oid,
+                        label,
+                        (index + 1) as f32,
+                    ));
+                }
+            }
+            CreateTypeKind::Range { subtype, collation } => {
+                if !type_oid_exists_in_state(state, subtype) {
+                    return Err(CatalogError::new(
+                        "42704",
+                        format!("range subtype OID {} does not exist", subtype.0),
+                    ));
+                }
+                state
+                    .overlay
+                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
+                        oid: type_oid,
+                        namespace,
+                        name: &name,
+                        typlen: -1,
+                        typbyval: false,
+                        typtype: b'r',
+                        typcategory: b'R',
+                        typisdefined: true,
+                        typrelid: INVALID_OID,
+                        typelem: INVALID_OID,
+                        typarray: array_oid,
+                        typbasetype: INVALID_OID,
+                        typcollation: collation,
+                        typsubscript: INVALID_OID,
+                        typinput: INVALID_OID,
+                        typoutput: INVALID_OID,
+                        typreceive: INVALID_OID,
+                        typsend: INVALID_OID,
+                        typalign: b'd',
+                        typstorage: b'x',
+                    }));
+                state
+                    .overlay
+                    .insert(pg_range_row(type_oid, subtype, collation));
+            }
+            CreateTypeKind::Composite { columns } => {
+                for column in &columns {
+                    if !type_oid_exists_in_state(state, column.type_oid) {
+                        return Err(CatalogError::new(
+                            "42704",
+                            format!("type OID {} does not exist", column.type_oid.0),
+                        ));
+                    }
+                }
+                let relation_oid = next_relation_oid(state)?;
+                let relation = RelationRecord {
+                    oid: relation_oid,
+                    type_oid,
+                    namespace,
+                    name: name.clone(),
+                    columns: columns
+                        .into_iter()
+                        .map(|column| ColumnRecord {
+                            name: normalize_identifier(&column.name),
+                            type_oid: column.type_oid,
+                            type_mod: column.type_mod,
+                            is_not_null: false,
+                        })
+                        .collect(),
+                    primary_key: Vec::new(),
+                    primary_key_constraint_oid: None,
+                };
+                state
+                    .overlay
+                    .insert(pg_class_overlay_row(PgClassOverlayInput {
+                        oid: relation.oid,
+                        namespace: relation.namespace,
+                        name: &relation.name,
+                        reltype: relation.type_oid,
+                        relkind: b'c',
+                        relam: HEAP_TABLE_AM_OID,
+                        column_count: relation.columns.len(),
+                        has_index: false,
+                    }));
+                state
+                    .overlay
+                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
+                        oid: type_oid,
+                        namespace,
+                        name: &name,
+                        typlen: -1,
+                        typbyval: false,
+                        typtype: b'c',
+                        typcategory: b'C',
+                        typisdefined: true,
+                        typrelid: relation_oid,
+                        typelem: INVALID_OID,
+                        typarray: array_oid,
+                        typbasetype: INVALID_OID,
+                        typcollation: INVALID_OID,
+                        typsubscript: INVALID_OID,
+                        typinput: INVALID_OID,
+                        typoutput: INVALID_OID,
+                        typreceive: INVALID_OID,
+                        typsend: INVALID_OID,
+                        typalign: b'd',
+                        typstorage: b'x',
+                    }));
+                insert_relation_attribute_overlay_rows(state, &relation);
+                state
+                    .relation_names_by_oid
+                    .insert(relation.oid.0, name.clone());
+                state.relations_by_name.insert(name.clone(), relation);
+            }
+        }
+        bump_generation(state);
+        Ok(type_oid)
+    })
+}
+
+fn pg_proc_row(oid: Oid, spec: &CreateFunctionSpec) -> CatalogRow {
+    catalog_row_from_named_values(
+        PG_PROC_RELATION_OID,
+        oid.0 as u64,
+        vec![
+            ("oid", CatalogValue::Oid(oid)),
+            (
+                "proname",
+                CatalogValue::Name(normalize_identifier(&spec.name)),
+            ),
+            ("pronamespace", CatalogValue::Oid(PUBLIC_NAMESPACE_OID)),
+            ("proowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
+            ("prolang", CatalogValue::Oid(spec.language)),
+            ("procost", CatalogValue::Float32(1.0)),
+            ("prorows", CatalogValue::Float32(0.0)),
+            ("provariadic", CatalogValue::Oid(INVALID_OID)),
+            ("prosupport", CatalogValue::Oid(INVALID_OID)),
+            ("prokind", CatalogValue::Char(b'f')),
+            ("prosecdef", CatalogValue::Bool(false)),
+            ("proleakproof", CatalogValue::Bool(spec.leakproof)),
+            ("proisstrict", CatalogValue::Bool(spec.strict)),
+            ("proretset", CatalogValue::Bool(spec.returns_set)),
+            ("provolatile", CatalogValue::Char(spec.volatility)),
+            ("proparallel", CatalogValue::Char(spec.parallel)),
+            (
+                "pronargs",
+                CatalogValue::Int16(spec.arg_types.len().min(i16::MAX as usize) as i16),
+            ),
+            ("pronargdefaults", CatalogValue::Int16(0)),
+            ("prorettype", CatalogValue::Oid(spec.return_type)),
+            (
+                "proargtypes",
+                CatalogValue::OidVector(spec.arg_types.clone()),
+            ),
+            ("prosrc", CatalogValue::Text(spec.source.clone())),
+        ],
+    )
+}
+
+pub fn create_function(spec: CreateFunctionSpec) -> Result<Oid, CatalogError> {
+    let name = normalize_identifier(&spec.name);
+    if name.is_empty() {
+        return Err(CatalogError::new("42602", "function name cannot be empty"));
+    }
+    if lookup_type(spec.return_type).is_none() {
+        return Err(CatalogError::new(
+            "42704",
+            format!("return type OID {} does not exist", spec.return_type.0),
+        ));
+    }
+    for arg_type in &spec.arg_types {
+        if lookup_type(*arg_type).is_none() {
+            return Err(CatalogError::new(
+                "42704",
+                format!("argument type OID {} does not exist", arg_type.0),
+            ));
+        }
+    }
+
+    with_catalog(|state| {
+        let oid = next_object_oid(state)?;
+        state.overlay.insert(pg_proc_row(oid, &spec));
+        bump_generation(state);
+        Ok(oid)
+    })
+}
+
+fn access_method_oid_by_name(name: &str) -> Option<Oid> {
+    let table = static_catalog_by_name("pg_am")?;
+    let name = normalize_identifier(name);
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        let amname = catalog_row_value(table, &row, "amname").and_then(catalog_value_string)?;
+        let oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
+        (amname == name).then_some(oid)
+    })
+}
+
+pub fn create_opclass(
+    name: &str,
+    method_name: &str,
+    input_type: Oid,
+    is_default: bool,
+) -> Result<Oid, CatalogError> {
+    let name = normalize_identifier(name);
+    if lookup_type(input_type).is_none() {
+        return Err(CatalogError::new(
+            "42704",
+            format!(
+                "operator class input type OID {} does not exist",
+                input_type.0
+            ),
+        ));
+    }
+    let method_oid = access_method_oid_by_name(method_name).ok_or_else(|| {
+        CatalogError::new(
+            "42704",
+            format!(
+                "access method \"{}\" does not exist",
+                normalize_identifier(method_name)
+            ),
+        )
+    })?;
+    with_catalog(|state| {
+        let opfamily_oid = next_object_oid(state)?;
+        let opclass_oid = next_object_oid(state)?;
+        let opfamily_relation_oid =
+            catalog_relation_oid("pg_opfamily").expect("generated pg_opfamily catalog");
+        let opclass_relation_oid =
+            catalog_relation_oid("pg_opclass").expect("generated pg_opclass catalog");
+        state.overlay.insert(catalog_row_from_named_values(
+            opfamily_relation_oid,
+            opfamily_oid.0 as u64,
+            vec![
+                ("oid", CatalogValue::Oid(opfamily_oid)),
+                ("opfmethod", CatalogValue::Oid(method_oid)),
+                ("opfname", CatalogValue::Name(name.clone())),
+                ("opfnamespace", CatalogValue::Oid(PUBLIC_NAMESPACE_OID)),
+                ("opfowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
+            ],
+        ));
+        state.overlay.insert(catalog_row_from_named_values(
+            opclass_relation_oid,
+            opclass_oid.0 as u64,
+            vec![
+                ("oid", CatalogValue::Oid(opclass_oid)),
+                ("opcmethod", CatalogValue::Oid(method_oid)),
+                ("opcname", CatalogValue::Name(name)),
+                ("opcnamespace", CatalogValue::Oid(PUBLIC_NAMESPACE_OID)),
+                ("opcowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
+                ("opcfamily", CatalogValue::Oid(opfamily_oid)),
+                ("opcintype", CatalogValue::Oid(input_type)),
+                ("opcdefault", CatalogValue::Bool(is_default)),
+                ("opckeytype", CatalogValue::Oid(INVALID_OID)),
+            ],
+        ));
+        bump_generation(state);
+        Ok(opclass_oid)
+    })
+}
+
 #[cfg(test)]
 pub fn clear_for_tests() {
     with_catalog(|state| *state = CatalogState::default());
@@ -1337,6 +1921,104 @@ pub struct PgTypeRecord {
     pub typstorage: u8,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogTypeRecord {
+    pub oid: Oid,
+    pub name: String,
+    pub namespace: Oid,
+    pub owner: Oid,
+    pub typlen: i16,
+    pub typbyval: bool,
+    pub typalign: u8,
+    pub typdelim: u8,
+    pub typinput: Oid,
+    pub typoutput: Oid,
+    pub typreceive: Oid,
+    pub typsend: Oid,
+    pub typmodin: Oid,
+    pub typmodout: Oid,
+    pub typisdefined: bool,
+    pub typtype: u8,
+    pub typcategory: u8,
+    pub typispreferred: bool,
+    pub typrelid: Oid,
+    pub typelem: Oid,
+    pub typarray: Oid,
+    pub typbasetype: Oid,
+    pub typtypmod: i32,
+    pub typcollation: Oid,
+    pub typsubscript: Oid,
+    pub typstorage: u8,
+}
+
+impl From<PgTypeRecord> for CatalogTypeRecord {
+    fn from(record: PgTypeRecord) -> Self {
+        Self {
+            oid: record.oid,
+            name: record.name.to_owned(),
+            namespace: record.namespace,
+            owner: record.owner,
+            typlen: record.typlen,
+            typbyval: record.typbyval,
+            typalign: record.typalign,
+            typdelim: record.typdelim,
+            typinput: record.typinput,
+            typoutput: record.typoutput,
+            typreceive: record.typreceive,
+            typsend: record.typsend,
+            typmodin: record.typmodin,
+            typmodout: record.typmodout,
+            typisdefined: record.typisdefined,
+            typtype: record.typtype,
+            typcategory: record.typcategory,
+            typispreferred: record.typispreferred,
+            typrelid: record.typrelid,
+            typelem: record.typelem,
+            typarray: record.typarray,
+            typbasetype: record.typbasetype,
+            typtypmod: record.typtypmod,
+            typcollation: record.typcollation,
+            typsubscript: record.typsubscript,
+            typstorage: record.typstorage,
+        }
+    }
+}
+
+fn catalog_type_from_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+) -> Option<CatalogTypeRecord> {
+    Some(CatalogTypeRecord {
+        oid: catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?,
+        name: catalog_row_value(table, row, "typname").and_then(catalog_value_string)?,
+        namespace: catalog_row_value(table, row, "typnamespace").and_then(catalog_value_oid)?,
+        owner: catalog_row_value(table, row, "typowner").and_then(catalog_value_oid)?,
+        typlen: catalog_row_value(table, row, "typlen").and_then(catalog_value_i16)?,
+        typbyval: catalog_row_value(table, row, "typbyval").and_then(catalog_value_bool)?,
+        typalign: catalog_row_value(table, row, "typalign").and_then(catalog_value_u8)?,
+        typdelim: catalog_row_value(table, row, "typdelim").and_then(catalog_value_u8)?,
+        typinput: catalog_row_value(table, row, "typinput").and_then(catalog_value_oid)?,
+        typoutput: catalog_row_value(table, row, "typoutput").and_then(catalog_value_oid)?,
+        typreceive: catalog_row_value(table, row, "typreceive").and_then(catalog_value_oid)?,
+        typsend: catalog_row_value(table, row, "typsend").and_then(catalog_value_oid)?,
+        typmodin: catalog_row_value(table, row, "typmodin").and_then(catalog_value_oid)?,
+        typmodout: catalog_row_value(table, row, "typmodout").and_then(catalog_value_oid)?,
+        typisdefined: catalog_row_value(table, row, "typisdefined").and_then(catalog_value_bool)?,
+        typtype: catalog_row_value(table, row, "typtype").and_then(catalog_value_u8)?,
+        typcategory: catalog_row_value(table, row, "typcategory").and_then(catalog_value_u8)?,
+        typispreferred: catalog_row_value(table, row, "typispreferred")
+            .and_then(catalog_value_bool)?,
+        typrelid: catalog_row_value(table, row, "typrelid").and_then(catalog_value_oid)?,
+        typelem: catalog_row_value(table, row, "typelem").and_then(catalog_value_oid)?,
+        typarray: catalog_row_value(table, row, "typarray").and_then(catalog_value_oid)?,
+        typbasetype: catalog_row_value(table, row, "typbasetype").and_then(catalog_value_oid)?,
+        typtypmod: catalog_row_value(table, row, "typtypmod").and_then(catalog_value_i32)?,
+        typcollation: catalog_row_value(table, row, "typcollation").and_then(catalog_value_oid)?,
+        typsubscript: catalog_row_value(table, row, "typsubscript").and_then(catalog_value_oid)?,
+        typstorage: catalog_row_value(table, row, "typstorage").and_then(catalog_value_u8)?,
+    })
+}
+
 pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
     generated_catalog::STATIC_TYPES
         .iter()
@@ -1344,29 +2026,97 @@ pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
         .copied()
 }
 
+fn canonical_catalog_type_name(name: &str) -> String {
+    match normalize_identifier(name).as_str() {
+        "boolean" => "bool".to_owned(),
+        "character" => "bpchar".to_owned(),
+        "character varying" => "varchar".to_owned(),
+        "decimal" => "numeric".to_owned(),
+        "integer" | "int" => "int4".to_owned(),
+        "smallint" => "int2".to_owned(),
+        "bigint" => "int8".to_owned(),
+        "real" => "float4".to_owned(),
+        "double precision" => "float8".to_owned(),
+        "time without time zone" => "time".to_owned(),
+        "time with time zone" => "timetz".to_owned(),
+        "timestamp without time zone" => "timestamp".to_owned(),
+        "timestamp with time zone" => "timestamptz".to_owned(),
+        "bit varying" => "varbit".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn overlay_type_by_oid(state: &CatalogState, oid: Oid) -> Option<CatalogTypeRecord> {
+    let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
+    state
+        .overlay
+        .rows
+        .get(&PG_TYPE_RELATION_OID.0)?
+        .get(&(oid.0 as u64))
+        .and_then(|row| catalog_type_from_row(table, row))
+}
+
+fn type_oid_exists_in_state(state: &CatalogState, oid: Oid) -> bool {
+    lookup_builtin_type(oid).is_some() || overlay_type_by_oid(state, oid).is_some()
+}
+
+fn overlay_type_by_name(
+    state: &CatalogState,
+    name: &str,
+    namespace: Oid,
+) -> Option<CatalogTypeRecord> {
+    let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
+    state
+        .overlay
+        .rows
+        .get(&PG_TYPE_RELATION_OID.0)?
+        .values()
+        .find_map(|row| {
+            let record = catalog_type_from_row(table, row)?;
+            (record.namespace == namespace && record.name == name).then_some(record)
+        })
+}
+
+pub fn lookup_type(oid: Oid) -> Option<CatalogTypeRecord> {
+    lookup_builtin_type(oid)
+        .map(CatalogTypeRecord::from)
+        .or_else(|| {
+            with_catalog_read(|state| {
+                state
+                    .overlay
+                    .tombstones
+                    .get(&PG_TYPE_RELATION_OID.0)
+                    .is_none_or(|tombstones| !tombstones.contains(&(oid.0 as u64)))
+                    .then(|| overlay_type_by_oid(state, oid))
+                    .flatten()
+            })
+        })
+}
+
+pub fn type_by_name(name: &str, namespace: Oid) -> Option<CatalogTypeRecord> {
+    let canonical_name = canonical_catalog_type_name(name);
+    if namespace == PG_CATALOG_NAMESPACE_OID
+        && let Some(record) = generated_catalog::STATIC_TYPES
+            .iter()
+            .copied()
+            .find(|record| record.name == canonical_name)
+    {
+        return Some(record.into());
+    }
+    with_catalog_read(|state| overlay_type_by_name(state, &canonical_name, namespace))
+}
+
 pub fn builtin_type_by_name(name: &str, namespace: Oid) -> Option<PgTypeRecord> {
     if namespace != PG_CATALOG_NAMESPACE_OID {
         return None;
     }
 
-    let name = normalize_identifier(name);
-    let canonical_name = match name.as_str() {
-        "boolean" => "bool",
-        "character" => "bpchar",
-        "character varying" => "varchar",
-        "integer" | "int" => "int4",
-        "smallint" => "int2",
-        "bigint" => "int8",
-        "double precision" => "float8",
-        "timestamp without time zone" => "timestamp",
-        "timestamp with time zone" => "timestamptz",
-        other => other,
-    };
+    let canonical_name = canonical_catalog_type_name(name);
 
     generated_catalog::STATIC_TYPES
         .iter()
         .copied()
-        .find(|record| record.name == canonical_name)
+        .find(|record| record.name == canonical_name.as_str())
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

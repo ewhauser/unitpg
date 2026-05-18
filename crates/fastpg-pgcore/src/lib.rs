@@ -1033,6 +1033,102 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_catalog_visible_type_function_and_opclass_ddl() {
+        let session = PgCoreSession::new();
+        let suffix = std::process::id();
+        let enum_type = format!("fastpg_pgcore_enum_{suffix}");
+        let range_type = format!("fastpg_pgcore_range_{suffix}");
+        let composite_type = format!("fastpg_pgcore_composite_{suffix}");
+        let function = format!("fastpg_pgcore_hash_{suffix}");
+        let opclass = format!("fastpg_pgcore_int4_ops_{suffix}");
+
+        let create_enum = session
+            .prepare(&format!("create type {enum_type} as enum ('red', 'green')"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create_enum.statements[0].command_tag, "CREATE TYPE");
+
+        let create_range = session
+            .prepare(&format!(
+                "create type {range_type} as range (subtype = float8, subtype_diff = float8mi)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create_range.statements[0].command_tag, "CREATE TYPE");
+
+        let create_composite = session
+            .prepare(&format!(
+                "create type {composite_type} as (id int, label text)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create_composite.statements[0].command_tag, "CREATE TYPE");
+
+        let create_function = session
+            .prepare(&format!(
+                "create function {function}(value int4, seed int8) returns int8 \
+                 as $$ select value + seed $$ language sql strict immutable parallel safe"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create_function.statements[0].command_tag, "CREATE FUNCTION");
+
+        let create_opclass = session
+            .prepare(&format!(
+                "create operator class {opclass} for type int4 using hash as \
+                 operator 1 =, function 2 {function}(int4, int8)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            create_opclass.statements[0].command_tag,
+            "CREATE OPERATOR CLASS"
+        );
+
+        let type_lookup = session
+            .prepare(&format!(
+                "select typname from pg_type where typname = '{enum_type}'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            type_lookup.statements[0].rows,
+            vec![vec![PgCoreValue::Text(enum_type)]]
+        );
+
+        let proc_lookup = session
+            .prepare(&format!(
+                "select proname from pg_proc where proname = '{function}'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            proc_lookup.statements[0].rows,
+            vec![vec![PgCoreValue::Text(function)]]
+        );
+
+        let opclass_lookup = session
+            .prepare(&format!(
+                "select opcname from pg_opclass where opcname = '{opclass}'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            opclass_lookup.statements[0].rows,
+            vec![vec![PgCoreValue::Text(opclass)]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_alter_table_add_primary_key() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_pk_{}", std::process::id());
