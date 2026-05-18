@@ -29,6 +29,7 @@
 #include "parser/analyze.h"
 #include "parser/parser.h"
 #include "pgtime.h"
+#include "postmaster/postmaster.h"
 #include "tcop/tcopprot.h"
 #include "utils/elog.h"
 #include "utils/inval.h"
@@ -119,6 +120,29 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 } FastPgPgCoreCaptureDestReceiver;
 
 static bool fastpg_pgcore_initialized = false;
+
+/*
+ * We link selected backend objects without backend/main/main.c because that file
+ * also owns the postgres executable's main(). Some cold command-line paths in
+ * those backend objects still reference these dispatch symbols.
+ */
+const char *progname = "fastpg-server";
+
+DispatchOption
+parse_dispatch_option(const char *name)
+{
+	if (strcmp(name, "check") == 0)
+		return DISPATCH_CHECK;
+	if (strcmp(name, "boot") == 0)
+		return DISPATCH_BOOT;
+	if (strcmp(name, "forkchild") == 0)
+		return DISPATCH_FORKCHILD;
+	if (strcmp(name, "describe-config") == 0)
+		return DISPATCH_DESCRIBE_CONFIG;
+	if (strcmp(name, "single") == 0)
+		return DISPATCH_SINGLE;
+	return DISPATCH_POSTMASTER;
+}
 
 static void
 fastpg_pgcore_init_once(void)

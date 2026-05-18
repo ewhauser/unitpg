@@ -125,8 +125,10 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
 
 fn collect_backend_objects(build_dir: &Path, objects: &mut Vec<PathBuf>) {
     for relative in [
+        "src/backend/bootstrap/boot_parser.a.p",
         "src/backend/postgres_lib.a.p",
         "src/backend/nodes/nodefuncs.a.p",
+        "src/backend/replication/repl_parser.a.p",
         "src/backend/storage/page/checksum_backend_lib.a.p",
         "src/backend/utils/activity/wait_event_names.a.p",
         "src/backend/utils/adt/jsonpath.a.p",
