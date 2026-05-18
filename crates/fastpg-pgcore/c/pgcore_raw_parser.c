@@ -1290,7 +1290,6 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 
 	PG_TRY();
 	{
-		List	   *planned_statements_copy;
 		ListCell   *lc;
 		int			statement_index = 0;
 		ParamListInfo params;
@@ -1301,13 +1300,12 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 											parameter_values,
 											parameter_is_null,
 											parameter_count);
-		planned_statements_copy = copyObject(prepared->planned_statements);
-		result->statement_count = list_length(planned_statements_copy);
+		result->statement_count = list_length(prepared->planned_statements);
 		result->statements = palloc0_array(FastPgPgCoreExecuteStatement,
 										   result->statement_count);
 		snapshot = SnapshotAny;
 
-		foreach(lc, planned_statements_copy)
+		foreach(lc, prepared->planned_statements)
 		{
 			PlannedStmt *statement = lfirst_node(PlannedStmt, lc);
 			FastPgPgCoreExecuteStatement *summary =
