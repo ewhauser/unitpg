@@ -7,6 +7,7 @@ rust-version.workspace = true
 
 [features]
 default = []
+mini-sql-testkit = ["fastpg-exec/mini-sql-testkit"]
 postgres-linked = ["fastpg-exec/postgres-linked"]
 postgres-execution = ["postgres-linked", "fastpg-exec/postgres-execution"]
 

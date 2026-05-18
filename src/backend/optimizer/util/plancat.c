@@ -18,6 +18,9 @@
 #include <math.h>
 
 #include "access/genam.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup_details.h"
 #include "access/nbtree.h"
 #include "access/sysattr.h"
@@ -475,8 +478,21 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 			{
 				if (info->indpred == NIL)
 				{
+#ifdef USE_FASTPG
+					FastPgRustPrimaryKeyIndexInfo fastpg_index_info;
+
+					if (fastpg_rust_catalog_primary_key_index_info((uint32_t) RelationGetRelid(indexRelation),
+																	&fastpg_index_info))
+					{
+						info->pages = 1;
+						info->tuples = rel->tuples;
+					}
+					else
+#endif
+					{
 					info->pages = RelationGetNumberOfBlocks(indexRelation);
 					info->tuples = rel->tuples;
+					}
 				}
 				else
 				{

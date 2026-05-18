@@ -46,6 +46,14 @@ volatile sig_atomic_t catchupInterruptPending = false;
 void
 SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
+#ifdef USE_FASTPG
+	/*
+	 * fastpg's Rust server has no shared-memory sinval queue and no sibling
+	 * backend processes.  Command-end local invalidation still runs through
+	 * LocalExecuteInvalidationMessage; commit-time shared broadcast is a no-op.
+	 */
+	return;
+#endif
 	SIInsertDataEntries(msgs, n);
 }
 
@@ -69,6 +77,14 @@ void
 ReceiveSharedInvalidMessages(void (*invalFunction) (SharedInvalidationMessage *msg),
 							 void (*resetFunction) (void))
 {
+#ifdef USE_FASTPG
+	/*
+	 * There is no shared invalidation segment in the single-process Rust
+	 * server.  Avoid reading the uninitialized sinval shared-memory state when
+	 * PostgreSQL opens relations during parse/analyze/plan.
+	 */
+	return;
+#else
 #define MAXINVALMSGS 32
 	static SharedInvalidationMessage messages[MAXINVALMSGS];
 
@@ -138,6 +154,7 @@ ReceiveSharedInvalidMessages(void (*invalFunction) (SharedInvalidationMessage *m
 		elog(DEBUG4, "sinval catchup complete, cleaning queue");
 		SICleanupQueue(false, 0);
 	}
+#endif
 }
 
 

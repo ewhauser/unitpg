@@ -20,14 +20,45 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_namespace.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
 #include "utils/inval.h"
 #include "utils/syscache.h"
+
+#ifdef USE_FASTPG
+static bool
+FastPgRelationOidExists(Oid relationId)
+{
+	FastPgRustCatalogRelation fastpg_relation;
+
+	return fastpg_rust_catalog_relation_by_oid((uint32_t) relationId,
+											   &fastpg_relation);
+}
+
+static bool
+FastPgRangeVarExists(const RangeVar *relation)
+{
+	uint32_t	fastpg_oid;
+
+	if (relation == NULL || relation->relname == NULL)
+		return false;
+	if (relation->schemaname != NULL &&
+		strcmp(relation->schemaname, "public") != 0)
+		return false;
+
+	return fastpg_rust_catalog_relation_oid_by_name(relation->relname,
+													(uint32_t) PG_PUBLIC_NAMESPACE,
+													&fastpg_oid);
+}
+#endif
 
 
 /* ----------------
@@ -52,7 +83,11 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
 	/* Get the lock before trying to open the relcache entry */
-	if (lockmode != NoLock)
+	if (lockmode != NoLock
+#ifdef USE_FASTPG
+		&& !FastPgRelationOidExists(relationId)
+#endif
+		)
 		LockRelationOid(relationId, lockmode);
 
 	/* The relcache does all the real work... */
@@ -67,6 +102,9 @@ relation_open(Oid relationId, LOCKMODE lockmode)
 	 */
 	Assert(lockmode != NoLock ||
 		   IsBootstrapProcessingMode() ||
+#ifdef USE_FASTPG
+		   FastPgRelationOidExists(relationId) ||
+#endif
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
@@ -93,17 +131,29 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
 
 	/* Get the lock first */
-	if (lockmode != NoLock)
+	if (lockmode != NoLock
+#ifdef USE_FASTPG
+		&& !FastPgRelationOidExists(relationId)
+#endif
+		)
 		LockRelationOid(relationId, lockmode);
 
 	/*
 	 * Now that we have the lock, probe to see if the relation really exists
 	 * or not.
 	 */
-	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relationId)))
+	if (!SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relationId))
+#ifdef USE_FASTPG
+		&& !FastPgRelationOidExists(relationId)
+#endif
+		)
 	{
 		/* Release useless lock */
-		if (lockmode != NoLock)
+		if (lockmode != NoLock
+#ifdef USE_FASTPG
+			&& !FastPgRelationOidExists(relationId)
+#endif
+			)
 			UnlockRelationOid(relationId, lockmode);
 
 		return NULL;
@@ -117,6 +167,9 @@ try_relation_open(Oid relationId, LOCKMODE lockmode)
 
 	/* If we didn't get the lock ourselves, assert that caller holds one */
 	Assert(lockmode != NoLock ||
+#ifdef USE_FASTPG
+		   FastPgRelationOidExists(relationId) ||
+#endif
 		   CheckRelationLockedByMe(r, AccessShareLock, true));
 
 	/* Make note that we've accessed a temporary relation */
@@ -150,7 +203,11 @@ relation_openrv(const RangeVar *relation, LOCKMODE lockmode)
 	 * be redesigned, but for the moment we'll keep doing this like it's been
 	 * done historically.)
 	 */
-	if (lockmode != NoLock)
+	if (lockmode != NoLock
+#ifdef USE_FASTPG
+		&& !FastPgRangeVarExists(relation)
+#endif
+		)
 		AcceptInvalidationMessages();
 
 	/* Look up and lock the appropriate relation using namespace search */
@@ -179,7 +236,11 @@ relation_openrv_extended(const RangeVar *relation, LOCKMODE lockmode,
 	 * Check for shared-cache-inval messages before trying to open the
 	 * relation.  See comments in relation_openrv().
 	 */
-	if (lockmode != NoLock)
+	if (lockmode != NoLock
+#ifdef USE_FASTPG
+		&& !FastPgRangeVarExists(relation)
+#endif
+		)
 		AcceptInvalidationMessages();
 
 	/* Look up and lock the appropriate relation using namespace search */
@@ -212,6 +273,10 @@ relation_close(Relation relation, LOCKMODE lockmode)
 	/* The relcache does the real work... */
 	RelationClose(relation);
 
-	if (lockmode != NoLock)
+	if (lockmode != NoLock
+#ifdef USE_FASTPG
+		&& !FastPgRelationOidExists(relid.relId)
+#endif
+		)
 		UnlockRelationId(&relid, lockmode);
 }

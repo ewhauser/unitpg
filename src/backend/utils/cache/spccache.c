@@ -108,7 +108,9 @@ static TableSpaceCacheEntry *
 get_tablespace(Oid spcid)
 {
 	TableSpaceCacheEntry *spc;
+#ifndef USE_FASTPG
 	HeapTuple	tp;
+#endif
 	TableSpaceOpts *opts;
 
 	/*
@@ -128,6 +130,14 @@ get_tablespace(Oid spcid)
 	if (spc)
 		return spc;
 
+#ifdef USE_FASTPG
+	/*
+	 * The standalone fastpg pgcore path has no physical pg_tablespace.  Treat
+	 * all tablespaces as having default options and let the planner use the
+	 * normal global cost GUCs.
+	 */
+	opts = NULL;
+#else
 	/*
 	 * Not found in TableSpace cache.  Check catcache.  If we don't find a
 	 * valid HeapTuple, it must mean someone has managed to request tablespace
@@ -157,6 +167,7 @@ get_tablespace(Oid spcid)
 		}
 		ReleaseSysCache(tp);
 	}
+#endif
 
 	/*
 	 * Now create the cache entry.  It's important to do this only after

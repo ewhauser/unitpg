@@ -9,6 +9,7 @@ pub const INT8_OID: u32 = 20;
 pub const INT4_OID: u32 = 23;
 pub const TEXT_OID: u32 = 25;
 pub const VARCHAR_OID: u32 = 1043;
+pub const REGCLASS_OID: u32 = 2205;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreError {
@@ -45,6 +46,12 @@ pub struct StatementDescription {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PgCoreValue {
+    Text(String),
+    Null,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PgCoreParam {
     Text(String),
     Null,
 }
@@ -106,6 +113,13 @@ impl PreparedStatement {
     pub fn execute(&self) -> Result<ExecutionResult, PgCoreError> {
         self.inner.execute()
     }
+
+    pub fn execute_with_params(
+        &self,
+        params: &[PgCoreParam],
+    ) -> Result<ExecutionResult, PgCoreError> {
+        self.inner.execute_with_params(params)
+    }
 }
 
 #[derive(Debug)]
@@ -121,17 +135,25 @@ impl Portal {
     pub fn execute(&self) -> Result<ExecutionResult, PgCoreError> {
         self.statement.execute()
     }
+
+    pub fn execute_with_params(
+        &self,
+        params: &[PgCoreParam],
+    ) -> Result<ExecutionResult, PgCoreError> {
+        self.statement.execute_with_params(params)
+    }
 }
 
 #[cfg(feature = "postgres-linked")]
 mod inner {
     use std::ffi::{CStr, CString, c_char};
+    use std::ptr;
     use std::ptr::NonNull;
     use std::sync::Mutex;
 
     use super::{
-        ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField, PgCoreValue,
-        RawParseSummary, StatementDescription,
+        ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField, PgCoreParam,
+        PgCoreValue, RawParseSummary, StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
@@ -187,6 +209,12 @@ mod inner {
         ) -> u32;
         fn fastpg_pgcore_execute(
             prepared: *const FastPgPgCorePrepared,
+        ) -> *mut FastPgPgCoreExecuteResult;
+        fn fastpg_pgcore_execute_params(
+            prepared: *const FastPgPgCorePrepared,
+            parameter_values: *const *const c_char,
+            parameter_is_null: *const bool,
+            parameter_count: i32,
         ) -> *mut FastPgPgCoreExecuteResult;
         fn fastpg_pgcore_execute_result_free(result: *mut FastPgPgCoreExecuteResult);
         fn fastpg_pgcore_execute_result_ok(result: *const FastPgPgCoreExecuteResult) -> bool;
@@ -374,10 +402,61 @@ mod inner {
         }
 
         pub fn execute(&self) -> Result<ExecutionResult, PgCoreError> {
+            self.execute_with_params(&[])
+        }
+
+        pub fn execute_with_params(
+            &self,
+            params: &[PgCoreParam],
+        ) -> Result<ExecutionResult, PgCoreError> {
+            let param_count = i32::try_from(params.len()).map_err(|_| {
+                PgCoreError::new("54000", "too many parameters for PostgreSQL execution", 0)
+            })?;
+            let encoded_params = params
+                .iter()
+                .map(|param| match param {
+                    PgCoreParam::Text(value) => {
+                        CString::new(value.as_str()).map(Some).map_err(|_| {
+                            PgCoreError::new(
+                                "22023",
+                                "query parameter contains an embedded NUL byte",
+                                0,
+                            )
+                        })
+                    }
+                    PgCoreParam::Null => Ok(None),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut parameter_values = Vec::with_capacity(encoded_params.len());
+            let mut parameter_is_null = Vec::with_capacity(encoded_params.len());
+            for param in &encoded_params {
+                match param {
+                    Some(value) => {
+                        parameter_values.push(value.as_ptr());
+                        parameter_is_null.push(false);
+                    }
+                    None => {
+                        parameter_values.push(ptr::null());
+                        parameter_is_null.push(true);
+                    }
+                }
+            }
+
             let _guard = PGCORE_LOCK
                 .lock()
                 .expect("fastpg pgcore execute mutex poisoned");
-            let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
+            let result = if params.is_empty() {
+                unsafe { fastpg_pgcore_execute(self.as_ptr()) }
+            } else {
+                unsafe {
+                    fastpg_pgcore_execute_params(
+                        self.as_ptr(),
+                        parameter_values.as_ptr(),
+                        parameter_is_null.as_ptr(),
+                        param_count,
+                    )
+                }
+            };
             let Some(result) = NonNull::new(result) else {
                 return Err(PgCoreError::new(
                     "XX000",
@@ -558,6 +637,17 @@ mod inner {
                 0,
             ))
         }
+
+        pub fn execute_with_params(
+            &self,
+            _params: &[super::PgCoreParam],
+        ) -> Result<ExecutionResult, PgCoreError> {
+            Err(PgCoreError::new(
+                "0A000",
+                "fastpg-pgcore was built without postgres-linked support",
+                0,
+            ))
+        }
     }
 }
 
@@ -604,6 +694,141 @@ mod tests {
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("1".to_owned())]]
         );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_parameterized_select_through_executor_params() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select $1::int4").unwrap();
+        let description = statement.describe();
+        assert_eq!(description.parameter_type_oids, vec![INT4_OID]);
+
+        let result = statement
+            .execute_with_params(&[PgCoreParam::Text("41".to_owned())])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("41".to_owned())]]
+        );
+
+        let result = statement.execute_with_params(&[PgCoreParam::Null]).unwrap();
+        assert_eq!(result.statements[0].rows, vec![vec![PgCoreValue::Null]]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_parameter_count_mismatch_is_protocol_error() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select $1::int4").unwrap();
+
+        let error = statement.execute().unwrap_err();
+        assert_eq!(error.sqlstate, "08P01");
+        assert!(error.message.contains("expected 1 parameters but got 0"));
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_pg_class_relkind_by_regclass_param() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_relkind_{}", std::process::id());
+        session
+            .prepare(&format!("create table {table}(id int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let statement = session
+            .prepare("select relkind from pg_catalog.pg_class where oid=$1::pg_catalog.regclass")
+            .unwrap();
+        let description = statement.describe();
+        assert_eq!(description.parameter_type_oids, vec![REGCLASS_OID]);
+
+        let result = statement
+            .execute_with_params(&[PgCoreParam::Text(table.clone())])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("r".to_owned())]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_insert_and_count_user_relation() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_count_{}", std::process::id());
+        session
+            .prepare(&format!("create table {table}(id int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let insert = session
+            .prepare(&format!("insert into {table} values (1), (2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(insert.statements[0].command_tag, "INSERT");
+
+        let count = session
+            .prepare(&format!("select count(*) from {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            count.statements[0].rows,
+            vec![vec![PgCoreValue::Text("2".to_owned())]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_current_timestamp_assignment_to_timestamp_column() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_mtime_{}", std::process::id());
+        session
+            .prepare(&format!(
+                "create table {table}(id int not null, mtime timestamp)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        session
+            .prepare(&format!(
+                "insert into {table} values (1, current_timestamp)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let update = session
+            .prepare(&format!(
+                "update {table} set mtime = current_timestamp where id = 1"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(update.statements[0].command_tag, "UPDATE");
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
     }
 
     #[cfg(feature = "postgres-execution")]

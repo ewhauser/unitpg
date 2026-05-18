@@ -13,9 +13,11 @@
 
 #ifdef USE_FASTPG
 
+#include "access/amapi.h"
 #include "access/tableam.h"
 
 extern const TableAmRoutine *GetFastPgMemTableAmRoutine(void);
+extern const IndexAmRoutine *GetFastPgMemIndexAmRoutine(void);
 
 #endif							/* USE_FASTPG */
 

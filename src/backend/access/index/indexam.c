@@ -44,6 +44,9 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/relation.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
@@ -59,6 +62,16 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 
+#ifdef USE_FASTPG
+static bool
+fastpg_is_primary_key_index(Oid relationId)
+{
+	FastPgRustPrimaryKeyIndexInfo index_info;
+
+	return fastpg_rust_catalog_primary_key_index_info((uint32_t) relationId,
+													  &index_info);
+}
+#endif
 
 /* ----------------------------------------------------------------
  *					macros used in index_ routines
@@ -135,6 +148,11 @@ index_open(Oid relationId, LOCKMODE lockmode)
 {
 	Relation	r;
 
+#ifdef USE_FASTPG
+	if (fastpg_is_primary_key_index(relationId))
+		lockmode = NoLock;
+#endif
+
 	r = relation_open(relationId, lockmode);
 
 	validate_relation_as_index(r);
@@ -153,6 +171,11 @@ Relation
 try_index_open(Oid relationId, LOCKMODE lockmode)
 {
 	Relation	r;
+
+#ifdef USE_FASTPG
+	if (fastpg_is_primary_key_index(relationId))
+		lockmode = NoLock;
+#endif
 
 	r = try_relation_open(relationId, lockmode);
 
@@ -180,6 +203,11 @@ index_close(Relation relation, LOCKMODE lockmode)
 	LockRelId	relid = relation->rd_lockInfo.lockRelId;
 
 	Assert(lockmode >= NoLock && lockmode < MAX_LOCKMODES);
+
+#ifdef USE_FASTPG
+	if (fastpg_is_primary_key_index(RelationGetRelid(relation)))
+		lockmode = NoLock;
+#endif
 
 	/* The relcache does the real work... */
 	RelationClose(relation);

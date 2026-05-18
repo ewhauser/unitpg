@@ -12,12 +12,19 @@
 
 #ifdef USE_FASTPG
 
+#include "access/amapi.h"
+#include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
+#include "access/genam.h"
 #include "access/multixact.h"
+#include "access/nbtree.h"
+#include "access/relscan.h"
+#include "access/skey.h"
 #include "access/tableam.h"
 #include "access/xact.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "nodes/pathnodes.h"
 #include "storage/off.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
@@ -47,6 +54,14 @@ extern bool fastpg_rust_relation_insert(uint32_t relid,
 										const size_t *value_lens,
 										size_t natts,
 										uint64_t *row_id);
+extern bool fastpg_rust_relation_update(uint32_t relid,
+										uint64_t row_id,
+										const uintptr_t *values,
+										const uint8_t *isnull,
+										const uint8_t *byval,
+										const size_t *value_lens,
+										size_t natts);
+extern bool fastpg_rust_relation_delete(uint32_t relid, uint64_t row_id);
 extern bool fastpg_rust_relation_contains_row(uint32_t relid,
 											  uint64_t row_id);
 extern uint64_t fastpg_rust_scan_begin(uint32_t relid);
@@ -63,6 +78,11 @@ extern bool fastpg_rust_fetch_row(uint32_t relid,
 								  uintptr_t *values,
 								  uint8_t *isnull,
 								  size_t natts);
+extern bool fastpg_rust_primary_key_index_lookup(uint32_t index_relid,
+												 const uintptr_t *values,
+												 const uint8_t *isnull,
+												 size_t nkeys,
+												 uint64_t *row_id);
 extern void fastpg_rust_xact_begin(void);
 extern void fastpg_rust_xact_commit(void);
 extern void fastpg_rust_xact_abort(void);
@@ -71,7 +91,18 @@ extern void fastpg_rust_subxact_commit(void);
 extern void fastpg_rust_subxact_abort(void);
 
 static const TableAmRoutine fastpg_mem_methods;
+static const IndexAmRoutine fastpg_mem_index_methods;
 static bool fastpg_mem_xact_callbacks_registered = false;
+
+typedef struct FastPgMemIndexScan
+{
+	bool		done;
+	bool		unsupported;
+	uintptr_t	values[FASTPG_MAX_INDEX_KEYS];
+	uint8_t		isnull[FASTPG_MAX_INDEX_KEYS];
+	uint8_t		key_seen[FASTPG_MAX_INDEX_KEYS];
+	size_t		nkeys;
+} FastPgMemIndexScan;
 
 static void
 fastpg_mem_unsupported(const char *operation)
@@ -79,6 +110,15 @@ fastpg_mem_unsupported(const char *operation)
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("fastpg_mem table access method does not support %s",
+					operation)));
+}
+
+static void
+fastpg_mem_index_unsupported(const char *operation)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("fastpg_mem primary-key index does not support %s",
 					operation)));
 }
 
@@ -252,6 +292,18 @@ fastpg_mem_store_virtual_tuple(Relation rel,
 			 (unsigned long long) row_id);
 	slot->tts_tableOid = RelationGetRelid(rel);
 	ExecStoreVirtualTuple(slot);
+}
+
+static void
+fastpg_mem_fill_deleted_tmfd(ItemPointer tid, TM_FailureData *tmfd)
+{
+	if (tmfd == NULL)
+		return;
+
+	tmfd->ctid = *tid;
+	tmfd->xmax = InvalidTransactionId;
+	tmfd->cmax = InvalidCommandId;
+	tmfd->traversed = false;
 }
 
 static const TupleTableSlotOps *
@@ -467,6 +519,192 @@ fastpg_mem_index_delete_tuples(Relation rel, TM_IndexDeleteOp *delstate)
 	return InvalidTransactionId;
 }
 
+static IndexBuildResult *
+fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
+					   IndexInfo *indexInfo)
+{
+	fastpg_mem_index_unsupported("physical index builds");
+	return NULL;
+}
+
+static void
+fastpg_mem_index_build_empty(Relation indexRelation)
+{
+}
+
+static bool
+fastpg_mem_index_insert(Relation indexRelation,
+						Datum *values,
+						bool *isnull,
+						ItemPointer heap_tid,
+						Relation heapRelation,
+						IndexUniqueCheck checkUnique,
+						bool indexUnchanged,
+						IndexInfo *indexInfo)
+{
+	/*
+	 * Rust table storage owns the primary-key map.  Executor calls still pass
+	 * through here once the index is planner-visible, so this AM is a no-op
+	 * writer rather than a second source of truth.
+	 */
+	return true;
+}
+
+static IndexBulkDeleteResult *
+fastpg_mem_index_bulk_delete(IndexVacuumInfo *info,
+							 IndexBulkDeleteResult *stats,
+							 IndexBulkDeleteCallback callback,
+							 void *callback_state)
+{
+	return stats;
+}
+
+static IndexBulkDeleteResult *
+fastpg_mem_index_vacuum_cleanup(IndexVacuumInfo *info,
+								IndexBulkDeleteResult *stats)
+{
+	return stats;
+}
+
+static void
+fastpg_mem_index_cost_estimate(PlannerInfo *root,
+							   IndexPath *path,
+							   double loop_count,
+							   Cost *indexStartupCost,
+							   Cost *indexTotalCost,
+							   Selectivity *indexSelectivity,
+							   double *indexCorrelation,
+							   double *indexPages)
+{
+	*indexStartupCost = 0.0;
+	*indexTotalCost = 1.0;
+	*indexSelectivity = 0.00001;
+	*indexCorrelation = 1.0;
+	*indexPages = 1.0;
+}
+
+static bool
+fastpg_mem_index_validate(Oid opclassoid)
+{
+	return true;
+}
+
+static IndexScanDesc
+fastpg_mem_index_begin_scan(Relation indexRelation, int nkeys, int norderbys)
+{
+	IndexScanDesc scan;
+	FastPgMemIndexScan *opaque;
+	int			expected_keys;
+
+	if (norderbys != 0)
+		fastpg_mem_index_unsupported("ordered scans");
+	if (indexRelation->rd_index == NULL)
+		fastpg_mem_index_unsupported("indexes without pg_index metadata");
+
+	expected_keys = IndexRelationGetNumberOfKeyAttributes(indexRelation);
+	if (expected_keys <= 0 || expected_keys > FASTPG_MAX_INDEX_KEYS)
+		fastpg_mem_index_unsupported("indexes with invalid key count");
+
+	scan = RelationGetIndexScan(indexRelation, nkeys, norderbys);
+	opaque = palloc0_object(FastPgMemIndexScan);
+	opaque->nkeys = (size_t) expected_keys;
+	scan->opaque = opaque;
+	return scan;
+}
+
+static void
+fastpg_mem_index_rescan(IndexScanDesc scan,
+						ScanKey keys,
+						int nkeys,
+						ScanKey orderbys,
+						int norderbys)
+{
+	FastPgMemIndexScan *opaque = (FastPgMemIndexScan *) scan->opaque;
+
+	opaque->done = false;
+	opaque->unsupported = false;
+	memset(opaque->values, 0, sizeof(opaque->values));
+	memset(opaque->isnull, 1, sizeof(opaque->isnull));
+	memset(opaque->key_seen, 0, sizeof(opaque->key_seen));
+
+	if (norderbys != 0)
+		fastpg_mem_index_unsupported("ordered rescans");
+	if (nkeys != (int) opaque->nkeys)
+		fastpg_mem_index_unsupported("partial primary-key probes");
+	if (nkeys > 0 && keys == NULL)
+		fastpg_mem_index_unsupported("rescans without scan keys");
+
+	for (int index = 0; index < nkeys; index++)
+	{
+		ScanKey		key = &keys[index];
+		int			key_index = key->sk_attno - 1;
+
+		if (key->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL |
+							 SK_SEARCHNOTNULL | SK_ORDER_BY |
+							 SK_ROW_HEADER | SK_ROW_MEMBER))
+			fastpg_mem_index_unsupported("non-scalar equality scan keys");
+		if (key->sk_strategy != BTEqualStrategyNumber)
+			fastpg_mem_index_unsupported("non-equality scan keys");
+		if (key_index < 0 || key_index >= (int) opaque->nkeys)
+			fastpg_mem_index_unsupported("scan keys outside the primary-key prefix");
+
+		opaque->values[key_index] = (uintptr_t) key->sk_argument;
+		opaque->isnull[key_index] =
+			(key->sk_flags & SK_ISNULL) ? 1 : 0;
+		opaque->key_seen[key_index] = 1;
+	}
+
+	for (size_t index = 0; index < opaque->nkeys; index++)
+	{
+		if (opaque->key_seen[index] == 0)
+			fastpg_mem_index_unsupported("sparse primary-key probes");
+	}
+}
+
+static bool
+fastpg_mem_index_get_tuple(IndexScanDesc scan, ScanDirection direction)
+{
+	FastPgMemIndexScan *opaque = (FastPgMemIndexScan *) scan->opaque;
+	uint64_t	row_id = 0;
+
+	if (ScanDirectionIsBackward(direction))
+		fastpg_mem_index_unsupported("backward scans");
+	if (opaque->unsupported || opaque->done)
+		return false;
+	opaque->done = true;
+
+	if (!fastpg_rust_primary_key_index_lookup((uint32_t) RelationGetRelid(scan->indexRelation),
+											  opaque->values,
+											  opaque->isnull,
+											  opaque->nkeys,
+											  &row_id))
+		return false;
+
+	if (!fastpg_mem_row_id_to_tid(row_id, &scan->xs_heaptid))
+		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
+			 (unsigned long long) row_id);
+	scan->xs_recheck = false;
+	scan->xs_recheckorderby = false;
+	return true;
+}
+
+static int64
+fastpg_mem_index_get_bitmap(IndexScanDesc scan, TIDBitmap *tbm)
+{
+	fastpg_mem_index_unsupported("bitmap scans");
+	return 0;
+}
+
+static void
+fastpg_mem_index_end_scan(IndexScanDesc scan)
+{
+	if (scan->opaque != NULL)
+	{
+		pfree(scan->opaque);
+		scan->opaque = NULL;
+	}
+}
+
 static void
 fastpg_mem_tuple_insert(Relation rel,
 						TupleTableSlot *slot,
@@ -546,7 +784,21 @@ fastpg_mem_tuple_delete(Relation rel,
 						bool wait,
 						TM_FailureData *tmfd)
 {
-	fastpg_mem_unsupported("DELETE");
+	uint64_t	row_id;
+
+	if (!fastpg_mem_tid_to_row_id(tid, &row_id))
+	{
+		fastpg_mem_fill_deleted_tmfd(tid, tmfd);
+		return TM_Deleted;
+	}
+
+	fastpg_mem_ensure_write_xact();
+	if (!fastpg_rust_relation_delete(RelationGetRelid(rel), row_id))
+	{
+		fastpg_mem_fill_deleted_tmfd(tid, tmfd);
+		return TM_Deleted;
+	}
+
 	return TM_Ok;
 }
 
@@ -563,7 +815,52 @@ fastpg_mem_tuple_update(Relation rel,
 						LockTupleMode *lockmode,
 						TU_UpdateIndexes *update_indexes)
 {
-	fastpg_mem_unsupported("UPDATE");
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+	uintptr_t  *values;
+	uint8_t    *isnull;
+	uint8_t    *byval;
+	size_t	   *value_lens;
+	uint64_t	row_id;
+
+	if (update_indexes != NULL)
+		*update_indexes = TU_None;
+	if (lockmode != NULL)
+		*lockmode = LockTupleExclusive;
+
+	if (!fastpg_mem_tid_to_row_id(otid, &row_id))
+	{
+		fastpg_mem_fill_deleted_tmfd(otid, tmfd);
+		return TM_Deleted;
+	}
+
+	fastpg_mem_ensure_write_xact();
+	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
+								   &value_lens);
+	if (!fastpg_rust_relation_update(RelationGetRelid(rel),
+									 row_id,
+									 values,
+									 isnull,
+									 byval,
+									 value_lens,
+									 tupdesc->natts))
+	{
+		pfree(values);
+		pfree(isnull);
+		pfree(byval);
+		pfree(value_lens);
+		fastpg_mem_fill_deleted_tmfd(otid, tmfd);
+		return TM_Deleted;
+	}
+
+	if (!fastpg_mem_row_id_to_tid(row_id, &slot->tts_tid))
+		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
+			 (unsigned long long) row_id);
+	slot->tts_tableOid = RelationGetRelid(rel);
+	pfree(values);
+	pfree(isnull);
+	pfree(byval);
+	pfree(value_lens);
+
 	return TM_Ok;
 }
 
@@ -802,11 +1099,73 @@ static const TableAmRoutine fastpg_mem_methods = {
 	.scan_sample_next_tuple = fastpg_mem_scan_sample_next_tuple,
 };
 
+static const IndexAmRoutine fastpg_mem_index_methods = {
+	.type = T_IndexAmRoutine,
+	.amstrategies = BTMaxStrategyNumber,
+	.amsupport = 0,
+	.amoptsprocnum = 0,
+	.amcanorder = false,
+	.amcanorderbyop = false,
+	.amcanhash = false,
+	.amconsistentequality = true,
+	.amconsistentordering = false,
+	.amcanbackward = false,
+	.amcanunique = true,
+	.amcanmulticol = true,
+	.amoptionalkey = false,
+	.amsearcharray = false,
+	.amsearchnulls = false,
+	.amstorage = false,
+	.amclusterable = false,
+	.ampredlocks = true,
+	.amcanparallel = false,
+	.amcanbuildparallel = false,
+	.amcaninclude = false,
+	.amusemaintenanceworkmem = false,
+	.amsummarizing = false,
+	.amparallelvacuumoptions = 0,
+	.amkeytype = InvalidOid,
+
+	.ambuild = fastpg_mem_index_build,
+	.ambuildempty = fastpg_mem_index_build_empty,
+	.aminsert = fastpg_mem_index_insert,
+	.aminsertcleanup = NULL,
+	.ambulkdelete = fastpg_mem_index_bulk_delete,
+	.amvacuumcleanup = fastpg_mem_index_vacuum_cleanup,
+	.amcanreturn = NULL,
+	.amcostestimate = fastpg_mem_index_cost_estimate,
+	.amgettreeheight = NULL,
+	.amoptions = NULL,
+	.amproperty = NULL,
+	.ambuildphasename = NULL,
+	.amvalidate = fastpg_mem_index_validate,
+	.amadjustmembers = NULL,
+	.ambeginscan = fastpg_mem_index_begin_scan,
+	.amrescan = fastpg_mem_index_rescan,
+	.amgettuple = fastpg_mem_index_get_tuple,
+	.amgetbitmap = fastpg_mem_index_get_bitmap,
+	.amendscan = fastpg_mem_index_end_scan,
+	.ammarkpos = NULL,
+	.amrestrpos = NULL,
+	.amestimateparallelscan = NULL,
+	.aminitparallelscan = NULL,
+	.amparallelrescan = NULL,
+	.amtranslatestrategy = NULL,
+	.amtranslatecmptype = NULL,
+};
+
 const TableAmRoutine *
 GetFastPgMemTableAmRoutine(void)
 {
 	fastpg_mem_ensure_xact_callbacks();
 	return &fastpg_mem_methods;
+}
+
+const IndexAmRoutine *
+GetFastPgMemIndexAmRoutine(void)
+{
+	fastpg_mem_ensure_xact_callbacks();
+	return &fastpg_mem_index_methods;
 }
 
 #endif							/* USE_FASTPG */

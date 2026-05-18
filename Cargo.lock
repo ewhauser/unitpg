@@ -267,9 +267,7 @@ dependencies = [
  "fastpg-catalog",
  "fastpg-parser",
  "fastpg-pgcore",
- "fastpg-plan",
  "fastpg-storage",
- "fastpg-tx",
  "fastpg-types",
 ]
 

@@ -1,22 +1,48 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
 use std::sync::{Mutex, OnceLock};
 
 use fastpg_catalog::{
-    BPCHAR_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID, TEXT_OID,
-    TIMESTAMP_OID, VARCHAR_OID, add_primary_key, create_relation, drop_relation,
-    lookup_builtin_type, relation_by_name, relation_column_count, truncate_relation,
+    BPCHAR_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID,
+    PG_CATALOG_NAMESPACE_OID, TEXT_OID, TIMESTAMP_OID, VARCHAR_OID, add_primary_key,
+    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
+    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
+    builtin_proc_by_oid, builtin_procs_by_name, builtin_type_by_name, create_relation,
+    drop_relation, lookup_builtin_type, relation_by_name, relation_by_oid, relation_column_count,
+    relations, truncate_relation, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    virtual_catalogs,
 };
 use fastpg_types::Oid;
+
+const NAMEDATALEN: usize = 64;
+const FASTPG_PROC_MAX_ARGS: usize = 8;
+const FASTPG_PROC_SOURCE_LEN: usize = 64;
+const PG_CLASS_RELATION_ID: u32 = 1259;
+const PG_CLASS_ATTRIBUTE_COUNT: u16 = 34;
+const PG_ATTRIBUTE_ATTRIBUTE_COUNT: u16 = 25;
+const PG_PROC_ATTRIBUTE_COUNT: u16 = 30;
+const PG_TYPE_ATTRIBUTE_COUNT: u16 = 32;
+const PG_INDEX_ATTRIBUTE_COUNT: u16 = 21;
+const PG_NAMESPACE_ATTRIBUTE_COUNT: u16 = 4;
+const HEAP_TABLE_AM_OID: u32 = 2;
+const BTREE_INDEX_AM_OID: u32 = 403;
+const BOOTSTRAP_SUPERUSER_OID: u32 = 10;
+const FIRST_NORMAL_TRANSACTION_ID: u32 = 3;
+const FIRST_MULTI_XACT_ID: u32 = 1;
+const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
+const FASTPG_MAX_INDEX_KEYS: usize = 32;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FastPgRustCatalogType {
     pub oid: u32,
+    pub namespace_oid: u32,
+    pub owner_oid: u32,
+    pub name: [c_char; NAMEDATALEN],
     pub typlen: i16,
     pub typbyval: u8,
     pub typalign: u8,
@@ -43,6 +69,134 @@ pub struct FastPgRustCatalogType {
     pub _trailing_padding: [u8; 3],
 }
 
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogRelation {
+    pub oid: u32,
+    pub namespace_oid: u32,
+    pub name: [c_char; NAMEDATALEN],
+    pub column_count: u16,
+    pub relkind: u8,
+    pub has_primary_key: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogColumn {
+    pub name: [c_char; NAMEDATALEN],
+    pub type_oid: u32,
+    pub type_mod: i32,
+    pub is_not_null: u8,
+    pub _padding: [u8; 3],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustPrimaryKeyIndexInfo {
+    pub index_oid: u32,
+    pub heap_oid: u32,
+    pub key_count: u16,
+    pub _padding: [u8; 2],
+    pub attnums: [i16; FASTPG_MAX_INDEX_KEYS],
+    pub type_oids: [u32; FASTPG_MAX_INDEX_KEYS],
+    pub collation_oids: [u32; FASTPG_MAX_INDEX_KEYS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogNamespace {
+    pub oid: u32,
+    pub owner_oid: u32,
+    pub name: [c_char; NAMEDATALEN],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FastPgRustCatalogProc {
+    pub oid: u32,
+    pub namespace_oid: u32,
+    pub owner_oid: u32,
+    pub language_oid: u32,
+    pub name: [c_char; NAMEDATALEN],
+    pub source: [c_char; FASTPG_PROC_SOURCE_LEN],
+    pub cost: f32,
+    pub rows: f32,
+    pub variadic_oid: u32,
+    pub support_oid: u32,
+    pub return_type_oid: u32,
+    pub arg_count: u16,
+    pub arg_default_count: u16,
+    pub kind: u8,
+    pub security_definer: u8,
+    pub leakproof: u8,
+    pub is_strict: u8,
+    pub returns_set: u8,
+    pub volatility: u8,
+    pub parallel: u8,
+    pub _padding: u8,
+    pub arg_type_oids: [u32; FASTPG_PROC_MAX_ARGS],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogAggregate {
+    pub function_oid: u32,
+    pub transition_fn_oid: u32,
+    pub final_fn_oid: u32,
+    pub combine_fn_oid: u32,
+    pub serial_fn_oid: u32,
+    pub deserial_fn_oid: u32,
+    pub moving_transition_fn_oid: u32,
+    pub moving_inverse_fn_oid: u32,
+    pub moving_final_fn_oid: u32,
+    pub sort_operator_oid: u32,
+    pub transition_type_oid: u32,
+    pub moving_transition_type_oid: u32,
+    pub transition_space: i32,
+    pub moving_transition_space: i32,
+    pub direct_arg_count: u16,
+    pub kind: u8,
+    pub final_extra: u8,
+    pub moving_final_extra: u8,
+    pub final_modify: u8,
+    pub moving_final_modify: u8,
+    pub has_init_value: u8,
+    pub has_moving_init_value: u8,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogOperator {
+    pub oid: u32,
+    pub namespace_oid: u32,
+    pub owner_oid: u32,
+    pub name: [c_char; NAMEDATALEN],
+    pub kind: u8,
+    pub can_merge: u8,
+    pub can_hash: u8,
+    pub _padding: u8,
+    pub left_type_oid: u32,
+    pub right_type_oid: u32,
+    pub result_type_oid: u32,
+    pub commutator_oid: u32,
+    pub negator_oid: u32,
+    pub code_fn_oid: u32,
+    pub rest_fn_oid: u32,
+    pub join_fn_oid: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogCast {
+    pub oid: u32,
+    pub source_type_oid: u32,
+    pub target_type_oid: u32,
+    pub function_oid: u32,
+    pub context: u8,
+    pub method: u8,
+    pub _padding: [u8; 2],
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RowId(pub u64);
 
@@ -58,6 +212,16 @@ struct Row {
     cells: Vec<Cell>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+enum IndexKeyPart {
+    Null,
+    ByValue(usize),
+    Bytes(Vec<u8>),
+}
+
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+struct IndexKey(Vec<IndexKeyPart>);
+
 #[derive(Default, Debug)]
 struct RowSegment {
     rows: Vec<Row>,
@@ -67,6 +231,8 @@ struct RowSegment {
 #[derive(Debug)]
 struct RelationRows {
     committed: Vec<RowSegment>,
+    committed_row_index: HashMap<u64, Row>,
+    primary_key_index: BTreeMap<IndexKey, u64>,
     next_row_id: u64,
 }
 
@@ -74,6 +240,8 @@ impl Default for RelationRows {
     fn default() -> Self {
         Self {
             committed: Vec::new(),
+            committed_row_index: HashMap::new(),
+            primary_key_index: BTreeMap::new(),
             next_row_id: 1,
         }
     }
@@ -93,11 +261,13 @@ impl RelationRows {
 #[derive(Default, Debug)]
 struct TransactionOverlay {
     relations: HashMap<u32, RowSegment>,
+    deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScanState {
     rows: Vec<Row>,
+    payloads: Vec<Box<[u8]>>,
     next_index: usize,
 }
 
@@ -137,66 +307,161 @@ impl StorageState {
     }
 
     fn visible_row_count(&self, relid: u32) -> usize {
-        let committed = self
-            .relations
-            .get(&relid)
-            .map(|relation| {
-                relation
-                    .committed
-                    .iter()
-                    .map(|segment| segment.rows.len())
-                    .sum()
-            })
-            .unwrap_or(0);
-        let in_flight: usize = self
-            .transaction_stack
-            .iter()
-            .filter_map(|overlay| overlay.relations.get(&relid))
-            .map(|segment| segment.rows.len())
-            .sum();
-        committed + in_flight
+        let Some(relation) = self.relations.get(&relid) else {
+            return self
+                .transaction_stack
+                .iter()
+                .filter_map(|overlay| overlay.relations.get(&relid))
+                .map(|segment| segment.rows.len())
+                .sum();
+        };
+
+        let mut row_count = committed_row_count(relation);
+        let mut visible_overlay_row_ids = BTreeSet::new();
+        let mut deleted_committed_row_ids = BTreeSet::new();
+
+        for overlay in &self.transaction_stack {
+            if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
+                for row_id in deleted_row_ids {
+                    if visible_overlay_row_ids.remove(row_id) {
+                        row_count = row_count.saturating_sub(1);
+                    } else if !deleted_committed_row_ids.contains(row_id)
+                        && committed_contains_row_id(relation, *row_id)
+                    {
+                        deleted_committed_row_ids.insert(*row_id);
+                        row_count = row_count.saturating_sub(1);
+                    }
+                }
+            }
+
+            if let Some(segment) = overlay.relations.get(&relid) {
+                for row in &segment.rows {
+                    if visible_overlay_row_ids.insert(row.row_id) {
+                        row_count += 1;
+                    }
+                }
+            }
+        }
+
+        row_count
     }
 
     fn visible_rows(&self, relid: u32) -> Vec<Row> {
-        let mut rows = Vec::with_capacity(self.visible_row_count(relid));
+        let mut rows = BTreeMap::new();
         if let Some(relation) = self.relations.get(&relid) {
             for segment in &relation.committed {
-                rows.extend(segment.rows.iter().cloned());
+                for row in &segment.rows {
+                    rows.insert(row.row_id, row.clone());
+                }
             }
         }
         for overlay in &self.transaction_stack {
+            if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
+                for row_id in deleted_row_ids {
+                    rows.remove(row_id);
+                }
+            }
             if let Some(segment) = overlay.relations.get(&relid) {
-                rows.extend(segment.rows.iter().cloned());
+                for row in &segment.rows {
+                    rows.insert(row.row_id, row.clone());
+                }
             }
         }
-        rows
+        rows.into_values().collect()
     }
 
     fn find_visible_row(&self, relid: u32, row_id: u64) -> Option<Row> {
         if row_id == 0 {
             return None;
         }
-        if let Some(relation) = self.relations.get(&relid) {
-            for segment in &relation.committed {
-                if let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id) {
-                    return Some(row.clone());
-                }
+
+        for overlay in self.transaction_stack.iter().rev() {
+            if let Some(segment) = overlay.relations.get(&relid)
+                && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
+            {
+                return Some(row.clone());
+            }
+            if overlay
+                .deleted_row_ids
+                .get(&relid)
+                .is_some_and(|deleted| deleted.contains(&row_id))
+            {
+                return None;
             }
         }
-        for overlay in &self.transaction_stack {
-            if let Some(segment) = overlay.relations.get(&relid) {
-                if let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id) {
-                    return Some(row.clone());
-                }
+
+        self.find_committed_row(relid, row_id)
+    }
+
+    fn find_committed_row(&self, relid: u32, row_id: u64) -> Option<Row> {
+        self.relations
+            .get(&relid)
+            .and_then(|relation| relation.committed_row_index.get(&row_id).cloned())
+    }
+
+    fn find_visible_row_by_primary_key(&self, relid: u32, key: &IndexKey) -> Option<Row> {
+        let mut committed_candidate = self
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.primary_key_index.get(key).copied());
+
+        for overlay in self.transaction_stack.iter().rev() {
+            if let Some(segment) = overlay.relations.get(&relid)
+                && let Some(row) = segment
+                    .rows
+                    .iter()
+                    .find(|row| primary_key_for_row(relid, row).as_ref() == Some(key))
+            {
+                return Some(row.clone());
+            }
+
+            if let Some(row_id) = committed_candidate
+                && overlay
+                    .deleted_row_ids
+                    .get(&relid)
+                    .is_some_and(|deleted| deleted.contains(&row_id))
+            {
+                committed_candidate = None;
             }
         }
-        None
+
+        committed_candidate.and_then(|row_id| self.find_committed_row(relid, row_id))
+    }
+
+    fn has_primary_key_conflict(
+        &self,
+        relid: u32,
+        row: &Row,
+        replacing_row_id: Option<u64>,
+    ) -> bool {
+        let Some(key) = primary_key_for_row(relid, row) else {
+            return false;
+        };
+
+        self.find_visible_row_by_primary_key(relid, &key)
+            .is_some_and(|existing| Some(existing.row_id) != replacing_row_id)
+    }
+
+    fn rebuild_primary_key_index(&mut self, relid: u32) {
+        let Some(relation) = self.relations.get_mut(&relid) else {
+            return;
+        };
+
+        relation.committed_row_index.clear();
+        relation.primary_key_index.clear();
+        for row in relation.committed.iter().flat_map(|segment| &segment.rows) {
+            relation.committed_row_index.insert(row.row_id, row.clone());
+            if let Some(key) = primary_key_for_row(relid, row) {
+                relation.primary_key_index.insert(key, row.row_id);
+            }
+        }
     }
 
     fn clear_relation(&mut self, relid: u32) {
         self.relations.insert(relid, RelationRows::default());
         for overlay in &mut self.transaction_stack {
             overlay.relations.remove(&relid);
+            overlay.deleted_row_ids.remove(&relid);
         }
     }
 
@@ -213,20 +478,74 @@ impl StorageState {
     }
 
     fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
+        for (relid, deleted_row_ids) in &overlay.deleted_row_ids {
+            if deleted_row_ids.is_empty() {
+                continue;
+            }
+            self.remove_committed_primary_key_entries(*relid, deleted_row_ids);
+            let relation = self.relations.entry(*relid).or_default();
+            remove_rows_from_segments(&mut relation.committed, deleted_row_ids);
+        }
+
         for (relid, segment) in overlay.relations {
             if segment.rows.is_empty() {
                 continue;
             }
-            self.relations
-                .entry(relid)
-                .or_default()
-                .committed
-                .push(segment);
+            let relation = self.relations.entry(relid).or_default();
+            for row in &segment.rows {
+                relation.committed_row_index.insert(row.row_id, row.clone());
+                if let Some(key) = primary_key_for_row(relid, row) {
+                    relation.primary_key_index.insert(key, row.row_id);
+                }
+            }
+            relation.committed.push(segment);
+        }
+    }
+
+    fn remove_committed_primary_key_entries(
+        &mut self,
+        relid: u32,
+        deleted_row_ids: &BTreeSet<u64>,
+    ) {
+        if deleted_row_ids.is_empty() {
+            return;
+        }
+
+        if let Some(relation) = self.relations.get_mut(&relid) {
+            for row_id in deleted_row_ids {
+                if let Some(row) = relation.committed_row_index.remove(row_id)
+                    && let Some(key) = primary_key_for_row(relid, &row)
+                {
+                    relation.primary_key_index.remove(&key);
+                }
+            }
         }
     }
 }
 
+fn committed_row_count(relation: &RelationRows) -> usize {
+    relation.committed_row_index.len()
+}
+
+fn committed_contains_row_id(relation: &RelationRows, row_id: u64) -> bool {
+    relation.committed_row_index.contains_key(&row_id)
+}
+
 fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: TransactionOverlay) {
+    for (relid, deleted_row_ids) in overlay.deleted_row_ids {
+        if deleted_row_ids.is_empty() {
+            continue;
+        }
+        if let Some(parent_segment) = parent.relations.get_mut(&relid) {
+            remove_rows_from_segment(parent_segment, &deleted_row_ids);
+        }
+        parent
+            .deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .extend(deleted_row_ids);
+    }
+
     for (relid, mut segment) in overlay.relations {
         if segment.rows.is_empty() {
             continue;
@@ -235,6 +554,19 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
         parent_segment.rows.append(&mut segment.rows);
         parent_segment.payloads.append(&mut segment.payloads);
     }
+}
+
+fn remove_rows_from_segments(segments: &mut Vec<RowSegment>, deleted_row_ids: &BTreeSet<u64>) {
+    for segment in segments.iter_mut() {
+        remove_rows_from_segment(segment, deleted_row_ids);
+    }
+    segments.retain(|segment| !segment.rows.is_empty());
+}
+
+fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet<u64>) {
+    segment
+        .rows
+        .retain(|row| !deleted_row_ids.contains(&row.row_id));
 }
 
 static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
@@ -322,6 +654,21 @@ unsafe fn write_c_output(buffer: *mut c_char, buffer_len: usize, value: &str) {
     }
 }
 
+fn fixed_c_bytes<const N: usize>(value: &str) -> [c_char; N] {
+    let mut out = [0 as c_char; N];
+    if N == 0 {
+        return out;
+    }
+    for (index, byte) in value.as_bytes().iter().copied().take(N - 1).enumerate() {
+        out[index] = byte as c_char;
+    }
+    out
+}
+
+fn fixed_c_name(value: &str) -> [c_char; NAMEDATALEN] {
+    fixed_c_bytes(value)
+}
+
 unsafe fn write_catalog_error(
     sqlstate_out: *mut c_char,
     sqlstate_len: usize,
@@ -336,8 +683,355 @@ unsafe fn write_catalog_error(
     }
 }
 
+fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatalogRelation {
+    FastPgRustCatalogRelation {
+        oid: relation.oid.0,
+        namespace_oid: relation.namespace.0,
+        name: fixed_c_name(&relation.name),
+        column_count: relation.columns.len().min(u16::MAX as usize) as u16,
+        relkind: b'r',
+        has_primary_key: u8::from(!relation.primary_key.is_empty()),
+    }
+}
+
+fn primary_key_index_to_ffi(
+    relation: &fastpg_catalog::RelationRecord,
+    index_oid: Oid,
+) -> FastPgRustCatalogRelation {
+    FastPgRustCatalogRelation {
+        oid: index_oid.0,
+        namespace_oid: relation.namespace.0,
+        name: fixed_c_name(&primary_key_index_name(relation)),
+        column_count: relation.primary_key.len().min(u16::MAX as usize) as u16,
+        relkind: b'i',
+        has_primary_key: 0,
+    }
+}
+
+fn virtual_catalog_column_count(relation_oid: Oid) -> u16 {
+    match relation_oid.0 {
+        PG_CLASS_RELATION_ID => PG_CLASS_ATTRIBUTE_COUNT,
+        1249 => PG_ATTRIBUTE_ATTRIBUTE_COUNT,
+        1255 => PG_PROC_ATTRIBUTE_COUNT,
+        1247 => PG_TYPE_ATTRIBUTE_COUNT,
+        2610 => PG_INDEX_ATTRIBUTE_COUNT,
+        2615 => PG_NAMESPACE_ATTRIBUTE_COUNT,
+        _ => 0,
+    }
+}
+
+fn virtual_catalog_relation_to_ffi(
+    relation: fastpg_catalog::VirtualCatalogRecord,
+) -> FastPgRustCatalogRelation {
+    FastPgRustCatalogRelation {
+        oid: relation.relation_oid.0,
+        namespace_oid: PG_CATALOG_NAMESPACE_OID.0,
+        name: fixed_c_name(relation.name),
+        column_count: virtual_catalog_column_count(relation.relation_oid),
+        relkind: b'r',
+        has_primary_key: 0,
+    }
+}
+
+fn column_to_ffi(column: &ColumnRecord) -> FastPgRustCatalogColumn {
+    FastPgRustCatalogColumn {
+        name: fixed_c_name(&column.name),
+        type_oid: column.type_oid.0,
+        type_mod: column.type_mod,
+        is_not_null: u8::from(column.is_not_null),
+        _padding: [0; 3],
+    }
+}
+
+fn namespace_to_ffi(record: &fastpg_catalog::PgNamespaceRecord) -> FastPgRustCatalogNamespace {
+    FastPgRustCatalogNamespace {
+        oid: record.oid.0,
+        owner_oid: record.owner.0,
+        name: fixed_c_name(record.name),
+    }
+}
+
+fn proc_to_ffi(record: &fastpg_catalog::PgProcRecord) -> Option<FastPgRustCatalogProc> {
+    let mut arg_type_oids = [0; FASTPG_PROC_MAX_ARGS];
+    if record.arg_types.len() > FASTPG_PROC_MAX_ARGS {
+        return None;
+    }
+    for (index, oid) in record.arg_types.iter().enumerate() {
+        arg_type_oids[index] = oid.0;
+    }
+
+    Some(FastPgRustCatalogProc {
+        oid: record.oid.0,
+        namespace_oid: record.namespace.0,
+        owner_oid: record.owner.0,
+        language_oid: record.language.0,
+        name: fixed_c_name(record.name),
+        source: fixed_c_bytes(record.source),
+        cost: record.cost as f32,
+        rows: record.rows as f32,
+        variadic_oid: record.variadic.0,
+        support_oid: record.support.0,
+        return_type_oid: record.return_type.0,
+        arg_count: record.arg_types.len() as u16,
+        arg_default_count: record.arg_defaults,
+        kind: record.kind,
+        security_definer: u8::from(record.security_definer),
+        leakproof: u8::from(record.leakproof),
+        is_strict: u8::from(record.strict),
+        returns_set: u8::from(record.returns_set),
+        volatility: record.volatility,
+        parallel: record.parallel,
+        _padding: 0,
+        arg_type_oids,
+    })
+}
+
+fn aggregate_to_ffi(record: &fastpg_catalog::PgAggregateRecord) -> FastPgRustCatalogAggregate {
+    FastPgRustCatalogAggregate {
+        function_oid: record.function_oid.0,
+        transition_fn_oid: record.transition_fn.0,
+        final_fn_oid: record.final_fn.0,
+        combine_fn_oid: record.combine_fn.0,
+        serial_fn_oid: record.serial_fn.0,
+        deserial_fn_oid: record.deserial_fn.0,
+        moving_transition_fn_oid: record.moving_transition_fn.0,
+        moving_inverse_fn_oid: record.moving_inverse_fn.0,
+        moving_final_fn_oid: record.moving_final_fn.0,
+        sort_operator_oid: record.sort_operator.0,
+        transition_type_oid: record.transition_type.0,
+        moving_transition_type_oid: record.moving_transition_type.0,
+        transition_space: record.transition_space,
+        moving_transition_space: record.moving_transition_space,
+        direct_arg_count: record.direct_arg_count,
+        kind: record.kind,
+        final_extra: u8::from(record.final_extra),
+        moving_final_extra: u8::from(record.moving_final_extra),
+        final_modify: record.final_modify,
+        moving_final_modify: record.moving_final_modify,
+        has_init_value: u8::from(record.init_value.is_some()),
+        has_moving_init_value: u8::from(record.moving_init_value.is_some()),
+    }
+}
+
+fn operator_to_ffi(record: &fastpg_catalog::PgOperatorRecord) -> FastPgRustCatalogOperator {
+    FastPgRustCatalogOperator {
+        oid: record.oid.0,
+        namespace_oid: record.namespace.0,
+        owner_oid: record.owner.0,
+        name: fixed_c_name(record.name),
+        kind: record.kind,
+        can_merge: u8::from(record.can_merge),
+        can_hash: u8::from(record.can_hash),
+        _padding: 0,
+        left_type_oid: record.left_type.0,
+        right_type_oid: record.right_type.0,
+        result_type_oid: record.result_type.0,
+        commutator_oid: record.commutator.0,
+        negator_oid: record.negator.0,
+        code_fn_oid: record.code.0,
+        rest_fn_oid: record.rest.0,
+        join_fn_oid: record.join.0,
+    }
+}
+
+fn cast_to_ffi(record: &fastpg_catalog::PgCastRecord) -> FastPgRustCatalogCast {
+    FastPgRustCatalogCast {
+        oid: record.oid.0,
+        source_type_oid: record.source_type.0,
+        target_type_oid: record.target_type.0,
+        function_oid: record.function.0,
+        context: record.context,
+        method: record.method,
+        _padding: [0; 2],
+    }
+}
+
 fn invalid_ffi_argument(message: String) -> CatalogError {
     CatalogError::new("22023", message)
+}
+
+fn primary_key_column_indexes(relation: &fastpg_catalog::RelationRecord) -> Option<Vec<usize>> {
+    if relation.primary_key.is_empty() {
+        return None;
+    }
+
+    relation
+        .primary_key
+        .iter()
+        .map(|primary_key_column| {
+            relation
+                .columns
+                .iter()
+                .position(|column| &column.name == primary_key_column)
+        })
+        .collect()
+}
+
+fn primary_key_index_oid(relation: &fastpg_catalog::RelationRecord) -> Option<Oid> {
+    if relation.primary_key.is_empty() {
+        return None;
+    }
+    relation
+        .oid
+        .0
+        .checked_add(PRIMARY_KEY_INDEX_OID_OFFSET)
+        .map(Oid)
+}
+
+fn primary_key_index_name(relation: &fastpg_catalog::RelationRecord) -> String {
+    format!("{}_pkey", relation.name)
+}
+
+fn primary_key_index_relation(index_oid: Oid) -> Option<fastpg_catalog::RelationRecord> {
+    let relation_oid = index_oid.0.checked_sub(PRIMARY_KEY_INDEX_OID_OFFSET)?;
+    let relation = relation_by_oid(Oid(relation_oid))?;
+    primary_key_index_oid(&relation)
+        .is_some_and(|primary_key_index_oid| primary_key_index_oid == index_oid)
+        .then_some(relation)
+}
+
+fn primary_key_index_relation_by_name(name: &str) -> Option<fastpg_catalog::RelationRecord> {
+    let relation_name = name.strip_suffix("_pkey")?;
+    let relation = relation_by_name(relation_name)?;
+    (!relation.primary_key.is_empty() && primary_key_index_name(&relation) == name)
+        .then_some(relation)
+}
+
+fn primary_key_column(
+    relation: &fastpg_catalog::RelationRecord,
+    column_index: usize,
+) -> Option<&ColumnRecord> {
+    let column_name = relation.primary_key.get(column_index)?;
+    relation
+        .columns
+        .iter()
+        .find(|column| &column.name == column_name)
+}
+
+fn primary_key_index_info(
+    relation: &fastpg_catalog::RelationRecord,
+    index_oid: Oid,
+) -> Option<FastPgRustPrimaryKeyIndexInfo> {
+    let key_count = relation.primary_key.len();
+    if key_count == 0 || key_count > FASTPG_MAX_INDEX_KEYS {
+        return None;
+    }
+
+    let mut attnums = [0i16; FASTPG_MAX_INDEX_KEYS];
+    let mut type_oids = [0u32; FASTPG_MAX_INDEX_KEYS];
+    let mut collation_oids = [0u32; FASTPG_MAX_INDEX_KEYS];
+    for (key_index, primary_key_column) in relation.primary_key.iter().enumerate() {
+        let column_index = relation
+            .columns
+            .iter()
+            .position(|column| &column.name == primary_key_column)?;
+        let column = relation.columns.get(column_index)?;
+        let type_record = lookup_builtin_type(column.type_oid)?;
+        attnums[key_index] = (column_index + 1).try_into().ok()?;
+        type_oids[key_index] = column.type_oid.0;
+        collation_oids[key_index] = type_record.typcollation.0;
+    }
+
+    Some(FastPgRustPrimaryKeyIndexInfo {
+        index_oid: index_oid.0,
+        heap_oid: relation.oid.0,
+        key_count: key_count as u16,
+        _padding: [0; 2],
+        attnums,
+        type_oids,
+        collation_oids,
+    })
+}
+
+fn primary_key_for_row(relid: u32, row: &Row) -> Option<IndexKey> {
+    let relation = relation_by_oid(Oid(relid))?;
+    let column_indexes = primary_key_column_indexes(&relation)?;
+    let mut parts = Vec::with_capacity(column_indexes.len());
+
+    for column_index in column_indexes {
+        let column = relation.columns.get(column_index)?;
+        let cell = row.cells.get(column_index)?;
+        parts.push(index_key_part(column, cell)?);
+    }
+
+    Some(IndexKey(parts))
+}
+
+fn primary_key_for_datums(
+    relation: &fastpg_catalog::RelationRecord,
+    values: &[usize],
+    is_null: &[u8],
+) -> Option<IndexKey> {
+    let column_indexes = primary_key_column_indexes(relation)?;
+    if column_indexes.len() != values.len() || values.len() != is_null.len() {
+        return None;
+    }
+
+    let mut parts = Vec::with_capacity(column_indexes.len());
+    for (key_index, column_index) in column_indexes.into_iter().enumerate() {
+        let column = relation.columns.get(column_index)?;
+        let cell = Cell {
+            value: values[key_index],
+            is_null: is_null[key_index] != 0,
+        };
+        parts.push(index_key_part(column, &cell)?);
+    }
+
+    Some(IndexKey(parts))
+}
+
+fn index_key_part(column: &ColumnRecord, cell: &Cell) -> Option<IndexKeyPart> {
+    if cell.is_null {
+        return Some(IndexKeyPart::Null);
+    }
+
+    let pg_type = lookup_builtin_type(column.type_oid)?;
+    if pg_type.typbyval {
+        return Some(IndexKeyPart::ByValue(cell.value));
+    }
+
+    let bytes = byref_key_bytes(cell.value, pg_type.typlen)?;
+    Some(IndexKeyPart::Bytes(bytes))
+}
+
+fn byref_key_bytes(value: usize, typlen: i16) -> Option<Vec<u8>> {
+    if value == 0 {
+        return None;
+    }
+
+    let len = if typlen > 0 {
+        typlen as usize
+    } else if typlen == -1 {
+        varlena_payload_len(value)?
+    } else if typlen == -2 {
+        c_string_payload_len(value)?
+    } else {
+        return None;
+    };
+
+    let bytes = unsafe { slice::from_raw_parts(value as *const u8, len) };
+    Some(bytes.to_vec())
+}
+
+fn varlena_payload_len(value: usize) -> Option<usize> {
+    let raw = unsafe { std::ptr::read_unaligned(value as *const u32) };
+    let len = if cfg!(target_endian = "little") {
+        (raw >> 2) as usize
+    } else {
+        raw as usize
+    };
+    (len >= 4).then_some(len)
+}
+
+fn c_string_payload_len(value: usize) -> Option<usize> {
+    let mut len = 0usize;
+    loop {
+        let byte = unsafe { std::ptr::read((value as *const u8).add(len)) };
+        len = len.checked_add(1)?;
+        if byte == 0 {
+            return Some(len);
+        }
+    }
 }
 
 pub fn copy_text_line(table: &str, line: &str) -> Result<bool, String> {
@@ -525,6 +1219,9 @@ pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
     unsafe {
         *out = FastPgRustCatalogType {
             oid: record.oid.0,
+            namespace_oid: record.namespace.0,
+            owner_oid: record.owner.0,
+            name: fixed_c_name(record.name),
             typlen: record.typlen,
             typbyval: u8::from(record.typbyval),
             typalign: record.typalign,
@@ -550,6 +1247,409 @@ pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
             typstorage: record.typstorage,
             _trailing_padding: [0; 3],
         };
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_type_by_name(
+    name: *const c_char,
+    namespace_oid: u32,
+    out: *mut FastPgRustCatalogType,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let Some(record) = builtin_type_by_name(&name, Oid(namespace_oid)) else {
+        return false;
+    };
+
+    unsafe {
+        *out = FastPgRustCatalogType {
+            oid: record.oid.0,
+            namespace_oid: record.namespace.0,
+            owner_oid: record.owner.0,
+            name: fixed_c_name(record.name),
+            typlen: record.typlen,
+            typbyval: u8::from(record.typbyval),
+            typalign: record.typalign,
+            typdelim: record.typdelim,
+            _padding: 0,
+            typinput: record.typinput.0,
+            typoutput: record.typoutput.0,
+            typreceive: record.typreceive.0,
+            typsend: record.typsend.0,
+            typmodin: record.typmodin.0,
+            typmodout: record.typmodout.0,
+            typisdefined: u8::from(record.typisdefined),
+            typtype: record.typtype,
+            typcategory: record.typcategory,
+            typispreferred: u8::from(record.typispreferred),
+            typrelid: record.typrelid.0,
+            typelem: record.typelem.0,
+            typarray: record.typarray.0,
+            typbasetype: record.typbasetype.0,
+            typtypmod: record.typtypmod,
+            typcollation: record.typcollation.0,
+            typsubscript: record.typsubscript.0,
+            typstorage: record.typstorage,
+            _trailing_padding: [0; 3],
+        };
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_catalog_policy_by_relation_oid(relation_oid: u32) -> u8 {
+    virtual_catalog_by_relation_oid(Oid(relation_oid))
+        .map(|record| record.policy.code())
+        .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
+    name: *const c_char,
+    namespace_oid: u32,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    if let Some(relation) = virtual_catalog_by_name(&name, Oid(namespace_oid)) {
+        unsafe {
+            *oid_out = relation.relation_oid.0;
+        }
+        return true;
+    }
+    if let Some(relation) = primary_key_index_relation_by_name(&name) {
+        if relation.namespace.0 != namespace_oid {
+            return false;
+        }
+        let Some(index_oid) = primary_key_index_oid(&relation) else {
+            return false;
+        };
+        unsafe {
+            *oid_out = index_oid.0;
+        }
+        return true;
+    }
+    let Some(relation) = relation_by_name(&name) else {
+        return false;
+    };
+    if relation.namespace.0 != namespace_oid {
+        return false;
+    }
+
+    unsafe {
+        *oid_out = relation.oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_oid(
+    oid: u32,
+    out: *mut FastPgRustCatalogRelation,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+
+    unsafe {
+        if let Some(relation) = relation_by_oid(Oid(oid)) {
+            *out = relation_to_ffi(&relation);
+            return true;
+        }
+        if let Some(relation) = primary_key_index_relation(Oid(oid))
+            && let Some(index_oid) = primary_key_index_oid(&relation)
+        {
+            *out = primary_key_index_to_ffi(&relation, index_oid);
+            return true;
+        }
+        if let Some(relation) = virtual_catalog_by_relation_oid(Oid(oid)) {
+            *out = virtual_catalog_relation_to_ffi(relation);
+            return true;
+        }
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
+    relation_oid: u32,
+    column_index: usize,
+    out: *mut FastPgRustCatalogColumn,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let relation = if let Some(relation) = relation_by_oid(Oid(relation_oid)) {
+        relation
+    } else if let Some(relation) = primary_key_index_relation(Oid(relation_oid)) {
+        let Some(column) = primary_key_column(&relation, column_index) else {
+            return false;
+        };
+        unsafe {
+            *out = column_to_ffi(column);
+        }
+        return true;
+    } else {
+        return false;
+    };
+    let Some(column) = relation.columns.get(column_index) else {
+        return false;
+    };
+
+    unsafe {
+        *out = column_to_ffi(column);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_info(
+    index_oid: u32,
+    out: *mut FastPgRustPrimaryKeyIndexInfo,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(relation) = primary_key_index_relation(Oid(index_oid)) else {
+        return false;
+    };
+    let Some(index_info) = primary_key_index_info(&relation, Oid(index_oid)) else {
+        return false;
+    };
+    unsafe {
+        *out = index_info;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_oid(
+    relation_oid: u32,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let Some(relation) = relation_by_oid(Oid(relation_oid)) else {
+        return false;
+    };
+    let Some(index_oid) = primary_key_index_oid(&relation) else {
+        return false;
+    };
+    unsafe {
+        *oid_out = index_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_namespace_by_oid(
+    oid: u32,
+    out: *mut FastPgRustCatalogNamespace,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(record) = builtin_namespace_by_oid(Oid(oid)) else {
+        return false;
+    };
+
+    unsafe {
+        *out = namespace_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_namespace_by_name(
+    name: *const c_char,
+    out: *mut FastPgRustCatalogNamespace,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let Some(record) = builtin_namespace_by_name(&name) else {
+        return false;
+    };
+
+    unsafe {
+        *out = namespace_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_oid(
+    oid: u32,
+    out: *mut FastPgRustCatalogProc,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(record) = builtin_proc_by_oid(Oid(oid)) else {
+        return false;
+    };
+    let Some(ffi_record) = proc_to_ffi(record) else {
+        return false;
+    };
+
+    unsafe {
+        *out = ffi_record;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_proc_count_by_name(name: *const c_char) -> usize {
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return 0;
+    };
+    builtin_procs_by_name(&name).count()
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_name_index(
+    name: *const c_char,
+    index: usize,
+    out: *mut FastPgRustCatalogProc,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let Some(record) = builtin_procs_by_name(&name).nth(index) else {
+        return false;
+    };
+    let Some(ffi_record) = proc_to_ffi(record) else {
+        return false;
+    };
+
+    unsafe {
+        *out = ffi_record;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_aggregate_by_proc_oid(
+    function_oid: u32,
+    out: *mut FastPgRustCatalogAggregate,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(record) = builtin_aggregate_by_proc_oid(Oid(function_oid)) else {
+        return false;
+    };
+
+    unsafe {
+        *out = aggregate_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_aggregate_init_value(
+    function_oid: u32,
+    moving: bool,
+    out: *mut c_char,
+    out_len: usize,
+) -> bool {
+    let Some(record) = builtin_aggregate_by_proc_oid(Oid(function_oid)) else {
+        return false;
+    };
+    let value = if moving {
+        record.moving_init_value
+    } else {
+        record.init_value
+    };
+    let Some(value) = value else {
+        return false;
+    };
+    unsafe {
+        write_c_output(out, out_len, value);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_oid(
+    oid: u32,
+    out: *mut FastPgRustCatalogOperator,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(record) = builtin_operator_by_oid(Oid(oid)) else {
+        return false;
+    };
+
+    unsafe {
+        *out = operator_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_signature(
+    name: *const c_char,
+    left_type_oid: u32,
+    right_type_oid: u32,
+    namespace_oid: u32,
+    out: *mut FastPgRustCatalogOperator,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let Some(record) = builtin_operator_by_signature(
+        &name,
+        Oid(left_type_oid),
+        Oid(right_type_oid),
+        Oid(namespace_oid),
+    ) else {
+        return false;
+    };
+
+    unsafe {
+        *out = operator_to_ffi(record);
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_cast_by_source_target(
+    source_type_oid: u32,
+    target_type_oid: u32,
+    out: *mut FastPgRustCatalogCast,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Some(record) = builtin_cast_by_source_target(Oid(source_type_oid), Oid(target_type_oid))
+    else {
+        return false;
+    };
+
+    unsafe {
+        *out = cast_to_ffi(record);
     }
     true
 }
@@ -736,7 +1836,11 @@ pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
         let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
         let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
             .map_err(invalid_ffi_argument)?;
-        add_primary_key(&name, column_names)
+        add_primary_key(&name, column_names)?;
+        if let Some(relation) = relation_by_name(&name) {
+            with_storage(|state| state.rebuild_primary_key_index(relation.oid.0));
+        }
+        Ok::<(), CatalogError>(())
     })();
 
     match result {
@@ -821,6 +1925,47 @@ pub extern "C" fn fastpg_rust_relation_contains_row(relid: u32, row_id: u64) -> 
 }
 
 #[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
+    index_relid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    row_id_out: *mut u64,
+) -> bool {
+    if nkeys > 0 && (values.is_null() || is_null.is_null()) {
+        return false;
+    }
+    let Some(relation) = primary_key_index_relation(Oid(index_relid)) else {
+        return false;
+    };
+
+    let values = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(values, nkeys) }
+    };
+    let is_null = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(is_null, nkeys) }
+    };
+    let Some(key) = primary_key_for_datums(&relation, values, is_null) else {
+        return false;
+    };
+
+    let row = with_storage(|state| state.find_visible_row_by_primary_key(relation.oid.0, &key));
+    let Some(row) = row else {
+        return false;
+    };
+    if !row_id_out.is_null() {
+        unsafe {
+            *row_id_out = row.row_id;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
 pub unsafe extern "C" fn fastpg_rust_relation_insert(
     relid: u32,
     values: *const usize,
@@ -830,10 +1975,152 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
+    let Some((values, is_null, byval, value_lens)) =
+        (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
+    else {
+        return false;
+    };
+
+    with_storage(|state| {
+        let row_id = match state.relations.entry(relid).or_default().allocate_row_id() {
+            Some(row_id) => row_id,
+            None => return false,
+        };
+
+        state.ensure_transaction();
+        let cells = {
+            let segment = state
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured")
+                .relations
+                .entry(relid)
+                .or_default();
+
+            match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
+                Some(cells) => cells,
+                None => return false,
+            }
+        };
+
+        let row = Row { row_id, cells };
+        if state.has_primary_key_conflict(relid, &row, None) {
+            return false;
+        }
+
+        let segment = state
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured")
+            .relations
+            .entry(relid)
+            .or_default();
+        segment.rows.push(row);
+        if !row_id_out.is_null() {
+            unsafe {
+                *row_id_out = row_id;
+            }
+        }
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_relation_update(
+    relid: u32,
+    row_id: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+) -> bool {
+    if row_id == 0 {
+        return false;
+    }
+    let Some((values, is_null, byval, value_lens)) =
+        (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
+    else {
+        return false;
+    };
+
+    with_storage(|state| {
+        if state.find_visible_row(relid, row_id).is_none() {
+            return false;
+        }
+
+        state.ensure_transaction();
+        let cells = {
+            let overlay = state
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured");
+            let segment = overlay.relations.entry(relid).or_default();
+            match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
+                Some(cells) => cells,
+                None => return false,
+            }
+        };
+        let row = Row { row_id, cells };
+        if state.has_primary_key_conflict(relid, &row, Some(row_id)) {
+            return false;
+        }
+
+        let overlay = state
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        overlay
+            .deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .insert(row_id);
+        let segment = overlay.relations.entry(relid).or_default();
+        segment.rows.retain(|row| row.row_id != row_id);
+        segment.rows.push(row);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
+    if row_id == 0 {
+        return false;
+    }
+
+    with_storage(|state| {
+        if state.find_visible_row(relid, row_id).is_none() {
+            return false;
+        }
+
+        state.ensure_transaction();
+        let overlay = state
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        overlay
+            .deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .insert(row_id);
+        if let Some(segment) = overlay.relations.get_mut(&relid) {
+            segment.rows.retain(|row| row.row_id != row_id);
+        }
+        true
+    })
+}
+
+unsafe fn row_input_arrays<'a>(
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+) -> Option<(&'a [usize], &'a [u8], &'a [u8], &'a [usize])> {
     if natts > 0
         && (values.is_null() || is_null.is_null() || byval.is_null() || value_lens.is_null())
     {
-        return false;
+        return None;
     }
 
     let values = if natts == 0 {
@@ -857,34 +2144,7 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
         unsafe { slice::from_raw_parts(value_lens, natts) }
     };
 
-    with_storage(|state| {
-        let row_id = match state.relations.entry(relid).or_default().allocate_row_id() {
-            Some(row_id) => row_id,
-            None => return false,
-        };
-
-        state.ensure_transaction();
-        let segment = state
-            .transaction_stack
-            .last_mut()
-            .expect("transaction was just ensured")
-            .relations
-            .entry(relid)
-            .or_default();
-
-        let cells = match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
-            Some(cells) => cells,
-            None => return false,
-        };
-
-        segment.rows.push(Row { row_id, cells });
-        if !row_id_out.is_null() {
-            unsafe {
-                *row_id_out = row_id;
-            }
-        }
-        true
-    })
+    Some((values, is_null, byval, value_lens))
 }
 
 fn copy_cells_to_segment(
@@ -932,19 +2192,170 @@ fn copy_cells_to_segment(
     Some(cells)
 }
 
+fn datum(value: usize) -> Cell {
+    Cell {
+        value,
+        is_null: false,
+    }
+}
+
+fn null_datum() -> Cell {
+    Cell {
+        value: 0,
+        is_null: true,
+    }
+}
+
+fn bool_datum(value: bool) -> Cell {
+    datum(usize::from(value))
+}
+
+fn char_datum(value: u8) -> Cell {
+    datum(value as usize)
+}
+
+fn float4_datum(value: f32) -> Cell {
+    datum(value.to_bits() as usize)
+}
+
+fn name_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
+    let mut bytes = [0u8; NAMEDATALEN];
+    for (index, byte) in value
+        .as_bytes()
+        .iter()
+        .copied()
+        .take(NAMEDATALEN - 1)
+        .enumerate()
+    {
+        bytes[index] = byte;
+    }
+    payloads.push(bytes.to_vec().into_boxed_slice());
+    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PgClassScanRelation {
+    oid: u32,
+    namespace_oid: u32,
+    name: String,
+    column_count: u16,
+    relkind: u8,
+    has_index: bool,
+}
+
+fn pg_class_scan_row(relation: PgClassScanRelation, payloads: &mut Vec<Box<[u8]>>) -> Row {
+    Row {
+        row_id: relation.oid as u64,
+        cells: vec![
+            datum(relation.oid as usize),
+            name_datum(&relation.name, payloads),
+            datum(relation.namespace_oid as usize),
+            datum(0),
+            datum(0),
+            datum(BOOTSTRAP_SUPERUSER_OID as usize),
+            datum(if relation.relkind == b'i' {
+                BTREE_INDEX_AM_OID
+            } else {
+                HEAP_TABLE_AM_OID
+            } as usize),
+            datum(relation.oid as usize),
+            datum(0),
+            datum(0),
+            float4_datum(-1.0),
+            datum(0),
+            datum(0),
+            datum(0),
+            bool_datum(relation.has_index),
+            bool_datum(false),
+            char_datum(b'p'),
+            char_datum(relation.relkind),
+            datum(relation.column_count as usize),
+            datum(0),
+            bool_datum(false),
+            bool_datum(false),
+            bool_datum(false),
+            bool_datum(false),
+            bool_datum(false),
+            bool_datum(true),
+            char_datum(b'n'),
+            bool_datum(false),
+            datum(0),
+            datum(FIRST_NORMAL_TRANSACTION_ID as usize),
+            datum(FIRST_MULTI_XACT_ID as usize),
+            null_datum(),
+            null_datum(),
+            null_datum(),
+        ],
+    }
+}
+
+fn pg_class_scan_state() -> ScanState {
+    let mut payloads = Vec::new();
+    let mut rows = Vec::new();
+
+    rows.extend(virtual_catalogs().iter().map(|relation| {
+        pg_class_scan_row(
+            PgClassScanRelation {
+                oid: relation.relation_oid.0,
+                namespace_oid: PG_CATALOG_NAMESPACE_OID.0,
+                name: relation.name.to_owned(),
+                column_count: virtual_catalog_column_count(relation.relation_oid),
+                relkind: b'r',
+                has_index: false,
+            },
+            &mut payloads,
+        )
+    }));
+    for relation in relations() {
+        let has_primary_key = !relation.primary_key.is_empty();
+        rows.push(pg_class_scan_row(
+            PgClassScanRelation {
+                oid: relation.oid.0,
+                namespace_oid: relation.namespace.0,
+                name: relation.name.clone(),
+                column_count: relation.columns.len().min(u16::MAX as usize) as u16,
+                relkind: b'r',
+                has_index: has_primary_key,
+            },
+            &mut payloads,
+        ));
+        if has_primary_key && let Some(index_oid) = primary_key_index_oid(&relation) {
+            rows.push(pg_class_scan_row(
+                PgClassScanRelation {
+                    oid: index_oid.0,
+                    namespace_oid: relation.namespace.0,
+                    name: primary_key_index_name(&relation),
+                    column_count: relation.primary_key.len().min(u16::MAX as usize) as u16,
+                    relkind: b'i',
+                    has_index: false,
+                },
+                &mut payloads,
+            ));
+        }
+    }
+
+    ScanState {
+        rows,
+        payloads,
+        next_index: 0,
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
+    let virtual_scan = (relid == PG_CLASS_RELATION_ID).then(pg_class_scan_state);
+
     with_storage(|state| {
-        state.relations.entry(relid).or_default();
-        let rows = state.visible_rows(relid);
-        let handle = state.allocate_scan_handle();
-        state.scans.insert(
-            handle,
+        let scan = virtual_scan.unwrap_or_else(|| {
+            state.relations.entry(relid).or_default();
             ScanState {
-                rows,
+                rows: state.visible_rows(relid),
+                payloads: Vec::new(),
                 next_index: 0,
-            },
-        );
+            }
+        });
+        let handle = state.allocate_scan_handle();
+        state.scans.insert(handle, scan);
         handle
     })
 }
@@ -1109,6 +2520,37 @@ mod tests {
                 row_id,
             )
         }
+    }
+
+    unsafe fn update_byval(relid: u32, row_id: u64, values: &[usize], is_null: &[u8]) -> bool {
+        let byval = vec![1u8; values.len()];
+        let value_lens = vec![0usize; values.len()];
+        unsafe {
+            fastpg_rust_relation_update(
+                relid,
+                row_id,
+                values.as_ptr(),
+                is_null.as_ptr(),
+                byval.as_ptr(),
+                value_lens.as_ptr(),
+                values.len(),
+            )
+        }
+    }
+
+    unsafe fn fetch_byval(relid: u32, row_id: u64, natts: usize) -> Option<(Vec<usize>, Vec<u8>)> {
+        let mut values = vec![0usize; natts];
+        let mut nulls = vec![0u8; natts];
+        let found = unsafe {
+            fastpg_rust_fetch_row(
+                relid,
+                row_id,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                natts,
+            )
+        };
+        found.then_some((values, nulls))
     }
 
     #[test]
@@ -1295,6 +2737,123 @@ mod tests {
     }
 
     #[test]
+    fn updates_shadow_committed_rows_and_rollback_cleanly() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[10, 20], &[0, 0], &mut row_id));
+        }
+        fastpg_rust_xact_commit();
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(update_byval(relid, row_id, &[30, 40], &[0, 0]));
+        }
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert_eq!(
+            unsafe { fetch_byval(relid, row_id, 2) },
+            Some((vec![30, 40], vec![0, 0]))
+        );
+        fastpg_rust_xact_abort();
+
+        assert_eq!(
+            unsafe { fetch_byval(relid, row_id, 2) },
+            Some((vec![10, 20], vec![0, 0]))
+        );
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(update_byval(relid, row_id, &[50, 60], &[0, 0]));
+        }
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert_eq!(
+            unsafe { fetch_byval(relid, row_id, 2) },
+            Some((vec![50, 60], vec![0, 0]))
+        );
+    }
+
+    #[test]
+    fn deletes_hide_rows_and_rollback_cleanly() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut row_id));
+        }
+        fastpg_rust_xact_commit();
+
+        fastpg_rust_xact_begin();
+        assert!(fastpg_rust_relation_delete(relid, row_id));
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, row_id));
+        fastpg_rust_xact_abort();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert!(fastpg_rust_relation_contains_row(relid, row_id));
+
+        fastpg_rust_xact_begin();
+        assert!(fastpg_rust_relation_delete(relid, row_id));
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, row_id));
+    }
+
+    #[test]
+    fn inserted_then_deleted_overlay_rows_do_not_underflow_counts() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut row_id));
+        }
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert!(fastpg_rust_relation_delete(relid, row_id));
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, row_id));
+    }
+
+    #[test]
+    fn committed_subxact_updates_merge_into_parent_overlay() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut row_id));
+        }
+        fastpg_rust_subxact_begin();
+        unsafe {
+            assert!(update_byval(relid, row_id, &[2], &[0]));
+        }
+        fastpg_rust_subxact_commit();
+        assert_eq!(
+            unsafe { fetch_byval(relid, row_id, 1) },
+            Some((vec![2], vec![0]))
+        );
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert_eq!(
+            unsafe { fetch_byval(relid, row_id, 1) },
+            Some((vec![2], vec![0]))
+        );
+    }
+
+    #[test]
     fn byref_values_are_copied_into_rust_storage() {
         let _guard = test_guard();
         let relid = next_relid();
@@ -1365,5 +2924,109 @@ mod tests {
         }
         assert_eq!(values, [70_000]);
         assert_eq!(nulls, [0]);
+    }
+
+    #[test]
+    fn primary_key_index_enforces_uniqueness_and_tracks_updates() {
+        let _guard = test_guard();
+        create_relation(
+            "pk_storage",
+            vec![
+                ColumnRecord::new("id", INT4_OID, -1, true),
+                ColumnRecord::new("value", INT4_OID, -1, false),
+            ],
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        add_primary_key("pk_storage", vec!["id".to_owned()]).unwrap();
+        let relation = relation_by_name("pk_storage").unwrap();
+        let index_oid = primary_key_index_oid(&relation).unwrap();
+        let relid = relation.oid.0;
+        let mut first_row_id = 0;
+        let mut second_row_id = 0;
+        let mut index_relation = FastPgRustCatalogRelation {
+            oid: 0,
+            namespace_oid: 0,
+            name: [0; NAMEDATALEN],
+            column_count: 0,
+            relkind: 0,
+            has_primary_key: 0,
+        };
+        let mut index_info = FastPgRustPrimaryKeyIndexInfo {
+            index_oid: 0,
+            heap_oid: 0,
+            key_count: 0,
+            _padding: [0; 2],
+            attnums: [0; FASTPG_MAX_INDEX_KEYS],
+            type_oids: [0; FASTPG_MAX_INDEX_KEYS],
+            collation_oids: [0; FASTPG_MAX_INDEX_KEYS],
+        };
+
+        unsafe {
+            assert!(fastpg_rust_catalog_relation_by_oid(
+                index_oid.0,
+                &mut index_relation,
+            ));
+            assert!(fastpg_rust_catalog_primary_key_index_info(
+                index_oid.0,
+                &mut index_info,
+            ));
+        }
+        assert_eq!(index_relation.relkind, b'i');
+        assert_eq!(index_relation.column_count, 1);
+        assert_eq!(index_info.heap_oid, relid);
+        assert_eq!(index_info.key_count, 1);
+        assert_eq!(index_info.attnums[0], 1);
+        assert_eq!(index_info.type_oids[0], INT4_OID.0);
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1, 10], &[0, 0], &mut first_row_id));
+            assert!(insert_byval(relid, &[2, 20], &[0, 0], &mut second_row_id));
+            assert!(!insert_byval(relid, &[1, 30], &[0, 0], &mut 0));
+        }
+        fastpg_rust_xact_commit();
+
+        let mut found_row_id = 0;
+        unsafe {
+            assert!(fastpg_rust_primary_key_index_lookup(
+                index_oid.0,
+                [2usize].as_ptr(),
+                [0u8].as_ptr(),
+                1,
+                &mut found_row_id,
+            ));
+        }
+        assert_eq!(found_row_id, second_row_id);
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(update_byval(relid, second_row_id, &[3, 40], &[0, 0]));
+            assert!(!update_byval(relid, second_row_id, &[1, 50], &[0, 0]));
+        }
+        fastpg_rust_xact_commit();
+
+        unsafe {
+            assert!(!fastpg_rust_primary_key_index_lookup(
+                index_oid.0,
+                [2usize].as_ptr(),
+                [0u8].as_ptr(),
+                1,
+                &mut found_row_id,
+            ));
+            assert!(fastpg_rust_primary_key_index_lookup(
+                index_oid.0,
+                [3usize].as_ptr(),
+                [0u8].as_ptr(),
+                1,
+                &mut found_row_id,
+            ));
+        }
+        assert_eq!(found_row_id, second_row_id);
+        assert_eq!(
+            unsafe { fetch_byval(relid, second_row_id, 2) },
+            Some((vec![3, 40], vec![0, 0]))
+        );
     }
 }

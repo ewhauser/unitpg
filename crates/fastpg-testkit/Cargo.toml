@@ -5,6 +5,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+mini-sql-testkit = ["fastpg-server/mini-sql-testkit"]
+postgres-execution = ["fastpg-server/postgres-execution"]
+
 [dependencies]
 fastpg-server.workspace = true
 tokio.workspace = true

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import html
 import json
 import os
 import platform
@@ -22,6 +23,8 @@ from typing import Any
 
 TPS_RE = re.compile(r"^tps =\s+([0-9.]+)\s+\(without initial connection time\)", re.MULTILINE)
 LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
+SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
+HOTSPOT_RE = re.compile(r"^(.*) \((\d+) samples?, ([0-9.]+)%\)$")
 
 
 @dataclass(frozen=True)
@@ -85,6 +88,7 @@ class PgBenchCompare:
                 "rust_build_profile": args.rust_build_profile,
                 "rust_pgcore": args.rust_pgcore,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
+                "profile_normal_postgres": args.profile_normal_postgres,
                 "profile_tool": args.profile_tool,
                 "profile_phase": args.profile_phase,
                 "profile_open": args.profile_open,
@@ -325,6 +329,7 @@ class PgBenchCompare:
         env = postgres_env(paths["bindir"], paths["libdir"])
         logfile = run_dir / "postgres.log"
         started = False
+        profiler: dict[str, Any] | None = None
         stop_failure: BenchmarkFailure | None = None
 
         run_record: dict[str, Any] = {
@@ -386,18 +391,36 @@ class PgBenchCompare:
             )
             run_record["commands"]["pgbench_init"] = init.as_json()
 
-            bench = self.checked_command(
-                variant.name,
-                "pgbench-run",
-                self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
-                run_dir,
-                "pgbench-run",
-                env=env,
-            )
+            if self.should_profile_normal_postgres(variant) and self.args.profile_phase == "run":
+                postmaster_pid = read_postmaster_pid(data_dir)
+                bench, profiler = self.run_profiled_postgres_pgbench(
+                    variant.name,
+                    self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
+                    postmaster_pid,
+                    run_dir,
+                    env,
+                )
+                run_record["commands"]["profile_start"] = profiler["result"].as_json()
+            else:
+                bench = self.checked_command(
+                    variant.name,
+                    "pgbench-run",
+                    self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
+                    run_dir,
+                    "pgbench-run",
+                    env=env,
+                )
             run_record["commands"]["pgbench_run"] = bench.as_json()
             run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
             return run_record
         finally:
+            active_failure = sys.exc_info()[0] is not None
+            if profiler is not None:
+                profile_result = self.finish_profiler(profiler, run_dir)
+                run_record["commands"]["profile_stop"] = profile_result.as_json()
+                run_record["profile"] = profiler["profile_record"]
+                if profile_result.returncode != 0 and stop_failure is None and not active_failure:
+                    stop_failure = BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
             if started:
                 stopped = self.command(
                     [
@@ -414,7 +437,7 @@ class PgBenchCompare:
                     env=env,
                 )
                 run_record["commands"]["stop"] = stopped.as_json()
-                if stopped.returncode != 0:
+                if stopped.returncode != 0 and not active_failure:
                     stop_failure = BenchmarkFailure(variant.name, "stop", stopped, run_dir)
             shutil.rmtree(socket_dir, ignore_errors=True)
             self.write_results()
@@ -473,16 +496,17 @@ class PgBenchCompare:
             run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
             return run_record
         finally:
+            active_failure = sys.exc_info()[0] is not None
             if server is not None:
                 stopped = self.stop_rust_server(server, run_dir)
                 run_record["commands"]["stop"] = stopped.as_json()
-                if stopped.returncode != 0:
+                if stopped.returncode != 0 and not active_failure:
                     stop_failure = BenchmarkFailure(variant.name, "stop", stopped, run_dir)
             if profiler is not None:
                 profile_result = self.finish_rust_profiler(profiler, run_dir)
                 run_record["commands"]["profile_stop"] = profile_result.as_json()
                 run_record["profile"] = profiler["profile_record"]
-                if profile_result.returncode != 0 and stop_failure is None:
+                if profile_result.returncode != 0 and stop_failure is None and not active_failure:
                     stop_failure = BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
             self.write_results()
             if stop_failure is not None:
@@ -581,6 +605,86 @@ class PgBenchCompare:
     def should_profile_rust_server_name(self, variant_name: str) -> bool:
         return self.args.profile_fastpg_rust_server and variant_name == "fastpg"
 
+    def should_profile_normal_postgres(self, variant: Variant) -> bool:
+        return (
+            self.args.profile_normal_postgres
+            and variant.name == "normal"
+            and variant.engine == "postgres"
+        )
+
+    def run_profiled_postgres_pgbench(
+        self,
+        variant: str,
+        command: list[str],
+        postmaster_pid: int,
+        output_dir: Path,
+        env: dict[str, str],
+    ) -> tuple[CommandResult, dict[str, Any]]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        stdout_path = output_dir / "pgbench-run.stdout"
+        stderr_path = output_dir / "pgbench-run.stderr"
+        stdout_file = stdout_path.open("w")
+        stderr_file = stderr_path.open("w")
+        started = time.monotonic()
+        pgbench_process = subprocess.Popen(
+            command,
+            cwd=self.source_root,
+            env=env,
+            text=True,
+            stdout=stdout_file,
+            stderr=stderr_file,
+        )
+        profiler: dict[str, Any] | None = None
+        try:
+            backend_pid = wait_for_postgres_backend(postmaster_pid, pgbench_process)
+            if backend_pid is None:
+                failure = CommandResult(
+                    command,
+                    str(self.source_root),
+                    pgbench_process.poll() if pgbench_process.poll() is not None else 1,
+                    read_text(stdout_path),
+                    read_text(stderr_path),
+                    time.monotonic() - started,
+                )
+                raise BenchmarkFailure(
+                    variant,
+                    "profile",
+                    CommandResult(
+                        ["find-postgres-backend", f"postmaster={postmaster_pid}"],
+                        str(self.source_root),
+                        1,
+                        failure.stdout,
+                        "could not find active Postgres backend to profile",
+                        failure.seconds,
+                    ),
+                    output_dir,
+                )
+            profiler = self.start_profiler(
+                variant,
+                backend_pid,
+                output_dir,
+                "normal-postgres-flamegraph.svg",
+                "normal Postgres pgbench backend",
+            )
+            pgbench_process.wait()
+        finally:
+            stdout_file.close()
+            stderr_file.close()
+
+        result = CommandResult(
+            command=command,
+            cwd=str(self.source_root),
+            returncode=pgbench_process.returncode if pgbench_process.returncode is not None else 1,
+            stdout=read_text(stdout_path),
+            stderr=read_text(stderr_path),
+            seconds=time.monotonic() - started,
+        )
+        (output_dir / "pgbench-run.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
+        if result.returncode != 0:
+            raise BenchmarkFailure(variant, "pgbench-run", result, output_dir)
+        assert profiler is not None
+        return result, profiler
+
     def start_rust_profiler(
         self,
         variant: str,
@@ -588,12 +692,27 @@ class PgBenchCompare:
         output_dir: Path,
     ) -> dict[str, Any]:
         process = server["process"]
-        pid = process.pid
+        return self.start_profiler(
+            variant,
+            process.pid,
+            output_dir,
+            "fastpg-server-flamegraph.svg",
+            "fastpg Rust server pgbench",
+        )
+
+    def start_profiler(
+        self,
+        variant: str,
+        pid: int,
+        output_dir: Path,
+        output_name: str,
+        title: str,
+    ) -> dict[str, Any]:
         profile_dir = output_dir / "profile"
         profile_dir.mkdir(parents=True, exist_ok=True)
         tool = self.args.profile_tool
         if tool == "flamegraph":
-            command, profile_path = self.flamegraph_command(pid, profile_dir)
+            command, profile_path = self.flamegraph_command(pid, profile_dir, output_name, title)
         else:
             raise BenchmarkFailure(
                 variant,
@@ -609,7 +728,7 @@ class PgBenchCompare:
         started = time.monotonic()
         profiler_process = subprocess.Popen(
             command,
-            cwd=self.source_root,
+            cwd=profile_dir,
             text=True,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -621,7 +740,7 @@ class PgBenchCompare:
             stderr_file.flush()
             failure = CommandResult(
                 command,
-                str(self.source_root),
+                str(profile_dir),
                 profiler_process.returncode if profiler_process.returncode is not None else 1,
                 read_text(stdout_path),
                 read_text(stderr_path),
@@ -631,7 +750,7 @@ class PgBenchCompare:
             stderr_file.close()
             raise BenchmarkFailure(variant, "profile", failure, profile_dir)
 
-        result = CommandResult(command, str(self.source_root), 0, "", "", time.monotonic() - started)
+        result = CommandResult(command, str(profile_dir), 0, "", "", time.monotonic() - started)
         (profile_dir / f"{tool}-start.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
         return {
             "command": command,
@@ -651,7 +770,9 @@ class PgBenchCompare:
             },
         }
 
-    def flamegraph_command(self, pid: int, profile_dir: Path) -> tuple[list[str], Path]:
+    def flamegraph_command(
+        self, pid: int, profile_dir: Path, output_name: str, title: str
+    ) -> tuple[list[str], Path]:
         flamegraph = shutil.which("flamegraph")
         if flamegraph is None:
             raise BenchmarkFailure(
@@ -668,7 +789,7 @@ class PgBenchCompare:
                 profile_dir,
             )
 
-        output = profile_dir / "fastpg-server-flamegraph.svg"
+        output = profile_dir / output_name
         command = [
             flamegraph,
             "-p",
@@ -676,7 +797,7 @@ class PgBenchCompare:
             "-o",
             str(output),
             "--title",
-            "fastpg Rust server pgbench",
+            title,
             "--notes",
             f"builtin={self.args.builtin} scale={self.args.scale} transactions={self.args.transactions}",
         ]
@@ -685,6 +806,9 @@ class PgBenchCompare:
         return command, output
 
     def finish_rust_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
+        return self.finish_profiler(profiler, output_dir)
+
+    def finish_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
         started = time.monotonic()
         process = profiler["process"]
         command = ["wait-profile", f"pid={process.pid}"]
@@ -707,12 +831,14 @@ class PgBenchCompare:
             returncode = 1
         result = CommandResult(
             command,
-            str(self.source_root),
+            str(profiler["profile_dir"]),
             returncode,
             read_text(profiler["stdout_path"]),
             read_text(profiler["stderr_path"]),
             time.monotonic() - started,
         )
+        if profile_path.exists():
+            profiler["profile_record"]["hotspots"] = profile_hotspots(profile_path)
         (profiler["profile_dir"] / "profile-stop.command.json").write_text(
             json.dumps(result.as_json(), indent=2) + "\n"
         )
@@ -813,6 +939,10 @@ class PgBenchCompare:
         result_json = self.result_root / "summary.json"
         result_json.write_text(json.dumps(self.results, indent=2, sort_keys=True) + "\n")
         (self.result_root / "summary.md").write_text(render_markdown(self.results, self.result_root))
+        if profile_records_by_variant(self.results):
+            (self.result_root / "profile-side-by-side.html").write_text(
+                render_profile_comparison_html(self.results, self.result_root)
+            )
 
     def print_success(self) -> None:
         normal = self.results["variants"]["normal"]["summary"]
@@ -864,6 +994,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="profile the fastpg Rust server during the pgbench run",
     )
     parser.add_argument(
+        "--profile-normal-postgres",
+        action="store_true",
+        help="profile the normal Postgres backend process during the pgbench run",
+    )
+    parser.add_argument(
         "--profile-tool",
         choices=["flamegraph"],
         default="flamegraph",
@@ -891,6 +1026,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--runs must be at least 1")
     if args.profile_fastpg_rust_server and args.fastpg_engine != "rust-server":
         parser.error("--profile-fastpg-rust-server requires --fastpg-engine=rust-server")
+    if args.profile_normal_postgres and args.clients != 1:
+        parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:
         parser.error("--profile-warmup-seconds must be non-negative")
     return args
@@ -952,6 +1089,116 @@ def read_text(path: Path) -> str:
         return ""
 
 
+def read_postmaster_pid(data_dir: Path) -> int:
+    pid_file = data_dir / "postmaster.pid"
+    first_line = pid_file.read_text().splitlines()[0]
+    return int(first_line)
+
+
+def wait_for_postgres_backend(
+    postmaster_pid: int,
+    pgbench_process: subprocess.Popen[str],
+    timeout_seconds: float = 10.0,
+) -> int | None:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        backend_pid = postgres_backend_child_pid(postmaster_pid)
+        if backend_pid is not None:
+            return backend_pid
+        if pgbench_process.poll() is not None:
+            return None
+        time.sleep(0.02)
+    return None
+
+
+def postgres_backend_child_pid(postmaster_pid: int) -> int | None:
+    ps = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,command="],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if ps.returncode != 0:
+        return None
+    candidates: list[int] = []
+    for line in ps.stdout.splitlines():
+        parts = line.strip().split(None, 2)
+        if len(parts) != 3:
+            continue
+        try:
+            pid = int(parts[0])
+            ppid = int(parts[1])
+        except ValueError:
+            continue
+        command = parts[2]
+        if ppid == postmaster_pid and is_postgres_client_backend(command):
+            candidates.append(pid)
+    return max(candidates) if candidates else None
+
+
+def is_postgres_client_backend(command: str) -> bool:
+    lowered = command.lower()
+    if "postgres:" not in lowered:
+        return False
+    if "[local]" not in lowered and "127.0.0.1" not in lowered:
+        return False
+    auxiliary_processes = (
+        "autovacuum launcher",
+        "background writer",
+        "checkpointer",
+        "logger",
+        "logical replication launcher",
+        "startup",
+        "walwriter",
+        "writer",
+    )
+    return not any(name in lowered for name in auxiliary_processes)
+
+
+def profile_hotspots(profile_path: Path, limit: int = 40) -> list[dict[str, Any]]:
+    text = read_text(profile_path)
+    by_name: dict[str, dict[str, Any]] = {}
+    for raw_title in SVG_TITLE_RE.findall(text):
+        title = html.unescape(raw_title)
+        match = HOTSPOT_RE.match(title)
+        if match is None:
+            continue
+        name = match.group(1)
+        if is_profile_noise(name):
+            continue
+        hotspot = {
+            "name": name,
+            "samples": int(match.group(2)),
+            "percent": float(match.group(3)),
+        }
+        previous = by_name.get(name)
+        if previous is None or hotspot["percent"] > previous["percent"]:
+            by_name[name] = hotspot
+    return sorted(by_name.values(), key=lambda value: value["percent"], reverse=True)[:limit]
+
+
+def is_profile_noise(name: str) -> bool:
+    if name in {"all", "main", "start", "<deduplicated_symbol>"}:
+        return True
+    noisy_prefixes = (
+        "std::rt::",
+        "std::sys::backtrace",
+        "tokio::runtime::context::",
+        "tokio::runtime::scheduler::current_thread::CoreGuard",
+    )
+    noisy_exact = {
+        "BackendRun",
+        "BackendMain",
+        "fastpg_server::main",
+        "postmaster_child_launch",
+        "PostgresMain",
+        "ServerLoop",
+        "PostmasterMain",
+    }
+    return name in noisy_exact or any(name.startswith(prefix) for prefix in noisy_prefixes)
+
+
 def parse_pgbench_metrics(stdout: str) -> dict[str, float | None]:
     tps_match = TPS_RE.search(stdout)
     latency_match = LATENCY_RE.search(stdout)
@@ -983,6 +1230,17 @@ def speedup_ratio(fastpg_tps: float | None, normal_tps: float | None) -> float |
     if fastpg_tps is None or normal_tps in (None, 0):
         return None
     return fastpg_tps / normal_tps
+
+
+def profile_records_by_variant(results: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    records: dict[str, dict[str, Any]] = {}
+    for variant_name, variant in results.get("variants", {}).items():
+        for run in variant.get("runs", []):
+            profile = run.get("profile")
+            if profile is not None:
+                records[variant_name] = profile
+                break
+    return records
 
 
 def render_markdown(results: dict[str, Any], result_root: Path) -> str:
@@ -1026,6 +1284,28 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
         )
         lines.extend(["## Comparison", "", f"- fastpg/normal median TPS ratio: `{ratio}`", ""])
 
+    profiles = profile_records_by_variant(results)
+    if profiles:
+        lines.extend(["## Profiles", ""])
+        lines.append(f"- side-by-side HTML: `{result_root / 'profile-side-by-side.html'}`")
+        for variant_name in ("normal", "fastpg"):
+            profile = profiles.get(variant_name)
+            if profile is None:
+                continue
+            lines.append(f"- {variant_name} flamegraph: `{profile.get('path')}`")
+        lines.append("")
+        if all(name in profiles for name in ("normal", "fastpg")):
+            lines.extend(["### Hotspot Comparison", ""])
+            lines.append("| rank | normal Postgres | fastpg Rust server |")
+            lines.append("| --- | --- | --- |")
+            normal_hotspots = profiles["normal"].get("hotspots", [])
+            fastpg_hotspots = profiles["fastpg"].get("hotspots", [])
+            for index in range(min(12, max(len(normal_hotspots), len(fastpg_hotspots)))):
+                normal = format_hotspot_cell(normal_hotspots, index)
+                fastpg = format_hotspot_cell(fastpg_hotspots, index)
+                lines.append(f"| {index + 1} | {normal} | {fastpg} |")
+            lines.append("")
+
     if results.get("failure"):
         failure = results["failure"]
         lines.extend(
@@ -1055,6 +1335,98 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
     lines.append(f"Raw results: `{result_root / 'summary.json'}`")
     lines.append("")
     return "\n".join(lines)
+
+
+def format_hotspot_cell(hotspots: list[dict[str, Any]], index: int) -> str:
+    if index >= len(hotspots):
+        return ""
+    hotspot = hotspots[index]
+    return f"`{hotspot['name']}` {hotspot['percent']:.2f}%"
+
+
+def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -> str:
+    profiles = profile_records_by_variant(results)
+    normal = profiles.get("normal")
+    fastpg = profiles.get("fastpg")
+    normal_path = relative_profile_path(normal, result_root)
+    fastpg_path = relative_profile_path(fastpg, result_root)
+    return f"""<!doctype html>
+<html lang=\"en\">
+<head>
+  <meta charset=\"utf-8\">
+  <title>pgbench profile comparison</title>
+  <style>
+    body {{ font-family: -apple-system, BlinkMacSystemFont, sans-serif; margin: 24px; }}
+    .profiles {{ display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }}
+    .profile {{ min-width: 0; }}
+    object {{ width: 100%; height: 760px; border: 1px solid #ddd; }}
+    table {{ border-collapse: collapse; width: 100%; margin-top: 24px; }}
+    th, td {{ border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }}
+    th {{ text-align: left; background: #f6f6f6; }}
+    code {{ white-space: normal; }}
+  </style>
+</head>
+<body>
+  <h1>pgbench profile comparison</h1>
+  <div class=\"profiles\">
+    <section class=\"profile\">
+      <h2>normal Postgres</h2>
+      {profile_object(normal_path)}
+    </section>
+    <section class=\"profile\">
+      <h2>fastpg Rust server</h2>
+      {profile_object(fastpg_path)}
+    </section>
+  </div>
+  {render_hotspot_table_html(normal, fastpg)}
+</body>
+</html>
+"""
+
+
+def relative_profile_path(profile: dict[str, Any] | None, result_root: Path) -> str | None:
+    if profile is None or profile.get("path") is None:
+        return None
+    return os.path.relpath(profile["path"], result_root)
+
+
+def profile_object(path: str | None) -> str:
+    if path is None:
+        return "<p>No profile captured.</p>"
+    escaped = html.escape(path)
+    return f'<object data="{escaped}" type="image/svg+xml"><a href="{escaped}">{escaped}</a></object>'
+
+
+def render_hotspot_table_html(
+    normal: dict[str, Any] | None,
+    fastpg: dict[str, Any] | None,
+) -> str:
+    normal_hotspots = normal.get("hotspots", []) if normal else []
+    fastpg_hotspots = fastpg.get("hotspots", []) if fastpg else []
+    rows = []
+    for index in range(min(25, max(len(normal_hotspots), len(fastpg_hotspots)))):
+        rows.append(
+            "<tr>"
+            f"<td>{index + 1}</td>"
+            f"<td>{html_hotspot_cell(normal_hotspots, index)}</td>"
+            f"<td>{html_hotspot_cell(fastpg_hotspots, index)}</td>"
+            "</tr>"
+        )
+    return (
+        "<h2>Hot frames</h2>"
+        "<table><thead><tr><th>rank</th><th>normal Postgres</th>"
+        "<th>fastpg Rust server</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def html_hotspot_cell(hotspots: list[dict[str, Any]], index: int) -> str:
+    if index >= len(hotspots):
+        return ""
+    hotspot = hotspots[index]
+    name = html.escape(str(hotspot["name"]))
+    return f"<code>{name}</code><br>{hotspot['percent']:.2f}% ({hotspot['samples']} samples)"
 
 
 def tail(text: str, limit: int = 4000) -> str:

@@ -31,6 +31,7 @@
 #include <unistd.h>
 
 #ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
 #include "access/transam.h"
 #endif
@@ -41,6 +42,7 @@
 #include "access/sysattr.h"
 #include "access/table.h"
 #include "access/tableam.h"
+#include "access/tupdesc.h"
 #include "access/tupdesc_details.h"
 #include "access/xact.h"
 #include "catalog/binary_upgrade.h"
@@ -311,6 +313,15 @@ static void RelationInitPhysicalAddr(Relation relation);
 static void load_critical_index(Oid indexoid, Oid heapoid);
 static TupleDesc GetPgClassDescriptor(void);
 static TupleDesc GetPgIndexDescriptor(void);
+#ifdef USE_FASTPG
+static HeapTuple FastPgBuildPgClassTuple(Oid targetRelId);
+static HeapTuple FastPgBuildPgIndexTuple(const FastPgRustPrimaryKeyIndexInfo *index_info);
+static bool FastPgOpclassForType(Oid type_oid, Oid *opclass_oid,
+								 Oid *opfamily_oid, Oid *opcintype_oid);
+static bool FastPgInitPrimaryKeyIndexAccessInfo(Relation relation);
+static bool FastPgBuildTupleDesc(Relation relation);
+static bool FastPgBuildVirtualCatalogTupleDesc(Relation relation);
+#endif
 static void AttrDefaultFetch(Relation relation, int ndef);
 static int	AttrDefaultCmp(const void *a, const void *b);
 static void CheckNNConstraintFetch(Relation relation);
@@ -350,6 +361,12 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 	SysScanDesc pg_class_scan;
 	ScanKeyData key[1];
 	Snapshot	snapshot = NULL;
+
+#ifdef USE_FASTPG
+	pg_class_tuple = FastPgBuildPgClassTuple(targetRelId);
+	if (HeapTupleIsValid(pg_class_tuple))
+		return pg_class_tuple;
+#endif
 
 	/*
 	 * If something goes wrong during backend startup, we might find ourselves
@@ -408,6 +425,252 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 
 	return pg_class_tuple;
 }
+
+#ifdef USE_FASTPG
+static HeapTuple
+FastPgBuildPgClassTuple(Oid targetRelId)
+{
+	FastPgRustCatalogRelation fastpg_relation;
+	Datum		values[Natts_pg_class];
+	bool		nulls[Natts_pg_class];
+	NameData	relname;
+
+	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) targetRelId,
+											 &fastpg_relation))
+		return NULL;
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	namestrcpy(&relname, fastpg_relation.name);
+
+	values[Anum_pg_class_oid - 1] = ObjectIdGetDatum((Oid) fastpg_relation.oid);
+	values[Anum_pg_class_relname - 1] = NameGetDatum(&relname);
+	values[Anum_pg_class_relnamespace - 1] =
+		ObjectIdGetDatum((Oid) fastpg_relation.namespace_oid);
+	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_reloftype - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_relowner - 1] = ObjectIdGetDatum(BOOTSTRAP_SUPERUSERID);
+	values[Anum_pg_class_relam - 1] =
+		ObjectIdGetDatum(fastpg_relation.relkind == RELKIND_INDEX ?
+						 BTREE_AM_OID : HEAP_TABLE_AM_OID);
+	values[Anum_pg_class_relfilenode - 1] =
+		ObjectIdGetDatum((Oid) fastpg_relation.oid);
+	values[Anum_pg_class_reltablespace - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_relpages - 1] = Int32GetDatum(0);
+	values[Anum_pg_class_reltuples - 1] = Float4GetDatum(-1.0);
+	values[Anum_pg_class_relallvisible - 1] = Int32GetDatum(0);
+	values[Anum_pg_class_relallfrozen - 1] = Int32GetDatum(0);
+	values[Anum_pg_class_reltoastrelid - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_relhasindex - 1] =
+		BoolGetDatum(fastpg_relation.has_primary_key != 0);
+	values[Anum_pg_class_relisshared - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relpersistence - 1] =
+		CharGetDatum(RELPERSISTENCE_PERMANENT);
+	values[Anum_pg_class_relkind - 1] =
+		CharGetDatum((char) fastpg_relation.relkind);
+	values[Anum_pg_class_relnatts - 1] =
+		Int16GetDatum((int16) fastpg_relation.column_count);
+	values[Anum_pg_class_relchecks - 1] = Int16GetDatum(0);
+	values[Anum_pg_class_relhasrules - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relhastriggers - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relhassubclass - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relrowsecurity - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relforcerowsecurity - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relispopulated - 1] = BoolGetDatum(true);
+	values[Anum_pg_class_relreplident - 1] =
+		CharGetDatum(REPLICA_IDENTITY_NOTHING);
+	values[Anum_pg_class_relispartition - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relrewrite - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_relfrozenxid - 1] =
+		TransactionIdGetDatum(FirstNormalTransactionId);
+	values[Anum_pg_class_relminmxid - 1] =
+		MultiXactIdGetDatum(FirstMultiXactId);
+	nulls[Anum_pg_class_relacl - 1] = true;
+	nulls[Anum_pg_class_reloptions - 1] = true;
+	nulls[Anum_pg_class_relpartbound - 1] = true;
+
+	return heap_form_tuple(GetPgClassDescriptor(), values, nulls);
+}
+
+static HeapTuple
+FastPgBuildPgIndexTuple(const FastPgRustPrimaryKeyIndexInfo *index_info)
+{
+	Datum		values[Natts_pg_index];
+	bool		nulls[Natts_pg_index];
+	int16		indkey_values[FASTPG_MAX_INDEX_KEYS];
+	Oid			indcollation_values[FASTPG_MAX_INDEX_KEYS];
+	Oid			indclass_values[FASTPG_MAX_INDEX_KEYS];
+	int16		indoption_values[FASTPG_MAX_INDEX_KEYS];
+	int			key_count = (int) index_info->key_count;
+
+	if (key_count <= 0 || key_count > FASTPG_MAX_INDEX_KEYS)
+		elog(ERROR, "fastpg primary-key index %u has invalid key count %d",
+			 index_info->index_oid, key_count);
+
+	memset(values, 0, sizeof(values));
+	memset(nulls, false, sizeof(nulls));
+	memset(indkey_values, 0, sizeof(indkey_values));
+	memset(indcollation_values, 0, sizeof(indcollation_values));
+	memset(indclass_values, 0, sizeof(indclass_values));
+	memset(indoption_values, 0, sizeof(indoption_values));
+
+	for (int index = 0; index < key_count; index++)
+	{
+		Oid			opclass_oid;
+		Oid			opfamily_oid;
+		Oid			opcintype_oid;
+
+		if (!FastPgOpclassForType((Oid) index_info->type_oids[index],
+								  &opclass_oid,
+								  &opfamily_oid,
+								  &opcintype_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("fastpg primary-key indexes do not support type %u",
+							index_info->type_oids[index])));
+		indkey_values[index] = index_info->attnums[index];
+		indcollation_values[index] = (Oid) index_info->collation_oids[index];
+		indclass_values[index] = opclass_oid;
+	}
+
+	values[Anum_pg_index_indexrelid - 1] =
+		ObjectIdGetDatum((Oid) index_info->index_oid);
+	values[Anum_pg_index_indrelid - 1] =
+		ObjectIdGetDatum((Oid) index_info->heap_oid);
+	values[Anum_pg_index_indnatts - 1] = Int16GetDatum((int16) key_count);
+	values[Anum_pg_index_indnkeyatts - 1] = Int16GetDatum((int16) key_count);
+	values[Anum_pg_index_indisunique - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indnullsnotdistinct - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indisprimary - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indisexclusion - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indimmediate - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indisclustered - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indisvalid - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indcheckxmin - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indisready - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indislive - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indisreplident - 1] = BoolGetDatum(false);
+	values[Anum_pg_index_indkey - 1] =
+		PointerGetDatum(buildint2vector(indkey_values, key_count));
+	values[Anum_pg_index_indcollation - 1] =
+		PointerGetDatum(buildoidvector(indcollation_values, key_count));
+	values[Anum_pg_index_indclass - 1] =
+		PointerGetDatum(buildoidvector(indclass_values, key_count));
+	values[Anum_pg_index_indoption - 1] =
+		PointerGetDatum(buildint2vector(indoption_values, key_count));
+	nulls[Anum_pg_index_indexprs - 1] = true;
+	nulls[Anum_pg_index_indpred - 1] = true;
+
+	return heap_form_tuple(GetPgIndexDescriptor(), values, nulls);
+}
+
+static bool
+FastPgOpclassForType(Oid type_oid, Oid *opclass_oid,
+					 Oid *opfamily_oid, Oid *opcintype_oid)
+{
+	switch (type_oid)
+	{
+		case INT2OID:
+			*opclass_oid = INT2_BTREE_OPS_OID;
+			*opfamily_oid = INTEGER_BTREE_FAM_OID;
+			*opcintype_oid = INT2OID;
+			return true;
+		case INT4OID:
+			*opclass_oid = INT4_BTREE_OPS_OID;
+			*opfamily_oid = INTEGER_BTREE_FAM_OID;
+			*opcintype_oid = INT4OID;
+			return true;
+		case INT8OID:
+			*opclass_oid = INT8_BTREE_OPS_OID;
+			*opfamily_oid = INTEGER_BTREE_FAM_OID;
+			*opcintype_oid = INT8OID;
+			return true;
+		case OIDOID:
+			*opclass_oid = OID_BTREE_OPS_OID;
+			*opfamily_oid = OID_BTREE_FAM_OID;
+			*opcintype_oid = OIDOID;
+			return true;
+		case TEXTOID:
+		case VARCHAROID:
+			*opclass_oid = TEXT_BTREE_OPS_OID;
+			*opfamily_oid = TEXT_BTREE_FAM_OID;
+			*opcintype_oid = TEXTOID;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+FastPgInitPrimaryKeyIndexAccessInfo(Relation relation)
+{
+	FastPgRustPrimaryKeyIndexInfo index_info;
+	HeapTuple	pg_index_tuple;
+	MemoryContext indexcxt;
+	MemoryContext oldcontext;
+	int			indnkeyatts;
+
+	if (!fastpg_rust_catalog_primary_key_index_info((uint32_t) RelationGetRelid(relation),
+													&index_info))
+		return false;
+
+	pg_index_tuple = FastPgBuildPgIndexTuple(&index_info);
+	oldcontext = MemoryContextSwitchTo(CacheMemoryContext);
+	relation->rd_indextuple = heap_copytuple(pg_index_tuple);
+	relation->rd_index = (Form_pg_index) GETSTRUCT(relation->rd_indextuple);
+	MemoryContextSwitchTo(oldcontext);
+	heap_freetuple(pg_index_tuple);
+
+	indnkeyatts = IndexRelationGetNumberOfKeyAttributes(relation);
+	indexcxt = AllocSetContextCreate(CacheMemoryContext,
+									 "fastpg index info",
+									 ALLOCSET_SMALL_SIZES);
+	relation->rd_indexcxt = indexcxt;
+	MemoryContextCopyAndSetIdentifier(indexcxt,
+									  RelationGetRelationName(relation));
+	relation->rd_amhandler = InvalidOid;
+	relation->rd_indam = GetFastPgMemIndexAmRoutine();
+	relation->rd_support = NULL;
+	relation->rd_supportinfo = NULL;
+	relation->rd_opfamily = (Oid *)
+		MemoryContextAllocZero(indexcxt, indnkeyatts * sizeof(Oid));
+	relation->rd_opcintype = (Oid *)
+		MemoryContextAllocZero(indexcxt, indnkeyatts * sizeof(Oid));
+	relation->rd_indcollation = (Oid *)
+		MemoryContextAllocZero(indexcxt, indnkeyatts * sizeof(Oid));
+	relation->rd_indoption = (int16 *)
+		MemoryContextAllocZero(indexcxt, indnkeyatts * sizeof(int16));
+	relation->rd_opcoptions = (bytea **)
+		MemoryContextAllocZero(indexcxt,
+							   RelationGetNumberOfAttributes(relation) *
+							   sizeof(bytea *));
+
+	for (int index = 0; index < indnkeyatts; index++)
+	{
+		Oid			opclass_oid;
+
+		if (!FastPgOpclassForType((Oid) index_info.type_oids[index],
+								  &opclass_oid,
+								  &relation->rd_opfamily[index],
+								  &relation->rd_opcintype[index]))
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("fastpg primary-key indexes do not support type %u",
+							index_info.type_oids[index])));
+		relation->rd_indcollation[index] =
+			(Oid) index_info.collation_oids[index];
+		relation->rd_indoption[index] = 0;
+	}
+
+	relation->rd_indexprs = NIL;
+	relation->rd_indpred = NIL;
+	relation->rd_exclops = NULL;
+	relation->rd_exclprocs = NULL;
+	relation->rd_exclstrats = NULL;
+	relation->rd_amcache = NULL;
+	return true;
+}
+#endif
 
 /*
  *		AllocateRelationDesc
@@ -543,6 +806,11 @@ RelationBuildTupleDesc(Relation relation)
 	relation->rd_att->tdtypeid =
 		relation->rd_rel->reltype ? relation->rd_rel->reltype : RECORDOID;
 	relation->rd_att->tdtypmod = -1;	/* just to be sure */
+
+#ifdef USE_FASTPG
+	if (FastPgBuildTupleDesc(relation))
+		return;
+#endif
 
 	constr = (TupleConstr *) MemoryContextAllocZero(CacheMemoryContext,
 													sizeof(TupleConstr));
@@ -730,6 +998,104 @@ RelationBuildTupleDesc(Relation relation)
 
 	TupleDescFinalize(relation->rd_att);
 }
+
+#ifdef USE_FASTPG
+static bool
+FastPgBuildTupleDesc(Relation relation)
+{
+	FastPgRustCatalogRelation fastpg_relation;
+
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(relation)) != 0)
+		return FastPgBuildVirtualCatalogTupleDesc(relation);
+
+	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) RelationGetRelid(relation),
+											 &fastpg_relation))
+		return false;
+
+	if (fastpg_relation.column_count != RelationGetNumberOfAttributes(relation))
+		elog(ERROR,
+			 "fastpg catalog column count mismatch for relation \"%s\"",
+			 RelationGetRelationName(relation));
+
+	for (int index = 0; index < RelationGetNumberOfAttributes(relation); index++)
+	{
+		FastPgRustCatalogColumn fastpg_column;
+
+		if (!fastpg_rust_catalog_relation_column_by_index(
+				(uint32_t) RelationGetRelid(relation),
+				(size_t) index,
+				&fastpg_column))
+			elog(ERROR,
+				 "fastpg catalog is missing attribute %d for relation \"%s\"",
+				 index + 1,
+				 RelationGetRelationName(relation));
+
+		TupleDescInitEntry(relation->rd_att,
+						   (AttrNumber) (index + 1),
+						   fastpg_column.name,
+						   (Oid) fastpg_column.type_oid,
+						   fastpg_column.type_mod,
+						   0);
+	}
+
+	relation->rd_att->constr = NULL;
+	TupleDescFinalize(relation->rd_att);
+	return true;
+}
+
+static bool
+FastPgBuildVirtualCatalogTupleDesc(Relation relation)
+{
+	const FormData_pg_attribute *attrs = NULL;
+	int			natts = 0;
+
+	switch (RelationGetRelid(relation))
+	{
+		case RelationRelationId:
+			attrs = Desc_pg_class;
+			natts = Natts_pg_class;
+			break;
+		case AttributeRelationId:
+			attrs = Desc_pg_attribute;
+			natts = Natts_pg_attribute;
+			break;
+		case ProcedureRelationId:
+			attrs = Desc_pg_proc;
+			natts = Natts_pg_proc;
+			break;
+		case TypeRelationId:
+			attrs = Desc_pg_type;
+			natts = Natts_pg_type;
+			break;
+		case IndexRelationId:
+			attrs = Desc_pg_index;
+			natts = Natts_pg_index;
+			break;
+		default:
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("fastpg virtual catalog %u has no tuple descriptor",
+							RelationGetRelid(relation))));
+	}
+
+	if (RelationGetNumberOfAttributes(relation) != natts)
+		elog(ERROR,
+			 "fastpg virtual catalog column count mismatch for relation \"%s\"",
+			 RelationGetRelationName(relation));
+
+	for (int index = 0; index < natts; index++)
+	{
+		memcpy(TupleDescAttr(relation->rd_att, index),
+			   &attrs[index],
+			   ATTRIBUTE_FIXED_PART_SIZE);
+		populate_compact_attribute(relation->rd_att, index);
+	}
+
+	relation->rd_att->constr = NULL;
+	TupleDescFinalize(relation->rd_att);
+	return true;
+}
+#endif
 
 /*
  *		RelationBuildRuleLock
@@ -1454,6 +1820,11 @@ RelationInitIndexAccessInfo(Relation relation)
 	int			indnkeyatts;
 	uint16		amsupport;
 
+#ifdef USE_FASTPG
+	if (FastPgInitPrimaryKeyIndexAccessInfo(relation))
+		return;
+#endif
+
 	/*
 	 * Make a copy of the pg_index entry for the index.  Since pg_index
 	 * contains variable-length and possibly-null fields, we have to do this
@@ -1819,6 +2190,12 @@ InitTableAmRoutine(Relation relation)
 
 #ifdef USE_FASTPG
 static bool
+IsFastPgVirtualCatalogRelation(Relation relation)
+{
+	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(relation)) != 0;
+}
+
+static bool
 UseFastPgMemTableAm(Relation relation)
 {
 	Oid			relnamespace = RelationGetNamespace(relation);
@@ -1850,6 +2227,14 @@ RelationInitTableAccessMethod(Relation relation)
 		Assert(relation->rd_rel->relam == InvalidOid);
 		relation->rd_amhandler = F_HEAP_TABLEAM_HANDLER;
 	}
+#ifdef USE_FASTPG
+	else if (IsFastPgVirtualCatalogRelation(relation))
+	{
+		relation->rd_amhandler = F_HEAP_TABLEAM_HANDLER;
+		relation->rd_tableam = GetFastPgMemTableAmRoutine();
+		return;
+	}
+#endif
 	else if (IsCatalogRelation(relation))
 	{
 		/*
@@ -4878,6 +5263,38 @@ RelationGetIndexList(Relation relation)
 	if (relation->rd_indexvalid)
 		return list_copy(relation->rd_indexlist);
 
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogRelation fastpg_relation;
+		uint32_t	fastpg_index_oid;
+
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) RelationGetRelid(relation),
+												&fastpg_relation))
+		{
+			result = NIL;
+			pkeyIndex = InvalidOid;
+			if (fastpg_relation.has_primary_key != 0 &&
+				fastpg_rust_catalog_primary_key_index_oid((uint32_t) RelationGetRelid(relation),
+														  &fastpg_index_oid))
+			{
+				pkeyIndex = (Oid) fastpg_index_oid;
+				result = list_make1_oid(pkeyIndex);
+			}
+
+			oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+			oldlist = relation->rd_indexlist;
+			relation->rd_indexlist = list_copy(result);
+			relation->rd_pkindex = pkeyIndex;
+			relation->rd_ispkdeferrable = false;
+			relation->rd_replidindex = InvalidOid;
+			relation->rd_indexvalid = true;
+			MemoryContextSwitchTo(oldcxt);
+			list_free(oldlist);
+			return result;
+		}
+	}
+#endif
+
 	/*
 	 * We build the list we intend to return (in the caller's context) while
 	 * doing the scan.  After successfully completing the scan, we copy that
@@ -5014,6 +5431,24 @@ RelationGetStatExtList(Relation relation)
 	/* Quick exit if we already computed the list. */
 	if (relation->rd_statvalid != 0)
 		return list_copy(relation->rd_statlist);
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogRelation fastpg_relation;
+
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) RelationGetRelid(relation),
+												&fastpg_relation))
+		{
+			oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+			oldlist = relation->rd_statlist;
+			relation->rd_statlist = NIL;
+			relation->rd_statvalid = true;
+			MemoryContextSwitchTo(oldcxt);
+			list_free(oldlist);
+			return NIL;
+		}
+	}
+#endif
 
 	/*
 	 * We build the list we intend to return (in the caller's context) while

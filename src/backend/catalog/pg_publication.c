@@ -1004,6 +1004,10 @@ GetAllTablesPublications(void)
 	SysScanDesc scan;
 	HeapTuple	tup;
 
+#ifdef USE_FASTPG
+	return NIL;
+#endif
+
 	/* Find all publications that are marked as for all tables. */
 	rel = table_open(PublicationRelationId, AccessShareLock);
 

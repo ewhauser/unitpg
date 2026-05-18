@@ -14,6 +14,9 @@
 */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup.h"
 #include "access/htup_details.h"
 #include "access/transam.h"
@@ -61,6 +64,16 @@ check_enable_rls(Oid relid, Oid checkAsUser, bool noError)
 	/* Nothing to do for built-in relations */
 	if (relid < (Oid) FirstNormalObjectId)
 		return RLS_NONE;
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogRelation fastpg_relation;
+
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) relid,
+												&fastpg_relation))
+			return RLS_NONE;
+	}
+#endif
 
 	/* Fetch relation's relrowsecurity and relforcerowsecurity flags */
 	tuple = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));

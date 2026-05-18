@@ -1064,6 +1064,44 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 			att->attcollation = InvalidOid;
 			break;
 
+#ifdef USE_FASTPG
+		case CHAROID:
+			att->attlen = 1;
+			att->attbyval = true;
+			att->attalign = TYPALIGN_CHAR;
+			att->attstorage = TYPSTORAGE_PLAIN;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = InvalidOid;
+			break;
+
+		case NAMEOID:
+			att->attlen = NAMEDATALEN;
+			att->attbyval = false;
+			att->attalign = TYPALIGN_CHAR;
+			att->attstorage = TYPSTORAGE_PLAIN;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = C_COLLATION_OID;
+			break;
+
+		case INT2OID:
+			att->attlen = 2;
+			att->attbyval = true;
+			att->attalign = TYPALIGN_SHORT;
+			att->attstorage = TYPSTORAGE_PLAIN;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = InvalidOid;
+			break;
+
+		case FLOAT4OID:
+			att->attlen = 4;
+			att->attbyval = true;
+			att->attalign = TYPALIGN_INT;
+			att->attstorage = TYPSTORAGE_PLAIN;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = InvalidOid;
+			break;
+#endif
+
 		case INT4OID:
 			att->attlen = 4;
 			att->attbyval = true;
@@ -1083,6 +1121,9 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 			break;
 
 		case OIDOID:
+#ifdef USE_FASTPG
+		case REGPROCOID:
+#endif
 			att->attlen = 4;
 			att->attbyval = true;
 			att->attalign = TYPALIGN_INT;
@@ -1090,6 +1131,42 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 			att->attcompression = InvalidCompressionMethod;
 			att->attcollation = InvalidOid;
 			break;
+
+#ifdef USE_FASTPG
+		case TIDOID:
+			att->attlen = 6;
+			att->attbyval = false;
+			att->attalign = TYPALIGN_SHORT;
+			att->attstorage = TYPSTORAGE_PLAIN;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = InvalidOid;
+			break;
+
+		case XIDOID:
+		case CIDOID:
+			att->attlen = 4;
+			att->attbyval = true;
+			att->attalign = TYPALIGN_INT;
+			att->attstorage = TYPSTORAGE_PLAIN;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = InvalidOid;
+			break;
+
+		case OIDVECTOROID:
+		case OIDARRAYOID:
+		case FLOAT4ARRAYOID:
+		case ANYARRAYOID:
+		case CHARARRAYOID:
+		case PG_NODE_TREEOID:
+		case ACLITEMARRAYOID:
+			att->attlen = -1;
+			att->attbyval = false;
+			att->attalign = TYPALIGN_INT;
+			att->attstorage = TYPSTORAGE_EXTENDED;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = InvalidOid;
+			break;
+#endif
 
 		default:
 			elog(ERROR, "unsupported type %u", oidtypeid);

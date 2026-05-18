@@ -60,10 +60,102 @@
 get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
 
 #ifdef USE_FASTPG
+#define FASTPG_INT2_EQ_OP 94
+#define FASTPG_INT8_EQ_OP 410
+#define FASTPG_OID_EQ_OP 607
+
 static bool
 fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
 {
 	return fastpg_rust_catalog_type_by_oid((uint32_t) typid, type);
+}
+
+static bool
+fastpg_lookup_relation(Oid relid, FastPgRustCatalogRelation *relation)
+{
+	return fastpg_rust_catalog_relation_by_oid((uint32_t) relid, relation);
+}
+
+static bool
+fastpg_equality_operator_member(Oid opno, Oid opfamily,
+								Oid *lefttype, Oid *righttype,
+								int *strategy)
+{
+	Oid			type = InvalidOid;
+
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+			if (opfamily == INTEGER_BTREE_FAM_OID)
+				type = INT2OID;
+			break;
+		case Int4EqualOperator:
+			if (opfamily == INTEGER_BTREE_FAM_OID)
+				type = INT4OID;
+			break;
+		case FASTPG_INT8_EQ_OP:
+			if (opfamily == INTEGER_BTREE_FAM_OID)
+				type = INT8OID;
+			break;
+		case FASTPG_OID_EQ_OP:
+			if (opfamily == OID_BTREE_FAM_OID)
+				type = OIDOID;
+			break;
+		case TextEqualOperator:
+			if (opfamily == TEXT_BTREE_FAM_OID)
+				type = TEXTOID;
+			break;
+		default:
+			break;
+	}
+
+	if (!OidIsValid(type))
+		return false;
+	if (lefttype != NULL)
+		*lefttype = type;
+	if (righttype != NULL)
+		*righttype = type;
+	if (strategy != NULL)
+		*strategy = BTEqualStrategyNumber;
+	return true;
+}
+
+static Oid
+fastpg_equality_operator_for_family_type(Oid opfamily, Oid lefttype,
+										 Oid righttype, int16 strategy)
+{
+	if (strategy != BTEqualStrategyNumber || lefttype != righttype)
+		return InvalidOid;
+
+	switch (opfamily)
+	{
+		case INTEGER_BTREE_FAM_OID:
+			switch (lefttype)
+			{
+				case INT2OID:
+					return FASTPG_INT2_EQ_OP;
+				case INT4OID:
+					return Int4EqualOperator;
+				case INT8OID:
+					return FASTPG_INT8_EQ_OP;
+				default:
+					return InvalidOid;
+			}
+		case OID_BTREE_FAM_OID:
+			return lefttype == OIDOID ? FASTPG_OID_EQ_OP : InvalidOid;
+		case TEXT_BTREE_FAM_OID:
+			return lefttype == TEXTOID ? TextEqualOperator : InvalidOid;
+		default:
+			return InvalidOid;
+	}
+}
+
+static bool
+fastpg_is_btree_opfamily(Oid opfamily)
+{
+	return opfamily == INTEGER_BTREE_FAM_OID ||
+		opfamily == OID_BTREE_FAM_OID ||
+		opfamily == TEXT_BTREE_FAM_OID;
 }
 #endif
 
@@ -80,6 +172,11 @@ fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
 bool
 op_in_opfamily(Oid opno, Oid opfamily)
 {
+#ifdef USE_FASTPG
+	if (fastpg_equality_operator_member(opno, opfamily, NULL, NULL, NULL))
+		return true;
+#endif
+
 	return SearchSysCacheExists3(AMOPOPID,
 								 ObjectIdGetDatum(opno),
 								 CharGetDatum(AMOP_SEARCH),
@@ -100,6 +197,11 @@ get_op_opfamily_strategy(Oid opno, Oid opfamily)
 	HeapTuple	tp;
 	Form_pg_amop amop_tup;
 	int			result;
+
+#ifdef USE_FASTPG
+	if (fastpg_equality_operator_member(opno, opfamily, NULL, NULL, &result))
+		return result;
+#endif
 
 	tp = SearchSysCache3(AMOPOPID,
 						 ObjectIdGetDatum(opno),
@@ -156,6 +258,13 @@ get_op_opfamily_properties(Oid opno, Oid opfamily, bool ordering_op,
 	HeapTuple	tp;
 	Form_pg_amop amop_tup;
 
+#ifdef USE_FASTPG
+	if (!ordering_op &&
+		fastpg_equality_operator_member(opno, opfamily,
+										lefttype, righttype, strategy))
+		return;
+#endif
+
 	tp = SearchSysCache3(AMOPOPID,
 						 ObjectIdGetDatum(opno),
 						 CharGetDatum(ordering_op ? AMOP_ORDER : AMOP_SEARCH),
@@ -184,6 +293,13 @@ get_opfamily_member(Oid opfamily, Oid lefttype, Oid righttype,
 	HeapTuple	tp;
 	Form_pg_amop amop_tup;
 	Oid			result;
+
+#ifdef USE_FASTPG
+	result = fastpg_equality_operator_for_family_type(opfamily, lefttype,
+													 righttype, strategy);
+	if (OidIsValid(result))
+		return result;
+#endif
 
 	tp = SearchSysCache4(AMOPSTRATEGY,
 						 ObjectIdGetDatum(opfamily),
@@ -1481,6 +1597,11 @@ get_opfamily_method(Oid opfid)
 	Form_pg_opfamily opfform;
 	Oid			result;
 
+#ifdef USE_FASTPG
+	if (fastpg_is_btree_opfamily(opfid))
+		return BTREE_AM_OID;
+#endif
+
 	tp = SearchSysCache1(OPFAMILYOID, ObjectIdGetDatum(opfid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for operator family %u", opfid);
@@ -2126,6 +2247,24 @@ get_func_support(Oid funcid)
 Oid
 get_relname_relid(const char *relname, Oid relnamespace)
 {
+#ifdef USE_FASTPG
+	uint32_t	fastpg_oid;
+
+	if (fastpg_rust_catalog_relation_oid_by_name(relname,
+												 (uint32_t) relnamespace,
+												 &fastpg_oid))
+		return (Oid) fastpg_oid;
+
+	/*
+	 * The Rust pgcore path has no physical pg_class.  A virtual-catalog miss
+	 * is definitive there; returning InvalidOid lets namespace search continue
+	 * to later schemas such as public without touching storage-managed
+	 * catalogs.
+	 */
+	if (!IsUnderPostmaster)
+		return InvalidOid;
+#endif
+
 	return GetSysCacheOid2(RELNAMENSP, Anum_pg_class_oid,
 						   PointerGetDatum(relname),
 						   ObjectIdGetDatum(relnamespace));
@@ -2171,6 +2310,13 @@ get_rel_name(Oid relid)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogRelation fastpg_relation;
+
+	if (fastpg_lookup_relation(relid, &fastpg_relation))
+		return pstrdup(fastpg_relation.name);
+#endif
+
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -2194,6 +2340,13 @@ Oid
 get_rel_namespace(Oid relid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogRelation fastpg_relation;
+
+	if (fastpg_lookup_relation(relid, &fastpg_relation))
+		return (Oid) fastpg_relation.namespace_oid;
+#endif
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))
@@ -2245,6 +2398,13 @@ char
 get_rel_relkind(Oid relid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogRelation fastpg_relation;
+
+	if (fastpg_lookup_relation(relid, &fastpg_relation))
+		return (char) fastpg_relation.relkind;
+#endif
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (HeapTupleIsValid(tp))
@@ -2323,6 +2483,13 @@ get_rel_persistence(Oid relid)
 	Form_pg_class reltup;
 	char		result;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogRelation fastpg_relation;
+
+	if (fastpg_lookup_relation(relid, &fastpg_relation))
+		return RELPERSISTENCE_PERMANENT;
+#endif
+
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for relation %u", relid);
@@ -2344,6 +2511,13 @@ get_rel_relam(Oid relid)
 	HeapTuple	tp;
 	Form_pg_class reltup;
 	Oid			result;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogRelation fastpg_relation;
+
+	if (fastpg_lookup_relation(relid, &fastpg_relation))
+		return HEAP_TABLE_AM_OID;
+#endif
 
 	tp = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(tp))

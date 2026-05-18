@@ -32,12 +32,14 @@
  * the status of the last requested roleid.  The cache can be flushed
  * at need by watching for cache update events on pg_authid.
  */
+#ifndef USE_FASTPG
 static Oid	last_roleid = InvalidOid;	/* InvalidOid == cache not valid */
 static bool last_roleid_is_super = false;
 static bool roleid_callback_registered = false;
 
 static void RoleidCallback(Datum arg, SysCacheIdentifier cacheid,
 						   uint32 hashvalue);
+#endif
 
 
 /*
@@ -56,6 +58,13 @@ superuser(void)
 bool
 superuser_arg(Oid roleid)
 {
+#ifdef USE_FASTPG
+	/*
+	 * fastpg runs as a single-user in-memory engine.  Treat every role check
+	 * as superuser so PostgreSQL does not consult pg_authid.
+	 */
+	return true;
+#else
 	bool		result;
 	HeapTuple	rtup;
 
@@ -94,8 +103,10 @@ superuser_arg(Oid roleid)
 	last_roleid_is_super = result;
 
 	return result;
+#endif
 }
 
+#ifndef USE_FASTPG
 /*
  * RoleidCallback
  *		Syscache inval callback function
@@ -106,3 +117,4 @@ RoleidCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 	/* Invalidate our local cache in case role's superuserness changed */
 	last_roleid = InvalidOid;
 }
+#endif

@@ -38,6 +38,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -3009,6 +3012,10 @@ static AclMode
 pg_aclmask(ObjectType objtype, Oid object_oid, AttrNumber attnum, Oid roleid,
 		   AclMode mask, AclMaskHow how)
 {
+#ifdef USE_FASTPG
+	return mask;
+#endif
+
 	switch (objtype)
 	{
 		case OBJECT_COLUMN:
@@ -3072,6 +3079,10 @@ static AclMode
 object_aclmask(Oid classid, Oid objectid, Oid roleid,
 			   AclMode mask, AclMaskHow how)
 {
+#ifdef USE_FASTPG
+	return mask;
+#endif
+
 	return object_aclmask_ext(classid, objectid, roleid, mask, how, NULL);
 }
 
@@ -3173,6 +3184,10 @@ static AclMode
 pg_attribute_aclmask(Oid table_oid, AttrNumber attnum, Oid roleid,
 					 AclMode mask, AclMaskHow how)
 {
+#ifdef USE_FASTPG
+	return mask;
+#endif
+
 	return pg_attribute_aclmask_ext(table_oid, attnum, roleid,
 									mask, how, NULL);
 }
@@ -3193,6 +3208,18 @@ pg_attribute_aclmask_ext(Oid table_oid, AttrNumber attnum, Oid roleid,
 	bool		isNull;
 	Acl		   *acl;
 	Oid			ownerId;
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogRelation fastpg_relation;
+
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) table_oid,
+												&fastpg_relation) &&
+			attnum > 0 &&
+			attnum <= (AttrNumber) fastpg_relation.column_count)
+			return mask;
+	}
+#endif
 
 	/*
 	 * First, get the column's ACL from its pg_attribute entry
@@ -3298,6 +3325,10 @@ AclMode
 pg_class_aclmask(Oid table_oid, Oid roleid,
 				 AclMode mask, AclMaskHow how)
 {
+#ifdef USE_FASTPG
+	return mask;
+#endif
+
 	return pg_class_aclmask_ext(table_oid, roleid, mask, how, NULL);
 }
 
@@ -3315,6 +3346,16 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 	bool		isNull;
 	Acl		   *acl;
 	Oid			ownerId;
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogRelation fastpg_relation;
+
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) table_oid,
+												&fastpg_relation))
+			return mask;
+	}
+#endif
 
 	/*
 	 * Must get the relation's tuple from pg_class
@@ -3891,6 +3932,12 @@ object_aclcheck_ext(Oid classid, Oid objectid,
 					Oid roleid, AclMode mode,
 					bool *is_missing)
 {
+#ifdef USE_FASTPG
+	if (is_missing != NULL)
+		*is_missing = false;
+	return ACLCHECK_OK;
+#endif
+
 	if (object_aclmask_ext(classid, objectid, roleid, mode, ACLMASK_ANY,
 						   is_missing) != 0)
 		return ACLCHECK_OK;
@@ -3924,6 +3971,12 @@ AclResult
 pg_attribute_aclcheck_ext(Oid table_oid, AttrNumber attnum,
 						  Oid roleid, AclMode mode, bool *is_missing)
 {
+#ifdef USE_FASTPG
+	if (is_missing != NULL)
+		*is_missing = false;
+	return ACLCHECK_OK;
+#endif
+
 	if (pg_attribute_aclmask_ext(table_oid, attnum, roleid, mode,
 								 ACLMASK_ANY, is_missing) != 0)
 		return ACLCHECK_OK;
@@ -3966,12 +4019,27 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 							  AclMode mode, AclMaskHow how,
 							  bool *is_missing)
 {
+#ifdef USE_FASTPG
+	if (is_missing != NULL)
+		*is_missing = false;
+	return ACLCHECK_OK;
+#else
 	AclResult	result;
 	HeapTuple	classTuple;
 	Form_pg_class classForm;
 	Oid			ownerId;
 	AttrNumber	nattrs;
 	AttrNumber	curr_att;
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogRelation fastpg_relation;
+
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) table_oid,
+												&fastpg_relation))
+			return ACLCHECK_OK;
+	}
+#endif
 
 	/*
 	 * Must fetch pg_class row to get owner ID and number of attributes.
@@ -4070,6 +4138,7 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 	}
 
 	return result;
+#endif
 }
 
 /*
@@ -4093,6 +4162,12 @@ AclResult
 pg_class_aclcheck_ext(Oid table_oid, Oid roleid,
 					  AclMode mode, bool *is_missing)
 {
+#ifdef USE_FASTPG
+	if (is_missing != NULL)
+		*is_missing = false;
+	return ACLCHECK_OK;
+#endif
+
 	if (pg_class_aclmask_ext(table_oid, roleid, mode,
 							 ACLMASK_ANY, is_missing) != 0)
 		return ACLCHECK_OK;
@@ -4107,6 +4182,10 @@ pg_class_aclcheck_ext(Oid table_oid, Oid roleid,
 AclResult
 pg_parameter_aclcheck(const char *name, Oid roleid, AclMode mode)
 {
+#ifdef USE_FASTPG
+	return ACLCHECK_OK;
+#endif
+
 	if (pg_parameter_aclmask(name, roleid, mode, ACLMASK_ANY) != 0)
 		return ACLCHECK_OK;
 	else
@@ -4120,6 +4199,10 @@ AclResult
 pg_largeobject_aclcheck_snapshot(Oid lobj_oid, Oid roleid, AclMode mode,
 								 Snapshot snapshot)
 {
+#ifdef USE_FASTPG
+	return ACLCHECK_OK;
+#endif
+
 	if (pg_largeobject_aclmask_snapshot(lobj_oid, roleid, mode,
 										ACLMASK_ANY, snapshot) != 0)
 		return ACLCHECK_OK;

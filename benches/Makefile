@@ -21,7 +21,7 @@ PROFILE_OPEN ?= 0
 PROFILE_WARMUP_SECONDS ?= 1.0
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-profile-rust-server pgbench-profile-rust-server-open pgbench-open-latest-flamegraph
+.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph
 
 pgbench-compare:
 	$(PYTHON) pgbench_compare.py \
@@ -94,6 +94,26 @@ pgbench-profile-rust-server:
 		--profile-fastpg-rust-server \
 		--profile-tool "$(PROFILE_TOOL)" \
 		--profile-phase "$(PROFILE_PHASE)" \
+		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" $(PROFILE_OPEN_FLAG)
+
+pgbench-profile-side-by-side:
+	$(PYTHON) pgbench_compare.py \
+		--builtin "tpcb-like" \
+		--init-steps "default" \
+		--scale "$(SCALE)" \
+		--transactions "$(PROFILE_TRANSACTIONS)" \
+		--clients "1" \
+		--jobs "1" \
+		--runs "1" \
+		--protocol "$(PROTOCOL)" \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--fastpg-engine "rust-server" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full" \
+		--profile-normal-postgres \
+		--profile-fastpg-rust-server \
+		--profile-tool "$(PROFILE_TOOL)" \
+		--profile-phase "run" \
 		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" $(PROFILE_OPEN_FLAG)
 
 pgbench-profile-rust-server-open:

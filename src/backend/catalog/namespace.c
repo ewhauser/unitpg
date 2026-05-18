@@ -19,6 +19,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "access/xact.h"
@@ -235,6 +238,16 @@ static void InvalidationCallback(Datum arg, SysCacheIdentifier cacheid,
 static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 						   bool include_out_arguments, int pronargs,
 						   int **argnumbers, int *fgc_flags);
+#ifdef USE_FASTPG
+static bool FastPgFuncnameGetCandidates(List *names, int nargs,
+										List *argnames,
+										bool expand_variadic,
+										bool expand_defaults,
+										bool include_out_arguments,
+										bool missing_ok,
+										int *fgc_flags,
+										FuncCandidateList *result);
+#endif
 
 /*
  * Recomputing the namespace path can be costly when done frequently, such as
@@ -563,6 +576,17 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 		if (lockmode == NoLock)
 			break;
 
+#ifdef USE_FASTPG
+		if (OidIsValid(relId))
+		{
+			FastPgRustCatalogRelation fastpg_relation;
+
+			if (fastpg_rust_catalog_relation_by_oid((uint32_t) relId,
+													&fastpg_relation))
+				break;
+		}
+#endif
+
 		/*
 		 * If, upon retry, we get back the same OID we did last time, then the
 		 * invalidation messages we processed did not change the final answer.
@@ -887,6 +911,15 @@ RelnameGetRelid(const char *relname)
 {
 	Oid			relid;
 	ListCell   *l;
+
+#ifdef USE_FASTPG
+	uint32_t	fastpg_oid;
+
+	if (fastpg_rust_catalog_relation_oid_by_name(relname,
+												 (uint32_t) PG_PUBLIC_NAMESPACE,
+												 &fastpg_oid))
+		return (Oid) fastpg_oid;
+#endif
 
 	recomputeNamespacePath();
 
@@ -1217,6 +1250,14 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 	/* deconstruct the name list */
 	DeconstructQualifiedName(names, &schemaname, &funcname);
+
+#ifdef USE_FASTPG
+	if (FastPgFuncnameGetCandidates(names, nargs, argnames,
+									expand_variadic, expand_defaults,
+									include_out_arguments, missing_ok,
+									fgc_flags, &resultList))
+		return resultList;
+#endif
 
 	if (schemaname)
 	{
@@ -1591,6 +1632,94 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 	return resultList;
 }
 
+#ifdef USE_FASTPG
+static bool
+FastPgFuncnameGetCandidates(List *names, int nargs, List *argnames,
+							bool expand_variadic, bool expand_defaults,
+							bool include_out_arguments, bool missing_ok,
+							int *fgc_flags, FuncCandidateList *result)
+{
+	FuncCandidateList resultList = NULL;
+	FuncCandidateList *tail = &resultList;
+	char	   *schemaname;
+	char	   *funcname;
+	Oid			namespaceId = InvalidOid;
+	size_t		proc_count;
+
+	*result = NULL;
+
+	/*
+	 * This virtual path covers deterministic pg_catalog built-ins that the
+	 * standalone fastpg pgcore path needs before a physical pg_proc exists.
+	 * It intentionally does not try to satisfy arbitrary functions yet.
+	 */
+	if (include_out_arguments || argnames != NIL)
+		return false;
+
+	DeconstructQualifiedName(names, &schemaname, &funcname);
+	proc_count = fastpg_rust_catalog_proc_count_by_name(funcname);
+	if (proc_count == 0)
+		return false;
+
+	if (schemaname)
+	{
+		*fgc_flags |= FGC_SCHEMA_GIVEN;
+		if (strcmp(schemaname, "pg_catalog") != 0)
+		{
+			if (!missing_ok)
+				*fgc_flags |= FGC_SCHEMA_EXISTS;
+			*result = NULL;
+			return true;
+		}
+		namespaceId = PG_CATALOG_NAMESPACE;
+		*fgc_flags |= FGC_SCHEMA_EXISTS;
+	}
+	else
+		namespaceId = PG_CATALOG_NAMESPACE;
+
+	for (size_t i = 0; i < proc_count; i++)
+	{
+		FastPgRustCatalogProc proc;
+		FuncCandidateList newResult;
+		int			pronargs;
+		int			effective_nargs;
+
+		if (!fastpg_rust_catalog_proc_by_name_index(funcname, i, &proc))
+			continue;
+		*fgc_flags |= FGC_NAME_EXISTS;
+
+		if (proc.namespace_oid != namespaceId)
+			continue;
+		*fgc_flags |= FGC_NAME_VISIBLE;
+
+		pronargs = (int) proc.arg_count;
+		if (nargs >= 0 && pronargs != nargs)
+			continue;
+		*fgc_flags |= FGC_ARGCOUNT_MATCH;
+
+		effective_nargs = Max(pronargs, nargs);
+		newResult = (FuncCandidateList)
+			palloc0(offsetof(struct _FuncCandidateList, args) +
+					effective_nargs * sizeof(Oid));
+		newResult->pathpos = 0;
+		newResult->oid = (Oid) proc.oid;
+		newResult->nominalnargs = pronargs;
+		newResult->nargs = effective_nargs;
+		newResult->nvargs = 0;
+		newResult->ndargs = 0;
+		newResult->argnumbers = NULL;
+		for (int arg = 0; arg < pronargs; arg++)
+			newResult->args[arg] = (Oid) proc.arg_type_oids[arg];
+
+		*tail = newResult;
+		tail = &newResult->next;
+	}
+
+	*result = resultList;
+	return true;
+}
+#endif
+
 /*
  * MatchNamedCall
  *		Given a pg_proc heap tuple and a call's list of argument names,
@@ -1851,6 +1980,18 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 		{
 			HeapTuple	opertup;
 
+#ifdef USE_FASTPG
+			FastPgRustCatalogOperator fastpg_operator;
+
+			if (fastpg_rust_catalog_operator_by_signature(opername,
+														  (uint32_t) oprleft,
+														  (uint32_t) oprright,
+														  (uint32_t) namespaceId,
+														  &fastpg_operator))
+				return (Oid) fastpg_operator.oid;
+			if (!IsUnderPostmaster)
+				return InvalidOid;
+#endif
 			opertup = SearchSysCache4(OPERNAMENSP,
 									  CStringGetDatum(opername),
 									  ObjectIdGetDatum(oprleft),
@@ -1868,6 +2009,21 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 
 		return InvalidOid;
 	}
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogOperator fastpg_operator;
+
+		if (fastpg_rust_catalog_operator_by_signature(opername,
+													  (uint32_t) oprleft,
+													  (uint32_t) oprright,
+													  PG_CATALOG_NAMESPACE,
+													  &fastpg_operator))
+			return (Oid) fastpg_operator.oid;
+		if (!IsUnderPostmaster)
+			return InvalidOid;
+	}
+#endif
 
 	/* Search syscache by name and argument types */
 	catlist = SearchSysCacheList3(OPERNAMENSP,

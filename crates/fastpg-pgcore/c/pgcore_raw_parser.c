@@ -12,12 +12,15 @@
 
 #include "access/fastpg_catalog.h"
 #include "access/tupdesc.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_type_d.h"
 #include "executor/execdesc.h"
 #include "executor/executor.h"
 #include "executor/tuptable.h"
+#include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/params.h"
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "nodes/plannodes.h"
@@ -25,13 +28,16 @@
 #include "nodes/value.h"
 #include "parser/analyze.h"
 #include "parser/parser.h"
+#include "pgtime.h"
 #include "tcop/tcopprot.h"
 #include "utils/elog.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/snapmgr.h"
 #include "utils/snapshot.h"
+#include "utils/syscache.h"
 
 typedef struct FastPgPgCoreParseResult
 {
@@ -121,6 +127,11 @@ fastpg_pgcore_init_once(void)
 
 	MyProcPid = getpid();
 	MemoryContextInit();
+	pg_timezone_initialize();
+	RelationCacheInitialize();
+	InitCatalogCache();
+	namespace_search_path = pstrdup("pg_catalog, public");
+	InitializeSearchPath();
 
 	fastpg_pgcore_initialized = true;
 }
@@ -1039,6 +1050,7 @@ fastpg_pgcore_prepare(const char *query)
 		return NULL;
 
 	fastpg_pgcore_enter();
+	fastpg_pgcore_ensure_execution_owner();
 	oldcontext = CurrentMemoryContext;
 	result->context = AllocSetContextCreate(TopMemoryContext,
 											"fastpg pgcore prepared statement",
@@ -1177,8 +1189,80 @@ fastpg_pgcore_prepared_field_type_oid(const FastPgPgCorePrepared *prepared,
 	return prepared->fields[index].type_oid;
 }
 
+static ParamListInfo
+fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
+						   const char *const *parameter_values,
+						   const bool *parameter_is_null,
+						   int parameter_count)
+{
+	ParamListInfo param_list;
+
+	if (parameter_count != prepared->parameter_count)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("fastpg pgcore expected %d parameters but got %d",
+						prepared->parameter_count,
+						parameter_count)));
+	if (parameter_count == 0)
+		return NULL;
+	if (prepared->parameter_type_oids == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("fastpg pgcore prepared statement has no parameter type table")));
+	if (parameter_values == NULL || parameter_is_null == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("fastpg pgcore parameter buffers are missing")));
+
+	param_list = makeParamList(parameter_count);
+	for (int i = 0; i < parameter_count; i++)
+	{
+		ParamExternData *param = &param_list->params[i];
+		Oid			parameter_type = prepared->parameter_type_oids[i];
+
+		if (!OidIsValid(parameter_type))
+			ereport(ERROR,
+					(errcode(ERRCODE_PROTOCOL_VIOLATION),
+					 errmsg("fastpg pgcore parameter %d has no inferred type",
+							i + 1)));
+
+		param->ptype = parameter_type;
+		param->pflags = PARAM_FLAG_CONST;
+
+		if (parameter_is_null[i])
+		{
+			param->isnull = true;
+			param->value = (Datum) 0;
+		}
+		else
+		{
+			Oid			typinput;
+			Oid			typioparam;
+
+			if (parameter_values[i] == NULL)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("fastpg pgcore parameter %d is missing text data",
+								i + 1)));
+
+			getTypeInputInfo(parameter_type, &typinput, &typioparam);
+			param->isnull = false;
+			param->value =
+				OidInputFunctionCall(typinput,
+									 (char *) parameter_values[i],
+									 typioparam,
+									 -1);
+		}
+	}
+
+	return param_list;
+}
+
 FastPgPgCoreExecuteResult *
-fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
+fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
+							 const char *const *parameter_values,
+							 const bool *parameter_is_null,
+							 int parameter_count)
 {
 	FastPgPgCoreExecuteResult *result;
 	MemoryContext oldcontext;
@@ -1209,12 +1293,19 @@ fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 		List	   *planned_statements_copy;
 		ListCell   *lc;
 		int			statement_index = 0;
+		ParamListInfo params;
+		Snapshot	snapshot;
 
 		MemoryContextSwitchTo(result->context);
+		params = fastpg_pgcore_build_params(prepared,
+											parameter_values,
+											parameter_is_null,
+											parameter_count);
 		planned_statements_copy = copyObject(prepared->planned_statements);
 		result->statement_count = list_length(planned_statements_copy);
 		result->statements = palloc0_array(FastPgPgCoreExecuteStatement,
 										   result->statement_count);
+		snapshot = SnapshotAny;
 
 		foreach(lc, planned_statements_copy)
 		{
@@ -1238,10 +1329,10 @@ fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 														 result->context);
 			query_desc = CreateQueryDesc(statement,
 										 prepared->source_text,
-										 InvalidSnapshot,
+										 snapshot,
 										 InvalidSnapshot,
 										 dest,
-										 NULL,
+										 params,
 										 NULL,
 										 0);
 
@@ -1249,6 +1340,8 @@ fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 			ExecutorRun(query_desc, ForwardScanDirection, 0);
 			ExecutorFinish(query_desc);
 			ExecutorEnd(query_desc);
+			query_desc->snapshot = InvalidSnapshot;
+			query_desc->crosscheck_snapshot = InvalidSnapshot;
 			FreeQueryDesc(query_desc);
 			query_desc = NULL;
 
@@ -1270,7 +1363,11 @@ fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 		if (snapshot_pushed)
 			PopActiveSnapshot();
 		if (query_desc != NULL)
+		{
+			query_desc->snapshot = InvalidSnapshot;
+			query_desc->crosscheck_snapshot = InvalidSnapshot;
 			FreeQueryDesc(query_desc);
+		}
 
 		edata = CopyErrorData();
 		FlushErrorState();
@@ -1281,6 +1378,12 @@ fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 
 	MemoryContextSwitchTo(oldcontext);
 	return result;
+}
+
+FastPgPgCoreExecuteResult *
+fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
+{
+	return fastpg_pgcore_execute_params(prepared, NULL, NULL, 0);
 }
 
 void

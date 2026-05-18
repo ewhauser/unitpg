@@ -7,15 +7,14 @@ rust-version.workspace = true
 
 [features]
 default = []
-postgres-linked = ["fastpg-parser/postgres-linked", "fastpg-pgcore/postgres-linked"]
+mini-sql-testkit = ["dep:fastpg-bind", "dep:fastpg-parser"]
+postgres-linked = ["fastpg-pgcore/postgres-linked"]
 postgres-execution = ["postgres-linked", "fastpg-pgcore/postgres-execution"]
 
 [dependencies]
-fastpg-bind.workspace = true
+fastpg-bind = { workspace = true, optional = true }
 fastpg-catalog.workspace = true
-fastpg-parser.workspace = true
+fastpg-parser = { workspace = true, optional = true }
 fastpg-pgcore.workspace = true
-fastpg-plan.workspace = true
 fastpg-storage.workspace = true
-fastpg-tx.workspace = true
 fastpg-types.workspace = true
