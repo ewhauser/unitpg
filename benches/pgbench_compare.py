@@ -449,8 +449,18 @@ class PgBenchCompare:
     ) -> dict[str, Any]:
         run_dir = variant_dir / f"run-{run_index}"
         run_dir.mkdir(parents=True, exist_ok=True)
-        host = "127.0.0.1"
         port = free_port()
+        socket_dir: Path | None = None
+        socket_path: Path | None = None
+        if os.name == "nt":
+            host = "127.0.0.1"
+            listen_address = f"{host}:{port}"
+        else:
+            socket_dir = Path(f"/private/tmp/fpgb-{os.getpid()}-{variant.name}-{run_index}")
+            socket_dir.mkdir(parents=True, exist_ok=True)
+            socket_path = socket_dir / f".s.PGSQL.{port}"
+            host = str(socket_dir)
+            listen_address = f"unix:{socket_path}"
         env = rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"])
         server: dict[str, Any] | None = None
         profiler: dict[str, Any] | None = None
@@ -462,9 +472,19 @@ class PgBenchCompare:
             "port": port,
             "commands": {},
         }
+        if socket_dir is not None:
+            run_record["socket_dir"] = str(socket_dir)
 
         try:
-            server = self.start_rust_server(variant.name, paths["server_binary"], host, port, run_dir)
+            server = self.start_rust_server(
+                variant.name,
+                paths["server_binary"],
+                listen_address,
+                run_dir,
+                host=host,
+                port=port,
+                socket_path=socket_path,
+            )
             run_record["commands"]["start"] = server["result"].as_json()
             if "profiler" in server:
                 profiler = server["profiler"]
@@ -509,14 +529,24 @@ class PgBenchCompare:
                 if profile_result.returncode != 0 and stop_failure is None and not active_failure:
                     stop_failure = BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
             self.write_results()
+            if socket_dir is not None:
+                shutil.rmtree(socket_dir, ignore_errors=True)
             if stop_failure is not None:
                 raise stop_failure
 
     def start_rust_server(
-        self, variant: str, server_binary: Path, host: str, port: int, output_dir: Path
+        self,
+        variant: str,
+        server_binary: Path,
+        listen_address: str,
+        output_dir: Path,
+        *,
+        host: str,
+        port: int,
+        socket_path: Path | None = None,
     ) -> dict[str, Any]:
         output_dir.mkdir(parents=True, exist_ok=True)
-        command = [str(server_binary), f"{host}:{port}"]
+        command = [str(server_binary), listen_address]
         stdout_path = output_dir / "fastpg-server.stdout"
         stderr_path = output_dir / "fastpg-server.stderr"
         stdout_file = stdout_path.open("w")
@@ -540,7 +570,11 @@ class PgBenchCompare:
             "result": result,
         }
 
-        if not wait_for_tcp_server(process, host, port):
+        if socket_path is None:
+            ready = wait_for_tcp_server(process, host, port)
+        else:
+            ready = wait_for_unix_server(process, socket_path)
+        if not ready:
             stdout_file.flush()
             stderr_file.flush()
             failure = CommandResult(
@@ -1079,6 +1113,21 @@ def wait_for_tcp_server(
                 return True
         except OSError:
             time.sleep(0.05)
+    return False
+
+
+def wait_for_unix_server(
+    process: subprocess.Popen[str],
+    socket_path: Path,
+    timeout_seconds: float = 5.0,
+) -> bool:
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if process.poll() is not None:
+            return False
+        if socket_path.exists():
+            return True
+        time.sleep(0.05)
     return False
 
 
