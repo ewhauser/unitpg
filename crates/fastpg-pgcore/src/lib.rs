@@ -53,6 +53,7 @@ pub enum PgCoreValue {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PgCoreParam {
     Text(String),
+    Datum(usize),
     Null,
 }
 
@@ -220,6 +221,8 @@ mod inner {
             prepared: *const FastPgPgCorePrepared,
             parameter_values: *const *const c_char,
             parameter_is_null: *const bool,
+            parameter_datums: *const usize,
+            parameter_is_datum: *const bool,
             parameter_count: i32,
         ) -> *mut FastPgPgCoreExecuteResult;
         fn fastpg_pgcore_execute_result_free(result: *mut FastPgPgCoreExecuteResult);
@@ -421,32 +424,38 @@ mod inner {
             let param_count = i32::try_from(params.len()).map_err(|_| {
                 PgCoreError::new("54000", "too many parameters for PostgreSQL execution", 0)
             })?;
-            let encoded_params = params
-                .iter()
-                .map(|param| match param {
+            let mut encoded_text_params = Vec::with_capacity(params.len());
+            let mut parameter_values = Vec::with_capacity(params.len());
+            let mut parameter_is_null = Vec::with_capacity(params.len());
+            let mut parameter_datums = Vec::with_capacity(params.len());
+            let mut parameter_is_datum = Vec::with_capacity(params.len());
+            for param in params {
+                match param {
                     PgCoreParam::Text(value) => {
-                        CString::new(value.as_str()).map(Some).map_err(|_| {
+                        let value = CString::new(value.as_str()).map_err(|_| {
                             PgCoreError::new(
                                 "22023",
                                 "query parameter contains an embedded NUL byte",
                                 0,
                             )
-                        })
-                    }
-                    PgCoreParam::Null => Ok(None),
-                })
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut parameter_values = Vec::with_capacity(encoded_params.len());
-            let mut parameter_is_null = Vec::with_capacity(encoded_params.len());
-            for param in &encoded_params {
-                match param {
-                    Some(value) => {
+                        })?;
                         parameter_values.push(value.as_ptr());
                         parameter_is_null.push(false);
+                        parameter_datums.push(0);
+                        parameter_is_datum.push(false);
+                        encoded_text_params.push(value);
                     }
-                    None => {
+                    PgCoreParam::Datum(value) => {
+                        parameter_values.push(ptr::null());
+                        parameter_is_null.push(false);
+                        parameter_datums.push(*value);
+                        parameter_is_datum.push(true);
+                    }
+                    PgCoreParam::Null => {
                         parameter_values.push(ptr::null());
                         parameter_is_null.push(true);
+                        parameter_datums.push(0);
+                        parameter_is_datum.push(false);
                     }
                 }
             }
@@ -462,6 +471,8 @@ mod inner {
                         self.as_ptr(),
                         parameter_values.as_ptr(),
                         parameter_is_null.as_ptr(),
+                        parameter_datums.as_ptr(),
+                        parameter_is_datum.as_ptr(),
                         param_count,
                     )
                 }

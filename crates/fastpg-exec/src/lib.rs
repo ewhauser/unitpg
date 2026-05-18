@@ -909,8 +909,8 @@ fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryEx
 #[cfg(feature = "postgres-execution")]
 fn pgcore_param_value(value: &Value) -> PgCoreParam {
     match value {
-        Value::Int4(value) => PgCoreParam::Text(value.to_string()),
-        Value::Int8(value) => PgCoreParam::Text(value.to_string()),
+        Value::Int4(value) => PgCoreParam::Datum(*value as usize),
+        Value::Int8(value) => PgCoreParam::Datum(*value as usize),
         Value::Text(value) => PgCoreParam::Text(value.clone()),
         Value::Null => PgCoreParam::Null,
     }

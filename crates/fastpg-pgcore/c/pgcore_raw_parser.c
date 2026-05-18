@@ -1193,6 +1193,8 @@ static ParamListInfo
 fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 						   const char *const *parameter_values,
 						   const bool *parameter_is_null,
+						   const Datum *parameter_datums,
+						   const bool *parameter_is_datum,
 						   int parameter_count)
 {
 	ParamListInfo param_list;
@@ -1213,6 +1215,10 @@ fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("fastpg pgcore parameter buffers are missing")));
+	if (parameter_datums == NULL || parameter_is_datum == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_PROTOCOL_VIOLATION),
+				 errmsg("fastpg pgcore datum parameter buffers are missing")));
 
 	param_list = makeParamList(parameter_count);
 	for (int i = 0; i < parameter_count; i++)
@@ -1233,6 +1239,11 @@ fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 		{
 			param->isnull = true;
 			param->value = (Datum) 0;
+		}
+		else if (parameter_is_datum[i])
+		{
+			param->isnull = false;
+			param->value = parameter_datums[i];
 		}
 		else
 		{
@@ -1262,6 +1273,8 @@ FastPgPgCoreExecuteResult *
 fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 							 const char *const *parameter_values,
 							 const bool *parameter_is_null,
+							 const Datum *parameter_datums,
+							 const bool *parameter_is_datum,
 							 int parameter_count)
 {
 	FastPgPgCoreExecuteResult *result;
@@ -1299,6 +1312,8 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		params = fastpg_pgcore_build_params(prepared,
 											parameter_values,
 											parameter_is_null,
+											parameter_datums,
+											parameter_is_datum,
 											parameter_count);
 		result->statement_count = list_length(prepared->planned_statements);
 		result->statements = palloc0_array(FastPgPgCoreExecuteStatement,
@@ -1381,7 +1396,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 FastPgPgCoreExecuteResult *
 fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 {
-	return fastpg_pgcore_execute_params(prepared, NULL, NULL, 0);
+	return fastpg_pgcore_execute_params(prepared, NULL, NULL, NULL, NULL, 0);
 }
 
 void
