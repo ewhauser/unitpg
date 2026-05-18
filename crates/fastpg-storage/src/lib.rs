@@ -8,16 +8,16 @@ use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    BPCHAR_OID, CatalogError, CatalogValue, ColumnRecord, INT2_OID, INT2VECTOR_OID, INT4_OID,
-    INT8_OID, NAME_OID, OID_OID, OIDVECTOR_OID, PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID,
-    TEXT_OID, TIMESTAMP_OID, VARCHAR_OID, add_primary_key,
-    btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
-    builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
-    builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
-    builtin_proc_by_oid, builtin_procs_by_name, builtin_type_by_name, catalog_row_value,
-    catalog_rows, create_relation, drop_relation, lookup_builtin_type, relation_by_name,
-    relation_by_oid, relation_column_count, static_catalog_by_name, static_catalog_by_relation_oid,
-    truncate_relation, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    BPCHAR_OID, CatalogError, CatalogValue, ColumnRecord, CreateFunctionSpec, CreateTypeColumn,
+    CreateTypeKind, INT2_OID, INT2VECTOR_OID, INT4_OID, INT8_OID, NAME_OID, OID_OID, OIDVECTOR_OID,
+    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, TEXT_OID, TIMESTAMP_OID, VARCHAR_OID,
+    add_primary_key, btree_opclass_for_type as catalog_btree_opclass_for_type,
+    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
+    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
+    builtin_operators_by_name, catalog_row_value, catalog_rows, create_function, create_opclass,
+    create_relation, create_type, drop_relation, lookup_type, relation_by_name, relation_by_oid,
+    relation_column_count, static_catalog_by_name, static_catalog_by_relation_oid,
+    truncate_relation, type_by_name, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -1011,39 +1011,37 @@ fn namespace_to_ffi(record: &fastpg_catalog::PgNamespaceRecord) -> FastPgRustCat
     }
 }
 
-fn proc_to_ffi(record: &fastpg_catalog::PgProcRecord) -> Option<FastPgRustCatalogProc> {
-    let mut arg_type_oids = [0; FASTPG_PROC_MAX_ARGS];
-    if record.arg_types.len() > FASTPG_PROC_MAX_ARGS {
-        return None;
-    }
-    for (index, oid) in record.arg_types.iter().enumerate() {
-        arg_type_oids[index] = oid.0;
-    }
-
-    Some(FastPgRustCatalogProc {
+fn type_to_ffi(record: &fastpg_catalog::CatalogTypeRecord) -> FastPgRustCatalogType {
+    FastPgRustCatalogType {
         oid: record.oid.0,
         namespace_oid: record.namespace.0,
         owner_oid: record.owner.0,
-        language_oid: record.language.0,
-        name: fixed_c_name(record.name),
-        source: fixed_c_bytes(record.source),
-        cost: record.cost as f32,
-        rows: record.rows as f32,
-        variadic_oid: record.variadic.0,
-        support_oid: record.support.0,
-        return_type_oid: record.return_type.0,
-        arg_count: record.arg_types.len() as u16,
-        arg_default_count: record.arg_defaults,
-        kind: record.kind,
-        security_definer: u8::from(record.security_definer),
-        leakproof: u8::from(record.leakproof),
-        is_strict: u8::from(record.strict),
-        returns_set: u8::from(record.returns_set),
-        volatility: record.volatility,
-        parallel: record.parallel,
+        name: fixed_c_name(&record.name),
+        typlen: record.typlen,
+        typbyval: u8::from(record.typbyval),
+        typalign: record.typalign,
+        typdelim: record.typdelim,
         _padding: 0,
-        arg_type_oids,
-    })
+        typinput: record.typinput.0,
+        typoutput: record.typoutput.0,
+        typreceive: record.typreceive.0,
+        typsend: record.typsend.0,
+        typmodin: record.typmodin.0,
+        typmodout: record.typmodout.0,
+        typisdefined: u8::from(record.typisdefined),
+        typtype: record.typtype,
+        typcategory: record.typcategory,
+        typispreferred: u8::from(record.typispreferred),
+        typrelid: record.typrelid.0,
+        typelem: record.typelem.0,
+        typarray: record.typarray.0,
+        typbasetype: record.typbasetype.0,
+        typtypmod: record.typtypmod,
+        typcollation: record.typcollation.0,
+        typsubscript: record.typsubscript.0,
+        typstorage: record.typstorage,
+        _trailing_padding: [0; 3],
+    }
 }
 
 fn aggregate_to_ffi(record: &fastpg_catalog::PgAggregateRecord) -> FastPgRustCatalogAggregate {
@@ -1137,6 +1135,45 @@ fn catalog_value_name(value: &CatalogValue) -> Option<&str> {
     }
 }
 
+fn catalog_value_i16(value: &CatalogValue) -> Option<i16> {
+    match value {
+        CatalogValue::Int16(value) => Some(*value),
+        CatalogValue::Int32(value) => i16::try_from(*value).ok(),
+        CatalogValue::Raw(value) => value.parse::<i16>().ok(),
+        _ => None,
+    }
+}
+
+fn catalog_value_f32(value: &CatalogValue) -> Option<f32> {
+    match value {
+        CatalogValue::Float32(value) => Some(*value),
+        CatalogValue::Raw(value) => value.parse::<f32>().ok(),
+        _ => None,
+    }
+}
+
+fn catalog_value_char(value: &CatalogValue) -> Option<u8> {
+    match value {
+        CatalogValue::Char(value) => Some(*value),
+        CatalogValue::Raw(value) => value.as_bytes().first().copied(),
+        _ => None,
+    }
+}
+
+fn catalog_value_oid_vector(value: &CatalogValue) -> Option<Vec<Oid>> {
+    match value {
+        CatalogValue::OidVector(values) => Some(values.clone()),
+        CatalogValue::Raw(value) => Some(
+            value
+                .split_whitespace()
+                .filter_map(|part| part.parse::<u32>().ok())
+                .map(Oid)
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 fn opclass_to_ffi(row: &fastpg_catalog::CatalogRow) -> Option<FastPgRustCatalogOpclass> {
     let table = static_catalog_by_name("pg_opclass")?;
     let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
@@ -1162,6 +1199,114 @@ fn opclass_to_ffi(row: &fastpg_catalog::CatalogRow) -> Option<FastPgRustCatalogO
         _padding: [0; 3],
         name: fixed_c_name(name),
     })
+}
+
+fn proc_row_to_ffi(row: &fastpg_catalog::CatalogRow) -> Option<FastPgRustCatalogProc> {
+    let table = static_catalog_by_name("pg_proc")?;
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let namespace = catalog_row_value(table, row, "pronamespace").and_then(catalog_value_oid)?;
+    let owner = catalog_row_value(table, row, "proowner").and_then(catalog_value_oid)?;
+    let language = catalog_row_value(table, row, "prolang").and_then(catalog_value_oid)?;
+    let name = catalog_row_value(table, row, "proname").and_then(catalog_value_name)?;
+    let cost = catalog_row_value(table, row, "procost")
+        .and_then(catalog_value_f32)
+        .unwrap_or(1.0);
+    let rows = catalog_row_value(table, row, "prorows")
+        .and_then(catalog_value_f32)
+        .unwrap_or(0.0);
+    let variadic = catalog_row_value(table, row, "provariadic")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let support = catalog_row_value(table, row, "prosupport")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let return_type = catalog_row_value(table, row, "prorettype").and_then(catalog_value_oid)?;
+    let arg_types = catalog_row_value(table, row, "proargtypes")
+        .and_then(catalog_value_oid_vector)
+        .unwrap_or_default();
+    if arg_types.len() > FASTPG_PROC_MAX_ARGS {
+        return None;
+    }
+    let mut arg_type_oids = [0; FASTPG_PROC_MAX_ARGS];
+    for (index, oid) in arg_types.iter().enumerate() {
+        arg_type_oids[index] = oid.0;
+    }
+    let source = catalog_row_value(table, row, "prosrc")
+        .and_then(catalog_value_name)
+        .unwrap_or("");
+
+    Some(FastPgRustCatalogProc {
+        oid: oid.0,
+        namespace_oid: namespace.0,
+        owner_oid: owner.0,
+        language_oid: language.0,
+        name: fixed_c_name(name),
+        source: fixed_c_bytes(source),
+        cost,
+        rows,
+        variadic_oid: variadic.0,
+        support_oid: support.0,
+        return_type_oid: return_type.0,
+        arg_count: arg_types.len() as u16,
+        arg_default_count: catalog_row_value(table, row, "pronargdefaults")
+            .and_then(catalog_value_i16)
+            .unwrap_or(0)
+            .max(0) as u16,
+        kind: catalog_row_value(table, row, "prokind")
+            .and_then(catalog_value_char)
+            .unwrap_or(b'f'),
+        security_definer: catalog_row_value(table, row, "prosecdef")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false)
+            .into(),
+        leakproof: catalog_row_value(table, row, "proleakproof")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false)
+            .into(),
+        is_strict: catalog_row_value(table, row, "proisstrict")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false)
+            .into(),
+        returns_set: catalog_row_value(table, row, "proretset")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false)
+            .into(),
+        volatility: catalog_row_value(table, row, "provolatile")
+            .and_then(catalog_value_char)
+            .unwrap_or(b'v'),
+        parallel: catalog_row_value(table, row, "proparallel")
+            .and_then(catalog_value_char)
+            .unwrap_or(b'u'),
+        _padding: 0,
+        arg_type_oids,
+    })
+}
+
+fn proc_row_by_oid(oid: Oid) -> Option<FastPgRustCatalogProc> {
+    let table = static_catalog_by_name("pg_proc")?;
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        let row_oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
+        (row_oid == oid).then(|| proc_row_to_ffi(&row)).flatten()
+    })
+}
+
+fn proc_rows_by_name(name: &str) -> impl Iterator<Item = FastPgRustCatalogProc> {
+    let normalized = name.to_ascii_lowercase();
+    let rows = static_catalog_by_name("pg_proc")
+        .map(|table| {
+            catalog_rows(table.oid)
+                .into_iter()
+                .filter_map(move |row| {
+                    let row_name =
+                        catalog_row_value(table, &row, "proname").and_then(catalog_value_name)?;
+                    (row_name == normalized)
+                        .then(|| proc_row_to_ffi(&row))
+                        .flatten()
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    rows.into_iter()
 }
 
 fn opclass_by_oid(oid: Oid) -> Option<FastPgRustCatalogOpclass> {
@@ -1219,7 +1364,7 @@ fn primary_key_spec(relation: &fastpg_catalog::RelationRecord) -> Option<Primary
             .iter()
             .position(|column| &column.name == primary_key_column)?;
         let column = relation.columns.get(column_index)?;
-        let pg_type = lookup_builtin_type(column.type_oid)?;
+        let pg_type = lookup_type(column.type_oid)?;
         columns.push(PrimaryKeyColumnSpec {
             column_index,
             typbyval: pg_type.typbyval,
@@ -1289,7 +1434,7 @@ fn primary_key_index_info(
             .iter()
             .position(|column| &column.name == primary_key_column)?;
         let column = relation.columns.get(column_index)?;
-        let type_record = lookup_builtin_type(column.type_oid)?;
+        let type_record = lookup_type(column.type_oid)?;
         attnums[key_index] = (column_index + 1).try_into().ok()?;
         type_oids[key_index] = column.type_oid.0;
         collation_oids[key_index] = type_record.typcollation.0;
@@ -1569,7 +1714,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
     oid: u32,
     out: *mut FastPgRustCatalogType,
 ) -> bool {
-    let Some(record) = lookup_builtin_type(Oid(oid)) else {
+    let Some(record) = lookup_type(Oid(oid)) else {
         return false;
     };
 
@@ -1578,36 +1723,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
     }
 
     unsafe {
-        *out = FastPgRustCatalogType {
-            oid: record.oid.0,
-            namespace_oid: record.namespace.0,
-            owner_oid: record.owner.0,
-            name: fixed_c_name(record.name),
-            typlen: record.typlen,
-            typbyval: u8::from(record.typbyval),
-            typalign: record.typalign,
-            typdelim: record.typdelim,
-            _padding: 0,
-            typinput: record.typinput.0,
-            typoutput: record.typoutput.0,
-            typreceive: record.typreceive.0,
-            typsend: record.typsend.0,
-            typmodin: record.typmodin.0,
-            typmodout: record.typmodout.0,
-            typisdefined: u8::from(record.typisdefined),
-            typtype: record.typtype,
-            typcategory: record.typcategory,
-            typispreferred: u8::from(record.typispreferred),
-            typrelid: record.typrelid.0,
-            typelem: record.typelem.0,
-            typarray: record.typarray.0,
-            typbasetype: record.typbasetype.0,
-            typtypmod: record.typtypmod,
-            typcollation: record.typcollation.0,
-            typsubscript: record.typsubscript.0,
-            typstorage: record.typstorage,
-            _trailing_padding: [0; 3],
-        };
+        *out = type_to_ffi(&record);
     }
     true
 }
@@ -1628,41 +1744,12 @@ pub unsafe extern "C" fn fastpg_rust_catalog_type_by_name(
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return false;
     };
-    let Some(record) = builtin_type_by_name(&name, Oid(namespace_oid)) else {
+    let Some(record) = type_by_name(&name, Oid(namespace_oid)) else {
         return false;
     };
 
     unsafe {
-        *out = FastPgRustCatalogType {
-            oid: record.oid.0,
-            namespace_oid: record.namespace.0,
-            owner_oid: record.owner.0,
-            name: fixed_c_name(record.name),
-            typlen: record.typlen,
-            typbyval: u8::from(record.typbyval),
-            typalign: record.typalign,
-            typdelim: record.typdelim,
-            _padding: 0,
-            typinput: record.typinput.0,
-            typoutput: record.typoutput.0,
-            typreceive: record.typreceive.0,
-            typsend: record.typsend.0,
-            typmodin: record.typmodin.0,
-            typmodout: record.typmodout.0,
-            typisdefined: u8::from(record.typisdefined),
-            typtype: record.typtype,
-            typcategory: record.typcategory,
-            typispreferred: u8::from(record.typispreferred),
-            typrelid: record.typrelid.0,
-            typelem: record.typelem.0,
-            typarray: record.typarray.0,
-            typbasetype: record.typbasetype.0,
-            typtypmod: record.typtypmod,
-            typcollation: record.typcollation.0,
-            typsubscript: record.typsubscript.0,
-            typstorage: record.typstorage,
-            _trailing_padding: [0; 3],
-        };
+        *out = type_to_ffi(&record);
     }
     true
 }
@@ -1901,10 +1988,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_oid(
     if out.is_null() {
         return false;
     }
-    let Some(record) = builtin_proc_by_oid(Oid(oid)) else {
-        return false;
-    };
-    let Some(ffi_record) = proc_to_ffi(record) else {
+    let Some(ffi_record) = proc_row_by_oid(Oid(oid)) else {
         return false;
     };
 
@@ -1923,7 +2007,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_proc_count_by_name(name: *const c_c
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return 0;
     };
-    builtin_procs_by_name(&name).count()
+    proc_rows_by_name(&name).count()
 }
 
 #[unsafe(no_mangle)]
@@ -1942,10 +2026,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_proc_by_name_index(
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return false;
     };
-    let Some(record) = builtin_procs_by_name(&name).nth(index) else {
-        return false;
-    };
-    let Some(ffi_record) = proc_to_ffi(record) else {
+    let Some(ffi_record) = proc_rows_by_name(&name).nth(index) else {
         return false;
     };
 
@@ -2398,6 +2479,189 @@ pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
         if let Some(relation) = relation_by_name(&name) {
             with_storage(|state, _session| state.rebuild_primary_key_index(relation.oid.0));
         }
+        Ok::<(), CatalogError>(())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_catalog_create_type(
+    name: *const c_char,
+    kind: u8,
+    subtype_oid: u32,
+    collation_oid: u32,
+    labels: *const *const c_char,
+    label_count: usize,
+    column_names: *const *const c_char,
+    column_type_oids: *const u32,
+    column_type_mods: *const i32,
+    column_count: usize,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let kind = match kind {
+            b's' => CreateTypeKind::Shell,
+            b'b' => CreateTypeKind::Base,
+            b'e' => {
+                let labels = unsafe { c_str_array_to_strings(labels, label_count) }
+                    .map_err(invalid_ffi_argument)?;
+                CreateTypeKind::Enum { labels }
+            }
+            b'r' => CreateTypeKind::Range {
+                subtype: Oid(subtype_oid),
+                collation: Oid(collation_oid),
+            },
+            b'c' => {
+                let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
+                    .map_err(invalid_ffi_argument)?;
+                let column_type_oids = unsafe { u32_array(column_type_oids, column_count) }
+                    .map_err(invalid_ffi_argument)?;
+                let column_type_mods = unsafe { i32_array(column_type_mods, column_count) }
+                    .map_err(invalid_ffi_argument)?;
+                let columns = column_names
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, name)| CreateTypeColumn {
+                        name,
+                        type_oid: Oid(column_type_oids[index]),
+                        type_mod: column_type_mods[index],
+                    })
+                    .collect();
+                CreateTypeKind::Composite { columns }
+            }
+            other => {
+                return Err(CatalogError::new(
+                    "22023",
+                    format!("unknown CREATE TYPE kind byte {other}"),
+                ));
+            }
+        };
+        create_type(&name, kind)?;
+        Ok::<(), CatalogError>(())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_catalog_create_function(
+    name: *const c_char,
+    return_type_oid: u32,
+    arg_type_oids: *const u32,
+    arg_count: usize,
+    language_oid: u32,
+    is_strict: u8,
+    leakproof: u8,
+    returns_set: u8,
+    volatility: u8,
+    parallel: u8,
+    source: *const c_char,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let source = unsafe { c_str_to_string(source) }.map_err(invalid_ffi_argument)?;
+        let arg_type_oids =
+            unsafe { u32_array(arg_type_oids, arg_count) }.map_err(invalid_ffi_argument)?;
+        let arg_types = arg_type_oids.iter().copied().map(Oid).collect();
+        create_function(CreateFunctionSpec {
+            name,
+            return_type: Oid(return_type_oid),
+            arg_types,
+            language: Oid(language_oid),
+            strict: is_strict != 0,
+            leakproof: leakproof != 0,
+            returns_set: returns_set != 0,
+            volatility,
+            parallel,
+            source,
+        })?;
+        Ok::<(), CatalogError>(())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_catalog_create_opclass(
+    name: *const c_char,
+    method_name: *const c_char,
+    input_type_oid: u32,
+    is_default: u8,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let method_name = unsafe { c_str_to_string(method_name) }.map_err(invalid_ffi_argument)?;
+        create_opclass(&name, &method_name, Oid(input_type_oid), is_default != 0)?;
         Ok::<(), CatalogError>(())
     })();
 
