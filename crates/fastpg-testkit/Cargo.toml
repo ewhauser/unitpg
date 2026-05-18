@@ -8,9 +8,10 @@ rust-version.workspace = true
 [features]
 default = []
 mini-sql-testkit = ["fastpg-server/mini-sql-testkit"]
-postgres-execution = ["fastpg-server/postgres-execution"]
+postgres-execution = ["fastpg-pgcore/postgres-execution", "fastpg-server/postgres-execution"]
 
 [dependencies]
+fastpg-pgcore.workspace = true
 fastpg-server.workspace = true
 tokio.workspace = true
 

@@ -32,6 +32,19 @@ pub fn raw_parse(sql: &str) -> Result<RawParseSummary, PgCoreError> {
     inner::raw_parse(sql)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PgCoreLaneMetrics {
+    pub operations: u64,
+    pub active: u64,
+    pub max_active: u64,
+    pub wait_nanos: u64,
+    pub execution_nanos: u64,
+}
+
+pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
+    inner::pgcore_lane_metrics()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreField {
     pub name: String,
@@ -156,14 +169,106 @@ mod inner {
     use std::ffi::{CStr, CString, c_char};
     use std::ptr;
     use std::ptr::NonNull;
-    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
+    use std::time::Instant;
 
     use super::{
-        ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField, PgCoreParam,
-        PgCoreValue, RawParseSummary, StatementDescription,
+        ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField,
+        PgCoreLaneMetrics, PgCoreParam, PgCoreValue, RawParseSummary, StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
+    static PGCORE_OPERATIONS: AtomicU64 = AtomicU64::new(0);
+    static PGCORE_ACTIVE: AtomicU64 = AtomicU64::new(0);
+    static PGCORE_MAX_ACTIVE: AtomicU64 = AtomicU64::new(0);
+    static PGCORE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
+    static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
+    static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+    pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
+        PgCoreLaneMetrics {
+            operations: PGCORE_OPERATIONS.load(Ordering::Relaxed),
+            active: PGCORE_ACTIVE.load(Ordering::Relaxed),
+            max_active: PGCORE_MAX_ACTIVE.load(Ordering::Relaxed),
+            wait_nanos: PGCORE_WAIT_NANOS.load(Ordering::Relaxed),
+            execution_nanos: PGCORE_EXECUTION_NANOS.load(Ordering::Relaxed),
+        }
+    }
+
+    struct PgCoreLaneGuard {
+        _guard: MutexGuard<'static, ()>,
+        started_at: Instant,
+    }
+
+    fn enter_pgcore_lane(operation: &'static str) -> PgCoreLaneGuard {
+        let waiting_since = Instant::now();
+        let guard = PGCORE_LOCK
+            .lock()
+            .unwrap_or_else(|_| panic!("fastpg pgcore {operation} mutex poisoned"));
+        let started_at = Instant::now();
+        add_duration(
+            &PGCORE_WAIT_NANOS,
+            started_at.duration_since(waiting_since).as_nanos(),
+        );
+        let active = PGCORE_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
+        update_max_active(active);
+        refresh_pgcore_caches_if_catalog_changed();
+        PgCoreLaneGuard {
+            _guard: guard,
+            started_at,
+        }
+    }
+
+    impl Drop for PgCoreLaneGuard {
+        fn drop(&mut self) {
+            add_duration(
+                &PGCORE_EXECUTION_NANOS,
+                self.started_at.elapsed().as_nanos(),
+            );
+            PGCORE_ACTIVE.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    fn add_duration(counter: &AtomicU64, nanos: u128) {
+        let addition = u64::try_from(nanos).unwrap_or(u64::MAX);
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_add(addition);
+            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn update_max_active(active: u64) {
+        let mut current = PGCORE_MAX_ACTIVE.load(Ordering::Relaxed);
+        while active > current {
+            match PGCORE_MAX_ACTIVE.compare_exchange_weak(
+                current,
+                active,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    fn refresh_pgcore_caches_if_catalog_changed() {
+        let current_generation = fastpg_catalog::current_generation();
+        if PGCORE_CATALOG_GENERATION.load(Ordering::Relaxed) == current_generation {
+            return;
+        }
+        unsafe {
+            fastpg_pgcore_invalidate_system_caches();
+        }
+        PGCORE_CATALOG_GENERATION.store(current_generation, Ordering::Relaxed);
+    }
 
     #[repr(C)]
     struct FastPgPgCoreParseResult {
@@ -182,6 +287,7 @@ mod inner {
 
     unsafe extern "C" {
         fn fastpg_pgcore_raw_parse(sql: *const c_char) -> *mut FastPgPgCoreParseResult;
+        fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
         fn fastpg_pgcore_parse_result_statement_count(
@@ -286,9 +392,7 @@ mod inner {
     pub fn raw_parse(sql: &str) -> Result<RawParseSummary, PgCoreError> {
         let c_sql = CString::new(sql)
             .map_err(|_| PgCoreError::new("22023", "query contains an embedded NUL byte", 0))?;
-        let _guard = PGCORE_LOCK
-            .lock()
-            .expect("fastpg pgcore raw parser mutex poisoned");
+        let _guard = enter_pgcore_lane("raw_parse");
 
         let result = unsafe { fastpg_pgcore_raw_parse(c_sql.as_ptr()) };
         let Some(result) = NonNull::new(result) else {
@@ -352,9 +456,7 @@ mod inner {
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
             let c_sql = CString::new(sql)
                 .map_err(|_| PgCoreError::new("22023", "query contains an embedded NUL byte", 0))?;
-            let _guard = PGCORE_LOCK
-                .lock()
-                .expect("fastpg pgcore prepare mutex poisoned");
+            let _guard = enter_pgcore_lane("prepare");
             let prepared = unsafe { fastpg_pgcore_prepare(c_sql.as_ptr()) };
             let Some(prepared) = NonNull::new(prepared) else {
                 return Err(PgCoreError::new(
@@ -388,9 +490,7 @@ mod inner {
         }
 
         pub fn describe(&self) -> StatementDescription {
-            let _guard = PGCORE_LOCK
-                .lock()
-                .expect("fastpg pgcore describe mutex poisoned");
+            let _guard = enter_pgcore_lane("describe");
             let parameter_count =
                 unsafe { fastpg_pgcore_prepared_parameter_count(self.as_ptr()) }.max(0);
             let field_count = unsafe { fastpg_pgcore_prepared_field_count(self.as_ptr()) }.max(0);
@@ -460,9 +560,7 @@ mod inner {
                 }
             }
 
-            let _guard = PGCORE_LOCK
-                .lock()
-                .expect("fastpg pgcore execute mutex poisoned");
+            let _guard = enter_pgcore_lane("execute");
             let result = if params.is_empty() {
                 unsafe { fastpg_pgcore_execute(self.as_ptr()) }
             } else {
@@ -499,9 +597,7 @@ mod inner {
 
     impl Drop for PreparedStatement {
         fn drop(&mut self) {
-            let _guard = PGCORE_LOCK
-                .lock()
-                .expect("fastpg pgcore prepared free mutex poisoned");
+            let _guard = enter_pgcore_lane("prepared_free");
             unsafe {
                 fastpg_pgcore_prepared_free(self.0.as_ptr());
             }
@@ -619,7 +715,13 @@ mod inner {
 
 #[cfg(not(feature = "postgres-linked"))]
 mod inner {
-    use super::{ExecutionResult, PgCoreError, RawParseSummary, StatementDescription};
+    use super::{
+        ExecutionResult, PgCoreError, PgCoreLaneMetrics, RawParseSummary, StatementDescription,
+    };
+
+    pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
+        PgCoreLaneMetrics::default()
+    }
 
     pub fn raw_parse(_sql: &str) -> Result<RawParseSummary, PgCoreError> {
         Ok(RawParseSummary { statement_count: 0 })

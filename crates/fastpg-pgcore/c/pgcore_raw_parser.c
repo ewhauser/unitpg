@@ -31,6 +31,7 @@
 #include "pgtime.h"
 #include "tcop/tcopprot.h"
 #include "utils/elog.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/relcache.h"
@@ -118,9 +119,6 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 } FastPgPgCoreCaptureDestReceiver;
 
 static bool fastpg_pgcore_initialized = false;
-#ifdef USE_FASTPG
-static bool fastpg_pgcore_transaction_block = false;
-#endif
 
 static void
 fastpg_pgcore_init_once(void)
@@ -144,6 +142,13 @@ fastpg_pgcore_enter(void)
 {
 	fastpg_pgcore_init_once();
 	(void) set_stack_base();
+}
+
+void
+fastpg_pgcore_invalidate_system_caches(void)
+{
+	fastpg_pgcore_enter();
+	InvalidateSystemCaches();
 }
 
 static void
@@ -732,21 +737,18 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 		case TRANS_STMT_START:
 #ifdef USE_FASTPG
 			fastpg_rust_xact_begin();
-			fastpg_pgcore_transaction_block = true;
 #endif
 			summary->command_tag = pstrdup("BEGIN");
 			break;
 		case TRANS_STMT_COMMIT:
 #ifdef USE_FASTPG
 			fastpg_rust_xact_commit();
-			fastpg_pgcore_transaction_block = false;
 #endif
 			summary->command_tag = pstrdup("COMMIT");
 			break;
 		case TRANS_STMT_ROLLBACK:
 #ifdef USE_FASTPG
 			fastpg_rust_xact_abort();
-			fastpg_pgcore_transaction_block = false;
 #endif
 			summary->command_tag = pstrdup("ROLLBACK");
 			break;
@@ -1370,7 +1372,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 			FreeQueryDesc(query_desc);
 			query_desc = NULL;
 #ifdef USE_FASTPG
-			if (!fastpg_pgcore_transaction_block)
+			if (!fastpg_rust_xact_is_explicit())
 				fastpg_rust_xact_commit_if_implicit();
 #endif
 
@@ -1392,7 +1394,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		if (snapshot_pushed)
 			PopActiveSnapshot();
 #ifdef USE_FASTPG
-		if (!fastpg_pgcore_transaction_block)
+		if (!fastpg_rust_xact_is_explicit())
 			fastpg_rust_xact_abort_if_implicit();
 #endif
 		if (query_desc != NULL)

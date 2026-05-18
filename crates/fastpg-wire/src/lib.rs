@@ -5,7 +5,8 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use fastpg_session::{
-    Column, CopyTarget, PgType, QueryDescription, QueryExecution, QueryResult, SessionState, Value,
+    Column, CopyTarget, PgType, QueryDescription, QueryExecution, QueryResult, ServerState,
+    SessionState, Value,
 };
 use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
@@ -69,14 +70,14 @@ impl PgWireServerHandlers for FastPgServerHandlers {
 
 #[derive(Debug)]
 pub struct FastPgWireHandler {
-    session: Arc<SessionState>,
+    server: Arc<ServerState>,
     query_parser: Arc<NoopQueryParser>,
 }
 
 impl FastPgWireHandler {
     pub fn new(server_version: impl Into<String>) -> Self {
         Self {
-            session: Arc::new(SessionState::new(server_version)),
+            server: Arc::new(ServerState::new(server_version)),
             query_parser: Arc::new(NoopQueryParser::new()),
         }
     }
@@ -92,7 +93,7 @@ impl Default for FastPgWireHandler {
 impl NoopStartupHandler for FastPgWireHandler {
     async fn post_startup<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         _message: PgWireFrontendMessage,
     ) -> PgWireResult<()>
     where
@@ -100,6 +101,7 @@ impl NoopStartupHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        session_for_client(client, &self.server);
         Ok(())
     }
 }
@@ -112,7 +114,8 @@ impl SimpleQueryHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let execution = self.session.execute(query, &[]);
+        let session = session_for_client(client, &self.server);
+        let execution = session.execute(query, &[]);
         remember_copy_target(client, &execution);
         Ok(vec![execution_to_response(execution, FieldFormat::Text)?])
     }
@@ -129,7 +132,7 @@ impl ExtendedQueryHandler for FastPgWireHandler {
 
     async fn do_describe_statement<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &StoredStatement<Self::Statement>,
     ) -> PgWireResult<DescribeStatementResponse>
     where
@@ -137,7 +140,8 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let Some(description) = self.session.describe(&target.statement) else {
+        let session = session_for_client(client, &self.server);
+        let Some(description) = session.describe(&target.statement) else {
             return Ok(DescribeStatementResponse::new(vec![], vec![]));
         };
 
@@ -149,7 +153,7 @@ impl ExtendedQueryHandler for FastPgWireHandler {
 
     async fn do_describe_portal<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         target: &Portal<Self::Statement>,
     ) -> PgWireResult<DescribePortalResponse>
     where
@@ -157,7 +161,8 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let Some(description) = self.session.describe(&target.statement.statement) else {
+        let session = session_for_client(client, &self.server);
+        let Some(description) = session.describe(&target.statement.statement) else {
             return Ok(DescribePortalResponse::new(vec![]));
         };
 
@@ -169,7 +174,7 @@ impl ExtendedQueryHandler for FastPgWireHandler {
 
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
@@ -178,13 +183,14 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let session = session_for_client(client, &self.server);
         let query = &portal.statement.statement;
-        let parameters = match self.session.describe(query) {
+        let parameters = match session.describe(query) {
             Some(description) => decode_parameters(portal, &description)?,
             None => vec![],
         };
-        let execution = self.session.execute(query, &parameters);
-        remember_copy_target(_client, &execution);
+        let execution = session.execute(query, &parameters);
+        remember_copy_target(client, &execution);
 
         execution_to_response(execution, portal.result_column_format.format_for(0))
     }
@@ -198,12 +204,13 @@ impl CopyHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let session = session_for_client(client, &self.server);
         let active_copy = active_copy(client)?;
         let mut active_copy = active_copy
             .lock()
             .expect("fastpg active COPY mutex poisoned");
         active_copy
-            .push_data(&self.session, copy_data.data.as_ref())
+            .push_data(&session, copy_data.data.as_ref())
             .map_err(copy_data_error)?;
         Ok(())
     }
@@ -214,14 +221,15 @@ impl CopyHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        let session = session_for_client(client, &self.server);
         let rows = {
             let active_copy = active_copy(client)?;
             let mut active_copy = active_copy
                 .lock()
                 .expect("fastpg active COPY mutex poisoned");
-            active_copy.finish(&self.session).map_err(copy_data_error)?
+            active_copy.finish(&session).map_err(copy_data_error)?
         };
-        self.session.finish_copy();
+        session.finish_copy();
 
         client
             .send(PgWireBackendMessage::CommandComplete(
@@ -231,19 +239,30 @@ impl CopyHandler for FastPgWireHandler {
         Ok(())
     }
 
-    async fn on_copy_fail<C>(&self, _client: &mut C, fail: CopyFail) -> PgWireError
+    async fn on_copy_fail<C>(&self, client: &mut C, fail: CopyFail) -> PgWireError
     where
         C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        self.session.abort_copy();
+        let session = session_for_client(client, &self.server);
+        session.abort_copy();
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "57014".to_owned(),
             format!("COPY cancelled by client: {}", fail.message),
         )))
     }
+}
+
+fn session_for_client<C>(client: &C, server: &Arc<ServerState>) -> Arc<SessionState>
+where
+    C: ClientInfo,
+{
+    let server = server.clone();
+    client
+        .session_extensions()
+        .get_or_insert_with(move || SessionState::for_server(server))
 }
 
 fn parameter_types(description: &QueryDescription) -> Vec<Type> {

@@ -1,10 +1,11 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
     BPCHAR_OID, CID_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID,
@@ -303,10 +304,7 @@ struct ScanState {
 struct StorageState {
     relations: HashMap<u32, RelationRows>,
     primary_key_specs: HashMap<u32, Option<PrimaryKeySpec>>,
-    transaction_stack: Vec<TransactionOverlay>,
-    explicit_transaction: bool,
-    scans: HashMap<u64, ScanState>,
-    next_scan_handle: u64,
+    primary_key_generation: u64,
 }
 
 impl Default for StorageState {
@@ -314,6 +312,22 @@ impl Default for StorageState {
         Self {
             relations: HashMap::new(),
             primary_key_specs: HashMap::new(),
+            primary_key_generation: fastpg_catalog::current_generation(),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct SessionStorage {
+    transaction_stack: Vec<TransactionOverlay>,
+    explicit_transaction: bool,
+    scans: HashMap<u64, ScanState>,
+    next_scan_handle: u64,
+}
+
+impl Default for SessionStorage {
+    fn default() -> Self {
+        Self {
             transaction_stack: Vec::new(),
             explicit_transaction: false,
             scans: HashMap::new(),
@@ -322,7 +336,49 @@ impl Default for StorageState {
     }
 }
 
-impl StorageState {
+pub type SessionStorageHandle = Arc<Mutex<SessionStorage>>;
+
+pub fn new_session_storage() -> SessionStorageHandle {
+    Arc::new(Mutex::new(SessionStorage::default()))
+}
+
+static DEFAULT_SESSION_STORAGE: OnceLock<SessionStorageHandle> = OnceLock::new();
+
+thread_local! {
+    static CURRENT_SESSION_STORAGE: RefCell<Option<SessionStorageHandle>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug)]
+pub struct SessionStorageGuard {
+    previous: Option<SessionStorageHandle>,
+}
+
+pub fn enter_session_storage(handle: SessionStorageHandle) -> SessionStorageGuard {
+    let previous = CURRENT_SESSION_STORAGE.with(|slot| slot.replace(Some(handle)));
+    SessionStorageGuard { previous }
+}
+
+impl Drop for SessionStorageGuard {
+    fn drop(&mut self) {
+        CURRENT_SESSION_STORAGE.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+fn default_session_storage() -> SessionStorageHandle {
+    DEFAULT_SESSION_STORAGE
+        .get_or_init(new_session_storage)
+        .clone()
+}
+
+fn current_session_storage() -> SessionStorageHandle {
+    CURRENT_SESSION_STORAGE
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(default_session_storage)
+}
+
+impl SessionStorage {
     fn allocate_scan_handle(&mut self) -> u64 {
         let handle = self.next_scan_handle;
         self.next_scan_handle = self.next_scan_handle.checked_add(1).unwrap_or(1);
@@ -337,46 +393,52 @@ impl StorageState {
             self.transaction_stack.push(TransactionOverlay::default());
         }
     }
+}
 
-    fn begin_explicit_transaction(&mut self) {
-        if !self.explicit_transaction {
-            self.commit_implicit_transaction();
+impl StorageState {
+    fn begin_explicit_transaction(&mut self, session: &mut SessionStorage) {
+        if !session.explicit_transaction {
+            self.commit_implicit_transaction(session);
         }
-        self.ensure_transaction();
-        self.explicit_transaction = true;
+        session.ensure_transaction();
+        session.explicit_transaction = true;
     }
 
-    fn commit_explicit_transaction(&mut self) {
-        while !self.transaction_stack.is_empty() {
-            self.commit_top_overlay();
+    fn commit_explicit_transaction(&mut self, session: &mut SessionStorage) {
+        while !session.transaction_stack.is_empty() {
+            self.commit_top_overlay(session);
         }
-        self.explicit_transaction = false;
+        session.explicit_transaction = false;
     }
 
-    fn abort_explicit_transaction(&mut self) {
-        self.transaction_stack.clear();
-        self.explicit_transaction = false;
+    fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
+        session.transaction_stack.clear();
+        session.explicit_transaction = false;
     }
 
-    fn commit_implicit_transaction(&mut self) {
-        if self.explicit_transaction {
+    fn commit_implicit_transaction(&mut self, session: &mut SessionStorage) {
+        if session.explicit_transaction {
             return;
         }
-        while !self.transaction_stack.is_empty() {
-            self.commit_top_overlay();
+        while !session.transaction_stack.is_empty() {
+            self.commit_top_overlay(session);
         }
     }
 
-    fn abort_implicit_transaction(&mut self) {
-        if !self.explicit_transaction {
-            self.transaction_stack.clear();
+    fn abort_implicit_transaction(&mut self, session: &mut SessionStorage) {
+        if !session.explicit_transaction {
+            session.transaction_stack.clear();
         }
     }
 
-    fn visible_row_count(&self, relid: u32) -> usize {
+    fn is_explicit_transaction(&self, session: &SessionStorage) -> bool {
+        session.explicit_transaction
+    }
+
+    fn visible_row_count(&self, session: &SessionStorage, relid: u32) -> usize {
         let Some(relation) = self.relations.get(&relid) else {
             return self
-                .transaction_stack
+                .visible_overlay_stack(session)
                 .iter()
                 .filter_map(|overlay| overlay.relations.get(&relid))
                 .map(|segment| segment.rows.len())
@@ -387,7 +449,7 @@ impl StorageState {
         let mut visible_overlay_row_ids = BTreeSet::new();
         let mut deleted_committed_row_ids = BTreeSet::new();
 
-        for overlay in &self.transaction_stack {
+        for overlay in self.visible_overlay_stack(session) {
             if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
                 for row_id in deleted_row_ids {
                     if visible_overlay_row_ids.remove(row_id) {
@@ -413,7 +475,7 @@ impl StorageState {
         row_count
     }
 
-    fn visible_rows(&self, relid: u32) -> Vec<Row> {
+    fn visible_rows(&self, session: &SessionStorage, relid: u32) -> Vec<Row> {
         let mut rows = BTreeMap::new();
         if let Some(relation) = self.relations.get(&relid) {
             for row_id in &relation.committed_row_ids {
@@ -422,7 +484,7 @@ impl StorageState {
                 }
             }
         }
-        for overlay in &self.transaction_stack {
+        for overlay in self.visible_overlay_stack(session) {
             if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
                 for row_id in deleted_row_ids {
                     rows.remove(row_id);
@@ -437,12 +499,12 @@ impl StorageState {
         rows.into_values().collect()
     }
 
-    fn find_visible_row(&self, relid: u32, row_id: u64) -> Option<Row> {
+    fn find_visible_row(&self, session: &SessionStorage, relid: u32, row_id: u64) -> Option<Row> {
         if row_id == 0 {
             return None;
         }
 
-        for overlay in self.transaction_stack.iter().rev() {
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
             if let Some(segment) = overlay.relations.get(&relid)
                 && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
             {
@@ -468,6 +530,7 @@ impl StorageState {
 
     fn find_visible_row_by_primary_key(
         &self,
+        session: &SessionStorage,
         relid: u32,
         primary_key_spec: &PrimaryKeySpec,
         key: &IndexKey,
@@ -477,7 +540,7 @@ impl StorageState {
             .get(&relid)
             .and_then(|relation| relation.primary_key_index.get(key).copied());
 
-        for overlay in self.transaction_stack.iter().rev() {
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
             if let Some(segment) = overlay.relations.get(&relid)
                 && let Some(row) = segment
                     .rows
@@ -502,6 +565,7 @@ impl StorageState {
 
     fn has_primary_key_conflict(
         &mut self,
+        session: &SessionStorage,
         relid: u32,
         row: &Row,
         replacing_row_id: Option<u64>,
@@ -513,11 +577,16 @@ impl StorageState {
             return false;
         };
 
-        self.find_visible_row_by_primary_key(relid, &primary_key_spec, &key)
+        self.find_visible_row_by_primary_key(session, relid, &primary_key_spec, &key)
             .is_some_and(|existing| Some(existing.row_id) != replacing_row_id)
     }
 
     fn primary_key_spec(&mut self, relid: u32) -> Option<PrimaryKeySpec> {
+        let catalog_generation = fastpg_catalog::current_generation();
+        if self.primary_key_generation != catalog_generation {
+            self.primary_key_specs.clear();
+            self.primary_key_generation = catalog_generation;
+        }
         if let Some(spec) = self.primary_key_specs.get(&relid) {
             return spec.clone();
         }
@@ -551,25 +620,29 @@ impl StorageState {
         }
     }
 
-    fn clear_relation(&mut self, relid: u32) {
+    fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
         self.invalidate_primary_key_spec(relid);
         self.relations.insert(relid, RelationRows::default());
-        for overlay in &mut self.transaction_stack {
+        for overlay in &mut session.transaction_stack {
             overlay.relations.remove(&relid);
             overlay.deleted_row_ids.remove(&relid);
         }
     }
 
-    fn commit_top_overlay(&mut self) {
-        let Some(overlay) = self.transaction_stack.pop() else {
+    fn commit_top_overlay(&mut self, session: &mut SessionStorage) {
+        let Some(overlay) = session.transaction_stack.pop() else {
             return;
         };
 
-        if let Some(parent) = self.transaction_stack.last_mut() {
+        if let Some(parent) = session.transaction_stack.last_mut() {
             merge_overlay_into_overlay(parent, overlay);
         } else {
             self.commit_overlay_to_relations(overlay);
         }
+    }
+
+    fn visible_overlay_stack<'a>(&self, session: &'a SessionStorage) -> &'a [TransactionOverlay] {
+        &session.transaction_stack
     }
 
     fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
@@ -731,12 +804,17 @@ fn primary_key_index_info_cache()
     PRIMARY_KEY_INDEX_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn with_storage<R>(f: impl FnOnce(&mut StorageState) -> R) -> R {
+fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStorage) -> R) -> R {
+    let session = current_session_storage();
+    let mut session = match session.lock() {
+        Ok(session) => session,
+        Err(poisoned) => poisoned.into_inner(),
+    };
     match storage().lock() {
-        Ok(mut state) => f(&mut state),
+        Ok(mut state) => f(&mut state, &mut session),
         Err(poisoned) => {
             let mut state = poisoned.into_inner();
-            f(&mut state)
+            f(&mut state, &mut session)
         }
     }
 }
@@ -1913,7 +1991,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_drop_relation(
         let dropped = drop_relation(&name, missing_ok)?;
         if let Some(relation) = dropped {
             clear_primary_key_index_info_cache();
-            with_storage(|state| state.clear_relation(relation.oid.0));
+            with_storage(|state, session| state.clear_relation(session, relation.oid.0));
         }
         Ok::<(), fastpg_catalog::CatalogError>(())
     })();
@@ -1947,7 +2025,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_truncate_relation(
     let result = (|| {
         let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
         let relation = truncate_relation(&name)?;
-        with_storage(|state| state.clear_relation(relation.oid.0));
+        with_storage(|state, session| state.clear_relation(session, relation.oid.0));
         Ok::<(), fastpg_catalog::CatalogError>(())
     })();
 
@@ -2028,7 +2106,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
         add_primary_key(&name, column_names)?;
         clear_primary_key_index_info_cache();
         if let Some(relation) = relation_by_name(&name) {
-            with_storage(|state| state.rebuild_primary_key_index(relation.oid.0));
+            with_storage(|state, _session| state.rebuild_primary_key_index(relation.oid.0));
         }
         Ok::<(), CatalogError>(())
     })();
@@ -2053,22 +2131,22 @@ pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_begin() {
-    with_storage(|state| state.begin_explicit_transaction());
+    with_storage(|state, session| state.begin_explicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_begin_implicit() {
-    with_storage(|state| state.ensure_transaction());
+    with_storage(|_state, session| session.ensure_transaction());
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_commit() {
-    with_storage(|state| state.commit_explicit_transaction());
+    with_storage(|state, session| state.commit_explicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_abort() {
-    with_storage(|state| state.abort_explicit_transaction());
+    with_storage(|state, session| state.abort_explicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
@@ -2082,52 +2160,59 @@ pub extern "C" fn fastpg_rust_xact_abort_if_implicit() {
 }
 
 pub fn commit_implicit_transaction() {
-    with_storage(|state| state.commit_implicit_transaction());
+    with_storage(|state, session| state.commit_implicit_transaction(session));
 }
 
 pub fn abort_implicit_transaction() {
-    with_storage(|state| state.abort_implicit_transaction());
+    with_storage(|state, session| state.abort_implicit_transaction(session));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_xact_is_explicit() -> bool {
+    with_storage(|state, session| state.is_explicit_transaction(session))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_subxact_begin() {
-    with_storage(|state| {
-        state.ensure_transaction();
-        state.transaction_stack.push(TransactionOverlay::default());
+    with_storage(|_state, session| {
+        session.ensure_transaction();
+        session
+            .transaction_stack
+            .push(TransactionOverlay::default());
     });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_subxact_commit() {
-    with_storage(|state| {
-        if state.transaction_stack.len() > 1 {
-            state.commit_top_overlay();
+    with_storage(|state, session| {
+        if session.transaction_stack.len() > 1 {
+            state.commit_top_overlay(session);
         }
     });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_subxact_abort() {
-    with_storage(|state| {
-        if state.transaction_stack.len() > 1 {
-            state.transaction_stack.pop();
+    with_storage(|_state, session| {
+        if session.transaction_stack.len() > 1 {
+            session.transaction_stack.pop();
         }
     });
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_clear(relid: u32) {
-    with_storage(|state| state.clear_relation(relid));
+    with_storage(|state, session| state.clear_relation(session, relid));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_row_count(relid: u32) -> usize {
-    with_storage(|state| state.visible_row_count(relid))
+    with_storage(|state, session| state.visible_row_count(session, relid))
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_contains_row(relid: u32, row_id: u64) -> bool {
-    with_storage(|state| state.find_visible_row(relid, row_id).is_some())
+    with_storage(|state, session| state.find_visible_row(session, relid, row_id).is_some())
 }
 
 #[unsafe(no_mangle)]
@@ -2155,10 +2240,15 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     } else {
         unsafe { slice::from_raw_parts(is_null, nkeys) }
     };
-    let row = with_storage(|state| {
+    let row = with_storage(|state, session| {
         let primary_key_spec = state.primary_key_spec(relation.oid.0)?;
         let key = primary_key_for_datums(&primary_key_spec, values, is_null)?;
-        Some(state.find_visible_row_by_primary_key(relation.oid.0, &primary_key_spec, &key))
+        Some(state.find_visible_row_by_primary_key(
+            session,
+            relation.oid.0,
+            &primary_key_spec,
+            &key,
+        ))
     })
     .flatten();
     let Some(row) = row else {
@@ -2188,15 +2278,15 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
         return false;
     };
 
-    with_storage(|state| {
+    with_storage(|state, session| {
         let row_id = match state.relations.entry(relid).or_default().allocate_row_id() {
             Some(row_id) => row_id,
             None => return false,
         };
 
-        state.ensure_transaction();
+        session.ensure_transaction();
         let cells = {
-            let segment = state
+            let segment = session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured")
@@ -2211,11 +2301,11 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
         };
 
         let row = Row { row_id, cells };
-        if state.has_primary_key_conflict(relid, &row, None) {
+        if state.has_primary_key_conflict(session, relid, &row, None) {
             return false;
         }
 
-        let segment = state
+        let segment = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured")
@@ -2251,14 +2341,14 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
         return false;
     };
 
-    with_storage(|state| {
-        if state.find_visible_row(relid, row_id).is_none() {
+    with_storage(|state, session| {
+        if state.find_visible_row(session, relid, row_id).is_none() {
             return false;
         }
 
-        state.ensure_transaction();
+        session.ensure_transaction();
         let cells = {
-            let overlay = state
+            let overlay = session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured");
@@ -2269,11 +2359,11 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
             }
         };
         let row = Row { row_id, cells };
-        if state.has_primary_key_conflict(relid, &row, Some(row_id)) {
+        if state.has_primary_key_conflict(session, relid, &row, Some(row_id)) {
             return false;
         }
 
-        let overlay = state
+        let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
@@ -2295,13 +2385,13 @@ pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
         return false;
     }
 
-    with_storage(|state| {
-        if state.find_visible_row(relid, row_id).is_none() {
+    with_storage(|state, session| {
+        if state.find_visible_row(session, relid, row_id).is_none() {
             return false;
         }
 
-        state.ensure_transaction();
-        let overlay = state
+        session.ensure_transaction();
+        let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
@@ -2904,25 +2994,25 @@ pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
         _ => None,
     };
 
-    with_storage(|state| {
+    with_storage(|state, session| {
         let scan = virtual_scan.unwrap_or_else(|| {
             state.relations.entry(relid).or_default();
             ScanState {
-                rows: state.visible_rows(relid),
+                rows: state.visible_rows(session, relid),
                 payloads: Vec::new(),
                 next_index: 0,
             }
         });
-        let handle = state.allocate_scan_handle();
-        state.scans.insert(handle, scan);
+        let handle = session.allocate_scan_handle();
+        session.scans.insert(handle, scan);
         handle
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_reset(scan_handle: u64) {
-    with_storage(|state| {
-        if let Some(scan) = state.scans.get_mut(&scan_handle) {
+    with_storage(|_state, session| {
+        if let Some(scan) = session.scans.get_mut(&scan_handle) {
             scan.next_index = 0;
         }
     });
@@ -2930,8 +3020,8 @@ pub extern "C" fn fastpg_rust_scan_reset(scan_handle: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_end(scan_handle: u64) {
-    with_storage(|state| {
-        state.scans.remove(&scan_handle);
+    with_storage(|_state, session| {
+        session.scans.remove(&scan_handle);
     });
 }
 
@@ -2944,8 +3034,8 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
-    let row = with_storage(|state| {
-        let scan = match state.scans.get_mut(&scan_handle) {
+    let row = with_storage(|_state, session| {
+        let scan = match session.scans.get_mut(&scan_handle) {
             Some(scan) => scan,
             None => return None,
         };
@@ -2988,7 +3078,7 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row(
     is_null_out: *mut u8,
     natts: usize,
 ) -> bool {
-    let row = with_storage(|state| state.find_visible_row(relid, row_id));
+    let row = with_storage(|state, session| state.find_visible_row(session, relid, row_id));
 
     match row {
         Some(row) => unsafe {
@@ -3276,6 +3366,43 @@ mod tests {
             unsafe { fetch_byval(relid, row_id, 1) },
             Some((vec![10], vec![0]))
         );
+    }
+
+    #[test]
+    fn transaction_overlays_are_session_owned() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let session_a = new_session_storage();
+        let session_b = new_session_storage();
+        let mut row_id = 0;
+
+        {
+            let _session_guard = enter_session_storage(session_a.clone());
+            fastpg_rust_xact_begin();
+            unsafe {
+                assert!(insert_byval(relid, &[42], &[0], &mut row_id));
+            }
+            assert!(fastpg_rust_xact_is_explicit());
+            assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        }
+
+        {
+            let _session_guard = enter_session_storage(session_b.clone());
+            assert!(!fastpg_rust_xact_is_explicit());
+            assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        }
+
+        {
+            let _session_guard = enter_session_storage(session_a);
+            assert!(fastpg_rust_xact_is_explicit());
+            fastpg_rust_xact_commit();
+        }
+
+        {
+            let _session_guard = enter_session_storage(session_b);
+            assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+            assert!(fastpg_rust_relation_contains_row(relid, row_id));
+        }
     }
 
     #[test]

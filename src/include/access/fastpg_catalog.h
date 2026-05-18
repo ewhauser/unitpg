@@ -268,6 +268,7 @@ extern void fastpg_rust_xact_commit(void);
 extern void fastpg_rust_xact_abort(void);
 extern void fastpg_rust_xact_commit_if_implicit(void);
 extern void fastpg_rust_xact_abort_if_implicit(void);
+extern bool fastpg_rust_xact_is_explicit(void);
 extern void fastpg_rust_subxact_begin(void);
 extern void fastpg_rust_subxact_commit(void);
 extern void fastpg_rust_subxact_abort(void);

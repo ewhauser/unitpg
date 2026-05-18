@@ -797,6 +797,7 @@ struct CatalogState {
     next_relation_oid: u32,
     relations_by_name: BTreeMap<String, RelationRecord>,
     relation_names_by_oid: BTreeMap<u32, String>,
+    generation: u64,
 }
 
 impl Default for CatalogState {
@@ -805,6 +806,7 @@ impl Default for CatalogState {
             next_relation_oid: FIRST_DYNAMIC_RELATION_OID,
             relations_by_name: BTreeMap::new(),
             relation_names_by_oid: BTreeMap::new(),
+            generation: 1,
         }
     }
 }
@@ -844,6 +846,14 @@ fn next_relation_oid(state: &mut CatalogState) -> Result<Oid, CatalogError> {
     Ok(Oid(oid))
 }
 
+fn bump_generation(state: &mut CatalogState) {
+    state.generation = state.generation.saturating_add(1).max(1);
+}
+
+pub fn current_generation() -> u64 {
+    with_catalog(|state| state.generation)
+}
+
 pub fn create_relation(
     name: &str,
     columns: Vec<ColumnRecord>,
@@ -879,6 +889,7 @@ pub fn create_relation(
             .relation_names_by_oid
             .insert(relation.oid.0, name.clone());
         state.relations_by_name.insert(name, relation.clone());
+        bump_generation(state);
         Ok(Some(relation))
     })
 }
@@ -888,6 +899,7 @@ pub fn drop_relation(name: &str, missing_ok: bool) -> Result<Option<RelationReco
     with_catalog(|state| match state.relations_by_name.remove(&name) {
         Some(relation) => {
             state.relation_names_by_oid.remove(&relation.oid.0);
+            bump_generation(state);
             Ok(Some(relation))
         }
         None if missing_ok => Ok(None),
@@ -901,9 +913,11 @@ pub fn drop_relation(name: &str, missing_ok: bool) -> Result<Option<RelationReco
 pub fn truncate_relation(name: &str) -> Result<RelationRecord, CatalogError> {
     let name = normalize_identifier(name);
     with_catalog(|state| {
-        state.relations_by_name.get(&name).cloned().ok_or_else(|| {
+        let relation = state.relations_by_name.get(&name).cloned().ok_or_else(|| {
             CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
-        })
+        })?;
+        bump_generation(state);
+        Ok(relation)
     })
 }
 
@@ -975,6 +989,7 @@ pub fn add_primary_key(name: &str, columns: Vec<String>) -> Result<(), CatalogEr
             }
         }
         relation.primary_key = columns;
+        bump_generation(state);
         Ok(())
     })
 }
@@ -2019,6 +2034,7 @@ mod tests {
     #[test]
     fn creates_drops_and_truncates_relations() {
         clear_for_tests();
+        let initial_generation = current_generation();
         let relation = create_relation(
             "PgBench_Accounts",
             vec![
@@ -2030,6 +2046,14 @@ mod tests {
         .unwrap()
         .expect("created");
 
+        assert!(current_generation() > initial_generation);
+        let after_create_generation = current_generation();
+        assert!(
+            create_relation("pgbench_accounts", Vec::new(), true)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(current_generation(), after_create_generation);
         assert_eq!(relation.name, "pgbench_accounts");
         assert_eq!(relation.columns[0].name, "aid");
         assert_eq!(
@@ -2044,7 +2068,11 @@ mod tests {
             truncate_relation("pgbench_accounts").unwrap().oid,
             relation.oid
         );
+        let after_truncate_generation = current_generation();
+        assert!(after_truncate_generation > after_create_generation);
         add_primary_key("pgbench_accounts", vec!["aid".to_owned()]).unwrap();
+        let after_primary_key_generation = current_generation();
+        assert!(after_primary_key_generation > after_truncate_generation);
         assert_eq!(
             relation_by_name("pgbench_accounts").unwrap().primary_key,
             vec!["aid"]
@@ -2056,6 +2084,7 @@ mod tests {
                 .oid,
             relation.oid
         );
+        assert!(current_generation() > after_primary_key_generation);
         assert!(relation_by_name("pgbench_accounts").is_none());
     }
 }

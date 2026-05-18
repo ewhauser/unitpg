@@ -4,11 +4,12 @@
 use std::collections::BTreeMap;
 #[cfg(feature = "postgres-execution")]
 use std::collections::HashMap;
+use std::sync::Arc;
 #[cfg(any(
     feature = "postgres-execution",
     all(feature = "mini-sql-testkit", not(feature = "postgres-execution"))
 ))]
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 use fastpg_bind::{BoundExpression, BoundStatement, bind};
@@ -68,15 +69,40 @@ pub enum QueryExecution {
 }
 
 #[derive(Clone, Debug)]
-pub struct QueryExecutor {
+pub struct QueryExecutorShared {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     server_version: String,
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     database: Arc<Mutex<DatabaseState>>,
+}
+
+impl QueryExecutorShared {
+    pub fn new(server_version: impl Into<String>) -> Self {
+        #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+        {
+            Self {
+                server_version: server_version.into(),
+                database: Arc::new(Mutex::new(DatabaseState::default())),
+            }
+        }
+        #[cfg(not(all(feature = "mini-sql-testkit", not(feature = "postgres-execution"))))]
+        {
+            let _ = server_version.into();
+            Self {}
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct QueryExecutor {
+    #[allow(dead_code)]
+    shared: Arc<QueryExecutorShared>,
     #[cfg(feature = "postgres-execution")]
     pgcore_session: PgCoreSession,
     #[cfg(feature = "postgres-execution")]
     prepared_cache: Arc<Mutex<HashMap<String, Arc<CachedPgCoreStatement>>>>,
+    #[cfg(feature = "postgres-execution")]
+    storage_session: fastpg_storage::SessionStorageHandle,
 }
 
 #[cfg(feature = "postgres-execution")]
@@ -84,6 +110,7 @@ pub struct QueryExecutor {
 struct CachedPgCoreStatement {
     statement: PreparedStatement,
     description: QueryDescription,
+    catalog_generation: u64,
 }
 
 #[cfg(feature = "postgres-execution")]
@@ -109,25 +136,26 @@ const PGBENCH_INSERT_HISTORY: &str = "INSERT INTO pgbench_history (tid, bid, aid
 
 impl QueryExecutor {
     pub fn new(server_version: impl Into<String>) -> Self {
+        Self::with_shared(Arc::new(QueryExecutorShared::new(server_version)))
+    }
+
+    pub fn with_shared(shared: Arc<QueryExecutorShared>) -> Self {
         #[cfg(feature = "postgres-execution")]
         {
-            let _ = server_version.into();
             Self {
+                shared,
                 pgcore_session: PgCoreSession::new(),
                 prepared_cache: Arc::new(Mutex::new(HashMap::new())),
+                storage_session: fastpg_storage::new_session_storage(),
             }
         }
         #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
         {
-            Self {
-                server_version: server_version.into(),
-                database: Arc::new(Mutex::new(DatabaseState::default())),
-            }
+            Self { shared }
         }
         #[cfg(not(any(feature = "postgres-execution", feature = "mini-sql-testkit")))]
         {
-            let _ = server_version.into();
-            Self {}
+            Self { shared }
         }
     }
 
@@ -180,6 +208,7 @@ impl QueryExecutor {
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
         #[cfg(feature = "postgres-execution")]
         {
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
             fastpg_storage::copy_text_line(table, line)
         }
         #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -190,6 +219,7 @@ impl QueryExecutor {
             }
 
             let mut database = self
+                .shared
                 .database
                 .lock()
                 .expect("fastpg database mutex poisoned");
@@ -210,6 +240,7 @@ impl QueryExecutor {
     pub fn finish_copy(&self) {
         #[cfg(feature = "postgres-execution")]
         {
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
             fastpg_storage::commit_implicit_transaction();
         }
     }
@@ -217,6 +248,7 @@ impl QueryExecutor {
     pub fn abort_copy(&self) {
         #[cfg(feature = "postgres-execution")]
         {
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
             fastpg_storage::abort_implicit_transaction();
         }
     }
@@ -245,7 +277,12 @@ impl QueryExecutor {
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
 
-        match cached.statement.execute_with_params(&parameters) {
+        let execution_result = {
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            cached.statement.execute_with_params(&parameters)
+        };
+
+        match execution_result {
             Ok(result) => {
                 let execution = pgcore_execution_to_query_execution(result);
                 if invalidates_pgcore_cache(&execution) {
@@ -267,21 +304,31 @@ impl QueryExecutor {
         }
 
         let cache_key = pgcore_cache_key(sql);
-        if let Some(cached) = self
-            .prepared_cache
-            .lock()
-            .expect("fastpg prepared statement cache mutex poisoned")
-            .get(&cache_key)
-            .cloned()
-        {
-            return Ok(cached);
-        }
+        let catalog_generation = fastpg_catalog::current_generation();
+        let stale = {
+            let mut cache = self
+                .prepared_cache
+                .lock()
+                .expect("fastpg prepared statement cache mutex poisoned");
+            if let Some(cached) = cache.get(&cache_key).cloned() {
+                if cached.catalog_generation == catalog_generation {
+                    return Ok(cached);
+                }
+                cache.remove(&cache_key)
+            } else {
+                None
+            }
+        };
+        drop(stale);
 
         let cached = self.prepare_uncached_pgcore(sql)?;
-        self.prepared_cache
-            .lock()
-            .expect("fastpg prepared statement cache mutex poisoned")
-            .insert(cache_key, cached.clone());
+        if cached.catalog_generation == catalog_generation {
+            self.prepared_cache
+                .lock()
+                .expect("fastpg prepared statement cache mutex poisoned")
+                .insert(cache_key, cached.clone());
+        }
+
         Ok(cached)
     }
 
@@ -290,11 +337,14 @@ impl QueryExecutor {
         &self,
         sql: &str,
     ) -> Result<Arc<CachedPgCoreStatement>, fastpg_pgcore::PgCoreError> {
+        let catalog_generation = fastpg_catalog::current_generation();
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
         let statement = self.pgcore_session.prepare(sql)?;
         let description = query_description_from_pgcore(&statement);
         Ok(Arc::new(CachedPgCoreStatement {
             statement,
             description,
+            catalog_generation,
         }))
     }
 
@@ -315,7 +365,7 @@ impl QueryExecutor {
             )),
             BoundStatement::ShowServerVersion => QueryExecution::Rows(QueryResult::new(
                 result_fields_for_statement(&BoundStatement::ShowServerVersion),
-                vec![vec![Value::Text(self.server_version.clone())]],
+                vec![vec![Value::Text(self.shared.server_version.clone())]],
             )),
             BoundStatement::SelectInt4Parameter => match parameters.first() {
                 Some(Value::Int4(value)) => QueryExecution::Rows(QueryResult::new(
@@ -374,6 +424,7 @@ impl QueryExecutor {
     fn result_fields(&self, statement: &BoundStatement) -> Vec<Column> {
         if let BoundStatement::SelectColumnWhereInt { table, column, .. } = statement {
             let database = self
+                .shared
                 .database
                 .lock()
                 .expect("fastpg database mutex poisoned");
@@ -395,6 +446,7 @@ impl QueryExecutor {
 
         let table = normalize_identifier(table);
         let database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -411,6 +463,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_pgbench_partition_info(&self) -> QueryExecution {
         let database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -430,6 +483,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_count(&self, table: &str) -> QueryExecution {
         let database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -454,6 +508,7 @@ impl QueryExecutor {
         key_value: i64,
     ) -> QueryExecution {
         let database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -470,6 +525,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_drop_tables(&self, if_exists: bool, names: &[String]) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -487,6 +543,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_create_table(&self, name: String, columns: Vec<Column>) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -504,6 +561,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_truncate_tables(&self, names: &[String]) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -523,6 +581,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_begin(&self) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -537,6 +596,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_commit(&self) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -550,6 +610,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_rollback(&self) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -565,6 +626,7 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_copy_from_stdin(&self, table: &str) -> QueryExecution {
         let database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -588,6 +650,7 @@ impl QueryExecutor {
         key_value: i64,
     ) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");
@@ -612,6 +675,7 @@ impl QueryExecutor {
         values: &[BoundExpression],
     ) -> QueryExecution {
         let mut database = self
+            .shared
             .database
             .lock()
             .expect("fastpg database mutex poisoned");

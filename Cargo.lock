@@ -291,6 +291,7 @@ name = "fastpg-pgcore"
 version = "0.1.0"
 dependencies = [
  "cc",
+ "fastpg-catalog",
  "fastpg-storage",
 ]
 
@@ -341,6 +342,7 @@ dependencies = [
 name = "fastpg-testkit"
 version = "0.1.0"
 dependencies = [
+ "fastpg-pgcore",
  "fastpg-server",
  "tokio",
  "tokio-postgres",

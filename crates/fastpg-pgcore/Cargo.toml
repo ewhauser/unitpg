@@ -11,6 +11,7 @@ postgres-linked = []
 postgres-execution = ["postgres-linked"]
 
 [dependencies]
+fastpg-catalog.workspace = true
 fastpg-storage.workspace = true
 
 [build-dependencies]
