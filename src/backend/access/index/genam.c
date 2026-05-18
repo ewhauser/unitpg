@@ -20,6 +20,9 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
@@ -393,6 +396,9 @@ systable_beginscan(Relation heapRelation,
 {
 	SysScanDesc sysscan;
 	Relation	irel;
+#ifdef USE_FASTPG
+	bool		fastpg_virtual_catalog_scan;
+#endif
 
 	/*
 	 * If this backend promised that it won't access shared catalogs during
@@ -401,6 +407,21 @@ systable_beginscan(Relation heapRelation,
 	Assert(!HistoricSnapshotActive() ||
 		   accessSharedCatalogsInDecoding ||
 		   !heapRelation->rd_rel->relisshared);
+
+#ifdef USE_FASTPG
+	fastpg_virtual_catalog_scan =
+		fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRelation)) != 0;
+
+	/*
+	 * Fastpg virtual catalogs are backed by Rust rows, not physical catalog
+	 * indexes.  Force the normal systable path to scan those virtual rows
+	 * directly; opening the declared PostgreSQL catalog index would pull us
+	 * back into physical relation state that the Rust server intentionally
+	 * does not initialize.
+	 */
+	if (fastpg_virtual_catalog_scan)
+		indexOK = false;
+#endif
 
 	if (indexOK &&
 		!IgnoreSystemIndexes &&
@@ -419,8 +440,18 @@ systable_beginscan(Relation heapRelation,
 	{
 		Oid			relid = RelationGetRelid(heapRelation);
 
-		snapshot = RegisterSnapshot(GetCatalogSnapshot(relid));
-		sysscan->snapshot = snapshot;
+#ifdef USE_FASTPG
+		if (fastpg_virtual_catalog_scan)
+		{
+			snapshot = SnapshotAny;
+			sysscan->snapshot = NULL;
+		}
+		else
+#endif
+		{
+			snapshot = RegisterSnapshot(GetCatalogSnapshot(relid));
+			sysscan->snapshot = snapshot;
+		}
 	}
 	else
 	{

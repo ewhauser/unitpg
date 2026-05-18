@@ -924,6 +924,56 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn autocommit_rows_survive_explicit_rollback() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_rollback_{}", std::process::id());
+        session
+            .prepare(&format!(
+                "create table {table}(id int not null, amount int)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1, 10)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session.prepare("begin").unwrap().execute().unwrap();
+        session
+            .prepare(&format!("update {table} set amount = 20 where id = 1"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (2, 30)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session.prepare("rollback").unwrap().execute().unwrap();
+
+        let result = session
+            .prepare(&format!("select id, amount from {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![
+                PgCoreValue::Text("1".to_owned()),
+                PgCoreValue::Text("10".to_owned())
+            ]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_copy_from_stdin_utility() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_copy_{}", std::process::id());

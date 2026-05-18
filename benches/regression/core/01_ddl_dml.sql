@@ -1,0 +1,12 @@
+DROP TABLE IF EXISTS fastpg_reg_basic;
+CREATE TABLE fastpg_reg_basic (id int NOT NULL, qty int, note text);
+INSERT INTO fastpg_reg_basic VALUES (1, 10, 'one');
+INSERT INTO fastpg_reg_basic VALUES (2, 20, 'two');
+INSERT INTO fastpg_reg_basic VALUES (3, 30, 'three');
+SELECT 'basic_before', id, qty, note FROM fastpg_reg_basic;
+UPDATE fastpg_reg_basic SET qty = qty + 7 WHERE id = 2;
+DELETE FROM fastpg_reg_basic WHERE id = 3;
+SELECT 'basic_after', id, qty, note FROM fastpg_reg_basic;
+TRUNCATE fastpg_reg_basic;
+SELECT 'basic_count', count(*) FROM fastpg_reg_basic;
+DROP TABLE fastpg_reg_basic;

@@ -1153,7 +1153,10 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 			break;
 
 		case OIDVECTOROID:
+		case INT2VECTOROID:
 		case OIDARRAYOID:
+		case INT2ARRAYOID:
+		case INT4ARRAYOID:
 		case FLOAT4ARRAYOID:
 		case ANYARRAYOID:
 		case CHARARRAYOID:

@@ -7,14 +7,14 @@ use std::slice;
 use std::sync::{Mutex, OnceLock};
 
 use fastpg_catalog::{
-    BPCHAR_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID,
-    PG_CATALOG_NAMESPACE_OID, TEXT_OID, TIMESTAMP_OID, VARCHAR_OID, add_primary_key,
-    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
-    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_proc_by_oid, builtin_procs_by_name, builtin_type_by_name, create_relation,
-    drop_relation, lookup_builtin_type, relation_by_name, relation_by_oid, relation_column_count,
-    relations, truncate_relation, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
-    virtual_catalogs,
+    BPCHAR_OID, CID_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID,
+    PG_CATALOG_NAMESPACE_OID, TEXT_OID, TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
+    add_primary_key, builtin_aggregate_by_proc_oid, builtin_cast_by_source_target,
+    builtin_namespace_by_name, builtin_namespace_by_oid, builtin_operator_by_oid,
+    builtin_operator_by_signature, builtin_proc_by_oid, builtin_procs_by_name,
+    builtin_type_by_name, create_relation, drop_relation, lookup_builtin_type, relation_by_name,
+    relation_by_oid, relation_column_count, relations, truncate_relation, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid, virtual_catalogs,
 };
 use fastpg_types::Oid;
 
@@ -22,12 +22,18 @@ const NAMEDATALEN: usize = 64;
 const FASTPG_PROC_MAX_ARGS: usize = 8;
 const FASTPG_PROC_SOURCE_LEN: usize = 64;
 const PG_CLASS_RELATION_ID: u32 = 1259;
+const PG_ATTRIBUTE_RELATION_ID: u32 = 1249;
 const PG_CLASS_ATTRIBUTE_COUNT: u16 = 34;
 const PG_ATTRIBUTE_ATTRIBUTE_COUNT: u16 = 25;
 const PG_PROC_ATTRIBUTE_COUNT: u16 = 30;
 const PG_TYPE_ATTRIBUTE_COUNT: u16 = 32;
 const PG_INDEX_ATTRIBUTE_COUNT: u16 = 21;
 const PG_NAMESPACE_ATTRIBUTE_COUNT: u16 = 4;
+const PG_CONSTRAINT_ATTRIBUTE_COUNT: u16 = 28;
+const PG_OPCLASS_ATTRIBUTE_COUNT: u16 = 9;
+const PG_INDEX_RELATION_ID: u32 = 2610;
+const PG_CONSTRAINT_RELATION_ID: u32 = 2606;
+const PG_OPCLASS_RELATION_ID: u32 = 2616;
 const HEAP_TABLE_AM_OID: u32 = 2;
 const BTREE_INDEX_AM_OID: u32 = 403;
 const BOOTSTRAP_SUPERUSER_OID: u32 = 10;
@@ -35,6 +41,14 @@ const FIRST_NORMAL_TRANSACTION_ID: u32 = 3;
 const FIRST_MULTI_XACT_ID: u32 = 1;
 const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
 const FASTPG_MAX_INDEX_KEYS: usize = 32;
+const INT2_BTREE_OPS_OID: u32 = 1979;
+const INT4_BTREE_OPS_OID: u32 = 1978;
+const INT8_BTREE_OPS_OID: u32 = 3124;
+const OID_BTREE_OPS_OID: u32 = 1981;
+const TEXT_BTREE_OPS_OID: u32 = 3126;
+const INTEGER_BTREE_FAMILY_OID: u32 = 1976;
+const OID_BTREE_FAMILY_OID: u32 = 1989;
+const TEXT_BTREE_FAMILY_OID: u32 = 1994;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -290,6 +304,7 @@ struct StorageState {
     relations: HashMap<u32, RelationRows>,
     primary_key_specs: HashMap<u32, Option<PrimaryKeySpec>>,
     transaction_stack: Vec<TransactionOverlay>,
+    explicit_transaction: bool,
     scans: HashMap<u64, ScanState>,
     next_scan_handle: u64,
 }
@@ -300,6 +315,7 @@ impl Default for StorageState {
             relations: HashMap::new(),
             primary_key_specs: HashMap::new(),
             transaction_stack: Vec::new(),
+            explicit_transaction: false,
             scans: HashMap::new(),
             next_scan_handle: 1,
         }
@@ -319,6 +335,41 @@ impl StorageState {
     fn ensure_transaction(&mut self) {
         if self.transaction_stack.is_empty() {
             self.transaction_stack.push(TransactionOverlay::default());
+        }
+    }
+
+    fn begin_explicit_transaction(&mut self) {
+        if !self.explicit_transaction {
+            self.commit_implicit_transaction();
+        }
+        self.ensure_transaction();
+        self.explicit_transaction = true;
+    }
+
+    fn commit_explicit_transaction(&mut self) {
+        while !self.transaction_stack.is_empty() {
+            self.commit_top_overlay();
+        }
+        self.explicit_transaction = false;
+    }
+
+    fn abort_explicit_transaction(&mut self) {
+        self.transaction_stack.clear();
+        self.explicit_transaction = false;
+    }
+
+    fn commit_implicit_transaction(&mut self) {
+        if self.explicit_transaction {
+            return;
+        }
+        while !self.transaction_stack.is_empty() {
+            self.commit_top_overlay();
+        }
+    }
+
+    fn abort_implicit_transaction(&mut self) {
+        if !self.explicit_transaction {
+            self.transaction_stack.clear();
         }
     }
 
@@ -845,11 +896,13 @@ fn primary_key_index_to_ffi(
 fn virtual_catalog_column_count(relation_oid: Oid) -> u16 {
     match relation_oid.0 {
         PG_CLASS_RELATION_ID => PG_CLASS_ATTRIBUTE_COUNT,
-        1249 => PG_ATTRIBUTE_ATTRIBUTE_COUNT,
+        PG_ATTRIBUTE_RELATION_ID => PG_ATTRIBUTE_ATTRIBUTE_COUNT,
         1255 => PG_PROC_ATTRIBUTE_COUNT,
         1247 => PG_TYPE_ATTRIBUTE_COUNT,
-        2610 => PG_INDEX_ATTRIBUTE_COUNT,
+        PG_INDEX_RELATION_ID => PG_INDEX_ATTRIBUTE_COUNT,
         2615 => PG_NAMESPACE_ATTRIBUTE_COUNT,
+        PG_CONSTRAINT_RELATION_ID => PG_CONSTRAINT_ATTRIBUTE_COUNT,
+        PG_OPCLASS_RELATION_ID => PG_OPCLASS_ATTRIBUTE_COUNT,
         _ => 0,
     }
 }
@@ -2000,24 +2053,40 @@ pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_begin() {
+    with_storage(|state| state.begin_explicit_transaction());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_xact_begin_implicit() {
     with_storage(|state| state.ensure_transaction());
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_commit() {
-    with_storage(|state| {
-        while state.transaction_stack.len() > 1 {
-            state.commit_top_overlay();
-        }
-        state.commit_top_overlay();
-    });
+    with_storage(|state| state.commit_explicit_transaction());
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_abort() {
-    with_storage(|state| {
-        state.transaction_stack.clear();
-    });
+    with_storage(|state| state.abort_explicit_transaction());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_xact_commit_if_implicit() {
+    commit_implicit_transaction();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_xact_abort_if_implicit() {
+    abort_implicit_transaction();
+}
+
+pub fn commit_implicit_transaction() {
+    with_storage(|state| state.commit_implicit_transaction());
+}
+
+pub fn abort_implicit_transaction() {
+    with_storage(|state| state.abort_implicit_transaction());
 }
 
 #[unsafe(no_mangle)]
@@ -2337,6 +2406,14 @@ fn datum(value: usize) -> Cell {
     }
 }
 
+fn int2_datum(value: i16) -> Cell {
+    datum(value as usize)
+}
+
+fn int4_datum(value: i32) -> Cell {
+    datum(value as usize)
+}
+
 fn null_datum() -> Cell {
     Cell {
         value: 0,
@@ -2369,6 +2446,342 @@ fn name_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
     }
     payloads.push(bytes.to_vec().into_boxed_slice());
     datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+}
+
+fn varlena_4b_header(size: usize) -> u32 {
+    let size = size.min(0x3fff_ffff) as u32;
+    #[cfg(target_endian = "little")]
+    {
+        size << 2
+    }
+    #[cfg(target_endian = "big")]
+    {
+        size
+    }
+}
+
+fn push_i32_ne(bytes: &mut Vec<u8>, value: i32) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_u32_ne(bytes: &mut Vec<u8>, value: u32) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn push_i16_ne(bytes: &mut Vec<u8>, value: i16) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
+fn int2vector_datum(values: &[i16], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+    let total_len = 24 + values.len() * std::mem::size_of::<i16>();
+    let mut bytes = Vec::with_capacity(total_len);
+    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
+    push_i32_ne(&mut bytes, 1);
+    push_i32_ne(&mut bytes, 0);
+    push_u32_ne(&mut bytes, INT2_OID.0);
+    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
+    push_i32_ne(&mut bytes, 0);
+    for value in values {
+        push_i16_ne(&mut bytes, *value);
+    }
+    payloads.push(bytes.into_boxed_slice());
+    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+}
+
+fn oidvector_datum(values: &[u32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+    let total_len = 24 + std::mem::size_of_val(values);
+    let mut bytes = Vec::with_capacity(total_len);
+    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
+    push_i32_ne(&mut bytes, 1);
+    push_i32_ne(&mut bytes, 0);
+    push_u32_ne(&mut bytes, OID_OID.0);
+    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
+    push_i32_ne(&mut bytes, 0);
+    for value in values {
+        push_u32_ne(&mut bytes, *value);
+    }
+    payloads.push(bytes.into_boxed_slice());
+    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+}
+
+fn pg_attribute_scan_row(
+    relation_oid: Oid,
+    attnum: i16,
+    name: &str,
+    type_oid: Oid,
+    type_mod: i32,
+    is_not_null: bool,
+    payloads: &mut Vec<Box<[u8]>>,
+) -> Option<Row> {
+    let type_record = lookup_builtin_type(type_oid)?;
+    Some(Row {
+        row_id: ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
+        cells: vec![
+            datum(relation_oid.0 as usize),
+            name_datum(name, payloads),
+            datum(type_oid.0 as usize),
+            int2_datum(type_record.typlen),
+            int2_datum(attnum),
+            int4_datum(type_mod),
+            int2_datum(0),
+            bool_datum(type_record.typbyval),
+            char_datum(type_record.typalign),
+            char_datum(type_record.typstorage),
+            char_datum(0),
+            bool_datum(is_not_null),
+            bool_datum(false),
+            bool_datum(false),
+            char_datum(0),
+            char_datum(0),
+            bool_datum(false),
+            bool_datum(true),
+            int2_datum(0),
+            datum(type_record.typcollation.0 as usize),
+            int2_datum(-1),
+            null_datum(),
+            null_datum(),
+            null_datum(),
+            null_datum(),
+        ],
+    })
+}
+
+fn push_system_attribute_rows(
+    rows: &mut Vec<Row>,
+    payloads: &mut Vec<Box<[u8]>>,
+    relation_oid: Oid,
+) {
+    let system_attributes = [
+        ("ctid", -1, TID_OID),
+        ("xmin", -2, XID_OID),
+        ("cmin", -3, CID_OID),
+        ("xmax", -4, XID_OID),
+        ("cmax", -5, CID_OID),
+        ("tableoid", -6, OID_OID),
+    ];
+    for (name, attnum, type_oid) in system_attributes {
+        if let Some(row) =
+            pg_attribute_scan_row(relation_oid, attnum, name, type_oid, -1, true, payloads)
+        {
+            rows.push(row);
+        }
+    }
+}
+
+fn push_user_attribute_rows(
+    rows: &mut Vec<Row>,
+    payloads: &mut Vec<Box<[u8]>>,
+    relation_oid: Oid,
+    columns: &[ColumnRecord],
+) {
+    for (index, column) in columns.iter().enumerate() {
+        let Some(attnum) = i16::try_from(index + 1).ok() else {
+            continue;
+        };
+        if let Some(row) = pg_attribute_scan_row(
+            relation_oid,
+            attnum,
+            &column.name,
+            column.type_oid,
+            column.type_mod,
+            column.is_not_null,
+            payloads,
+        ) {
+            rows.push(row);
+        }
+    }
+}
+
+fn pg_attribute_scan_state() -> ScanState {
+    let mut payloads = Vec::new();
+    let mut rows = Vec::new();
+
+    for relation in relations() {
+        push_system_attribute_rows(&mut rows, &mut payloads, relation.oid);
+        push_user_attribute_rows(&mut rows, &mut payloads, relation.oid, &relation.columns);
+
+        let Some(index_oid) = primary_key_index_oid(&relation) else {
+            continue;
+        };
+        let index_columns = relation
+            .primary_key
+            .iter()
+            .filter_map(|primary_key_column| {
+                relation
+                    .columns
+                    .iter()
+                    .find(|column| &column.name == primary_key_column)
+                    .cloned()
+            })
+            .collect::<Vec<_>>();
+        push_system_attribute_rows(&mut rows, &mut payloads, index_oid);
+        push_user_attribute_rows(&mut rows, &mut payloads, index_oid, &index_columns);
+    }
+
+    ScanState {
+        rows,
+        payloads,
+        next_index: 0,
+    }
+}
+
+fn btree_opclass_for_type(type_oid: u32) -> Option<u32> {
+    match Oid(type_oid) {
+        INT2_OID => Some(INT2_BTREE_OPS_OID),
+        INT4_OID => Some(INT4_BTREE_OPS_OID),
+        INT8_OID => Some(INT8_BTREE_OPS_OID),
+        OID_OID => Some(OID_BTREE_OPS_OID),
+        TEXT_OID | VARCHAR_OID => Some(TEXT_BTREE_OPS_OID),
+        _ => None,
+    }
+}
+
+fn pg_index_scan_row(
+    index_info: FastPgRustPrimaryKeyIndexInfo,
+    payloads: &mut Vec<Box<[u8]>>,
+) -> Option<Row> {
+    let key_count = usize::from(index_info.key_count);
+    if key_count == 0 || key_count > FASTPG_MAX_INDEX_KEYS {
+        return None;
+    }
+
+    let attnums = &index_info.attnums[..key_count];
+    let collations = &index_info.collation_oids[..key_count];
+    let opclasses = index_info.type_oids[..key_count]
+        .iter()
+        .copied()
+        .map(btree_opclass_for_type)
+        .collect::<Option<Vec<_>>>()?;
+    let options = vec![0i16; key_count];
+
+    Some(Row {
+        row_id: index_info.index_oid as u64,
+        cells: vec![
+            datum(index_info.index_oid as usize),
+            datum(index_info.heap_oid as usize),
+            int2_datum(index_info.key_count as i16),
+            int2_datum(index_info.key_count as i16),
+            bool_datum(true),
+            bool_datum(false),
+            bool_datum(true),
+            bool_datum(false),
+            bool_datum(true),
+            bool_datum(false),
+            bool_datum(true),
+            bool_datum(false),
+            bool_datum(true),
+            bool_datum(true),
+            bool_datum(false),
+            int2vector_datum(attnums, payloads),
+            oidvector_datum(collations, payloads),
+            oidvector_datum(&opclasses, payloads),
+            int2vector_datum(&options, payloads),
+            null_datum(),
+            null_datum(),
+        ],
+    })
+}
+
+fn pg_index_scan_state() -> ScanState {
+    let mut payloads = Vec::new();
+    let mut rows = Vec::new();
+
+    for relation in relations() {
+        let Some(index_oid) = primary_key_index_oid(&relation) else {
+            continue;
+        };
+        let Some(index_info) = primary_key_index_info(&relation, index_oid) else {
+            continue;
+        };
+        if let Some(row) = pg_index_scan_row(index_info, &mut payloads) {
+            rows.push(row);
+        }
+    }
+
+    ScanState {
+        rows,
+        payloads,
+        next_index: 0,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PgOpclassScanRow {
+    oid: u32,
+    name: &'static str,
+    family_oid: u32,
+    input_type_oid: Oid,
+}
+
+fn pg_opclass_scan_row(record: PgOpclassScanRow, payloads: &mut Vec<Box<[u8]>>) -> Row {
+    Row {
+        row_id: record.oid as u64,
+        cells: vec![
+            datum(record.oid as usize),
+            datum(BTREE_INDEX_AM_OID as usize),
+            name_datum(record.name, payloads),
+            datum(PG_CATALOG_NAMESPACE_OID.0 as usize),
+            datum(BOOTSTRAP_SUPERUSER_OID as usize),
+            datum(record.family_oid as usize),
+            datum(record.input_type_oid.0 as usize),
+            bool_datum(true),
+            datum(0),
+        ],
+    }
+}
+
+fn pg_opclass_scan_state() -> ScanState {
+    let mut payloads = Vec::new();
+    let opclasses = [
+        PgOpclassScanRow {
+            oid: INT2_BTREE_OPS_OID,
+            name: "int2_ops",
+            family_oid: INTEGER_BTREE_FAMILY_OID,
+            input_type_oid: INT2_OID,
+        },
+        PgOpclassScanRow {
+            oid: INT4_BTREE_OPS_OID,
+            name: "int4_ops",
+            family_oid: INTEGER_BTREE_FAMILY_OID,
+            input_type_oid: INT4_OID,
+        },
+        PgOpclassScanRow {
+            oid: INT8_BTREE_OPS_OID,
+            name: "int8_ops",
+            family_oid: INTEGER_BTREE_FAMILY_OID,
+            input_type_oid: INT8_OID,
+        },
+        PgOpclassScanRow {
+            oid: OID_BTREE_OPS_OID,
+            name: "oid_ops",
+            family_oid: OID_BTREE_FAMILY_OID,
+            input_type_oid: OID_OID,
+        },
+        PgOpclassScanRow {
+            oid: TEXT_BTREE_OPS_OID,
+            name: "text_ops",
+            family_oid: TEXT_BTREE_FAMILY_OID,
+            input_type_oid: TEXT_OID,
+        },
+    ];
+    let rows = opclasses
+        .into_iter()
+        .map(|opclass| pg_opclass_scan_row(opclass, &mut payloads))
+        .collect();
+
+    ScanState {
+        rows,
+        payloads,
+        next_index: 0,
+    }
+}
+
+fn empty_scan_state() -> ScanState {
+    ScanState {
+        rows: Vec::new(),
+        payloads: Vec::new(),
+        next_index: 0,
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -2481,7 +2894,15 @@ fn pg_class_scan_state() -> ScanState {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
-    let virtual_scan = (relid == PG_CLASS_RELATION_ID).then(pg_class_scan_state);
+    let virtual_scan = match relid {
+        PG_CLASS_RELATION_ID => Some(pg_class_scan_state()),
+        PG_ATTRIBUTE_RELATION_ID => Some(pg_attribute_scan_state()),
+        PG_INDEX_RELATION_ID => Some(pg_index_scan_state()),
+        PG_OPCLASS_RELATION_ID => Some(pg_opclass_scan_state()),
+        PG_CONSTRAINT_RELATION_ID => Some(empty_scan_state()),
+        _ if virtual_catalog_by_relation_oid(Oid(relid)).is_some() => Some(empty_scan_state()),
+        _ => None,
+    };
 
     with_storage(|state| {
         let scan = virtual_scan.unwrap_or_else(|| {
@@ -2832,6 +3253,29 @@ mod tests {
 
         assert_eq!(fastpg_rust_relation_row_count(relid), 1);
         assert!(fastpg_rust_relation_contains_row(relid, row_id));
+    }
+
+    #[test]
+    fn implicit_rows_are_committed_before_explicit_rollback() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        unsafe {
+            assert!(insert_byval(relid, &[10], &[0], &mut row_id));
+        }
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(update_byval(relid, row_id, &[20], &[0]));
+        }
+        fastpg_rust_xact_abort();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert_eq!(
+            unsafe { fetch_byval(relid, row_id, 1) },
+            Some((vec![10], vec![0]))
+        );
     }
 
     #[test]

@@ -17,6 +17,9 @@
 
 #include "access/amapi.h"
 #include "access/attmap.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/gist.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -2367,6 +2370,32 @@ ResolveOpClass(const List *opclass, Oid attrType,
  * Given the OIDs of a datatype and an access method, find the default
  * operator class, if any.  Returns InvalidOid if there is none.
  */
+#ifdef USE_FASTPG
+static Oid
+FastPgGetDefaultOpClass(Oid type_id, Oid am_id)
+{
+	if (am_id != BTREE_AM_OID)
+		return InvalidOid;
+
+	switch (type_id)
+	{
+		case INT2OID:
+			return INT2_BTREE_OPS_OID;
+		case INT4OID:
+			return INT4_BTREE_OPS_OID;
+		case INT8OID:
+			return INT8_BTREE_OPS_OID;
+		case OIDOID:
+			return OID_BTREE_OPS_OID;
+		case TEXTOID:
+		case VARCHAROID:
+			return TEXT_BTREE_OPS_OID;
+		default:
+			return InvalidOid;
+	}
+}
+#endif
+
 Oid
 GetDefaultOpClass(Oid type_id, Oid am_id)
 {
@@ -2382,6 +2411,12 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 
 	/* If it's a domain, look at the base type instead */
 	type_id = getBaseType(type_id);
+
+#ifdef USE_FASTPG
+	result = FastPgGetDefaultOpClass(type_id, am_id);
+	if (OidIsValid(result))
+		return result;
+#endif
 
 	tcategory = TypeCategory(type_id);
 

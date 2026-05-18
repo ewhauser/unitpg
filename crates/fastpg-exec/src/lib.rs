@@ -207,6 +207,20 @@ impl QueryExecutor {
         }
     }
 
+    pub fn finish_copy(&self) {
+        #[cfg(feature = "postgres-execution")]
+        {
+            fastpg_storage::commit_implicit_transaction();
+        }
+    }
+
+    pub fn abort_copy(&self) {
+        #[cfg(feature = "postgres-execution")]
+        {
+            fastpg_storage::abort_implicit_transaction();
+        }
+    }
+
     #[cfg(feature = "postgres-execution")]
     fn describe_pgcore(&self, sql: &str) -> Option<QueryDescription> {
         self.prepare_pgcore(sql)

@@ -28,6 +28,14 @@ impl SessionState {
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
         self.executor.copy_text_line(table, line)
     }
+
+    pub fn finish_copy(&self) {
+        self.executor.finish_copy();
+    }
+
+    pub fn abort_copy(&self) {
+        self.executor.abort_copy();
+    }
 }
 
 impl Default for SessionState {

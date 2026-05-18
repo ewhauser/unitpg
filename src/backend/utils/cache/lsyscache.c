@@ -19,6 +19,7 @@
 #include "access/fastpg_catalog.h"
 #endif
 #include "access/hash.h"
+#include "access/nbtree.h"
 #include "access/htup_details.h"
 #include "bootstrap/bootstrap.h"
 #include "catalog/namespace.h"
@@ -63,6 +64,8 @@ get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
 #define FASTPG_INT2_EQ_OP 94
 #define FASTPG_INT8_EQ_OP 410
 #define FASTPG_OID_EQ_OP 607
+#define FASTPG_INT4_GT_OP 521
+#define FASTPG_BTINT4CMP_PROC 351
 
 static bool
 fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
@@ -124,7 +127,7 @@ static Oid
 fastpg_equality_operator_for_family_type(Oid opfamily, Oid lefttype,
 										 Oid righttype, int16 strategy)
 {
-	if (strategy != BTEqualStrategyNumber || lefttype != righttype)
+	if (lefttype != righttype)
 		return InvalidOid;
 
 	switch (opfamily)
@@ -132,19 +135,33 @@ fastpg_equality_operator_for_family_type(Oid opfamily, Oid lefttype,
 		case INTEGER_BTREE_FAM_OID:
 			switch (lefttype)
 			{
-				case INT2OID:
-					return FASTPG_INT2_EQ_OP;
 				case INT4OID:
-					return Int4EqualOperator;
+					switch (strategy)
+					{
+						case BTLessStrategyNumber:
+							return Int4LessOperator;
+						case BTEqualStrategyNumber:
+							return Int4EqualOperator;
+						case BTGreaterStrategyNumber:
+							return FASTPG_INT4_GT_OP;
+						default:
+							return InvalidOid;
+					}
+				case INT2OID:
+					return strategy == BTEqualStrategyNumber ?
+						FASTPG_INT2_EQ_OP : InvalidOid;
 				case INT8OID:
-					return FASTPG_INT8_EQ_OP;
+					return strategy == BTEqualStrategyNumber ?
+						FASTPG_INT8_EQ_OP : InvalidOid;
 				default:
 					return InvalidOid;
 			}
 		case OID_BTREE_FAM_OID:
-			return lefttype == OIDOID ? FASTPG_OID_EQ_OP : InvalidOid;
+			return lefttype == OIDOID && strategy == BTEqualStrategyNumber ?
+				FASTPG_OID_EQ_OP : InvalidOid;
 		case TEXT_BTREE_FAM_OID:
-			return lefttype == TEXTOID ? TextEqualOperator : InvalidOid;
+			return lefttype == TEXTOID && strategy == BTEqualStrategyNumber ?
+				TextEqualOperator : InvalidOid;
 		default:
 			return InvalidOid;
 	}
@@ -156,6 +173,36 @@ fastpg_is_btree_opfamily(Oid opfamily)
 	return opfamily == INTEGER_BTREE_FAM_OID ||
 		opfamily == OID_BTREE_FAM_OID ||
 		opfamily == TEXT_BTREE_FAM_OID;
+}
+
+static bool
+fastpg_opclass_info(Oid opclass, Oid *opfamily, Oid *opcintype)
+{
+	switch (opclass)
+	{
+		case INT2_BTREE_OPS_OID:
+			*opfamily = INTEGER_BTREE_FAM_OID;
+			*opcintype = INT2OID;
+			return true;
+		case INT4_BTREE_OPS_OID:
+			*opfamily = INTEGER_BTREE_FAM_OID;
+			*opcintype = INT4OID;
+			return true;
+		case INT8_BTREE_OPS_OID:
+			*opfamily = INTEGER_BTREE_FAM_OID;
+			*opcintype = INT8OID;
+			return true;
+		case OID_BTREE_OPS_OID:
+			*opfamily = OID_BTREE_FAM_OID;
+			*opcintype = OIDOID;
+			return true;
+		case TEXT_BTREE_OPS_OID:
+			*opfamily = TEXT_BTREE_FAM_OID;
+			*opcintype = TEXTOID;
+			return true;
+		default:
+			return false;
+	}
 }
 #endif
 
@@ -397,6 +444,16 @@ get_ordering_op_properties(Oid opno,
 	*opcintype = InvalidOid;
 	*cmptype = COMPARE_INVALID;
 
+#ifdef USE_FASTPG
+	if (opno == Int4LessOperator || opno == FASTPG_INT4_GT_OP)
+	{
+		*opfamily = INTEGER_BTREE_FAM_OID;
+		*opcintype = INT4OID;
+		*cmptype = opno == Int4LessOperator ? COMPARE_LT : COMPARE_GT;
+		return true;
+	}
+#endif
+
 	/*
 	 * Search pg_amop to see if the target operator is registered as the "<"
 	 * or ">" operator of any btree opfamily.
@@ -494,6 +551,11 @@ get_ordering_op_for_equality_op(Oid opno, bool use_lhs_type)
 	CatCList   *catlist;
 	int			i;
 
+#ifdef USE_FASTPG
+	if (opno == Int4EqualOperator)
+		return Int4LessOperator;
+#endif
+
 	/*
 	 * Search pg_amop to see if the target operator is registered as the "="
 	 * operator of any btree opfamily.
@@ -559,6 +621,11 @@ get_mergejoin_opfamilies(Oid opno)
 	List	   *result = NIL;
 	CatCList   *catlist;
 	int			i;
+
+#ifdef USE_FASTPG
+	if (opno == Int4EqualOperator)
+		return list_make1_oid(INTEGER_BTREE_FAM_OID);
+#endif
 
 	/*
 	 * Search pg_amop to see if the target operator is registered as the "="
@@ -1083,6 +1150,14 @@ get_opfamily_proc(Oid opfamily, Oid lefttype, Oid righttype, int16 procnum)
 	Form_pg_amproc amproc_tup;
 	RegProcedure result;
 
+#ifdef USE_FASTPG
+	if (opfamily == INTEGER_BTREE_FAM_OID &&
+		lefttype == INT4OID &&
+		righttype == INT4OID &&
+		procnum == BTORDER_PROC)
+		return FASTPG_BTINT4CMP_PROC;
+#endif
+
 	tp = SearchSysCache4(AMPROCNUM,
 						 ObjectIdGetDatum(opfamily),
 						 ObjectIdGetDatum(lefttype),
@@ -1503,6 +1578,13 @@ get_opclass_family(Oid opclass)
 	Form_pg_opclass cla_tup;
 	Oid			result;
 
+#ifdef USE_FASTPG
+	Oid			opcintype;
+
+	if (fastpg_opclass_info(opclass, &result, &opcintype))
+		return result;
+#endif
+
 	tp = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for opclass %u", opclass);
@@ -1525,6 +1607,13 @@ get_opclass_input_type(Oid opclass)
 	Form_pg_opclass cla_tup;
 	Oid			result;
 
+#ifdef USE_FASTPG
+	Oid			opfamily;
+
+	if (fastpg_opclass_info(opclass, &opfamily, &result))
+		return result;
+#endif
+
 	tp = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for opclass %u", opclass);
@@ -1546,6 +1635,11 @@ get_opclass_opfamily_and_input_type(Oid opclass, Oid *opfamily, Oid *opcintype)
 {
 	HeapTuple	tp;
 	Form_pg_opclass cla_tup;
+
+#ifdef USE_FASTPG
+	if (fastpg_opclass_info(opclass, opfamily, opcintype))
+		return true;
+#endif
 
 	tp = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
 	if (!HeapTupleIsValid(tp))
@@ -1572,6 +1666,14 @@ get_opclass_method(Oid opclass)
 	HeapTuple	tp;
 	Form_pg_opclass cla_tup;
 	Oid			result;
+
+#ifdef USE_FASTPG
+	Oid			opfamily;
+	Oid			opcintype;
+
+	if (fastpg_opclass_info(opclass, &opfamily, &opcintype))
+		return BTREE_AM_OID;
+#endif
 
 	tp = SearchSysCache1(CLAOID, ObjectIdGetDatum(opclass));
 	if (!HeapTupleIsValid(tp))

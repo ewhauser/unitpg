@@ -1483,7 +1483,8 @@ FastPgCatalogCacheHandlesMiss(CatCache *cache, int nkeys)
 	if (cache->cc_reloid == RelationRelationId ||
 		cache->cc_reloid == AttributeRelationId ||
 		cache->cc_reloid == IndexRelationId ||
-		cache->cc_reloid == ConstraintRelationId)
+		cache->cc_reloid == ConstraintRelationId ||
+		cache->cc_reloid == OperatorClassRelationId)
 		return true;
 
 	if (cache->cc_reloid == ProcedureRelationId ||
@@ -1618,6 +1619,71 @@ FastPgOpclassForType(Oid type_oid, Oid *opclass_oid)
 		default:
 			return false;
 	}
+}
+
+typedef struct FastPgOpclassRecord
+{
+	Oid			oid;
+	const char *name;
+	Oid			opfamily;
+	Oid			opcintype;
+} FastPgOpclassRecord;
+
+static const FastPgOpclassRecord FastPgOpclassRecords[] = {
+	{INT2_BTREE_OPS_OID, "int2_ops", INTEGER_BTREE_FAM_OID, INT2OID},
+	{INT4_BTREE_OPS_OID, "int4_ops", INTEGER_BTREE_FAM_OID, INT4OID},
+	{INT8_BTREE_OPS_OID, "int8_ops", INTEGER_BTREE_FAM_OID, INT8OID},
+	{OID_BTREE_OPS_OID, "oid_ops", OID_BTREE_FAM_OID, OIDOID},
+	{TEXT_BTREE_OPS_OID, "text_ops", TEXT_BTREE_FAM_OID, TEXTOID},
+};
+
+static const FastPgOpclassRecord *
+FastPgOpclassByOid(Oid opclass_oid)
+{
+	for (int index = 0; index < lengthof(FastPgOpclassRecords); index++)
+	{
+		if (FastPgOpclassRecords[index].oid == opclass_oid)
+			return &FastPgOpclassRecords[index];
+	}
+
+	return NULL;
+}
+
+static const FastPgOpclassRecord *
+FastPgOpclassByName(Oid opcmethod, const char *name, Oid namespace_oid)
+{
+	if (opcmethod != BTREE_AM_OID || namespace_oid != PG_CATALOG_NAMESPACE)
+		return NULL;
+
+	for (int index = 0; index < lengthof(FastPgOpclassRecords); index++)
+	{
+		if (strcmp(FastPgOpclassRecords[index].name, name) == 0)
+			return &FastPgOpclassRecords[index];
+	}
+
+	return NULL;
+}
+
+static HeapTuple
+FastPgBuildOpclassTuple(TupleDesc tupdesc, const FastPgOpclassRecord *record)
+{
+	Datum		values[Natts_pg_opclass] = {0};
+	bool		nulls[Natts_pg_opclass] = {false};
+	NameData	opcname;
+
+	namestrcpy(&opcname, record->name);
+
+	values[Anum_pg_opclass_oid - 1] = ObjectIdGetDatum(record->oid);
+	values[Anum_pg_opclass_opcmethod - 1] = ObjectIdGetDatum(BTREE_AM_OID);
+	values[Anum_pg_opclass_opcname - 1] = NameGetDatum(&opcname);
+	values[Anum_pg_opclass_opcnamespace - 1] = ObjectIdGetDatum(PG_CATALOG_NAMESPACE);
+	values[Anum_pg_opclass_opcowner - 1] = ObjectIdGetDatum(BOOTSTRAP_SUPERUSERID);
+	values[Anum_pg_opclass_opcfamily - 1] = ObjectIdGetDatum(record->opfamily);
+	values[Anum_pg_opclass_opcintype - 1] = ObjectIdGetDatum(record->opcintype);
+	values[Anum_pg_opclass_opcdefault - 1] = BoolGetDatum(true);
+	values[Anum_pg_opclass_opckeytype - 1] = ObjectIdGetDatum(InvalidOid);
+
+	return heap_form_tuple(tupdesc, values, nulls);
 }
 
 static HeapTuple
@@ -1996,6 +2062,27 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 			fastpg_rust_catalog_primary_key_index_info((uint32_t) DatumGetObjectId(arguments[0]),
 													   &index_info))
 			return FastPgBuildIndexTuple(cache->cc_tupdesc, &index_info);
+	}
+	else if (cache->cc_reloid == OperatorClassRelationId)
+	{
+		const FastPgOpclassRecord *opclass = NULL;
+
+		if (nkeys == 1 && cache->cc_keyno[0] == Anum_pg_opclass_oid)
+		{
+			opclass = FastPgOpclassByOid(DatumGetObjectId(arguments[0]));
+		}
+		else if (nkeys == 3 &&
+				 cache->cc_keyno[0] == Anum_pg_opclass_opcmethod &&
+				 cache->cc_keyno[1] == Anum_pg_opclass_opcname &&
+				 cache->cc_keyno[2] == Anum_pg_opclass_opcnamespace)
+		{
+			opclass = FastPgOpclassByName(DatumGetObjectId(arguments[0]),
+										  DatumGetCString(arguments[1]),
+										  DatumGetObjectId(arguments[2]));
+		}
+
+		if (opclass != NULL)
+			return FastPgBuildOpclassTuple(cache->cc_tupdesc, opclass);
 	}
 	else if (cache->cc_reloid == ProcedureRelationId)
 	{

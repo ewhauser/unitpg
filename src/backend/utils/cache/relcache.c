@@ -1043,6 +1043,88 @@ FastPgBuildTupleDesc(Relation relation)
 	return true;
 }
 
+static void
+FastPgTupleDescInitEntry(TupleDesc tupdesc, AttrNumber attrNumber,
+						 const char *attributeName, Oid oidtypeid,
+						 bool notnull)
+{
+	TupleDescInitBuiltinEntry(tupdesc, attrNumber, attributeName, oidtypeid, -1, 0);
+	TupleDescAttr(tupdesc, attrNumber - 1)->attnotnull = notnull;
+}
+
+static void
+FastPgFinishVirtualCatalogTupleDesc(Relation relation)
+{
+	for (int index = 0; index < RelationGetNumberOfAttributes(relation); index++)
+		populate_compact_attribute(relation->rd_att, index);
+
+	relation->rd_att->constr = NULL;
+	TupleDescFinalize(relation->rd_att);
+}
+
+static bool
+FastPgBuildConstraintTupleDesc(Relation relation)
+{
+	if (RelationGetNumberOfAttributes(relation) != Natts_pg_constraint)
+		elog(ERROR,
+			 "fastpg virtual catalog column count mismatch for relation \"%s\"",
+			 RelationGetRelationName(relation));
+
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_oid, "oid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conname, "conname", NAMEOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_connamespace, "connamespace", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_contype, "contype", CHAROID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_condeferrable, "condeferrable", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_condeferred, "condeferred", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conenforced, "conenforced", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_convalidated, "convalidated", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conrelid, "conrelid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_contypid, "contypid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conindid, "conindid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conparentid, "conparentid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_confrelid, "confrelid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_confupdtype, "confupdtype", CHAROID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_confdeltype, "confdeltype", CHAROID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_confmatchtype, "confmatchtype", CHAROID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conislocal, "conislocal", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_coninhcount, "coninhcount", INT2OID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_connoinherit, "connoinherit", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conperiod, "conperiod", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conkey, "conkey", INT2ARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_confkey, "confkey", INT2ARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conpfeqop, "conpfeqop", OIDARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conppeqop, "conppeqop", OIDARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conffeqop, "conffeqop", OIDARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_confdelsetcols, "confdelsetcols", INT2ARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conexclop, "conexclop", OIDARRAYOID, false);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_constraint_conbin, "conbin", PG_NODE_TREEOID, false);
+
+	FastPgFinishVirtualCatalogTupleDesc(relation);
+	return true;
+}
+
+static bool
+FastPgBuildOpclassTupleDesc(Relation relation)
+{
+	if (RelationGetNumberOfAttributes(relation) != Natts_pg_opclass)
+		elog(ERROR,
+			 "fastpg virtual catalog column count mismatch for relation \"%s\"",
+			 RelationGetRelationName(relation));
+
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_oid, "oid", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcmethod, "opcmethod", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcname, "opcname", NAMEOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcnamespace, "opcnamespace", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcowner, "opcowner", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcfamily, "opcfamily", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcintype, "opcintype", OIDOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opcdefault, "opcdefault", BOOLOID, true);
+	FastPgTupleDescInitEntry(relation->rd_att, Anum_pg_opclass_opckeytype, "opckeytype", OIDOID, true);
+
+	FastPgFinishVirtualCatalogTupleDesc(relation);
+	return true;
+}
+
 static bool
 FastPgBuildVirtualCatalogTupleDesc(Relation relation)
 {
@@ -1071,6 +1153,10 @@ FastPgBuildVirtualCatalogTupleDesc(Relation relation)
 			attrs = Desc_pg_index;
 			natts = Natts_pg_index;
 			break;
+		case ConstraintRelationId:
+			return FastPgBuildConstraintTupleDesc(relation);
+		case OperatorClassRelationId:
+			return FastPgBuildOpclassTupleDesc(relation);
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

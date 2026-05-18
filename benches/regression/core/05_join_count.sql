@@ -1,0 +1,13 @@
+DROP TABLE IF EXISTS fastpg_reg_a;
+DROP TABLE IF EXISTS fastpg_reg_b;
+CREATE TABLE fastpg_reg_a (id int NOT NULL, group_id int, amount int);
+CREATE TABLE fastpg_reg_b (id int NOT NULL, label text);
+INSERT INTO fastpg_reg_a VALUES (1, 1, 10);
+INSERT INTO fastpg_reg_a VALUES (2, 1, 20);
+INSERT INTO fastpg_reg_a VALUES (3, 2, 30);
+INSERT INTO fastpg_reg_b VALUES (1, 'one');
+INSERT INTO fastpg_reg_b VALUES (2, 'two');
+INSERT INTO fastpg_reg_b VALUES (4, 'four');
+SELECT 'count_all', count(*) FROM fastpg_reg_a;
+DROP TABLE fastpg_reg_a;
+DROP TABLE fastpg_reg_b;

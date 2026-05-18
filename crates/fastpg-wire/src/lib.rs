@@ -221,6 +221,7 @@ impl CopyHandler for FastPgWireHandler {
                 .expect("fastpg active COPY mutex poisoned");
             active_copy.finish(&self.session).map_err(copy_data_error)?
         };
+        self.session.finish_copy();
 
         client
             .send(PgWireBackendMessage::CommandComplete(
@@ -236,6 +237,7 @@ impl CopyHandler for FastPgWireHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
+        self.session.abort_copy();
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "57014".to_owned(),
@@ -393,7 +395,12 @@ fn error_response(sqlstate: &str, message: &str) -> Response {
 }
 
 pub fn command_complete(tag: &str, rows: usize) -> Response {
-    Response::Execution(Tag::new(tag).with_rows(rows))
+    let tag = if tag == "INSERT" {
+        Tag::new(tag).with_oid(0).with_rows(rows)
+    } else {
+        Tag::new(tag).with_rows(rows)
+    };
+    Response::Execution(tag)
 }
 
 #[derive(Debug)]
@@ -474,4 +481,35 @@ fn copy_data_error(message: String) -> PgWireError {
         "22P04".to_owned(),
         message,
     )))
+}
+
+#[cfg(test)]
+mod tests {
+    use pgwire::messages::response::CommandComplete;
+
+    use super::*;
+
+    #[test]
+    fn insert_command_complete_includes_legacy_oid_field() {
+        assert_eq!(
+            command_complete_tag(command_complete("INSERT", 3)),
+            "INSERT 0 3"
+        );
+    }
+
+    #[test]
+    fn non_insert_command_complete_keeps_row_count_shape() {
+        assert_eq!(
+            command_complete_tag(command_complete("UPDATE", 2)),
+            "UPDATE 2"
+        );
+    }
+
+    fn command_complete_tag(response: Response) -> String {
+        let Response::Execution(tag) = response else {
+            panic!("expected execution response");
+        };
+        let command_complete = CommandComplete::from(tag);
+        command_complete.tag
+    }
 }

@@ -176,7 +176,7 @@ static void
 fastpg_mem_ensure_write_xact(void)
 {
 	fastpg_mem_ensure_xact_callbacks();
-	fastpg_rust_xact_begin();
+	fastpg_rust_xact_begin_implicit();
 }
 
 static bool
@@ -294,6 +294,37 @@ fastpg_mem_store_virtual_tuple(Relation rel,
 	ExecStoreVirtualTuple(slot);
 }
 
+static bool
+fastpg_mem_slot_key_test(TupleTableSlot *slot, int nkeys, ScanKey keys)
+{
+	ScanKey		cur_key = keys;
+
+	for (int cur_nkeys = nkeys; cur_nkeys--; cur_key++)
+	{
+		Datum		value;
+		Datum		test;
+		bool		isnull;
+
+		if (cur_key->sk_flags & SK_ISNULL)
+			return false;
+		if (cur_key->sk_attno <= 0)
+			fastpg_mem_unsupported("system-column scan keys");
+
+		value = slot_getattr(slot, cur_key->sk_attno, &isnull);
+		if (isnull)
+			return false;
+
+		test = FunctionCall2Coll(&cur_key->sk_func,
+								 cur_key->sk_collation,
+								 value,
+								 cur_key->sk_argument);
+		if (!DatumGetBool(test))
+			return false;
+	}
+
+	return true;
+}
+
 static void
 fastpg_mem_fill_deleted_tmfd(ItemPointer tid, TM_FailureData *tmfd)
 {
@@ -322,16 +353,21 @@ fastpg_mem_scan_begin(Relation rel,
 {
 	FastPgMemScanDesc *scan;
 
-	if (nkeys != 0)
-		fastpg_mem_unsupported("scan keys");
 	if (pscan != NULL)
 		fastpg_mem_unsupported("parallel scans");
 
 	scan = palloc0_object(FastPgMemScanDesc);
+	if (nkeys != 0)
+	{
+		scan->base.rs_key = palloc_array(ScanKeyData, nkeys);
+		memcpy(scan->base.rs_key, key, nkeys * sizeof(ScanKeyData));
+	}
+	else
+		scan->base.rs_key = NULL;
+
 	scan->base.rs_rd = rel;
 	scan->base.rs_snapshot = snapshot;
 	scan->base.rs_nkeys = nkeys;
-	scan->base.rs_key = NULL;
 	scan->base.rs_flags = flags;
 	scan->scan_handle = fastpg_rust_scan_begin(RelationGetRelid(rel));
 	if (scan->scan_handle == 0)
@@ -351,6 +387,8 @@ fastpg_mem_scan_end(TableScanDesc sscan)
 	fastpg_rust_scan_end(scan->scan_handle);
 	if (scan->base.rs_flags & SO_TEMP_SNAPSHOT)
 		UnregisterSnapshot(scan->base.rs_snapshot);
+	if (scan->base.rs_key != NULL)
+		pfree(scan->base.rs_key);
 	pfree(scan);
 }
 
@@ -364,8 +402,8 @@ fastpg_mem_scan_rescan(TableScanDesc sscan,
 {
 	FastPgMemScanDesc *scan = (FastPgMemScanDesc *) sscan;
 
-	if (key != NULL)
-		fastpg_mem_unsupported("scan keys");
+	if (key != NULL && scan->base.rs_nkeys > 0)
+		memcpy(scan->base.rs_key, key, scan->base.rs_nkeys * sizeof(ScanKeyData));
 	fastpg_rust_scan_reset(scan->scan_handle);
 }
 
@@ -385,18 +423,25 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 
 	values = palloc0_array(uintptr_t, natts);
 	isnull = palloc0_array(uint8_t, natts);
-	found = fastpg_rust_scan_next(scan->scan_handle,
-								  ScanDirectionIsBackward(direction) ? 0 : 1,
-								  values,
-								  isnull,
-								  natts,
-								  &row_id);
-	if (found)
+
+	while ((found = fastpg_rust_scan_next(scan->scan_handle,
+										  ScanDirectionIsBackward(direction) ? 0 : 1,
+										  values,
+										  isnull,
+										  natts,
+										  &row_id)))
+	{
 		fastpg_mem_store_virtual_tuple(scan->base.rs_rd,
 									   slot,
 									   values,
 									   isnull,
 									   row_id);
+		if (scan->base.rs_key == NULL ||
+			fastpg_mem_slot_key_test(slot, scan->base.rs_nkeys, scan->base.rs_key))
+			break;
+
+		ExecClearTuple(slot);
+	}
 
 	pfree(values);
 	pfree(isnull);

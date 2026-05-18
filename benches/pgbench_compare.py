@@ -62,14 +62,20 @@ class BenchmarkFailure(Exception):
 
 
 class PgBenchCompare:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(
+        self,
+        args: argparse.Namespace,
+        *,
+        result_subdir: str = "pgbench",
+        timestamp: str | None = None,
+    ):
         self.args = args
         self.source_root = Path(__file__).resolve().parents[1]
         self.bench_root = self.source_root / "benches"
         self.build_root = self.bench_root / ".build" / "pgbench"
         self.pgbench_client_paths: dict[str, Path] | None = None
-        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        self.result_root = self.bench_root / "results" / "pgbench" / timestamp
+        timestamp = timestamp or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        self.result_root = self.bench_root / "results" / result_subdir / timestamp
         self.result_root.mkdir(parents=True, exist_ok=True)
         self.results: dict[str, Any] = {
             "status": "running",

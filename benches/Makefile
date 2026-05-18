@@ -13,6 +13,9 @@ PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
 RUST_PGCORE ?= raw-parser
+REGRESSION_SUITE ?= core
+REGRESSION_INVENTORY_SUITE ?= inventory
+REGRESSION_CASES_DIR ?=
 PROFILE_TRANSACTIONS ?= 500
 PROFILE_RUNS ?= 1
 PROFILE_TOOL ?= flamegraph
@@ -20,8 +23,9 @@ PROFILE_PHASE ?= run
 PROFILE_OPEN ?= 0
 PROFILE_WARMUP_SECONDS ?= 1.0
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
+REGRESSION_CASES_ARG := $(if $(REGRESSION_CASES_DIR),--cases-dir "$(REGRESSION_CASES_DIR)",)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph
+.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph regression-compare-rust-server regression-compare-rust-server-inventory validate-rust-server
 
 pgbench-compare:
 	$(PYTHON) pgbench_compare.py \
@@ -121,3 +125,27 @@ pgbench-profile-rust-server-open:
 
 pgbench-open-latest-flamegraph:
 	$(PYTHON) open_latest_profile.py
+
+regression-compare-rust-server:
+	$(PYTHON) regression_compare.py \
+		--suite "$(REGRESSION_SUITE)" \
+		$(REGRESSION_CASES_ARG) \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full"
+
+regression-compare-rust-server-inventory:
+	$(PYTHON) regression_compare.py \
+		--suite "$(REGRESSION_INVENTORY_SUITE)" \
+		$(REGRESSION_CASES_ARG) \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full" \
+		--allow-fastpg-failures
+
+validate-rust-server:
+	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py
+	cargo test -p fastpg-storage
+	$(MAKE) pgbench-compare-rust-server-strict
+	$(MAKE) regression-compare-rust-server
+	meson test -C .build/pgbench/fastpg --suite fastpg_parser_probe --print-errorlogs

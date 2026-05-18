@@ -263,8 +263,11 @@ extern bool fastpg_rust_catalog_add_primary_key(const char *name,
 												char *message_out,
 												size_t message_len);
 extern void fastpg_rust_xact_begin(void);
+extern void fastpg_rust_xact_begin_implicit(void);
 extern void fastpg_rust_xact_commit(void);
 extern void fastpg_rust_xact_abort(void);
+extern void fastpg_rust_xact_commit_if_implicit(void);
+extern void fastpg_rust_xact_abort_if_implicit(void);
 extern void fastpg_rust_subxact_begin(void);
 extern void fastpg_rust_subxact_commit(void);
 extern void fastpg_rust_subxact_abort(void);

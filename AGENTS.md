@@ -147,3 +147,51 @@ python3 -m py_compile benches/open_latest_profile.py
 cargo test -p fastpg-storage
 meson test -C benches/.build/pgbench/fastpg --suite fastpg_parser_probe --print-errorlogs
 ```
+
+## SQL regression comparison harness
+
+The curated SQL regression harness also lives under `benches/`.
+
+Run the strict Rust-server SQL regression comparison with:
+
+```sh
+make -C benches regression-compare-rust-server
+```
+
+The harness builds/reuses the same normal Postgres client install as the
+pgbench harness, starts normal Postgres first, runs every SQL file in
+`benches/regression/core/`, then starts the Rust single-process server through
+the full PostgreSQL execution path and compares each case's stdout.
+
+Current core coverage is broader than pgbench and is intentionally small enough
+to be a correctness gate:
+
+- DDL, INSERT, UPDATE, DELETE, TRUNCATE, and `count(*)`
+- `COPY FROM STDIN`
+- BEGIN/COMMIT/ROLLBACK behavior
+- primary key catalog visibility and primary-key lookups
+- plain `count(*)` over Rust-backed storage
+
+Results are written under:
+
+```text
+benches/results/regression/<timestamp>/
+```
+
+For compatibility inventory work where fastpg failures should be recorded
+without making the command fail:
+
+```sh
+make -C benches regression-compare-rust-server-inventory
+```
+
+That inventory target defaults to `benches/regression/inventory/`. It is for
+known compatibility gaps and exploratory upstream-regression reductions, not for
+the blocking correctness gate. Current inventory probes cover deeper
+`pg_attribute`/`pg_index` catalog scans, joins, and grouped aggregation.
+
+To run the current Rust-server validation bundle:
+
+```sh
+make -C benches validate-rust-server
+```

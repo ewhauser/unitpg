@@ -10,19 +10,29 @@ pub const CHAR_OID: Oid = Oid(18);
 pub const NAME_OID: Oid = Oid(19);
 pub const INT8_OID: Oid = Oid(20);
 pub const INT2_OID: Oid = Oid(21);
+pub const INT2VECTOR_OID: Oid = Oid(22);
 pub const INT4_OID: Oid = Oid(23);
 pub const TEXT_OID: Oid = Oid(25);
 pub const OID_OID: Oid = Oid(26);
 pub const TID_OID: Oid = Oid(27);
 pub const XID_OID: Oid = Oid(28);
 pub const CID_OID: Oid = Oid(29);
+pub const OIDVECTOR_OID: Oid = Oid(30);
+pub const PG_NODE_TREE_OID: Oid = Oid(194);
 pub const FLOAT8_OID: Oid = Oid(701);
+pub const INT2_ARRAY_OID: Oid = Oid(1005);
+pub const INT4_ARRAY_OID: Oid = Oid(1007);
+pub const TEXT_ARRAY_OID: Oid = Oid(1009);
+pub const OID_ARRAY_OID: Oid = Oid(1028);
+pub const ACLITEM_OID: Oid = Oid(1033);
+pub const ACLITEM_ARRAY_OID: Oid = Oid(1034);
 pub const BPCHAR_OID: Oid = Oid(1042);
 pub const VARCHAR_OID: Oid = Oid(1043);
 pub const TIMESTAMP_OID: Oid = Oid(1114);
 pub const TIMESTAMPTZ_OID: Oid = Oid(1184);
 pub const REGCLASS_OID: Oid = Oid(2205);
 pub const ANY_OID: Oid = Oid(2276);
+pub const ANYARRAY_OID: Oid = Oid(2277);
 pub const INTERNAL_OID: Oid = Oid(2281);
 
 pub const DEFAULT_COLLATION_OID: Oid = Oid(100);
@@ -33,14 +43,26 @@ const F_NAMEIN: Oid = Oid(34);
 const F_NAMEOUT: Oid = Oid(35);
 const F_INT2IN: Oid = Oid(38);
 const F_INT2OUT: Oid = Oid(39);
+const F_INT2VECTORIN: Oid = Oid(40);
+const F_INT2VECTOROUT: Oid = Oid(41);
 const F_INT4IN: Oid = Oid(42);
 const F_INT4OUT: Oid = Oid(43);
 const F_TEXTIN: Oid = Oid(46);
 const F_TEXTOUT: Oid = Oid(47);
+const F_OIDVECTORIN: Oid = Oid(54);
+const F_OIDVECTOROUT: Oid = Oid(55);
+const F_PG_NODE_TREE_IN: Oid = Oid(195);
+const F_PG_NODE_TREE_OUT: Oid = Oid(196);
+const F_PG_NODE_TREE_RECV: Oid = Oid(197);
+const F_PG_NODE_TREE_SEND: Oid = Oid(198);
 const F_INT8IN: Oid = Oid(460);
 const F_INT8OUT: Oid = Oid(461);
 const F_FLOAT8IN: Oid = Oid(214);
 const F_FLOAT8OUT: Oid = Oid(215);
+const F_ARRAY_IN: Oid = Oid(750);
+const F_ARRAY_OUT: Oid = Oid(751);
+const F_ACLITEMIN: Oid = Oid(1031);
+const F_ACLITEMOUT: Oid = Oid(1032);
 const F_BPCHARIN: Oid = Oid(1044);
 const F_BPCHAROUT: Oid = Oid(1045);
 const F_VARCHARIN: Oid = Oid(1046);
@@ -58,6 +80,9 @@ const F_CIDIN: Oid = Oid(52);
 const F_CIDOUT: Oid = Oid(53);
 const F_OIDEQ: Oid = Oid(184);
 const F_INT4EQ: Oid = Oid(65);
+const F_INT4LT: Oid = Oid(66);
+const F_INT4GT: Oid = Oid(147);
+const F_BTINT4CMP: Oid = Oid(351);
 const F_EQSEL: Oid = Oid(101);
 const F_EQJOINSEL: Oid = Oid(105);
 const F_INT4PL: Oid = Oid(177);
@@ -75,6 +100,10 @@ const F_NAMERECV: Oid = Oid(2422);
 const F_NAMESEND: Oid = Oid(2423);
 const F_REGCLASSIN: Oid = Oid(2218);
 const F_REGCLASSOUT: Oid = Oid(2219);
+const F_ANYARRAYIN: Oid = Oid(2296);
+const F_ANYARRAYOUT: Oid = Oid(2297);
+const F_ARRAY_RECV: Oid = Oid(2400);
+const F_ARRAY_SEND: Oid = Oid(2401);
 const F_REGCLASSRECV: Oid = Oid(2452);
 const F_REGCLASSSEND: Oid = Oid(2453);
 const F_TIDRECV: Oid = Oid(2438);
@@ -83,6 +112,10 @@ const F_XIDRECV: Oid = Oid(2440);
 const F_XIDSEND: Oid = Oid(2441);
 const F_CIDRECV: Oid = Oid(2442);
 const F_CIDSEND: Oid = Oid(2443);
+const F_INT2VECTORRECV: Oid = Oid(2410);
+const F_INT2VECTORSEND: Oid = Oid(2411);
+const F_OIDVECTORRECV: Oid = Oid(2420);
+const F_OIDVECTORSEND: Oid = Oid(2421);
 const F_FLOAT8RECV: Oid = Oid(2426);
 const F_FLOAT8SEND: Oid = Oid(2427);
 const F_BPCHARRECV: Oid = Oid(2430);
@@ -109,6 +142,9 @@ const F_TIMESTAMPTYPMODIN: Oid = Oid(2905);
 const F_TIMESTAMPTYPMODOUT: Oid = Oid(2906);
 const F_TIMESTAMPTZTYPMODIN: Oid = Oid(2907);
 const F_TIMESTAMPTZTYPMODOUT: Oid = Oid(2908);
+const F_ANYARRAYRECV: Oid = Oid(2502);
+const F_ANYARRAYSEND: Oid = Oid(2503);
+const F_ARRAY_SUBSCRIPT_HANDLER: Oid = Oid(6179);
 const F_INT8PL: Oid = Oid(463);
 const F_INT8EQ: Oid = Oid(467);
 const F_INT8INC: Oid = Oid(1219);
@@ -120,8 +156,10 @@ const F_INT8DEC_ANY: Oid = Oid(3547);
 const F_INT8INC_SUPPORT: Oid = Oid(6236);
 
 const O_INT4EQ: Oid = Oid(96);
+const O_INT4LT: Oid = Oid(97);
 const O_OIDEQ: Oid = Oid(607);
 const O_INT8EQ: Oid = Oid(410);
+const O_INT4GT: Oid = Oid(521);
 const O_INT4PL: Oid = Oid(551);
 const O_INT8PL: Oid = Oid(684);
 const O_OID_REGCLASS_EQ: Oid = Oid(10184);
@@ -145,10 +183,13 @@ const TYPDELIM_COMMA: u8 = b',';
 const TYPSTORAGE_PLAIN: u8 = b'p';
 const TYPSTORAGE_EXTENDED: u8 = b'x';
 const TYPTYPE_BASE: u8 = b'b';
+const TYPTYPE_PSEUDO: u8 = b'p';
 
+const TYPCATEGORY_ARRAY: u8 = b'A';
 const TYPCATEGORY_BOOLEAN: u8 = b'B';
 const TYPCATEGORY_DATETIME: u8 = b'D';
 const TYPCATEGORY_NUMERIC: u8 = b'N';
+const TYPCATEGORY_PSEUDO: u8 = b'P';
 const TYPCATEGORY_STRING: u8 = b'S';
 const TYPCATEGORY_INTERNAL: u8 = b'Z';
 const TYPCATEGORY_USER_DEFINED: u8 = b'U';
@@ -595,6 +636,8 @@ impl PgOperatorRecord {
 
 const BUILTIN_OPERATORS: &[PgOperatorRecord] = &[
     PgOperatorRecord::equality(O_INT4EQ, INT4_OID, INT4_OID, F_INT4EQ),
+    PgOperatorRecord::binary(O_INT4LT, "<", INT4_OID, INT4_OID, BOOL_OID, F_INT4LT),
+    PgOperatorRecord::binary(O_INT4GT, ">", INT4_OID, INT4_OID, BOOL_OID, F_INT4GT),
     PgOperatorRecord::equality(O_OIDEQ, OID_OID, OID_OID, F_OIDEQ),
     PgOperatorRecord::equality(O_INT8EQ, INT8_OID, INT8_OID, F_INT8EQ),
     PgOperatorRecord::equality(O_OID_REGCLASS_EQ, OID_OID, REGCLASS_OID, F_OIDEQ),
@@ -1099,6 +1142,110 @@ impl PgTypeRecord {
             typstorage: TYPSTORAGE_EXTENDED,
         }
     }
+
+    const fn varlena_catalog(
+        oid: Oid,
+        name: &'static str,
+        typinput: Oid,
+        typoutput: Oid,
+        typreceive: Oid,
+        typsend: Oid,
+        typarray: Oid,
+        typcategory: u8,
+        typelem: Oid,
+        typcollation: Oid,
+        typstorage: u8,
+    ) -> Self {
+        Self {
+            oid,
+            name,
+            namespace: PG_CATALOG_NAMESPACE_OID,
+            owner: BOOTSTRAP_SUPERUSER_OID,
+            typlen: -1,
+            typbyval: false,
+            typalign: TYPALIGN_INT,
+            typdelim: TYPDELIM_COMMA,
+            typinput,
+            typoutput,
+            typreceive,
+            typsend,
+            typmodin: INVALID_OID,
+            typmodout: INVALID_OID,
+            typisdefined: true,
+            typtype: TYPTYPE_BASE,
+            typcategory,
+            typispreferred: false,
+            typrelid: INVALID_OID,
+            typelem,
+            typarray,
+            typbasetype: INVALID_OID,
+            typtypmod: -1,
+            typcollation,
+            typsubscript: if typelem.0 == 0 {
+                INVALID_OID
+            } else {
+                F_ARRAY_SUBSCRIPT_HANDLER
+            },
+            typstorage,
+        }
+    }
+
+    const fn varlena_array(
+        oid: Oid,
+        name: &'static str,
+        typelem: Oid,
+        typalign: u8,
+        typcollation: Oid,
+    ) -> Self {
+        Self {
+            typalign,
+            typstorage: TYPSTORAGE_EXTENDED,
+            ..Self::varlena_catalog(
+                oid,
+                name,
+                F_ARRAY_IN,
+                F_ARRAY_OUT,
+                F_ARRAY_RECV,
+                F_ARRAY_SEND,
+                INVALID_OID,
+                TYPCATEGORY_ARRAY,
+                typelem,
+                typcollation,
+                TYPSTORAGE_EXTENDED,
+            )
+        }
+    }
+
+    const fn pseudo_array(oid: Oid, name: &'static str) -> Self {
+        Self {
+            oid,
+            name,
+            namespace: PG_CATALOG_NAMESPACE_OID,
+            owner: BOOTSTRAP_SUPERUSER_OID,
+            typlen: -1,
+            typbyval: false,
+            typalign: TYPALIGN_DOUBLE,
+            typdelim: TYPDELIM_COMMA,
+            typinput: F_ANYARRAYIN,
+            typoutput: F_ANYARRAYOUT,
+            typreceive: F_ANYARRAYRECV,
+            typsend: F_ANYARRAYSEND,
+            typmodin: INVALID_OID,
+            typmodout: INVALID_OID,
+            typisdefined: true,
+            typtype: TYPTYPE_PSEUDO,
+            typcategory: TYPCATEGORY_PSEUDO,
+            typispreferred: false,
+            typrelid: INVALID_OID,
+            typelem: INVALID_OID,
+            typarray: INVALID_OID,
+            typbasetype: INVALID_OID,
+            typtypmod: -1,
+            typcollation: INVALID_OID,
+            typsubscript: INVALID_OID,
+            typstorage: TYPSTORAGE_EXTENDED,
+        }
+    }
 }
 
 pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
@@ -1176,6 +1323,19 @@ pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
             Oid(1005),
             TYPCATEGORY_NUMERIC,
             false,
+        )),
+        INT2VECTOR_OID => Some(PgTypeRecord::varlena_catalog(
+            INT2VECTOR_OID,
+            "int2vector",
+            F_INT2VECTORIN,
+            F_INT2VECTOROUT,
+            F_INT2VECTORRECV,
+            F_INT2VECTORSEND,
+            Oid(1006),
+            TYPCATEGORY_ARRAY,
+            INT2_OID,
+            INVALID_OID,
+            TYPSTORAGE_PLAIN,
         )),
         INT4_OID => Some(PgTypeRecord::fixed(
             INT4_OID,
@@ -1267,6 +1427,80 @@ pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
             Oid(1012),
             TYPCATEGORY_USER_DEFINED,
         )),
+        OIDVECTOR_OID => Some(PgTypeRecord::varlena_catalog(
+            OIDVECTOR_OID,
+            "oidvector",
+            F_OIDVECTORIN,
+            F_OIDVECTOROUT,
+            F_OIDVECTORRECV,
+            F_OIDVECTORSEND,
+            Oid(1013),
+            TYPCATEGORY_ARRAY,
+            OID_OID,
+            INVALID_OID,
+            TYPSTORAGE_PLAIN,
+        )),
+        PG_NODE_TREE_OID => Some(PgTypeRecord::varlena_catalog(
+            PG_NODE_TREE_OID,
+            "pg_node_tree",
+            F_PG_NODE_TREE_IN,
+            F_PG_NODE_TREE_OUT,
+            F_PG_NODE_TREE_RECV,
+            F_PG_NODE_TREE_SEND,
+            INVALID_OID,
+            TYPCATEGORY_INTERNAL,
+            INVALID_OID,
+            DEFAULT_COLLATION_OID,
+            TYPSTORAGE_EXTENDED,
+        )),
+        INT2_ARRAY_OID => Some(PgTypeRecord::varlena_array(
+            INT2_ARRAY_OID,
+            "_int2",
+            INT2_OID,
+            TYPALIGN_INT,
+            INVALID_OID,
+        )),
+        INT4_ARRAY_OID => Some(PgTypeRecord::varlena_array(
+            INT4_ARRAY_OID,
+            "_int4",
+            INT4_OID,
+            TYPALIGN_INT,
+            INVALID_OID,
+        )),
+        TEXT_ARRAY_OID => Some(PgTypeRecord::varlena_array(
+            TEXT_ARRAY_OID,
+            "_text",
+            TEXT_OID,
+            TYPALIGN_INT,
+            DEFAULT_COLLATION_OID,
+        )),
+        OID_ARRAY_OID => Some(PgTypeRecord::varlena_array(
+            OID_ARRAY_OID,
+            "_oid",
+            OID_OID,
+            TYPALIGN_INT,
+            INVALID_OID,
+        )),
+        ACLITEM_OID => Some(PgTypeRecord::fixed_custom(
+            ACLITEM_OID,
+            "aclitem",
+            16,
+            false,
+            TYPALIGN_DOUBLE,
+            F_ACLITEMIN,
+            F_ACLITEMOUT,
+            INVALID_OID,
+            INVALID_OID,
+            ACLITEM_ARRAY_OID,
+            TYPCATEGORY_USER_DEFINED,
+        )),
+        ACLITEM_ARRAY_OID => Some(PgTypeRecord::varlena_array(
+            ACLITEM_ARRAY_OID,
+            "_aclitem",
+            ACLITEM_OID,
+            TYPALIGN_DOUBLE,
+            INVALID_OID,
+        )),
         BPCHAR_OID => Some(PgTypeRecord::varlena_string(
             BPCHAR_OID,
             "bpchar",
@@ -1340,6 +1574,7 @@ pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
             TYPCATEGORY_NUMERIC,
             false,
         )),
+        ANYARRAY_OID => Some(PgTypeRecord::pseudo_array(ANYARRAY_OID, "anyarray")),
         _ => None,
     }
 }
@@ -1350,6 +1585,7 @@ const BUILTIN_TYPE_OIDS: &[Oid] = &[
     NAME_OID,
     INT8_OID,
     INT2_OID,
+    INT2VECTOR_OID,
     INT4_OID,
     FLOAT8_OID,
     TEXT_OID,
@@ -1357,11 +1593,20 @@ const BUILTIN_TYPE_OIDS: &[Oid] = &[
     TID_OID,
     XID_OID,
     CID_OID,
+    OIDVECTOR_OID,
+    PG_NODE_TREE_OID,
+    INT2_ARRAY_OID,
+    INT4_ARRAY_OID,
+    TEXT_ARRAY_OID,
+    OID_ARRAY_OID,
+    ACLITEM_OID,
+    ACLITEM_ARRAY_OID,
     BPCHAR_OID,
     VARCHAR_OID,
     TIMESTAMP_OID,
     TIMESTAMPTZ_OID,
     REGCLASS_OID,
+    ANYARRAY_OID,
 ];
 
 pub fn builtin_type_by_name(name: &str, namespace: Oid) -> Option<PgTypeRecord> {
@@ -1548,6 +1793,15 @@ const NO_ARGS: [Oid; 0] = [];
 
 const BUILTIN_PROCS: &[PgProcRecord] = &[
     PgProcRecord::internal_function(F_INT4EQ, "int4eq", BOOL_OID, &INT4_INT4_ARGS, "int4eq"),
+    PgProcRecord::internal_function(F_INT4LT, "int4lt", BOOL_OID, &INT4_INT4_ARGS, "int4lt"),
+    PgProcRecord::internal_function(F_INT4GT, "int4gt", BOOL_OID, &INT4_INT4_ARGS, "int4gt"),
+    PgProcRecord::internal_function(
+        F_BTINT4CMP,
+        "btint4cmp",
+        INT4_OID,
+        &INT4_INT4_ARGS,
+        "btint4cmp",
+    ),
     PgProcRecord::internal_function(F_OIDEQ, "oideq", BOOL_OID, &OID_OID_ARGS, "oideq"),
     PgProcRecord::internal_function(F_INT4PL, "int4pl", INT4_OID, &INT4_INT4_ARGS, "int4pl"),
     PgProcRecord::internal_function(F_INT8PL, "int8pl", INT8_OID, &INT8_INT8_ARGS, "int8pl"),
