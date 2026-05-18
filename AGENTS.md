@@ -57,11 +57,39 @@ of the transitional Postgres tableam wrapper:
 make -C benches pgbench-compare-rust-server
 ```
 
-That target defaults to a release Rust build. To temporarily run a quicker
-debug build:
+That target defaults to a release Rust build and links the Rust server against
+the local Postgres raw parser through `fastpg-pgcore`. The harness builds the
+normal Meson variant first, then passes that build directory to Cargo as
+`FASTPG_POSTGRES_BUILD_DIR`.
+
+To run the strict pgbench shape against the Rust server through the full
+PostgreSQL parser/analyzer/rewriter/planner/executor facade:
+
+```sh
+make -C benches pgbench-compare-rust-server-strict
+```
+
+That target uses `RUST_PGCORE=full`, builds the Rust server in release mode, and
+links it against a `-Dfastpg=true` Postgres backend build so the guarded virtual
+catalog hooks are available.
+
+To temporarily run a quicker debug build:
 
 ```sh
 make -C benches pgbench-compare-rust-server RUST_BUILD_PROFILE=debug
+```
+
+To compare the Rust server without the in-process Postgres parser link:
+
+```sh
+make -C benches pgbench-compare-rust-server RUST_PGCORE=off
+```
+
+To use the full PostgreSQL execution path with the non-strict Rust-server
+target:
+
+```sh
+make -C benches pgbench-compare-rust-server RUST_PGCORE=full
 ```
 
 To capture a CPU flamegraph of the Rust server during the pgbench transaction

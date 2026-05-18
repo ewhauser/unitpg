@@ -5,4 +5,9 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+default = []
+postgres-linked = ["fastpg-pgcore/postgres-linked"]
+
 [dependencies]
+fastpg-pgcore.workspace = true

@@ -1,8 +1,47 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::collections::HashMap;
+use std::ffi::CStr;
+use std::os::raw::c_char;
 use std::slice;
 use std::sync::{Mutex, OnceLock};
+
+use fastpg_catalog::{
+    BPCHAR_OID, CatalogError, ColumnRecord, INT2_OID, INT4_OID, INT8_OID, OID_OID, TEXT_OID,
+    TIMESTAMP_OID, VARCHAR_OID, add_primary_key, create_relation, drop_relation,
+    lookup_builtin_type, relation_by_name, relation_column_count, truncate_relation,
+};
+use fastpg_types::Oid;
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FastPgRustCatalogType {
+    pub oid: u32,
+    pub typlen: i16,
+    pub typbyval: u8,
+    pub typalign: u8,
+    pub typdelim: u8,
+    pub _padding: u8,
+    pub typinput: u32,
+    pub typoutput: u32,
+    pub typreceive: u32,
+    pub typsend: u32,
+    pub typmodin: u32,
+    pub typmodout: u32,
+    pub typisdefined: u8,
+    pub typtype: u8,
+    pub typcategory: u8,
+    pub typispreferred: u8,
+    pub typrelid: u32,
+    pub typelem: u32,
+    pub typarray: u32,
+    pub typbasetype: u32,
+    pub typtypmod: i32,
+    pub typcollation: u32,
+    pub typsubscript: u32,
+    pub typstorage: u8,
+    pub _trailing_padding: [u8; 3],
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RowId(pub u64);
@@ -210,6 +249,510 @@ fn with_storage<R>(f: impl FnOnce(&mut StorageState) -> R) -> R {
         Err(poisoned) => {
             let mut state = poisoned.into_inner();
             f(&mut state)
+        }
+    }
+}
+
+unsafe fn c_str_to_string(value: *const c_char) -> Result<String, String> {
+    if value.is_null() {
+        return Err("null string pointer".to_owned());
+    }
+    unsafe { CStr::from_ptr(value) }
+        .to_str()
+        .map(str::to_owned)
+        .map_err(|error| format!("invalid UTF-8 string: {error}"))
+}
+
+unsafe fn c_str_array_to_strings(
+    values: *const *const c_char,
+    len: usize,
+) -> Result<Vec<String>, String> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    if values.is_null() {
+        return Err("null string array pointer".to_owned());
+    }
+    unsafe { slice::from_raw_parts(values, len) }
+        .iter()
+        .map(|value| unsafe { c_str_to_string(*value) })
+        .collect()
+}
+
+unsafe fn u32_array<'a>(values: *const u32, len: usize) -> Result<&'a [u32], String> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if values.is_null() {
+        return Err("null OID array pointer".to_owned());
+    }
+    Ok(unsafe { slice::from_raw_parts(values, len) })
+}
+
+unsafe fn i32_array<'a>(values: *const i32, len: usize) -> Result<&'a [i32], String> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if values.is_null() {
+        return Err("null typmod array pointer".to_owned());
+    }
+    Ok(unsafe { slice::from_raw_parts(values, len) })
+}
+
+unsafe fn u8_array<'a>(values: *const u8, len: usize) -> Result<&'a [u8], String> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if values.is_null() {
+        return Err("null flag array pointer".to_owned());
+    }
+    Ok(unsafe { slice::from_raw_parts(values, len) })
+}
+
+unsafe fn write_c_output(buffer: *mut c_char, buffer_len: usize, value: &str) {
+    if buffer.is_null() || buffer_len == 0 {
+        return;
+    }
+
+    let bytes = value.as_bytes();
+    let copy_len = bytes.len().min(buffer_len - 1);
+    unsafe {
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.cast::<u8>(), copy_len);
+        *buffer.add(copy_len) = 0;
+    }
+}
+
+unsafe fn write_catalog_error(
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+    sqlstate: &str,
+    message: &str,
+) {
+    unsafe {
+        write_c_output(sqlstate_out, sqlstate_len, sqlstate);
+        write_c_output(message_out, message_len, message);
+    }
+}
+
+fn invalid_ffi_argument(message: String) -> CatalogError {
+    CatalogError::new("22023", message)
+}
+
+pub fn copy_text_line(table: &str, line: &str) -> Result<bool, String> {
+    let line = line.trim_end_matches('\n').trim_end_matches('\r');
+    if line == "\\." {
+        return Ok(false);
+    }
+
+    let relation = relation_by_name(table)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table.trim()))?;
+    let fields = line.split('\t').collect::<Vec<_>>();
+    if fields.len() != relation.columns.len() {
+        return Err(format!(
+            "COPY row for relation \"{}\" has {} fields but {} columns",
+            relation.name,
+            fields.len(),
+            relation.columns.len()
+        ));
+    }
+
+    let mut values = Vec::with_capacity(relation.columns.len());
+    let mut is_null = Vec::with_capacity(relation.columns.len());
+    let mut byval = Vec::with_capacity(relation.columns.len());
+    let mut value_lens = Vec::with_capacity(relation.columns.len());
+    let mut varlena_payloads = Vec::<Box<[u8]>>::new();
+
+    for (field, column) in fields.iter().zip(&relation.columns) {
+        if *field == "\\N" {
+            values.push(0);
+            is_null.push(1);
+            byval.push(0);
+            value_lens.push(0);
+            continue;
+        }
+
+        let copy_value = copy_text_field_to_datum(field, column.type_oid)?;
+        values.push(copy_value.value);
+        is_null.push(0);
+        byval.push(u8::from(copy_value.byval));
+        value_lens.push(copy_value.value_len);
+        if let Some(payload) = copy_value.payload {
+            let pointer = payload.as_ptr() as usize;
+            values.pop();
+            values.push(pointer);
+            varlena_payloads.push(payload);
+        }
+    }
+
+    let mut row_id = 0u64;
+    let inserted = unsafe {
+        fastpg_rust_relation_insert(
+            relation.oid.0,
+            values.as_ptr(),
+            is_null.as_ptr(),
+            byval.as_ptr(),
+            value_lens.as_ptr(),
+            relation.columns.len(),
+            &mut row_id,
+        )
+    };
+    if inserted {
+        Ok(true)
+    } else {
+        Err(format!(
+            "failed to insert COPY row into \"{}\"",
+            relation.name
+        ))
+    }
+}
+
+struct CopyDatum {
+    value: usize,
+    byval: bool,
+    value_len: usize,
+    payload: Option<Box<[u8]>>,
+}
+
+fn copy_text_field_to_datum(field: &str, type_oid: Oid) -> Result<CopyDatum, String> {
+    match type_oid {
+        INT2_OID => field
+            .parse::<i16>()
+            .map(|value| CopyDatum {
+                value: value as usize,
+                byval: true,
+                value_len: 0,
+                payload: None,
+            })
+            .map_err(|error| format!("invalid int2 literal {field:?}: {error}")),
+        INT4_OID => field
+            .parse::<i32>()
+            .map(|value| CopyDatum {
+                value: value as usize,
+                byval: true,
+                value_len: 0,
+                payload: None,
+            })
+            .map_err(|error| format!("invalid int4 literal {field:?}: {error}")),
+        INT8_OID => field
+            .parse::<i64>()
+            .map(|value| CopyDatum {
+                value: value as usize,
+                byval: true,
+                value_len: 0,
+                payload: None,
+            })
+            .map_err(|error| format!("invalid int8 literal {field:?}: {error}")),
+        OID_OID => field
+            .parse::<u32>()
+            .map(|value| CopyDatum {
+                value: value as usize,
+                byval: true,
+                value_len: 0,
+                payload: None,
+            })
+            .map_err(|error| format!("invalid oid literal {field:?}: {error}")),
+        TEXT_OID | BPCHAR_OID | VARCHAR_OID => {
+            let decoded = decode_copy_text_field(field);
+            let payload = postgres_text_payload(decoded.as_bytes());
+            Ok(CopyDatum {
+                value: 0,
+                byval: false,
+                value_len: payload.len(),
+                payload: Some(payload),
+            })
+        }
+        TIMESTAMP_OID => Ok(CopyDatum {
+            value: 0,
+            byval: true,
+            value_len: 0,
+            payload: None,
+        }),
+        other => Err(format!("COPY does not support type OID {}", other.0)),
+    }
+}
+
+fn postgres_text_payload(value: &[u8]) -> Box<[u8]> {
+    let len = (value.len() + 4) as u32;
+    let header = if cfg!(target_endian = "little") {
+        len << 2
+    } else {
+        len
+    };
+    let mut payload = Vec::with_capacity(value.len() + 4);
+    payload.extend_from_slice(&header.to_ne_bytes());
+    payload.extend_from_slice(value);
+    payload.into_boxed_slice()
+}
+
+fn decode_copy_text_field(field: &str) -> String {
+    let mut decoded = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('b') => decoded.push('\u{0008}'),
+            Some('f') => decoded.push('\u{000c}'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => decoded.push(other),
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_type_by_oid(
+    oid: u32,
+    out: *mut FastPgRustCatalogType,
+) -> bool {
+    let Some(record) = lookup_builtin_type(Oid(oid)) else {
+        return false;
+    };
+
+    if out.is_null() {
+        return false;
+    }
+
+    unsafe {
+        *out = FastPgRustCatalogType {
+            oid: record.oid.0,
+            typlen: record.typlen,
+            typbyval: u8::from(record.typbyval),
+            typalign: record.typalign,
+            typdelim: record.typdelim,
+            _padding: 0,
+            typinput: record.typinput.0,
+            typoutput: record.typoutput.0,
+            typreceive: record.typreceive.0,
+            typsend: record.typsend.0,
+            typmodin: record.typmodin.0,
+            typmodout: record.typmodout.0,
+            typisdefined: u8::from(record.typisdefined),
+            typtype: record.typtype,
+            typcategory: record.typcategory,
+            typispreferred: u8::from(record.typispreferred),
+            typrelid: record.typrelid.0,
+            typelem: record.typelem.0,
+            typarray: record.typarray.0,
+            typbasetype: record.typbasetype.0,
+            typtypmod: record.typtypmod,
+            typcollation: record.typcollation.0,
+            typsubscript: record.typsubscript.0,
+            typstorage: record.typstorage,
+            _trailing_padding: [0; 3],
+        };
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_create_relation(
+    name: *const c_char,
+    column_names: *const *const c_char,
+    type_oids: *const u32,
+    type_mods: *const i32,
+    not_nulls: *const u8,
+    column_count: usize,
+    if_not_exists: bool,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
+            .map_err(invalid_ffi_argument)?;
+        let type_oids =
+            unsafe { u32_array(type_oids, column_count) }.map_err(invalid_ffi_argument)?;
+        let type_mods =
+            unsafe { i32_array(type_mods, column_count) }.map_err(invalid_ffi_argument)?;
+        let not_nulls =
+            unsafe { u8_array(not_nulls, column_count) }.map_err(invalid_ffi_argument)?;
+        let columns = column_names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| {
+                ColumnRecord::new(
+                    name,
+                    Oid(type_oids[index]),
+                    type_mods[index],
+                    not_nulls[index] != 0,
+                )
+            })
+            .collect::<Vec<_>>();
+        create_relation(&name, columns, if_not_exists).map(|_| ())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_drop_relation(
+    name: *const c_char,
+    missing_ok: bool,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let dropped = drop_relation(&name, missing_ok)?;
+        if let Some(relation) = dropped {
+            with_storage(|state| state.clear_relation(relation.oid.0));
+        }
+        Ok::<(), fastpg_catalog::CatalogError>(())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_truncate_relation(
+    name: *const c_char,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let relation = truncate_relation(&name)?;
+        with_storage(|state| state.clear_relation(relation.oid.0));
+        Ok::<(), fastpg_catalog::CatalogError>(())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_count(
+    name: *const c_char,
+    count_out: *mut usize,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let count = relation_column_count(&name)?;
+        if count_out.is_null() {
+            return Err(CatalogError::new(
+                "22023",
+                "null column count output pointer",
+            ));
+        }
+        unsafe {
+            *count_out = count;
+        }
+        Ok::<(), CatalogError>(())
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
+    name: *const c_char,
+    column_names: *const *const c_char,
+    column_count: usize,
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let result = (|| {
+        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
+        let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
+            .map_err(invalid_ffi_argument)?;
+        add_primary_key(&name, column_names)
+    })();
+
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            unsafe {
+                write_catalog_error(
+                    sqlstate_out,
+                    sqlstate_len,
+                    message_out,
+                    message_len,
+                    &error.sqlstate,
+                    &error.message,
+                );
+            }
+            false
         }
     }
 }

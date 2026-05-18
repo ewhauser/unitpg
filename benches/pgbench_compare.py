@@ -83,6 +83,7 @@ class PgBenchCompare:
                 "fastpg_engine": args.fastpg_engine,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
+                "rust_pgcore": args.rust_pgcore,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
                 "profile_tool": args.profile_tool,
                 "profile_phase": args.profile_phase,
@@ -202,6 +203,14 @@ class PgBenchCompare:
             )
 
         build_command = ["cargo", "build", "-p", "fastpg-server"]
+        build_env = os.environ.copy()
+        if self.args.rust_pgcore == "raw-parser":
+            build_command.extend(["--features", "postgres-linked"])
+            build_env["FASTPG_POSTGRES_BUILD_DIR"] = str(self.pgbench_client_paths["build_dir"])
+        elif self.args.rust_pgcore == "full":
+            pgcore_build_dir = self.ensure_fastpg_pgcore_build(variant.name, output_dir)
+            build_command.extend(["--features", "postgres-execution"])
+            build_env["FASTPG_POSTGRES_BUILD_DIR"] = str(pgcore_build_dir)
         if self.args.rust_build_profile == "release":
             build_command.append("--release")
 
@@ -211,6 +220,7 @@ class PgBenchCompare:
             build_command,
             output_dir,
             "cargo-build-fastpg-server",
+            env=build_env,
         )
         server_binary_name = "fastpg-server.exe" if os.name == "nt" else "fastpg-server"
         server_binary = self.source_root / "target" / self.args.rust_build_profile / server_binary_name
@@ -229,12 +239,52 @@ class PgBenchCompare:
                 output_dir,
             )
 
-        return {
+        paths = {
             "server_binary": server_binary,
             "client_prefix": self.pgbench_client_paths["prefix"],
             "client_bindir": self.pgbench_client_paths["bindir"],
             "client_libdir": self.pgbench_client_paths["libdir"],
         }
+        if self.args.rust_pgcore == "full":
+            paths["pgcore_build_dir"] = Path(build_env["FASTPG_POSTGRES_BUILD_DIR"])
+        return paths
+
+    def ensure_fastpg_pgcore_build(self, variant_name: str, output_dir: Path) -> Path:
+        build_dir = self.build_root / "fastpg"
+        setup_args = [
+            "meson",
+            "setup",
+            str(build_dir),
+            str(self.source_root),
+            f"--buildtype={self.args.meson_buildtype}",
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            "-Dfastpg=true",
+        ]
+        reconfigure_args = [
+            "meson",
+            "setup",
+            "--reconfigure",
+            str(build_dir),
+            f"--buildtype={self.args.meson_buildtype}",
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            "-Dfastpg=true",
+        ]
+
+        if (build_dir / "build.ninja").exists():
+            self.checked_command(variant_name, "setup", reconfigure_args, output_dir, "meson-reconfigure-fastpg")
+        else:
+            self.checked_command(variant_name, "setup", setup_args, output_dir, "meson-setup-fastpg")
+
+        self.checked_command(
+            variant_name,
+            "setup",
+            ["meson", "compile", "-C", str(build_dir), "backend"],
+            output_dir,
+            "meson-compile-fastpg-backend",
+        )
+        return build_dir
 
     def repair_macos_libpq_names(self, variant: str, bindir: Path, libdir: Path, output_dir: Path) -> None:
         if platform.system() != "Darwin":
@@ -795,6 +845,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["debug", "release"],
         default="release",
         help="Cargo build profile for the Rust server when --fastpg-engine=rust-server",
+    )
+    parser.add_argument(
+        "--rust-pgcore",
+        choices=["off", "raw-parser", "full"],
+        default="raw-parser",
+        help="Postgres C components to link into the Rust server",
     )
     parser.add_argument(
         "--fastpg-engine",

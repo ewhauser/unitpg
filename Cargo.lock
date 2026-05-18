@@ -264,7 +264,9 @@ name = "fastpg-exec"
 version = "0.1.0"
 dependencies = [
  "fastpg-bind",
+ "fastpg-catalog",
  "fastpg-parser",
+ "fastpg-pgcore",
  "fastpg-plan",
  "fastpg-storage",
  "fastpg-tx",
@@ -282,6 +284,17 @@ dependencies = [
 [[package]]
 name = "fastpg-parser"
 version = "0.1.0"
+dependencies = [
+ "fastpg-pgcore",
+]
+
+[[package]]
+name = "fastpg-pgcore"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "fastpg-storage",
+]
 
 [[package]]
 name = "fastpg-plan"

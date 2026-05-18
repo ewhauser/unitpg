@@ -1,11 +1,25 @@
 #![forbid(unsafe_code)]
 
+#[cfg(not(feature = "postgres-execution"))]
 use std::collections::BTreeMap;
+#[cfg(not(feature = "postgres-execution"))]
 use std::sync::{Arc, Mutex};
 
+#[cfg(not(feature = "postgres-execution"))]
 use fastpg_bind::{BoundExpression, BoundStatement, bind};
-use fastpg_parser::parse;
+#[cfg(feature = "postgres-execution")]
+use fastpg_catalog::relation_by_name;
+#[cfg(not(feature = "postgres-execution"))]
+use fastpg_parser::{ParseError, parse};
+#[cfg(feature = "postgres-execution")]
+use fastpg_pgcore::{
+    ExecutionResult as PgCoreExecutionResult, INT4_OID, INT8_OID, PgCoreSession, PgCoreValue,
+    TEXT_OID, VARCHAR_OID,
+};
 use fastpg_types::{Column, PgType, Value};
+
+#[cfg(feature = "postgres-execution")]
+const BPCHAR_OID: u32 = 1042;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryDescription {
@@ -52,54 +66,134 @@ pub enum QueryExecution {
 
 #[derive(Clone, Debug)]
 pub struct QueryExecutor {
+    #[cfg(not(feature = "postgres-execution"))]
     server_version: String,
+    #[cfg(not(feature = "postgres-execution"))]
     database: Arc<Mutex<DatabaseState>>,
+    #[cfg(feature = "postgres-execution")]
+    pgcore_session: PgCoreSession,
 }
 
 impl QueryExecutor {
     pub fn new(server_version: impl Into<String>) -> Self {
-        Self {
-            server_version: server_version.into(),
-            database: Arc::new(Mutex::new(DatabaseState::default())),
+        #[cfg(feature = "postgres-execution")]
+        {
+            let _ = server_version.into();
+            Self {
+                pgcore_session: PgCoreSession::new(),
+            }
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            Self {
+                server_version: server_version.into(),
+                database: Arc::new(Mutex::new(DatabaseState::default())),
+            }
         }
     }
 
     pub fn describe(&self, sql: &str) -> Option<QueryDescription> {
-        let statement = bind_sql(sql).ok()?;
-        Some(QueryDescription::new(
-            parameter_types(&statement),
-            self.result_fields(&statement),
-        ))
+        #[cfg(feature = "postgres-execution")]
+        {
+            if let Some(description) = describe_virtual_catalog_query(sql) {
+                return Some(description);
+            }
+            self.describe_pgcore(sql)
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            let statement = bind_sql(sql).ok()?;
+            Some(QueryDescription::new(
+                parameter_types(&statement),
+                self.result_fields(&statement),
+            ))
+        }
     }
 
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
-        let Ok(statement) = bind_sql(sql) else {
-            return QueryExecution::Unsupported {
-                query: sql.to_owned(),
+        #[cfg(feature = "postgres-execution")]
+        {
+            if let Some(execution) = execute_virtual_catalog_query(sql, parameters) {
+                return execution;
+            }
+            if !parameters.is_empty() {
+                return QueryExecution::InvalidParameters {
+                    message: "pgcore execution does not yet accept bound parameters".to_owned(),
+                };
+            }
+            self.execute_pgcore(sql)
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            let statement = match bind_sql(sql) {
+                Ok(statement) => statement,
+                Err(error) => {
+                    return parse_failure_execution(error);
+                }
             };
-        };
 
-        self.execute_bound(statement, parameters)
+            self.execute_bound(statement, parameters)
+        }
     }
 
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
-        let line = line.trim_end_matches('\r');
-        if line == "\\." {
-            return Ok(false);
+        #[cfg(feature = "postgres-execution")]
+        {
+            fastpg_storage::copy_text_line(table, line)
         }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            let line = line.trim_end_matches('\r');
+            if line == "\\." {
+                return Ok(false);
+            }
 
-        let mut database = self
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let table = database
-            .tables
-            .get_mut(table)
-            .ok_or_else(|| format!("relation \"{table}\" does not exist"))?;
-        table.copy_text_row(line)?;
-        Ok(true)
+            let mut database = self
+                .database
+                .lock()
+                .expect("fastpg database mutex poisoned");
+            let table = database
+                .tables
+                .get_mut(table)
+                .ok_or_else(|| format!("relation \"{table}\" does not exist"))?;
+            table.copy_text_row(line)?;
+            Ok(true)
+        }
     }
 
+    #[cfg(feature = "postgres-execution")]
+    fn describe_pgcore(&self, sql: &str) -> Option<QueryDescription> {
+        let statement = self.pgcore_session.prepare(sql).ok()?;
+        let description = statement.describe();
+        Some(QueryDescription::new(
+            description
+                .parameter_type_oids
+                .iter()
+                .copied()
+                .map(pg_type_for_oid)
+                .collect(),
+            description
+                .fields
+                .into_iter()
+                .map(|field| Column::new(field.name, pg_type_for_oid(field.type_oid)))
+                .collect(),
+        ))
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn execute_pgcore(&self, sql: &str) -> QueryExecution {
+        let statement = match self.pgcore_session.prepare(sql) {
+            Ok(statement) => statement,
+            Err(error) => return pgcore_error_execution(error),
+        };
+
+        match statement.execute() {
+            Ok(result) => pgcore_execution_to_query_execution(result),
+            Err(error) => pgcore_error_execution(error),
+        }
+    }
+
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_bound(&self, statement: BoundStatement, parameters: &[Value]) -> QueryExecution {
         match statement {
             BoundStatement::SelectOne => QueryExecution::Rows(QueryResult::new(
@@ -163,6 +257,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn result_fields(&self, statement: &BoundStatement) -> Vec<Column> {
         if let BoundStatement::SelectColumnWhereInt { table, column, .. } = statement {
             let database = self
@@ -177,6 +272,7 @@ impl QueryExecutor {
         result_fields_for_statement(statement)
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_relkind_lookup(&self, parameters: &[Value]) -> QueryExecution {
         let Some(Value::Text(table)) = parameters.first() else {
             return QueryExecution::InvalidParameters {
@@ -199,6 +295,7 @@ impl QueryExecutor {
         ))
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_pgbench_partition_info(&self) -> QueryExecution {
         let database = self
             .database
@@ -217,6 +314,7 @@ impl QueryExecutor {
         ))
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_count(&self, table: &str) -> QueryExecution {
         let database = self
             .database
@@ -234,6 +332,7 @@ impl QueryExecutor {
         ))
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_select_column_where_int(
         &self,
         table: &str,
@@ -255,6 +354,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_drop_tables(&self, if_exists: bool, names: &[String]) -> QueryExecution {
         let mut database = self
             .database
@@ -271,6 +371,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_create_table(&self, name: String, columns: Vec<Column>) -> QueryExecution {
         let mut database = self
             .database
@@ -287,6 +388,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_truncate_tables(&self, names: &[String]) -> QueryExecution {
         let mut database = self
             .database
@@ -305,6 +407,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_begin(&self) -> QueryExecution {
         let mut database = self
             .database
@@ -318,6 +421,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_commit(&self) -> QueryExecution {
         let mut database = self
             .database
@@ -330,6 +434,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_rollback(&self) -> QueryExecution {
         let mut database = self
             .database
@@ -344,6 +449,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_copy_from_stdin(&self, table: &str) -> QueryExecution {
         let database = self
             .database
@@ -359,6 +465,7 @@ impl QueryExecutor {
         })
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_update_add_int(
         &self,
         table: &str,
@@ -384,6 +491,7 @@ impl QueryExecutor {
         }
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     fn execute_insert(
         &self,
         table: &str,
@@ -408,10 +516,20 @@ impl QueryExecutor {
     }
 }
 
-fn bind_sql(sql: &str) -> Result<BoundStatement, ()> {
-    parse(sql).map(bind).map_err(|_| ())
+#[cfg(not(feature = "postgres-execution"))]
+fn bind_sql(sql: &str) -> Result<BoundStatement, ParseError> {
+    parse(sql).map(bind)
 }
 
+#[cfg(not(feature = "postgres-execution"))]
+fn parse_failure_execution(error: ParseError) -> QueryExecution {
+    match (error.sqlstate, error.message) {
+        (Some(sqlstate), Some(message)) => QueryExecution::Error { sqlstate, message },
+        _ => QueryExecution::Unsupported { query: error.query },
+    }
+}
+
+#[cfg(not(feature = "postgres-execution"))]
 fn parameter_types(statement: &BoundStatement) -> Vec<PgType> {
     match statement {
         BoundStatement::SelectInt4Parameter => vec![PgType::Int4],
@@ -420,6 +538,7 @@ fn parameter_types(statement: &BoundStatement) -> Vec<PgType> {
     }
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn result_fields_for_statement(statement: &BoundStatement) -> Vec<Column> {
     match statement {
         BoundStatement::SelectOne | BoundStatement::SelectInt4Parameter => {
@@ -439,6 +558,7 @@ fn result_fields_for_statement(statement: &BoundStatement) -> Vec<Column> {
     }
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn undefined_table(table: &str) -> QueryExecution {
     execution_error("42P01", format!("relation \"{table}\" does not exist"))
 }
@@ -450,28 +570,174 @@ fn execution_error(sqlstate: impl Into<String>, message: impl Into<String>) -> Q
     }
 }
 
+#[cfg(feature = "postgres-execution")]
+fn describe_virtual_catalog_query(sql: &str) -> Option<QueryDescription> {
+    match normalize_sql_shape(sql).as_str() {
+        "select relkind from pg_catalog.pg_class where oid=$1::pg_catalog.regclass" => {
+            Some(QueryDescription::new(
+                vec![PgType::Varchar],
+                vec![Column::new("relkind", PgType::Varchar)],
+            ))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn execute_virtual_catalog_query(sql: &str, parameters: &[Value]) -> Option<QueryExecution> {
+    match normalize_sql_shape(sql).as_str() {
+        "select relkind from pg_catalog.pg_class where oid=$1::pg_catalog.regclass" => {
+            Some(execute_pg_class_relkind(parameters))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn execute_pg_class_relkind(parameters: &[Value]) -> QueryExecution {
+    let Some(parameter) = parameters.first() else {
+        return QueryExecution::InvalidParameters {
+            message: "missing regclass text parameter".to_owned(),
+        };
+    };
+    if parameters.len() != 1 {
+        return QueryExecution::InvalidParameters {
+            message: format!("expected 1 parameter, got {}", parameters.len()),
+        };
+    }
+
+    let Value::Text(table_name) = parameter else {
+        return QueryExecution::InvalidParameters {
+            message: format!("expected regclass text parameter, got {parameter:?}"),
+        };
+    };
+
+    if relation_by_name(table_name).is_none() {
+        return execution_error("42P01", format!("relation \"{table_name}\" does not exist"));
+    }
+
+    QueryExecution::Rows(QueryResult::new(
+        vec![Column::new("relkind", PgType::Varchar)],
+        vec![vec![Value::Text("r".to_owned())]],
+    ))
+}
+
+#[cfg(feature = "postgres-execution")]
+fn normalize_sql_shape(sql: &str) -> String {
+    sql.trim()
+        .trim_end_matches(';')
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_ascii_lowercase()
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
+    QueryExecution::Error {
+        sqlstate: error.sqlstate,
+        message: error.message,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryExecution {
+    let Some(statement) = result.statements.into_iter().next() else {
+        return QueryExecution::Command {
+            tag: "OK".to_owned(),
+            rows: 0,
+        };
+    };
+
+    if let Some(copy_in) = statement.copy_in {
+        return QueryExecution::CopyIn(CopyTarget {
+            table: copy_in.table,
+            columns: copy_in.columns,
+        });
+    }
+
+    if statement.fields.is_empty() {
+        return QueryExecution::Command {
+            tag: statement.command_tag,
+            rows: statement.rows.len(),
+        };
+    }
+
+    let fields = statement
+        .fields
+        .into_iter()
+        .map(|field| Column::new(field.name, pg_type_for_oid(field.type_oid)))
+        .collect::<Vec<_>>();
+    let rows = statement
+        .rows
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .zip(fields.iter())
+                .map(|(value, field)| pgcore_value_to_value(value, field.data_type))
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .collect::<Result<Vec<_>, _>>();
+
+    match rows {
+        Ok(rows) => QueryExecution::Rows(QueryResult::new(fields, rows)),
+        Err(message) => execution_error("22P02", message),
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pg_type_for_oid(type_oid: u32) -> PgType {
+    match type_oid {
+        INT4_OID => PgType::Int4,
+        INT8_OID => PgType::Int8,
+        TEXT_OID | VARCHAR_OID | BPCHAR_OID => PgType::Varchar,
+        _ => PgType::Varchar,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_value_to_value(value: PgCoreValue, data_type: PgType) -> Result<Value, String> {
+    match (value, data_type) {
+        (PgCoreValue::Null, _) => Ok(Value::Null),
+        (PgCoreValue::Text(value), PgType::Int4) => value
+            .parse::<i32>()
+            .map(Value::Int4)
+            .map_err(|error| format!("cannot decode PostgreSQL int4 value {value:?}: {error}")),
+        (PgCoreValue::Text(value), PgType::Int8) => value
+            .parse::<i64>()
+            .map(Value::Int8)
+            .map_err(|error| format!("cannot decode PostgreSQL int8 value {value:?}: {error}")),
+        (PgCoreValue::Text(value), PgType::Varchar) => Ok(Value::Text(value)),
+    }
+}
+
+#[cfg(not(feature = "postgres-execution"))]
 fn normalize_identifier(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DatabaseState {
     tables: BTreeMap<String, Table>,
     snapshots: Vec<BTreeMap<String, Table>>,
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 impl DatabaseState {
     fn column_type(&self, table: &str, column: &str) -> Option<PgType> {
         self.tables.get(table)?.column_type(column)
     }
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Table {
     columns: Vec<Column>,
     rows: Vec<Vec<Value>>,
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 impl Table {
     fn new(columns: Vec<Column>) -> Self {
         Self {
@@ -610,6 +876,7 @@ impl Table {
     }
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn copy_field_to_value(field: &str, data_type: PgType) -> Result<Value, String> {
     if field == "\\N" {
         return Ok(Value::Null);
@@ -629,6 +896,7 @@ fn copy_field_to_value(field: &str, data_type: PgType) -> Result<Value, String> 
     }
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn expression_to_value(expression: &BoundExpression, data_type: PgType) -> Result<Value, String> {
     match (expression, data_type) {
         (BoundExpression::Null, _) => Ok(Value::Null),
@@ -652,6 +920,7 @@ fn expression_to_value(expression: &BoundExpression, data_type: PgType) -> Resul
     }
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn decode_copy_text_field(field: &str) -> String {
     let mut decoded = String::with_capacity(field.len());
     let mut chars = field.chars();
@@ -675,10 +944,12 @@ fn decode_copy_text_field(field: &str) -> String {
     decoded
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn checked_i64_to_i32(value: i64) -> Result<i32, String> {
     i32::try_from(value).map_err(|_| "int4 out of range".to_owned())
 }
 
+#[cfg(not(feature = "postgres-execution"))]
 fn value_equals_i64(value: &Value, expected: i64) -> bool {
     match value {
         Value::Int4(value) => *value as i64 == expected,
@@ -692,6 +963,7 @@ fn value_equals_i64(value: &Value, expected: i64) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(feature = "postgres-execution"))]
     #[test]
     fn describes_parameterized_int4_query() {
         let executor = QueryExecutor::new("17.0-fastpg");
@@ -705,6 +977,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     #[test]
     fn executes_server_version_query() {
         let executor = QueryExecutor::new("17.0-fastpg");
@@ -720,6 +993,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     #[test]
     fn executes_pgbench_ddl_and_count() {
         let executor = QueryExecutor::new("17.0-fastpg");
@@ -743,6 +1017,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "postgres-execution"))]
     #[test]
     fn copies_rows_and_updates_them() {
         let executor = QueryExecutor::new("17.0-fastpg");
@@ -773,5 +1048,110 @@ mod tests {
                 vec![vec![Value::Int4(5)]]
             ))
         );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn executes_select_one_through_pgcore() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        assert_eq!(
+            executor.describe("SELECT 1").unwrap().fields,
+            vec![Column::new("?column?", PgType::Int4)]
+        );
+        assert_eq!(
+            executor.execute("SELECT 1", &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::new("?column?", PgType::Int4)],
+                vec![vec![Value::Int4(1)]]
+            ))
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn executes_create_table_through_pgcore() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_util_{}", std::process::id());
+
+        assert_eq!(
+            executor.execute(
+                &format!("create table {table}(id int not null, filler char(8), mtime timestamp)"),
+                &[]
+            ),
+            QueryExecution::Command {
+                tag: "CREATE TABLE".to_owned(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute(&format!("drop table if exists {table}"), &[]),
+            QueryExecution::Command {
+                tag: "DROP TABLE".to_owned(),
+                rows: 0,
+            }
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn answers_pgbench_relkind_virtual_catalog_query() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_relkind_{}", std::process::id());
+        executor.execute(&format!("create table {table}(id int not null)"), &[]);
+
+        let sql = "SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass";
+        assert_eq!(
+            executor.describe(sql).unwrap(),
+            QueryDescription::new(
+                vec![PgType::Varchar],
+                vec![Column::new("relkind", PgType::Varchar)]
+            )
+        );
+        assert_eq!(
+            executor.execute(sql, &[Value::Text(table.clone())]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::new("relkind", PgType::Varchar)],
+                vec![vec![Value::Text("r".to_owned())]]
+            ))
+        );
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn copy_from_stdin_uses_pgcore_and_rust_storage() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_copy_{}", std::process::id());
+        executor.execute(
+            &format!("create table {table}(id int not null, filler char(8))"),
+            &[],
+        );
+
+        assert_eq!(
+            executor.execute(&format!("copy {table} from stdin with (freeze on)"), &[]),
+            QueryExecution::CopyIn(CopyTarget {
+                table: table.clone(),
+                columns: 2,
+            })
+        );
+        assert!(executor.copy_text_line(&table, "1\t").unwrap());
+        assert!(!executor.copy_text_line(&table, "\\.").unwrap());
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn unsupported_pgcore_utilities_are_not_fallbacks() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        let result = executor.execute("SHOW server_version", &[]);
+        let QueryExecution::Error { sqlstate, message } = result else {
+            panic!("expected pgcore error, got {result:?}");
+        };
+        assert_eq!(sqlstate, "0A000");
+        assert!(message.contains("fastpg pgcore does not yet support utility statement"));
     }
 }

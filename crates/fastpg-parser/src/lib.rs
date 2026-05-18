@@ -6,6 +6,29 @@ pub struct SqlText(pub String);
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ParseError {
     pub query: String,
+    pub sqlstate: Option<String>,
+    pub message: Option<String>,
+    pub cursorpos: Option<i32>,
+}
+
+impl ParseError {
+    pub fn unsupported(query: impl Into<String>) -> Self {
+        Self {
+            query: query.into(),
+            sqlstate: None,
+            message: None,
+            cursorpos: None,
+        }
+    }
+
+    fn postgres(query: &str, error: fastpg_pgcore::PgCoreError) -> Self {
+        Self {
+            query: query.to_owned(),
+            sqlstate: Some(error.sqlstate),
+            message: Some(error.message),
+            cursorpos: Some(error.cursorpos),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -79,10 +102,10 @@ pub enum Literal {
 pub fn parse(sql: &str) -> Result<ParsedStatement, ParseError> {
     let query = trim_sql(sql);
     if query.is_empty() {
-        return Err(ParseError {
-            query: sql.to_owned(),
-        });
+        return Err(ParseError::unsupported(sql));
     }
+
+    fastpg_pgcore::raw_parse(sql).map_err(|error| ParseError::postgres(sql, error))?;
 
     parse_exact_query(query)
         .or_else(|| parse_transaction(query))
@@ -94,9 +117,7 @@ pub fn parse(sql: &str) -> Result<ParsedStatement, ParseError> {
         .or_else(|| parse_select_column_where_int(query))
         .or_else(|| parse_update_add_int(query))
         .or_else(|| parse_insert(query))
-        .ok_or_else(|| ParseError {
-            query: sql.to_owned(),
-        })
+        .ok_or_else(|| ParseError::unsupported(sql))
 }
 
 fn parse_exact_query(query: &str) -> Option<ParsedStatement> {

@@ -19,6 +19,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup_details.h"
 #include "access/toast_compression.h"
 #include "access/tupdesc_details.h"
@@ -948,6 +951,27 @@ TupleDescInitEntry(TupleDesc desc,
 	att->attislocal = true;
 	att->attinhcount = 0;
 	/* variable-length fields are not present in tupledescs */
+
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogType fastpg_type;
+
+		if (fastpg_rust_catalog_type_by_oid((uint32_t) oidtypeid,
+											&fastpg_type))
+		{
+			att->atttypid = oidtypeid;
+			att->attlen = fastpg_type.typlen;
+			att->attbyval = fastpg_type.typbyval != 0;
+			att->attalign = (char) fastpg_type.typalign;
+			att->attstorage = (char) fastpg_type.typstorage;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = fastpg_type.typcollation;
+
+			populate_compact_attribute(desc, attributeNumber - 1);
+			return;
+		}
+	}
+#endif
 
 	tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(oidtypeid));
 	if (!HeapTupleIsValid(tuple))

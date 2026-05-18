@@ -15,6 +15,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/hash.h"
 #include "access/htup_details.h"
 #include "bootstrap/bootstrap.h"
@@ -55,6 +58,14 @@
 
 /* Hook for plugins to get control in get_attavgwidth() */
 get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
+
+#ifdef USE_FASTPG
+static bool
+fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
+{
+	return fastpg_rust_catalog_type_by_oid((uint32_t) typid, type);
+}
+#endif
 
 
 /*				---------- AMOP CACHES ----------						 */
@@ -2405,6 +2416,13 @@ get_typisdefined(Oid typid)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typisdefined != 0;
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -2428,6 +2446,13 @@ int16
 get_typlen(Oid typid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typlen;
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
@@ -2453,6 +2478,13 @@ bool
 get_typbyval(Oid typid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typbyval != 0;
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
@@ -2484,6 +2516,17 @@ get_typlenbyval(Oid typid, int16 *typlen, bool *typbyval)
 	HeapTuple	tp;
 	Form_pg_type typtup;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+	{
+		*typlen = fastpg_type.typlen;
+		*typbyval = fastpg_type.typbyval != 0;
+		return;
+	}
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for type %u", typid);
@@ -2504,6 +2547,18 @@ get_typlenbyvalalign(Oid typid, int16 *typlen, bool *typbyval,
 {
 	HeapTuple	tp;
 	Form_pg_type typtup;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+	{
+		*typlen = fastpg_type.typlen;
+		*typbyval = fastpg_type.typbyval != 0;
+		*typalign = (char) fastpg_type.typalign;
+		return;
+	}
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (!HeapTupleIsValid(tp))
@@ -2564,6 +2619,36 @@ get_type_io_data(Oid typid,
 {
 	HeapTuple	typeTuple;
 	Form_pg_type typeStruct;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+	{
+		*typlen = fastpg_type.typlen;
+		*typbyval = fastpg_type.typbyval != 0;
+		*typalign = (char) fastpg_type.typalign;
+		*typdelim = (char) fastpg_type.typdelim;
+		*typioparam = OidIsValid(fastpg_type.typelem) ?
+			fastpg_type.typelem : fastpg_type.oid;
+		switch (which_func)
+		{
+			case IOFunc_input:
+				*func = fastpg_type.typinput;
+				break;
+			case IOFunc_output:
+				*func = fastpg_type.typoutput;
+				break;
+			case IOFunc_receive:
+				*func = fastpg_type.typreceive;
+				break;
+			case IOFunc_send:
+				*func = fastpg_type.typsend;
+				break;
+		}
+		return;
+	}
+#endif
 
 	/*
 	 * In bootstrap mode, pass it off to bootstrap.c.  This hack allows us to
@@ -2652,6 +2737,13 @@ char
 get_typstorage(Oid typid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return (char) fastpg_type.typstorage;
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
@@ -2770,6 +2862,10 @@ getBaseType(Oid typid)
 Oid
 getBaseTypeAndTypmod(Oid typid, int32 *typmod)
 {
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+#endif
+
 	/*
 	 * We loop to find the bottom base type in a stack of domains.
 	 */
@@ -2777,6 +2873,19 @@ getBaseTypeAndTypmod(Oid typid, int32 *typmod)
 	{
 		HeapTuple	tup;
 		Form_pg_type typTup;
+
+#ifdef USE_FASTPG
+		if (fastpg_lookup_type(typid, &fastpg_type))
+		{
+			if ((char) fastpg_type.typtype != TYPTYPE_DOMAIN)
+				break;
+
+			Assert(*typmod == -1);
+			typid = fastpg_type.typbasetype;
+			*typmod = fastpg_type.typtypmod;
+			continue;
+		}
+#endif
 
 		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 		if (!HeapTupleIsValid(tup))
@@ -2863,6 +2972,13 @@ get_typtype(Oid typid)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return (char) fastpg_type.typtype;
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -2945,6 +3061,17 @@ get_type_category_preferred(Oid typid, char *typcategory, bool *typispreferred)
 	HeapTuple	tp;
 	Form_pg_type typtup;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+	{
+		*typcategory = (char) fastpg_type.typcategory;
+		*typispreferred = fastpg_type.typispreferred != 0;
+		return;
+	}
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for type %u", typid);
@@ -2964,6 +3091,13 @@ Oid
 get_typ_typrelid(Oid typid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typrelid;
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
@@ -2993,6 +3127,14 @@ get_element_type(Oid typid)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typsubscript != InvalidOid ?
+			fastpg_type.typelem : InvalidOid;
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -3021,6 +3163,13 @@ get_array_type(Oid typid)
 {
 	HeapTuple	tp;
 	Oid			result = InvalidOid;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typarray;
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
@@ -3064,6 +3213,10 @@ get_promoted_array_type(Oid typid)
 Oid
 get_base_element_type(Oid typid)
 {
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+#endif
+
 	/*
 	 * We loop to find the bottom base type in a stack of domains.
 	 */
@@ -3071,6 +3224,18 @@ get_base_element_type(Oid typid)
 	{
 		HeapTuple	tup;
 		Form_pg_type typTup;
+
+#ifdef USE_FASTPG
+		if (fastpg_lookup_type(typid, &fastpg_type))
+		{
+			if ((char) fastpg_type.typtype != TYPTYPE_DOMAIN)
+				return fastpg_type.typsubscript != InvalidOid ?
+					fastpg_type.typelem : InvalidOid;
+
+			typid = fastpg_type.typbasetype;
+			continue;
+		}
+#endif
 
 		tup = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 		if (!HeapTupleIsValid(tup))
@@ -3109,6 +3274,26 @@ getTypeInputInfo(Oid type, Oid *typInput, Oid *typIOParam)
 	HeapTuple	typeTuple;
 	Form_pg_type pt;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(type, &fastpg_type))
+	{
+		if (fastpg_type.typisdefined == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("type %u is only a shell", type)));
+		if (!OidIsValid(fastpg_type.typinput))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("no input function available for type %u", type)));
+		*typInput = fastpg_type.typinput;
+		*typIOParam = OidIsValid(fastpg_type.typelem) ?
+			fastpg_type.typelem : fastpg_type.oid;
+		return;
+	}
+#endif
+
 	typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
 	if (!HeapTupleIsValid(typeTuple))
 		elog(ERROR, "cache lookup failed for type %u", type);
@@ -3141,6 +3326,26 @@ getTypeOutputInfo(Oid type, Oid *typOutput, bool *typIsVarlena)
 {
 	HeapTuple	typeTuple;
 	Form_pg_type pt;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(type, &fastpg_type))
+	{
+		if (fastpg_type.typisdefined == 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_OBJECT),
+					 errmsg("type %u is only a shell", type)));
+		if (!OidIsValid(fastpg_type.typoutput))
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_FUNCTION),
+					 errmsg("no output function available for type %u", type)));
+		*typOutput = fastpg_type.typoutput;
+		*typIsVarlena = (fastpg_type.typbyval == 0) &&
+			(fastpg_type.typlen == -1);
+		return;
+	}
+#endif
 
 	typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type));
 	if (!HeapTupleIsValid(typeTuple))
@@ -3240,6 +3445,13 @@ get_typmodin(Oid typid)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typmodin;
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -3290,6 +3502,13 @@ get_typcollation(Oid typid)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+		return fastpg_type.typcollation;
+#endif
+
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))
 	{
@@ -3330,6 +3549,17 @@ RegProcedure
 get_typsubscript(Oid typid, Oid *typelemp)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	FastPgRustCatalogType fastpg_type;
+
+	if (fastpg_lookup_type(typid, &fastpg_type))
+	{
+		if (typelemp)
+			*typelemp = fastpg_type.typelem;
+		return fastpg_type.typsubscript;
+	}
+#endif
 
 	tp = SearchSysCache1(TYPEOID, ObjectIdGetDatum(typid));
 	if (HeapTupleIsValid(tp))

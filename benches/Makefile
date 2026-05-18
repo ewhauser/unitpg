@@ -12,6 +12,7 @@ RUNS ?= 3
 PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
+RUST_PGCORE ?= raw-parser
 PROFILE_TRANSACTIONS ?= 500
 PROFILE_RUNS ?= 1
 PROFILE_TOOL ?= flamegraph
@@ -20,7 +21,7 @@ PROFILE_OPEN ?= 0
 PROFILE_WARMUP_SECONDS ?= 1.0
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-profile-rust-server pgbench-profile-rust-server-open pgbench-open-latest-flamegraph
+.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-profile-rust-server pgbench-profile-rust-server-open pgbench-open-latest-flamegraph
 
 pgbench-compare:
 	$(PYTHON) pgbench_compare.py \
@@ -58,7 +59,23 @@ pgbench-compare-rust-server:
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
 		--fastpg-engine "rust-server" \
-		--rust-build-profile "$(RUST_BUILD_PROFILE)"
+		--rust-build-profile "$(RUST_BUILD_PROFILE)" \
+		--rust-pgcore "$(RUST_PGCORE)"
+
+pgbench-compare-rust-server-strict:
+	$(PYTHON) pgbench_compare.py \
+		--builtin "tpcb-like" \
+		--init-steps "default" \
+		--scale "$(SCALE)" \
+		--transactions "$(TRANSACTIONS)" \
+		--clients "$(CLIENTS)" \
+		--jobs "$(JOBS)" \
+		--runs "$(RUNS)" \
+		--protocol "$(PROTOCOL)" \
+		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--fastpg-engine "rust-server" \
+		--rust-build-profile "release" \
+		--rust-pgcore "full"
 
 pgbench-profile-rust-server:
 	$(PYTHON) pgbench_compare.py \
@@ -73,6 +90,7 @@ pgbench-profile-rust-server:
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
 		--fastpg-engine "rust-server" \
 		--rust-build-profile "release" \
+		--rust-pgcore "$(RUST_PGCORE)" \
 		--profile-fastpg-rust-server \
 		--profile-tool "$(PROFILE_TOOL)" \
 		--profile-phase "$(PROFILE_PHASE)" \

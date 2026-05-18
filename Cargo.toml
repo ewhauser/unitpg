@@ -6,6 +6,7 @@ members = [
     "crates/fastpg-exec",
     "crates/fastpg-index",
     "crates/fastpg-parser",
+    "crates/fastpg-pgcore",
     "crates/fastpg-plan",
     "crates/fastpg-server",
     "crates/fastpg-session",
@@ -31,6 +32,7 @@ fastpg-compat = { path = "crates/fastpg-compat" }
 fastpg-exec = { path = "crates/fastpg-exec" }
 fastpg-index = { path = "crates/fastpg-index" }
 fastpg-parser = { path = "crates/fastpg-parser" }
+fastpg-pgcore = { path = "crates/fastpg-pgcore" }
 fastpg-plan = { path = "crates/fastpg-plan" }
 fastpg-server = { path = "crates/fastpg-server" }
 fastpg-session = { path = "crates/fastpg-session" }
@@ -43,3 +45,4 @@ futures = "0.3"
 pgwire = { version = "=0.40.0", default-features = false, features = ["server-api"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
 tokio-postgres = "0.7"
+cc = "1"
