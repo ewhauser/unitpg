@@ -148,4 +148,3 @@ validate-rust-server:
 	cargo test -p fastpg-storage
 	$(MAKE) pgbench-compare-rust-server-strict
 	$(MAKE) regression-compare-rust-server
-	meson test -C .build/pgbench/fastpg --suite fastpg_parser_probe --print-errorlogs

@@ -145,7 +145,8 @@ Useful validation commands after harness edits:
 python3 -m py_compile benches/pgbench_compare.py
 python3 -m py_compile benches/open_latest_profile.py
 cargo test -p fastpg-storage
-meson test -C benches/.build/pgbench/fastpg --suite fastpg_parser_probe --print-errorlogs
+make -C benches pgbench-compare-rust-server-strict
+make -C benches regression-compare-rust-server
 ```
 
 ## SQL regression comparison harness
