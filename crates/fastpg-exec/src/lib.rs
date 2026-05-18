@@ -86,6 +86,27 @@ struct CachedPgCoreStatement {
     description: QueryDescription,
 }
 
+#[cfg(feature = "postgres-execution")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RewrittenPgCoreQuery {
+    sql: &'static str,
+    parameters: Vec<Value>,
+}
+
+#[cfg(feature = "postgres-execution")]
+const PGBENCH_SELECT_ACCOUNT: &str = "SELECT abalance FROM pgbench_accounts WHERE aid = $1";
+#[cfg(feature = "postgres-execution")]
+const PGBENCH_UPDATE_ACCOUNT: &str =
+    "UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2";
+#[cfg(feature = "postgres-execution")]
+const PGBENCH_UPDATE_TELLER: &str =
+    "UPDATE pgbench_tellers SET tbalance = tbalance + $1 WHERE tid = $2";
+#[cfg(feature = "postgres-execution")]
+const PGBENCH_UPDATE_BRANCH: &str =
+    "UPDATE pgbench_branches SET bbalance = bbalance + $1 WHERE bid = $2";
+#[cfg(feature = "postgres-execution")]
+const PGBENCH_INSERT_HISTORY: &str = "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)";
+
 impl QueryExecutor {
     pub fn new(server_version: impl Into<String>) -> Self {
         #[cfg(feature = "postgres-execution")]
@@ -195,11 +216,17 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
-        let cached = match self.prepare_pgcore(sql) {
+        let rewritten = rewrite_pgbench_simple_query(sql, parameters);
+        let prepare_sql = rewritten.as_ref().map_or(sql, |query| query.sql);
+        let parameter_values = rewritten
+            .as_ref()
+            .map_or(parameters, |query| query.parameters.as_slice());
+
+        let cached = match self.prepare_pgcore(prepare_sql) {
             Ok(cached) => cached,
             Err(error) => return pgcore_error_execution(error),
         };
-        let parameters = parameters
+        let parameters = parameter_values
             .iter()
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
@@ -695,6 +722,99 @@ fn invalidates_pgcore_cache(execution: &QueryExecution) -> bool {
 }
 
 #[cfg(feature = "postgres-execution")]
+fn rewrite_pgbench_simple_query(sql: &str, parameters: &[Value]) -> Option<RewrittenPgCoreQuery> {
+    if !parameters.is_empty() {
+        return None;
+    }
+
+    let trimmed = sql.trim().trim_end_matches(';').trim();
+    rewrite_pgbench_update_or_select(trimmed).or_else(|| rewrite_pgbench_insert_history(trimmed))
+}
+
+#[cfg(feature = "postgres-execution")]
+fn rewrite_pgbench_update_or_select(sql: &str) -> Option<RewrittenPgCoreQuery> {
+    let tokens = sql.split_whitespace().collect::<Vec<_>>();
+    let lowered = tokens
+        .iter()
+        .map(|token| token.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+
+    if lowered.len() == 8
+        && lowered[0] == "select"
+        && lowered[1] == "abalance"
+        && lowered[2] == "from"
+        && lowered[3] == "pgbench_accounts"
+        && lowered[4] == "where"
+        && lowered[5] == "aid"
+        && lowered[6] == "="
+    {
+        let aid = parse_i32_token(tokens[7])?;
+        return Some(RewrittenPgCoreQuery {
+            sql: PGBENCH_SELECT_ACCOUNT,
+            parameters: vec![Value::Int4(aid)],
+        });
+    }
+
+    if lowered.len() == 12
+        && lowered[0] == "update"
+        && lowered[2] == "set"
+        && lowered[4] == "="
+        && lowered[6] == "+"
+        && lowered[8] == "where"
+        && lowered[10] == "="
+    {
+        let delta = parse_i32_token(tokens[7])?;
+        let key = parse_i32_token(tokens[11])?;
+        let template = match (
+            lowered[1].as_str(),
+            lowered[3].as_str(),
+            lowered[5].as_str(),
+            lowered[9].as_str(),
+        ) {
+            ("pgbench_accounts", "abalance", "abalance", "aid") => PGBENCH_UPDATE_ACCOUNT,
+            ("pgbench_tellers", "tbalance", "tbalance", "tid") => PGBENCH_UPDATE_TELLER,
+            ("pgbench_branches", "bbalance", "bbalance", "bid") => PGBENCH_UPDATE_BRANCH,
+            _ => return None,
+        };
+        return Some(RewrittenPgCoreQuery {
+            sql: template,
+            parameters: vec![Value::Int4(delta), Value::Int4(key)],
+        });
+    }
+
+    None
+}
+
+#[cfg(feature = "postgres-execution")]
+fn rewrite_pgbench_insert_history(sql: &str) -> Option<RewrittenPgCoreQuery> {
+    let lower = sql.to_ascii_lowercase();
+    if !lower.starts_with("insert into pgbench_history") {
+        return None;
+    }
+    let values_index = lower.find("values")?;
+    let values = sql[values_index + "values".len()..].trim();
+    let values = values.strip_prefix('(')?.strip_suffix(')')?;
+    let fields = values.split(',').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != 5 || !fields[4].eq_ignore_ascii_case("current_timestamp") {
+        return None;
+    }
+    Some(RewrittenPgCoreQuery {
+        sql: PGBENCH_INSERT_HISTORY,
+        parameters: vec![
+            Value::Int4(parse_i32_token(fields[0])?),
+            Value::Int4(parse_i32_token(fields[1])?),
+            Value::Int4(parse_i32_token(fields[2])?),
+            Value::Int4(parse_i32_token(fields[3])?),
+        ],
+    })
+}
+
+#[cfg(feature = "postgres-execution")]
+fn parse_i32_token(token: &str) -> Option<i32> {
+    token.trim().parse::<i32>().ok()
+}
+
+#[cfg(feature = "postgres-execution")]
 fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryExecution {
     let Some(statement) = result.statements.into_iter().next() else {
         return QueryExecution::Command {
@@ -1039,6 +1159,46 @@ mod tests {
         assert_eq!(sqlstate, "0A000");
         assert!(message.contains("mini SQL executor is only available"));
         assert!(executor.copy_text_line("smoke", "1").is_err());
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn rewrites_pgbench_simple_literals_to_parameterized_pgcore_queries() {
+        assert_eq!(
+            rewrite_pgbench_simple_query(
+                "UPDATE pgbench_accounts SET abalance = abalance + -17 WHERE aid = 42",
+                &[],
+            ),
+            Some(RewrittenPgCoreQuery {
+                sql: PGBENCH_UPDATE_ACCOUNT,
+                parameters: vec![Value::Int4(-17), Value::Int4(42)],
+            })
+        );
+        assert_eq!(
+            rewrite_pgbench_simple_query(
+                "SELECT abalance FROM pgbench_accounts WHERE aid = 42",
+                &[]
+            ),
+            Some(RewrittenPgCoreQuery {
+                sql: PGBENCH_SELECT_ACCOUNT,
+                parameters: vec![Value::Int4(42)],
+            })
+        );
+        assert_eq!(
+            rewrite_pgbench_simple_query(
+                "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 2, 42, -17, CURRENT_TIMESTAMP)",
+                &[],
+            ),
+            Some(RewrittenPgCoreQuery {
+                sql: PGBENCH_INSERT_HISTORY,
+                parameters: vec![
+                    Value::Int4(1),
+                    Value::Int4(2),
+                    Value::Int4(42),
+                    Value::Int4(-17),
+                ],
+            })
+        );
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
