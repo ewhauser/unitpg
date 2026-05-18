@@ -92,19 +92,27 @@ pub struct ExecutionResult {
 #[derive(Clone, Debug)]
 pub struct PgCoreSession {
     inner: inner::PgCoreSession,
+    storage_session: fastpg_storage::SessionStorageHandle,
 }
 
 impl PgCoreSession {
     pub fn new() -> Self {
+        Self::with_storage_session(fastpg_storage::new_session_storage())
+    }
+
+    pub fn with_storage_session(storage_session: fastpg_storage::SessionStorageHandle) -> Self {
         Self {
             inner: inner::PgCoreSession::new(),
+            storage_session,
         }
     }
 
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
-        self.inner
-            .prepare(sql)
-            .map(|inner| PreparedStatement { inner })
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        self.inner.prepare(sql).map(|inner| PreparedStatement {
+            inner,
+            storage_session: self.storage_session.clone(),
+        })
     }
 }
 
@@ -117,6 +125,7 @@ impl Default for PgCoreSession {
 #[derive(Debug)]
 pub struct PreparedStatement {
     inner: inner::PreparedStatement,
+    storage_session: fastpg_storage::SessionStorageHandle,
 }
 
 // pgcore is backed by PostgreSQL backend globals, so every public operation is
@@ -131,6 +140,7 @@ impl PreparedStatement {
     }
 
     pub fn execute(&self) -> Result<ExecutionResult, PgCoreError> {
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
         self.inner.execute()
     }
 
@@ -138,6 +148,7 @@ impl PreparedStatement {
         &self,
         params: &[PgCoreParam],
     ) -> Result<ExecutionResult, PgCoreError> {
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
         self.inner.execute_with_params(params)
     }
 }

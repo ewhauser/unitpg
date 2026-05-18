@@ -142,11 +142,12 @@ impl QueryExecutor {
     pub fn with_shared(shared: Arc<QueryExecutorShared>) -> Self {
         #[cfg(feature = "postgres-execution")]
         {
+            let storage_session = fastpg_storage::new_session_storage();
             Self {
                 shared,
-                pgcore_session: PgCoreSession::new(),
+                pgcore_session: PgCoreSession::with_storage_session(storage_session.clone()),
                 prepared_cache: Arc::new(Mutex::new(HashMap::new())),
-                storage_session: fastpg_storage::new_session_storage(),
+                storage_session,
             }
         }
         #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]

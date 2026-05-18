@@ -1,0 +1,204 @@
+name: Release server binaries
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+      - rusty
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-server-binaries-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x86_64
+            runner: ubuntu-24.04
+          - target: linux-aarch64
+            runner: ubuntu-24.04-arm
+          - target: macos-aarch64
+            runner: macos-15
+
+    env:
+      PGCORE_BUILD_DIR: benches/.build/ci-pgcore-${{ matrix.target }}
+      RELEASE_JOBS: 4
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            flex \
+            libipc-run-perl \
+            meson \
+            ninja-build \
+            patchelf \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        run: |
+          brew install bison flex meson ninja
+          {
+            echo "$(brew --prefix bison)/bin"
+            echo "$(brew --prefix flex)/bin"
+          } >> "$GITHUB_PATH"
+
+      - name: Build fastpg PostgreSQL core
+        run: |
+          set -euo pipefail
+          rm -rf "$PGCORE_BUILD_DIR"
+          meson setup "$PGCORE_BUILD_DIR" . \
+            --buildtype=release \
+            --auto-features=disabled \
+            -Dtap_tests=disabled \
+            -Dfastpg=true
+          meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
+          meson test -C "$PGCORE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
+
+      - name: Build Rust server
+        env:
+          FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
+        run: cargo build --release -p fastpg-server --features postgres-execution
+
+      - name: Run Rust unit tests
+        run: cargo test --workspace
+
+      - name: Run linked pgcore tests
+        env:
+          FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
+        run: cargo test -p fastpg-pgcore --features postgres-execution
+
+      - name: Run Rust server integration tests
+        env:
+          FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
+        run: cargo test -p fastpg-testkit --features postgres-execution
+
+      - name: Package Rust server distribution
+        run: |
+          set -euo pipefail
+          ci/package-rust-server-dist.sh \
+            target/release/fastpg-server \
+            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "${{ matrix.target }}" \
+            "$RUNNER_TEMP/server-dist"
+
+      - name: Check package layout
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
+          test -x "$dist/bin/fastpg-server"
+          test -x "$dist/bin/psql"
+          test -x "$dist/bin/pgbench"
+          test -f "$dist/README.server.txt"
+
+      - name: Smoke-test packaged Rust server
+        run: |
+          set -euo pipefail
+          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
+          workdir="$RUNNER_TEMP/server-smoke"
+          rm -rf "$workdir"
+          mkdir -p "$workdir"
+          export PGMAXPROTOCOLVERSION=3.0
+          export PGSSLMODE=disable
+          export PGGSSENCMODE=disable
+          port="$(python3 -c 'import socket; sock = socket.socket(); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()')"
+          "$dist/bin/fastpg-server" "127.0.0.1:$port" >"$workdir/fastpg-server.log" 2>&1 &
+          server_pid="$!"
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=0
+          for _ in $(seq 1 100); do
+            if "$dist/bin/psql" -h 127.0.0.1 -p "$port" -d postgres -U postgres -Atqc "select 1" | grep -Fx 1; then
+              ready=1
+              break
+            fi
+            sleep 0.1
+          done
+          test "$ready" -eq 1
+          result="$(
+            "$dist/bin/psql" -h 127.0.0.1 -p "$port" -d postgres -U postgres -v ON_ERROR_STOP=1 -Atq <<'SQL'
+          create table ci_smoke(id int not null, value int not null);
+          insert into ci_smoke values (1, 10);
+          begin;
+          insert into ci_smoke values (2, 20);
+          rollback;
+          select count(*) from ci_smoke;
+          SQL
+          )"
+          test "$result" = "1"
+          kill "$server_pid"
+          wait "$server_pid" || true
+          trap - EXIT
+
+      - name: Upload binary archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-dist-${{ matrix.target }}
+          path: |
+            ${{ runner.temp }}/server-dist/*.tar.gz
+            ${{ runner.temp }}/server-dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    runs-on: ubuntu-24.04
+    needs: build
+    timeout-minutes: 15
+
+    steps:
+      - name: Download binary archives
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          short_sha="${GITHUB_SHA::12}"
+          tag="postgres-server-${short_sha}"
+          title="PostgreSQL Rust server binaries ${short_sha}"
+          notes="$RUNNER_TEMP/release-notes.md"
+
+          {
+            echo "fastpg Rust single-process server binary distributions for ${GITHUB_SHA}."
+            echo
+            echo "Assets:"
+            for archive in dist/*.tar.gz; do
+              echo "- $(basename "$archive")"
+            done
+          } > "$notes"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" dist/* --clobber
+          else
+            gh release create "$tag" dist/* \
+              --target "$GITHUB_SHA" \
+              --title "$title" \
+              --notes-file "$notes"
+          fi
