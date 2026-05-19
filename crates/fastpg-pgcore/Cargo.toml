@@ -7,8 +7,7 @@ rust-version.workspace = true
 
 [features]
 default = []
-postgres-linked = []
-postgres-execution = ["postgres-linked"]
+postgres-execution = []
 
 [dependencies]
 fastpg-catalog.workspace = true

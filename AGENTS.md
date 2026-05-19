@@ -34,7 +34,6 @@ RUNS=3
 PROTOCOL=simple
 MESON_BUILDTYPE=release
 RUST_BUILD_PROFILE=release
-RUST_PGCORE=full
 ```
 
 `INIT_STEPS=dtg` is intentional. pgbench built-in transaction scripts derive
@@ -56,10 +55,10 @@ the full PostgreSQL parser/analyzer/rewriter/planner/executor facade:
 make -C benches pgbench-tpcb
 ```
 
-The `pgbench`, `pgbench-simple-indexed`, and `pgbench-tpcb` targets use
-`RUST_PGCORE=full`, build the Rust server in release mode, and link it against
-a `-Dfastpg=true` Postgres backend build so the guarded virtual catalog hooks
-are available. The default fastpg build includes the internal IPC guard.
+The `pgbench`, `pgbench-simple-indexed`, and `pgbench-tpcb` targets build the
+Rust server with full PostgreSQL execution in release mode and link it against a
+`-Dfastpg=true` Postgres backend build so the guarded virtual catalog hooks are
+available. The default fastpg build includes the internal IPC guard.
 
 To temporarily run a quicker debug build:
 

@@ -79,7 +79,6 @@ class RegressionCompare:
                 "allow_fastpg_failures": args.allow_fastpg_failures,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
-                "rust_pgcore": args.rust_pgcore,
             },
             "cases": [{"name": case.name, "path": str(case.path)} for case in self.cases],
             "variants": {},
@@ -395,10 +394,8 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         jobs=1,
         runs=1,
         protocol="simple",
-        fastpg_engine="rust-server",
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
-        rust_pgcore=args.rust_pgcore,
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
@@ -620,11 +617,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--rust-build-profile",
         choices=["debug", "release"],
         default="release",
-    )
-    parser.add_argument(
-        "--rust-pgcore",
-        choices=["raw-parser", "full"],
-        default="full",
     )
     parser.add_argument(
         "--allow-fastpg-failures",

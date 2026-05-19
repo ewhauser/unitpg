@@ -207,7 +207,7 @@ impl Portal {
     }
 }
 
-#[cfg(feature = "postgres-linked")]
+#[cfg(feature = "postgres-execution")]
 mod inner {
     use std::borrow::Cow;
     use std::ffi::{CStr, CString, c_char};
@@ -912,7 +912,7 @@ mod inner {
     }
 }
 
-#[cfg(not(feature = "postgres-linked"))]
+#[cfg(not(feature = "postgres-execution"))]
 mod inner {
     use super::{
         ExecutionResult, PgCoreError, PgCoreLaneMetrics, RawParseSummary, StatementDescription,
@@ -937,7 +937,7 @@ mod inner {
         pub fn prepare(&self, _sql: &str) -> Result<PreparedStatement, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
-                "fastpg-pgcore was built without postgres-linked support",
+                "fastpg-pgcore was built without PostgreSQL execution",
                 0,
             ))
         }
@@ -949,7 +949,7 @@ mod inner {
         ) -> Result<ExecutionResult, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
-                "fastpg-pgcore was built without postgres-linked support",
+                "fastpg-pgcore was built without PostgreSQL execution",
                 0,
             ))
         }
@@ -969,7 +969,7 @@ mod inner {
         pub fn execute(&self) -> Result<ExecutionResult, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
-                "fastpg-pgcore was built without postgres-linked support",
+                "fastpg-pgcore was built without PostgreSQL execution",
                 0,
             ))
         }
@@ -980,7 +980,7 @@ mod inner {
         ) -> Result<ExecutionResult, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
-                "fastpg-pgcore was built without postgres-linked support",
+                "fastpg-pgcore was built without PostgreSQL execution",
                 0,
             ))
         }
@@ -994,13 +994,13 @@ mod tests {
     #[test]
     fn raw_parse_smoke() {
         let summary = raw_parse("select 1").unwrap();
-        #[cfg(feature = "postgres-linked")]
+        #[cfg(feature = "postgres-execution")]
         assert_eq!(summary.statement_count, 1);
-        #[cfg(not(feature = "postgres-linked"))]
+        #[cfg(not(feature = "postgres-execution"))]
         assert_eq!(summary.statement_count, 0);
     }
 
-    #[cfg(feature = "postgres-linked")]
+    #[cfg(feature = "postgres-execution")]
     #[test]
     fn raw_parse_reports_postgres_syntax_errors() {
         let error = raw_parse("select from").unwrap_err();
