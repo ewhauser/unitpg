@@ -814,92 +814,91 @@ mod inner {
         fn to_execution_result(&self) -> ExecutionResult {
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
-            let statements = (0..statement_count)
-                .map(|statement_index| {
-                    let field_count = unsafe {
-                        fastpg_pgcore_execute_statement_column_count(self.as_ptr(), statement_index)
+            let mut statements = Vec::with_capacity(statement_count as usize);
+            for statement_index in 0..statement_count {
+                let field_count = unsafe {
+                    fastpg_pgcore_execute_statement_column_count(self.as_ptr(), statement_index)
+                }
+                .max(0);
+                let row_count = unsafe {
+                    fastpg_pgcore_execute_statement_row_count(self.as_ptr(), statement_index)
+                }
+                .max(0);
+                let copy_in = unsafe {
+                    fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
+                }
+                .then(|| PgCoreCopyIn {
+                    table: unsafe {
+                        c_string(fastpg_pgcore_execute_statement_copy_table(
+                            self.as_ptr(),
+                            statement_index,
+                        ))
+                    },
+                    columns: unsafe {
+                        fastpg_pgcore_execute_statement_copy_column_count(
+                            self.as_ptr(),
+                            statement_index,
+                        )
                     }
-                    .max(0);
-                    let row_count = unsafe {
-                        fastpg_pgcore_execute_statement_row_count(self.as_ptr(), statement_index)
-                    }
-                    .max(0);
-                    let copy_in = unsafe {
-                        fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
-                    }
-                    .then(|| PgCoreCopyIn {
-                        table: unsafe {
-                            c_string(fastpg_pgcore_execute_statement_copy_table(
+                    .max(0) as usize,
+                });
+                let mut fields = Vec::with_capacity(field_count as usize);
+                for column_index in 0..field_count {
+                    fields.push(PgCoreField {
+                        name: unsafe {
+                            c_string(fastpg_pgcore_execute_column_name(
                                 self.as_ptr(),
                                 statement_index,
+                                column_index,
                             ))
                         },
-                        columns: unsafe {
-                            fastpg_pgcore_execute_statement_copy_column_count(
+                        type_oid: unsafe {
+                            fastpg_pgcore_execute_column_type_oid(
                                 self.as_ptr(),
                                 statement_index,
+                                column_index,
                             )
-                        }
-                        .max(0) as usize,
+                        },
                     });
-                    let fields = (0..field_count)
-                        .map(|column_index| PgCoreField {
-                            name: unsafe {
-                                c_string(fastpg_pgcore_execute_column_name(
+                }
+                let mut rows = Vec::with_capacity(row_count as usize);
+                for row_index in 0..row_count {
+                    let mut row = Vec::with_capacity(field_count as usize);
+                    for column_index in 0..field_count {
+                        if unsafe {
+                            fastpg_pgcore_execute_value_is_null(
+                                self.as_ptr(),
+                                statement_index,
+                                row_index,
+                                column_index,
+                            )
+                        } {
+                            row.push(PgCoreValue::Null);
+                        } else {
+                            row.push(PgCoreValue::Text(unsafe {
+                                c_string(fastpg_pgcore_execute_value_text(
                                     self.as_ptr(),
                                     statement_index,
+                                    row_index,
                                     column_index,
                                 ))
-                            },
-                            type_oid: unsafe {
-                                fastpg_pgcore_execute_column_type_oid(
-                                    self.as_ptr(),
-                                    statement_index,
-                                    column_index,
-                                )
-                            },
-                        })
-                        .collect::<Vec<_>>();
-                    let rows = (0..row_count)
-                        .map(|row_index| {
-                            (0..field_count)
-                                .map(|column_index| {
-                                    if unsafe {
-                                        fastpg_pgcore_execute_value_is_null(
-                                            self.as_ptr(),
-                                            statement_index,
-                                            row_index,
-                                            column_index,
-                                        )
-                                    } {
-                                        PgCoreValue::Null
-                                    } else {
-                                        PgCoreValue::Text(unsafe {
-                                            c_string(fastpg_pgcore_execute_value_text(
-                                                self.as_ptr(),
-                                                statement_index,
-                                                row_index,
-                                                column_index,
-                                            ))
-                                        })
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    ExecutionStatement {
-                        command_tag: unsafe {
-                            command_tag(fastpg_pgcore_execute_statement_command_tag(
-                                self.as_ptr(),
-                                statement_index,
-                            ))
-                        },
-                        fields,
-                        rows,
-                        copy_in,
+                            }));
+                        }
                     }
-                })
-                .collect();
+                    rows.push(row);
+                }
+                statements.push(ExecutionStatement {
+                    command_tag: unsafe {
+                        command_tag(fastpg_pgcore_execute_statement_command_tag(
+                            self.as_ptr(),
+                            statement_index,
+                        ))
+                    },
+                    fields,
+                    rows,
+                    copy_in,
+                });
+            }
             ExecutionResult { statements }
         }
     }
