@@ -6,6 +6,7 @@ pub struct RawParseSummary {
 }
 
 pub const INT8_OID: u32 = 20;
+pub const INT2_OID: u32 = 21;
 pub const INT4_OID: u32 = 23;
 pub const TEXT_OID: u32 = 25;
 pub const VARCHAR_OID: u32 = 1043;
@@ -15,6 +16,8 @@ pub const REGCLASS_OID: u32 = 2205;
 pub struct PgCoreError {
     pub sqlstate: String,
     pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
     pub cursorpos: i32,
 }
 
@@ -23,6 +26,24 @@ impl PgCoreError {
         Self {
             sqlstate: sqlstate.into(),
             message: message.into(),
+            detail: None,
+            hint: None,
+            cursorpos,
+        }
+    }
+
+    pub fn with_fields(
+        sqlstate: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+        hint: Option<String>,
+        cursorpos: i32,
+    ) -> Self {
+        Self {
+            sqlstate: sqlstate.into(),
+            message: message.into(),
+            detail,
+            hint,
             cursorpos,
         }
     }
@@ -310,12 +331,19 @@ mod inner {
         fn fastpg_pgcore_parse_result_message(
             result: *const FastPgPgCoreParseResult,
         ) -> *const c_char;
+        fn fastpg_pgcore_parse_result_detail(
+            result: *const FastPgPgCoreParseResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_parse_result_hint(result: *const FastPgPgCoreParseResult)
+        -> *const c_char;
         fn fastpg_pgcore_parse_result_cursorpos(result: *const FastPgPgCoreParseResult) -> i32;
         fn fastpg_pgcore_prepare(sql: *const c_char) -> *mut FastPgPgCorePrepared;
         fn fastpg_pgcore_prepared_free(prepared: *mut FastPgPgCorePrepared);
         fn fastpg_pgcore_prepared_ok(prepared: *const FastPgPgCorePrepared) -> bool;
         fn fastpg_pgcore_prepared_sqlstate(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_message(prepared: *const FastPgPgCorePrepared) -> *const c_char;
+        fn fastpg_pgcore_prepared_detail(prepared: *const FastPgPgCorePrepared) -> *const c_char;
+        fn fastpg_pgcore_prepared_hint(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_cursorpos(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_count(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_type_oid(
@@ -348,6 +376,12 @@ mod inner {
             result: *const FastPgPgCoreExecuteResult,
         ) -> *const c_char;
         fn fastpg_pgcore_execute_result_message(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_result_detail(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_result_hint(
             result: *const FastPgPgCoreExecuteResult,
         ) -> *const c_char;
         fn fastpg_pgcore_execute_result_cursorpos(result: *const FastPgPgCoreExecuteResult) -> i32;
@@ -422,9 +456,11 @@ mod inner {
                 statement_count: statement_count.max(0) as usize,
             })
         } else {
-            Err(PgCoreError::new(
+            Err(PgCoreError::with_fields(
                 unsafe { c_string(fastpg_pgcore_parse_result_sqlstate(result.as_ptr())) },
                 unsafe { c_string(fastpg_pgcore_parse_result_message(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_parse_result_detail(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_parse_result_hint(result.as_ptr())) },
                 unsafe { fastpg_pgcore_parse_result_cursorpos(result.as_ptr()) },
             ))
         }
@@ -455,6 +491,16 @@ mod inner {
             .into_owned()
     }
 
+    unsafe fn optional_c_string(value: *const c_char) -> Option<String> {
+        if value.is_null() {
+            return None;
+        }
+        let value = unsafe { CStr::from_ptr(value) }
+            .to_string_lossy()
+            .into_owned();
+        if value.is_empty() { None } else { Some(value) }
+    }
+
     #[derive(Clone, Debug)]
     pub struct PgCoreSession;
 
@@ -481,9 +527,11 @@ mod inner {
                 drop(_guard);
                 Ok(prepared)
             } else {
-                let error = PgCoreError::new(
+                let error = PgCoreError::with_fields(
                     unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared.as_ptr())) },
                     unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
+                    unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr())) },
+                    unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr())) },
                     unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
                 );
                 drop(_guard);
@@ -597,9 +645,15 @@ mod inner {
             if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
                 Ok(result.to_execution_result())
             } else {
-                Err(PgCoreError::new(
+                Err(PgCoreError::with_fields(
                     unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
                     unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
+                    unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr()))
+                    },
+                    unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr()))
+                    },
                     unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
                 ))
             }
@@ -1029,6 +1083,81 @@ mod tests {
             .unwrap()
             .execute()
             .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_uuid_serial_generated_column_table() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_uuid_generated_{}", std::process::id());
+
+        let create = session
+            .prepare(&format!(
+                "create table {table}(
+                    id serial,
+                    guid_field uuid,
+                    guid_encoded text generated always as (encode(guid_field::bytea, 'base32hex')) stored
+                )"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create.statements[0].command_tag, "CREATE TABLE");
+
+        session
+            .prepare(&format!(
+                "insert into {table}(guid_field)
+                 values ('00000000-0000-0000-0000-000000000000'::uuid)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let select = session
+            .prepare(&format!("select id, guid_encoded from {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            select.statements[0].rows[0][0],
+            PgCoreValue::Text("1".to_owned())
+        );
+        assert_eq!(
+            select.statements[0].rows[0][1],
+            PgCoreValue::Text("00000000000000000000000000======".to_owned())
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table} cascade"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn repeated_executor_errors_keep_pgcore_session_alive() {
+        let session = PgCoreSession::new();
+
+        let first = session
+            .prepare("select format('Hello %s %s', 'World')")
+            .unwrap()
+            .execute()
+            .unwrap_err();
+        assert_eq!(first.sqlstate, "22023");
+
+        let second = session
+            .prepare("select format('Hello %s')")
+            .unwrap()
+            .execute()
+            .unwrap_err();
+        assert_eq!(second.sqlstate, "22023");
+
+        let ok = session.prepare("select 1").unwrap().execute().unwrap();
+        assert_eq!(
+            ok.statements[0].rows[0][0],
+            PgCoreValue::Text("1".to_owned())
+        );
     }
 
     #[cfg(feature = "postgres-execution")]

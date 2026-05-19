@@ -921,6 +921,20 @@ SetCurrentStatementStartTimestamp(void)
 		Assert(stmtStartTimestamp != 0);
 }
 
+#ifdef USE_FASTPG
+void
+FastPgSetCurrentTransactionStartTimestampToStatement(void)
+{
+	if (!IsParallelWorker())
+		xactStartTimestamp = stmtStartTimestamp;
+	else
+		Assert(xactStartTimestamp != 0);
+
+	pgstat_report_xact_timestamp(xactStartTimestamp);
+	xactStopTimestamp = 0;
+}
+#endif
+
 /*
  *	GetCurrentTransactionNestLevel
  *

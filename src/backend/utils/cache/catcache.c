@@ -188,8 +188,13 @@ static void CatCacheCopyKeys(TupleDesc tupdesc, int nkeys, const int *attnos,
 static bool FastPgCatalogCacheInitializeCache(CatCache *cache);
 static bool FastPgCatalogCacheHandlesMiss(CatCache *cache, int nkeys);
 static bool FastPgCatalogCacheIsEmpty(CatCache *cache);
+static bool FastPgCatalogRowIdToTid(uint64_t row_id, ItemPointer tid);
 static HeapTuple FastPgCatalogCacheLookup(CatCache *cache, int nkeys,
 										  Datum *arguments);
+static CatCList *FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
+											 Datum *arguments,
+											 uint32 lHashValue,
+											 dlist_head *lbucket);
 static CatCList *FastPgCatalogCacheBuildEmptyList(CatCache *cache, int nkeys,
 												  Datum *arguments,
 												  uint32 lHashValue,
@@ -634,6 +639,131 @@ FastPgCatalogCacheBuildEmptyList(CatCache *cache, int nkeys,
 	cl->nkeys = nkeys;
 	cl->hash_value = lHashValue;
 	cl->n_members = 0;
+
+	dlist_push_head(lbucket, &cl->cache_elem);
+	cache->cc_nlist++;
+	ResourceOwnerRememberCatCacheListRef(CurrentResourceOwner, cl);
+
+	return cl;
+}
+
+static CatCList *
+FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
+							Datum *arguments,
+							uint32 lHashValue,
+							dlist_head *lbucket)
+{
+	Datum	   *values;
+	uint8_t    *isnull;
+	uint64_t	scan_handle;
+	uint64_t	row_id = 0;
+	size_t		natts;
+	List	   *ctlist = NIL;
+	ListCell   *ctlist_item;
+	CatCList   *cl;
+	CatCTup    *ct;
+	MemoryContext oldcxt;
+	int			nmembers;
+	int			i = 0;
+
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) == 0)
+		return NULL;
+	if (cache->cc_tupdesc == NULL)
+		return FastPgCatalogCacheBuildEmptyList(cache, nkeys, arguments,
+												lHashValue, lbucket);
+
+	natts = (size_t) cache->cc_tupdesc->natts;
+	values = palloc0_array(Datum, natts);
+	isnull = palloc0_array(uint8_t, natts);
+	scan_handle = fastpg_rust_scan_begin((uint32_t) cache->cc_reloid);
+
+	while (fastpg_rust_scan_next(scan_handle,
+								 true,
+								 (uintptr_t *) values,
+								 isnull,
+								 natts,
+								 &row_id))
+	{
+		bool		matches = true;
+
+		for (int key_index = 0; key_index < nkeys; key_index++)
+		{
+			int			attnum = cache->cc_keyno[key_index];
+
+			if (attnum <= 0 || attnum > cache->cc_tupdesc->natts)
+			{
+				matches = false;
+				break;
+			}
+			if (isnull[attnum - 1] != 0 ||
+				!(cache->cc_fastequal[key_index]) (values[attnum - 1],
+												   arguments[key_index]))
+			{
+				matches = false;
+				break;
+			}
+		}
+
+		if (matches)
+		{
+			bool	   *nulls = palloc0_array(bool, natts);
+			HeapTuple	tuple;
+			uint32		hashValue;
+			Index		hashIndex;
+
+			for (size_t index = 0; index < natts; index++)
+				nulls[index] = isnull[index] != 0;
+			tuple = heap_form_tuple(cache->cc_tupdesc, values, nulls);
+			tuple->t_tableOid = cache->cc_reloid;
+			if (!FastPgCatalogRowIdToTid(row_id, &tuple->t_self))
+				elog(ERROR,
+					 "fastpg catalog row id %llu cannot be represented as a CTID",
+					 (unsigned long long) row_id);
+
+			hashValue = CatalogCacheComputeTupleHashValue(cache,
+														  cache->cc_nkeys,
+														  tuple);
+			hashIndex = HASH_INDEX(hashValue, cache->cc_nbuckets);
+			ct = CatalogCacheCreateEntry(cache, tuple, NULL,
+										 hashValue, hashIndex);
+			heap_freetuple(tuple);
+			pfree(nulls);
+			if (ct != NULL)
+				ctlist = lappend(ctlist, ct);
+		}
+	}
+
+	fastpg_rust_scan_end(scan_handle);
+	pfree(values);
+	pfree(isnull);
+
+	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
+	nmembers = list_length(ctlist);
+	cl = (CatCList *)
+		palloc(offsetof(CatCList, members) + nmembers * sizeof(CatCTup *));
+	CatCacheCopyKeys(cache->cc_tupdesc, nkeys, cache->cc_keyno,
+					 arguments, cl->keys);
+	MemoryContextSwitchTo(oldcxt);
+
+	cl->cl_magic = CL_MAGIC;
+	cl->my_cache = cache;
+	cl->refcount = 1;
+	cl->dead = false;
+	cl->ordered = false;
+	cl->nkeys = nkeys;
+	cl->hash_value = lHashValue;
+	cl->n_members = nmembers;
+
+	foreach(ctlist_item, ctlist)
+	{
+		ct = (CatCTup *) lfirst(ctlist_item);
+		Assert(ct->c_list == NULL);
+		ct->c_list = cl;
+		cl->members[i++] = ct;
+		if (ct->dead)
+			cl->dead = true;
+	}
+	Assert(i == nmembers);
 
 	dlist_push_head(lbucket, &cl->cache_elem);
 	cache->cc_nlist++;
@@ -2910,9 +3040,10 @@ SearchCatCacheList(CatCache *cache,
 	}
 
 #ifdef USE_FASTPG
-	if (FastPgCatalogCacheIsEmpty(cache))
-		return FastPgCatalogCacheBuildEmptyList(cache, nkeys, arguments,
-												lHashValue, lbucket);
+	cl = FastPgCatalogCacheBuildList(cache, nkeys, arguments,
+									 lHashValue, lbucket);
+	if (cl != NULL)
+		return cl;
 #endif
 
 	/*

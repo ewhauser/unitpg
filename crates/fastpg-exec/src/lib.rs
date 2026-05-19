@@ -17,8 +17,8 @@ use fastpg_bind::{BoundExpression, BoundStatement, bind};
 use fastpg_parser::{ParseError, parse};
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
-    ExecutionResult as PgCoreExecutionResult, INT4_OID, INT8_OID, PgCoreParam, PgCoreSession,
-    PgCoreValue, PreparedStatement, TEXT_OID, VARCHAR_OID,
+    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreParam,
+    PgCoreSession, PgCoreValue, PreparedStatement, TEXT_OID, VARCHAR_OID,
 };
 use fastpg_types::{Column, PgType, Value};
 
@@ -62,11 +62,24 @@ pub struct CopyTarget {
 pub enum QueryExecution {
     Empty,
     Rows(QueryResult),
-    Command { tag: String, rows: usize },
+    Command {
+        tag: String,
+        rows: usize,
+    },
     CopyIn(CopyTarget),
-    Unsupported { query: String },
-    InvalidParameters { message: String },
-    Error { sqlstate: String, message: String },
+    Unsupported {
+        query: String,
+    },
+    InvalidParameters {
+        message: String,
+    },
+    Error {
+        sqlstate: String,
+        message: String,
+        detail: Option<String>,
+        hint: Option<String>,
+        cursorpos: i32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -703,7 +716,13 @@ fn bind_sql(sql: &str) -> Result<BoundStatement, ParseError> {
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 fn parse_failure_execution(error: ParseError) -> QueryExecution {
     match (error.sqlstate, error.message) {
-        (Some(sqlstate), Some(message)) => QueryExecution::Error { sqlstate, message },
+        (Some(sqlstate), Some(message)) => QueryExecution::Error {
+            sqlstate,
+            message,
+            detail: None,
+            hint: None,
+            cursorpos: 0,
+        },
         _ => QueryExecution::Unsupported { query: error.query },
     }
 }
@@ -746,6 +765,9 @@ fn execution_error(sqlstate: impl Into<String>, message: impl Into<String>) -> Q
     QueryExecution::Error {
         sqlstate: sqlstate.into(),
         message: message.into(),
+        detail: None,
+        hint: None,
+        cursorpos: 0,
     }
 }
 
@@ -754,6 +776,9 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
     QueryExecution::Error {
         sqlstate: error.sqlstate,
         message: error.message,
+        detail: error.detail,
+        hint: error.hint,
+        cursorpos: error.cursorpos,
     }
 }
 
@@ -986,6 +1011,7 @@ fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryEx
 #[cfg(feature = "postgres-execution")]
 fn pgcore_param_value(value: &Value) -> PgCoreParam {
     match value {
+        Value::Int2(value) => PgCoreParam::Datum(*value as usize),
         Value::Int4(value) => PgCoreParam::Datum(*value as usize),
         Value::Int8(value) => PgCoreParam::Datum(*value as usize),
         Value::Text(value) => PgCoreParam::Text(value.clone()),
@@ -996,6 +1022,7 @@ fn pgcore_param_value(value: &Value) -> PgCoreParam {
 #[cfg(feature = "postgres-execution")]
 fn pg_type_for_oid(type_oid: u32) -> PgType {
     match type_oid {
+        INT2_OID => PgType::Int2,
         INT4_OID => PgType::Int4,
         INT8_OID => PgType::Int8,
         TEXT_OID | VARCHAR_OID | BPCHAR_OID => PgType::Varchar,
@@ -1007,6 +1034,10 @@ fn pg_type_for_oid(type_oid: u32) -> PgType {
 fn pgcore_value_to_value(value: PgCoreValue, data_type: PgType) -> Result<Value, String> {
     match (value, data_type) {
         (PgCoreValue::Null, _) => Ok(Value::Null),
+        (PgCoreValue::Text(value), PgType::Int2) => value
+            .parse::<i16>()
+            .map(Value::Int2)
+            .map_err(|error| format!("cannot decode PostgreSQL int2 value {value:?}: {error}")),
         (PgCoreValue::Text(value), PgType::Int4) => value
             .parse::<i32>()
             .map(Value::Int4)
@@ -1142,6 +1173,9 @@ impl Table {
             }
             updated += 1;
             match &mut row[column_idx] {
+                Value::Int2(value) => {
+                    *value = checked_i64_to_i16(*value as i64 + addend)?;
+                }
                 Value::Int4(value) => {
                     *value = checked_i64_to_i32(*value as i64 + addend)?;
                 }
@@ -1191,6 +1225,11 @@ fn copy_field_to_value(field: &str, data_type: PgType) -> Result<Value, String> 
     }
 
     match data_type {
+        PgType::Int2 => field
+            .parse::<i64>()
+            .map_err(|_| format!("invalid int2 literal: {field}"))
+            .and_then(checked_i64_to_i16)
+            .map(Value::Int2),
         PgType::Int4 => field
             .parse::<i64>()
             .map_err(|_| format!("invalid int4 literal: {field}"))
@@ -1208,10 +1247,16 @@ fn copy_field_to_value(field: &str, data_type: PgType) -> Result<Value, String> 
 fn expression_to_value(expression: &BoundExpression, data_type: PgType) -> Result<Value, String> {
     match (expression, data_type) {
         (BoundExpression::Null, _) => Ok(Value::Null),
+        (BoundExpression::Int(value), PgType::Int2) => checked_i64_to_i16(*value).map(Value::Int2),
         (BoundExpression::Int(value), PgType::Int4) => checked_i64_to_i32(*value).map(Value::Int4),
         (BoundExpression::Int(value), PgType::Int8) => Ok(Value::Int8(*value)),
         (BoundExpression::Int(value), PgType::Varchar) => Ok(Value::Text(value.to_string())),
         (BoundExpression::Text(value), PgType::Varchar) => Ok(Value::Text(value.clone())),
+        (BoundExpression::Text(value), PgType::Int2) => value
+            .parse::<i64>()
+            .map_err(|_| format!("invalid int2 literal: {value}"))
+            .and_then(checked_i64_to_i16)
+            .map(Value::Int2),
         (BoundExpression::Text(value), PgType::Int4) => value
             .parse::<i64>()
             .map_err(|_| format!("invalid int4 literal: {value}"))
@@ -1258,8 +1303,14 @@ fn checked_i64_to_i32(value: i64) -> Result<i32, String> {
 }
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+fn checked_i64_to_i16(value: i64) -> Result<i16, String> {
+    i16::try_from(value).map_err(|_| "int2 out of range".to_owned())
+}
+
+#[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 fn value_equals_i64(value: &Value, expected: i64) -> bool {
     match value {
+        Value::Int2(value) => *value as i64 == expected,
         Value::Int4(value) => *value as i64 == expected,
         Value::Int8(value) => *value == expected,
         Value::Text(value) => value.parse::<i64>().is_ok_and(|value| value == expected),
@@ -1277,7 +1328,10 @@ mod tests {
         let executor = QueryExecutor::new("17.0-fastpg");
 
         assert_eq!(executor.describe("SELECT 1"), None);
-        let QueryExecution::Error { sqlstate, message } = executor.execute("SELECT 1", &[]) else {
+        let QueryExecution::Error {
+            sqlstate, message, ..
+        } = executor.execute("SELECT 1", &[])
+        else {
             panic!("expected disabled executor error");
         };
         assert_eq!(sqlstate, "0A000");
@@ -1538,14 +1592,22 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
-    fn unsupported_pgcore_utilities_are_not_fallbacks() {
+    fn show_server_version_goes_through_pgcore() {
         let executor = QueryExecutor::new("17.0-fastpg");
 
         let result = executor.execute("SHOW server_version", &[]);
-        let QueryExecution::Error { sqlstate, message } = result else {
-            panic!("expected pgcore error, got {result:?}");
+        let QueryExecution::Rows(result) = result else {
+            panic!("expected pgcore rows, got {result:?}");
         };
-        assert_eq!(sqlstate, "0A000");
-        assert!(message.contains("fastpg pgcore does not yet support utility statement"));
+        assert_eq!(
+            result.fields,
+            vec![Column::new("server_version", PgType::Varchar)]
+        );
+        assert_eq!(result.rows.len(), 1);
+        let Value::Text(server_version) = &result.rows[0][0] else {
+            panic!("expected text server_version, got {:?}", result.rows[0][0]);
+        };
+        assert!(!server_version.is_empty());
+        assert_ne!(server_version, "17.0-fastpg");
     }
 }

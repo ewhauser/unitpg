@@ -330,6 +330,16 @@ ResetSequence(Oid seq_relid)
 static void
 fill_seq_with_data(Relation rel, HeapTuple tuple)
 {
+#ifdef USE_FASTPG
+	/*
+	 * The Rust server keeps relation contents outside PostgreSQL's buffer
+	 * manager.  ProcessUtility still needs the catalog-visible sequence rows,
+	 * but initializing a sequence fork would walk uninitialized shared buffer
+	 * state in the embedded backend.
+	 */
+	return;
+#endif
+
 	fill_seq_fork_with_data(rel, tuple, MAIN_FORKNUM);
 
 	if (rel->rd_rel->relpersistence == RELPERSISTENCE_UNLOGGED)
@@ -431,10 +441,14 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	Oid			relid;
 	SeqTable	elm;
 	Relation	seqrel;
+#ifndef USE_FASTPG
 	Buffer		buf;
 	HeapTupleData datatuple;
+#endif
 	Form_pg_sequence seqform;
+#ifndef USE_FASTPG
 	Form_pg_sequence_data newdataform;
+#endif
 	bool		need_seq_rewrite;
 	List	   *owned_by;
 	ObjectAddress address;
@@ -443,7 +457,9 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	bool		reset_state = false;
 	bool		is_called;
 	int64		last_value;
+#ifndef USE_FASTPG
 	HeapTuple	newdatatuple;
+#endif
 
 	/* Open and lock sequence, and check for ownership along the way. */
 	relid = RangeVarGetRelidExtended(stmt->sequence,
@@ -470,6 +486,10 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 
 	seqform = (Form_pg_sequence) GETSTRUCT(seqtuple);
 
+#ifdef USE_FASTPG
+	last_value = seqform->seqstart;
+	is_called = false;
+#else
 	/* lock page buffer and read tuple into new sequence structure */
 	(void) read_seq_tuple(seqrel, &buf, &datatuple);
 
@@ -480,6 +500,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	is_called = newdataform->is_called;
 
 	UnlockReleaseBuffer(buf);
+#endif
 
 	/* Check and set new values */
 	init_params(pstate, stmt->options, stmt->for_identity, false,
@@ -489,6 +510,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	/* If needed, rewrite the sequence relation itself */
 	if (need_seq_rewrite)
 	{
+#ifndef USE_FASTPG
 		/* check the comment above nextval_internal()'s equivalent call. */
 		if (RelationNeedsWAL(seqrel))
 			GetTopTransactionId();
@@ -515,6 +537,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 		if (reset_state)
 			newdataform->log_cnt = 0;
 		fill_seq_with_data(seqrel, newdatatuple);
+#endif
 	}
 
 	/* Clear local cache so that we don't think we have cached numbers */
@@ -632,6 +655,7 @@ nextval_internal(Oid relid, bool check_permissions)
 	HeapTupleData seqdatatuple;
 	Form_pg_sequence_data seq;
 	int64		incby,
+				startv,
 				maxv,
 				minv,
 				cache,
@@ -681,11 +705,65 @@ nextval_internal(Oid relid, bool check_permissions)
 		elog(ERROR, "cache lookup failed for sequence %u", relid);
 	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
 	incby = pgsform->seqincrement;
+	startv = pgsform->seqstart;
 	maxv = pgsform->seqmax;
 	minv = pgsform->seqmin;
 	cache = pgsform->seqcache;
 	cycle = pgsform->seqcycle;
 	ReleaseSysCache(pgstuple);
+
+#ifdef USE_FASTPG
+	if (!elm->last_valid)
+	{
+		result = startv;
+	}
+	else
+	{
+		result = elm->last;
+		if (incby > 0)
+		{
+			if ((maxv >= 0 && result > maxv - incby) ||
+				(maxv < 0 && result + incby > maxv))
+			{
+				if (!cycle)
+					ereport(ERROR,
+							(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
+							 errmsg("nextval: reached maximum value of sequence \"%s\" (%" PRId64 ")",
+									RelationGetRelationName(seqrel),
+									maxv)));
+				result = minv;
+			}
+			else
+				result += incby;
+		}
+		else
+		{
+			if ((minv < 0 && result < minv - incby) ||
+				(minv >= 0 && result + incby < minv))
+			{
+				if (!cycle)
+					ereport(ERROR,
+							(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
+							 errmsg("nextval: reached minimum value of sequence \"%s\" (%" PRId64 ")",
+									RelationGetRelationName(seqrel),
+									minv)));
+				result = maxv;
+			}
+			else
+				result += incby;
+		}
+	}
+
+	elm->increment = incby;
+	elm->last = result;
+	elm->cached = result;
+	elm->last_valid = true;
+	last_used_seq = elm;
+
+	sequence_close(seqrel, NoLock);
+
+	return result;
+#endif
 
 	/* lock page buffer and read tuple */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
@@ -1085,7 +1163,14 @@ setval3_oid(PG_FUNCTION_ARGS)
 static Relation
 lock_and_open_sequence(SeqTable seq)
 {
-	LocalTransactionId thislxid = MyProc->vxid.lxid;
+	LocalTransactionId thislxid;
+
+#ifdef USE_FASTPG
+	if (MyProc == NULL)
+		return sequence_open(seq->relid, NoLock);
+#endif
+
+	thislxid = MyProc->vxid.lxid;
 
 	/* Get the lock if not already held in this xact */
 	if (seq->lxid != thislxid)
@@ -1166,11 +1251,13 @@ init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
 	 * discard any cached-but-unissued values.  We do not touch the currval()
 	 * state, however.
 	 */
+#ifndef USE_FASTPG
 	if (seqrel->rd_rel->relfilenode != elm->filenumber)
 	{
 		elm->filenumber = seqrel->rd_rel->relfilenode;
 		elm->cached = elm->last;
 	}
+#endif
 
 	/* Return results */
 	*p_elm = elm;

@@ -16,11 +16,13 @@ use fastpg_catalog::{
     VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
     builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row, lookup_type,
+    builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row,
+    index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
-    relation_by_name, relation_by_oid, relation_column_count, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, upsert_catalog_row, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid,
+    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_count,
+    relation_oid_for_index_oid, static_catalog_by_name, static_catalog_by_relation_oid,
+    type_by_name, unique_index_records_for_relation_oid, upsert_catalog_row,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -73,10 +75,12 @@ pub struct FastPgRustCatalogType {
 pub struct FastPgRustCatalogRelation {
     pub oid: u32,
     pub namespace_oid: u32,
+    pub owner_oid: u32,
     pub name: [c_char; NAMEDATALEN],
     pub column_count: u16,
     pub relkind: u8,
     pub has_primary_key: u8,
+    pub has_indexes: u8,
 }
 
 #[repr(C)]
@@ -86,7 +90,9 @@ pub struct FastPgRustCatalogColumn {
     pub type_oid: u32,
     pub type_mod: i32,
     pub is_not_null: u8,
-    pub _padding: [u8; 3],
+    pub has_default: u8,
+    pub generated: u8,
+    pub _padding: u8,
 }
 
 #[repr(C)]
@@ -95,7 +101,10 @@ pub struct FastPgRustPrimaryKeyIndexInfo {
     pub index_oid: u32,
     pub heap_oid: u32,
     pub key_count: u16,
-    pub _padding: [u8; 2],
+    pub is_unique: u8,
+    pub is_primary: u8,
+    pub nulls_not_distinct: u8,
+    pub is_immediate: u8,
     pub attnums: [i16; FASTPG_MAX_INDEX_KEYS],
     pub type_oids: [u32; FASTPG_MAX_INDEX_KEYS],
     pub collation_oids: [u32; FASTPG_MAX_INDEX_KEYS],
@@ -625,15 +634,19 @@ enum IndexKeyPart {
 struct IndexKey(Vec<IndexKeyPart>);
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PrimaryKeyColumnSpec {
+struct IndexColumnSpec {
     column_index: usize,
     typbyval: bool,
     typlen: i16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct PrimaryKeySpec {
-    columns: Vec<PrimaryKeyColumnSpec>,
+struct UniqueIndexSpec {
+    index_oid: Oid,
+    relation_oid: Oid,
+    is_primary: bool,
+    nulls_not_distinct: bool,
+    columns: Vec<IndexColumnSpec>,
 }
 
 #[derive(Debug)]
@@ -832,8 +845,6 @@ impl ScanState {
 #[derive(Debug)]
 struct StorageState {
     relations: HashMap<u32, RelationRows>,
-    primary_key_specs: HashMap<u32, Option<PrimaryKeySpec>>,
-    primary_key_generation: u64,
     fixture_region: StorageRegion,
     epoch_region: StorageRegion,
     limits: StorageLimits,
@@ -843,8 +854,6 @@ impl Default for StorageState {
     fn default() -> Self {
         Self {
             relations: HashMap::new(),
-            primary_key_specs: HashMap::new(),
-            primary_key_generation: fastpg_catalog::current_generation(),
             fixture_region: StorageRegion::new(StorageRegionKind::Fixture),
             epoch_region: StorageRegion::new(StorageRegionKind::Epoch),
             limits: StorageLimits::default(),
@@ -1182,24 +1191,27 @@ impl StorageState {
             .and_then(|relation| relation.committed_row_index.get(&row_id).cloned())
     }
 
-    fn find_visible_row_by_primary_key(
+    fn find_visible_row_by_index_key(
         &self,
         session: &SessionStorage,
         relid: u32,
-        primary_key_spec: &PrimaryKeySpec,
+        index_spec: &UniqueIndexSpec,
         key: &IndexKey,
     ) -> Option<Row> {
-        let mut committed_candidate = self
-            .relations
-            .get(&relid)
-            .and_then(|relation| relation.primary_key_index.get(key).copied());
+        let mut committed_candidate = if index_spec.is_primary {
+            self.relations
+                .get(&relid)
+                .and_then(|relation| relation.primary_key_index.get(key).copied())
+        } else {
+            None
+        };
 
         for overlay in self.visible_overlay_stack(session).iter().rev() {
             if let Some(segment) = overlay.relations.get(&relid)
                 && let Some(row) = segment
                     .rows
                     .iter()
-                    .find(|row| primary_key_for_row(primary_key_spec, row).as_ref() == Some(key))
+                    .find(|row| index_key_for_row(index_spec, row).as_ref() == Some(key))
             {
                 return Some(row.clone());
             }
@@ -1214,48 +1226,64 @@ impl StorageState {
             }
         }
 
-        committed_candidate.and_then(|row_id| self.find_committed_row(relid, row_id))
+        if let Some(row) =
+            committed_candidate.and_then(|row_id| self.find_committed_row(relid, row_id))
+        {
+            return Some(row);
+        }
+
+        self.relations.get(&relid).and_then(|relation| {
+            relation
+                .committed_row_ids
+                .iter()
+                .filter_map(|row_id| relation.committed_row_index.get(row_id))
+                .find(|row| index_key_for_row(index_spec, row).as_ref() == Some(key))
+                .cloned()
+        })
     }
 
-    fn has_primary_key_conflict(
+    fn find_visible_row_by_index_key_excluding(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        index_spec: &UniqueIndexSpec,
+        key: &IndexKey,
+        replacing_row_id: Option<u64>,
+    ) -> Option<Row> {
+        self.visible_rows(session, relid).into_iter().find(|row| {
+            Some(row.row_id) != replacing_row_id
+                && index_key_for_row(index_spec, row).as_ref() == Some(key)
+        })
+    }
+
+    fn unique_index_conflict(
         &mut self,
         session: &SessionStorage,
         relid: u32,
         row: &Row,
         replacing_row_id: Option<u64>,
-    ) -> bool {
-        let Some(primary_key_spec) = self.primary_key_spec(relid) else {
-            return false;
-        };
-        let Some(key) = primary_key_for_row(&primary_key_spec, row) else {
-            return false;
-        };
-
-        self.find_visible_row_by_primary_key(session, relid, &primary_key_spec, &key)
-            .is_some_and(|existing| Some(existing.row_id) != replacing_row_id)
-    }
-
-    fn primary_key_spec(&mut self, relid: u32) -> Option<PrimaryKeySpec> {
-        let catalog_generation = fastpg_catalog::current_generation();
-        if self.primary_key_generation != catalog_generation {
-            self.primary_key_specs.clear();
-            self.primary_key_generation = catalog_generation;
+    ) -> Option<Oid> {
+        for index_spec in unique_index_specs_for_relation_oid(Oid(relid)) {
+            let Some(key) = index_key_for_row(&index_spec, row) else {
+                continue;
+            };
+            if self
+                .find_visible_row_by_index_key_excluding(
+                    session,
+                    relid,
+                    &index_spec,
+                    &key,
+                    replacing_row_id,
+                )
+                .is_some()
+            {
+                return Some(index_spec.index_oid);
+            }
         }
-        if let Some(spec) = self.primary_key_specs.get(&relid) {
-            return spec.clone();
-        }
-
-        let spec = relation_by_oid(Oid(relid)).and_then(|relation| primary_key_spec(&relation));
-        self.primary_key_specs.insert(relid, spec.clone());
-        spec
-    }
-
-    fn invalidate_primary_key_spec(&mut self, relid: u32) {
-        self.primary_key_specs.remove(&relid);
+        None
     }
 
     fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
-        self.invalidate_primary_key_spec(relid);
         self.relations.insert(relid, RelationRows::default());
         for overlay in &mut session.transaction_stack {
             overlay.relations.remove(&relid);
@@ -1291,7 +1319,15 @@ impl StorageState {
             if deleted_row_ids.is_empty() {
                 continue;
             }
-            let primary_key_spec = self.primary_key_spec(*relid);
+            let primary_key_spec = relation_by_oid(Oid(*relid)).and_then(|relation| {
+                primary_key_spec_for_relation(&relation).map(|columns| UniqueIndexSpec {
+                    index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
+                    relation_oid: relation.oid,
+                    is_primary: true,
+                    nulls_not_distinct: true,
+                    columns,
+                })
+            });
             let unchanged_row_ids = self.remove_committed_entries(
                 *relid,
                 primary_key_spec.as_ref(),
@@ -1307,7 +1343,15 @@ impl StorageState {
             if segment.rows.is_empty() {
                 continue;
             }
-            let primary_key_spec = self.primary_key_spec(relid);
+            let primary_key_spec = relation_by_oid(Oid(relid)).and_then(|relation| {
+                primary_key_spec_for_relation(&relation).map(|columns| UniqueIndexSpec {
+                    index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
+                    relation_oid: relation.oid,
+                    is_primary: true,
+                    nulls_not_distinct: true,
+                    columns,
+                })
+            });
             let unchanged_row_ids = unchanged_primary_key_updates.get(&relid);
             let relation = self.relations.entry(relid).or_default();
             for row in &segment.rows {
@@ -1324,7 +1368,7 @@ impl StorageState {
                     continue;
                 }
                 if let Some(primary_key_spec) = &primary_key_spec
-                    && let Some(key) = primary_key_for_row(primary_key_spec, &committed_row)
+                    && let Some(key) = index_key_for_row(primary_key_spec, &committed_row)
                 {
                     relation.insert_primary_key(key, committed_row.row_id);
                 }
@@ -1335,7 +1379,7 @@ impl StorageState {
     fn remove_committed_entries(
         &mut self,
         relid: u32,
-        primary_key_spec: Option<&PrimaryKeySpec>,
+        primary_key_spec: Option<&UniqueIndexSpec>,
         deleted_row_ids: &BTreeSet<u64>,
         replacement_segment: Option<&RowSegment>,
     ) -> BTreeSet<u64> {
@@ -1361,7 +1405,7 @@ impl StorageState {
                     unchanged_primary_key_row_ids.insert(*row_id);
                     continue;
                 }
-                if let Some(key) = primary_key_for_row(primary_key_spec, &row) {
+                if let Some(key) = index_key_for_row(primary_key_spec, &row) {
                     relation.remove_primary_key(&key);
                 }
             }
@@ -1410,7 +1454,7 @@ fn find_row_in_segment(segment: &RowSegment, row_id: u64) -> Option<&Row> {
     segment.rows.iter().find(|row| row.row_id == row_id)
 }
 
-fn primary_key_unchanged(primary_key_spec: &PrimaryKeySpec, old_row: &Row, new_row: &Row) -> bool {
+fn primary_key_unchanged(primary_key_spec: &UniqueIndexSpec, old_row: &Row, new_row: &Row) -> bool {
     primary_key_spec.columns.iter().all(|column| {
         let Some(old_cell) = old_row.cells.get(column.column_index) else {
             return false;
@@ -1478,7 +1522,7 @@ fn cached_primary_key_index_info(index_oid: Oid) -> Option<FastPgRustPrimaryKeyI
         return index_info;
     }
 
-    let index_info = primary_key_index_relation(index_oid)
+    let index_info = index_heap_relation(index_oid)
         .and_then(|relation| primary_key_index_info(&relation, index_oid));
     match primary_key_index_info_cache().lock() {
         Ok(mut cache) => {
@@ -1573,10 +1617,12 @@ fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatal
     FastPgRustCatalogRelation {
         oid: relation.oid.0,
         namespace_oid: relation.namespace.0,
+        owner_oid: relation.owner.0,
         name: fixed_c_name(&relation.name),
         column_count: relation.columns.len().min(u16::MAX as usize) as u16,
         relkind: relation.relkind,
         has_primary_key: u8::from(!relation.primary_key.is_empty()),
+        has_indexes: u8::from(!index_records_for_relation_oid(relation.oid).is_empty()),
     }
 }
 
@@ -1587,10 +1633,12 @@ fn primary_key_index_to_ffi(
     FastPgRustCatalogRelation {
         oid: index_oid.0,
         namespace_oid: relation.namespace.0,
+        owner_oid: relation.owner.0,
         name: fixed_c_name(&primary_key_index_name(relation)),
         column_count: relation.primary_key.len().min(u16::MAX as usize) as u16,
         relkind: b'i',
         has_primary_key: 0,
+        has_indexes: 0,
     }
 }
 
@@ -1606,10 +1654,12 @@ fn virtual_catalog_relation_to_ffi(
     FastPgRustCatalogRelation {
         oid: relation.relation_oid.0,
         namespace_oid: PG_CATALOG_NAMESPACE_OID.0,
+        owner_oid: 10,
         name: fixed_c_name(relation.name),
         column_count: virtual_catalog_column_count(relation.relation_oid),
         relkind: b'r',
         has_primary_key: 0,
+        has_indexes: 0,
     }
 }
 
@@ -1619,7 +1669,9 @@ fn column_to_ffi(column: &ColumnRecord) -> FastPgRustCatalogColumn {
         type_oid: column.type_oid.0,
         type_mod: column.type_mod,
         is_not_null: u8::from(column.is_not_null),
-        _padding: [0; 3],
+        has_default: u8::from(column.has_default),
+        generated: column.generated,
+        _padding: 0,
     }
 }
 
@@ -1631,7 +1683,9 @@ fn static_catalog_column_to_ffi(
         type_oid: column.type_oid.0,
         type_mod: -1,
         is_not_null: u8::from(column.attnotnull),
-        _padding: [0; 3],
+        has_default: 0,
+        generated: 0,
+        _padding: 0,
     }
 }
 
@@ -1984,7 +2038,9 @@ fn invalid_ffi_argument(message: String) -> CatalogError {
     CatalogError::new("22023", message)
 }
 
-fn primary_key_spec(relation: &fastpg_catalog::RelationRecord) -> Option<PrimaryKeySpec> {
+fn primary_key_spec_for_relation(
+    relation: &fastpg_catalog::RelationRecord,
+) -> Option<Vec<IndexColumnSpec>> {
     if relation.primary_key.is_empty() {
         return None;
     }
@@ -1997,14 +2053,71 @@ fn primary_key_spec(relation: &fastpg_catalog::RelationRecord) -> Option<Primary
             .position(|column| &column.name == primary_key_column)?;
         let column = relation.columns.get(column_index)?;
         let pg_type = lookup_type(column.type_oid)?;
-        columns.push(PrimaryKeyColumnSpec {
+        columns.push(IndexColumnSpec {
             column_index,
             typbyval: pg_type.typbyval,
             typlen: pg_type.typlen,
         });
     }
 
-    Some(PrimaryKeySpec { columns })
+    Some(columns)
+}
+
+fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
+    let relation = relation_by_oid(record.relation_oid)?;
+    if !record.is_unique || !record.is_valid || !record.is_ready || !record.is_live {
+        return None;
+    }
+    let mut columns = Vec::with_capacity(record.key_attnums.len());
+    for attnum in &record.key_attnums {
+        if *attnum <= 0 {
+            return None;
+        }
+        let column_index = usize::try_from(*attnum - 1).ok()?;
+        let column = relation.columns.get(column_index)?;
+        let pg_type = lookup_type(column.type_oid)?;
+        columns.push(IndexColumnSpec {
+            column_index,
+            typbyval: pg_type.typbyval,
+            typlen: pg_type.typlen,
+        });
+    }
+
+    if columns.is_empty() {
+        return None;
+    }
+
+    Some(UniqueIndexSpec {
+        index_oid: record.index_oid,
+        relation_oid: record.relation_oid,
+        is_primary: record.is_primary,
+        nulls_not_distinct: record.nulls_not_distinct,
+        columns,
+    })
+}
+
+fn unique_index_spec_for_index_oid(index_oid: Oid) -> Option<UniqueIndexSpec> {
+    let record = index_record_by_index_oid(index_oid)?;
+    unique_index_spec_for_record(&record)
+}
+
+fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec> {
+    unique_index_records_for_relation_oid(relation_oid)
+        .iter()
+        .filter_map(unique_index_spec_for_record)
+        .collect()
+}
+
+fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
+    let relation = relation_by_oid(relation_oid)?;
+    let columns = primary_key_spec_for_relation(&relation)?;
+    Some(UniqueIndexSpec {
+        index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
+        relation_oid: relation.oid,
+        is_primary: true,
+        nulls_not_distinct: true,
+        columns,
+    })
 }
 
 fn primary_key_index_oid(relation: &fastpg_catalog::RelationRecord) -> Option<Oid> {
@@ -2025,8 +2138,16 @@ fn primary_key_index_relation(index_oid: Oid) -> Option<fastpg_catalog::Relation
     relation_by_oid(relation_oid)
 }
 
-fn primary_key_index_relation_by_name(name: &str) -> Option<fastpg_catalog::RelationRecord> {
-    let index_relation = relation_by_name(name)?;
+fn index_heap_relation(index_oid: Oid) -> Option<fastpg_catalog::RelationRecord> {
+    let relation_oid = relation_oid_for_index_oid(index_oid)?;
+    relation_by_oid(relation_oid)
+}
+
+fn primary_key_index_relation_by_name(
+    name: &str,
+    namespace: Oid,
+) -> Option<fastpg_catalog::RelationRecord> {
+    let index_relation = relation_by_name_in_namespace(name, namespace)?;
     let relation_oid = primary_key_relation_oid_for_index_oid(index_relation.oid)?;
     relation_by_oid(relation_oid)
 }
@@ -2046,7 +2167,9 @@ fn primary_key_index_info(
     relation: &fastpg_catalog::RelationRecord,
     index_oid: Oid,
 ) -> Option<FastPgRustPrimaryKeyIndexInfo> {
-    let key_count = relation.primary_key.len();
+    let record = index_record_by_index_oid(index_oid)?;
+    let index_spec = unique_index_spec_for_record(&record)?;
+    let key_count = index_spec.columns.len();
     if key_count == 0 || key_count > FASTPG_MAX_INDEX_KEYS {
         return None;
     }
@@ -2054,14 +2177,10 @@ fn primary_key_index_info(
     let mut attnums = [0i16; FASTPG_MAX_INDEX_KEYS];
     let mut type_oids = [0u32; FASTPG_MAX_INDEX_KEYS];
     let mut collation_oids = [0u32; FASTPG_MAX_INDEX_KEYS];
-    for (key_index, primary_key_column) in relation.primary_key.iter().enumerate() {
-        let column_index = relation
-            .columns
-            .iter()
-            .position(|column| &column.name == primary_key_column)?;
-        let column = relation.columns.get(column_index)?;
+    for (key_index, index_column) in index_spec.columns.iter().enumerate() {
+        let column = relation.columns.get(index_column.column_index)?;
         let type_record = lookup_type(column.type_oid)?;
-        attnums[key_index] = (column_index + 1).try_into().ok()?;
+        attnums[key_index] = (index_column.column_index + 1).try_into().ok()?;
         type_oids[key_index] = column.type_oid.0;
         collation_oids[key_index] = type_record.typcollation.0;
     }
@@ -2070,51 +2189,56 @@ fn primary_key_index_info(
         index_oid: index_oid.0,
         heap_oid: relation.oid.0,
         key_count: key_count as u16,
-        _padding: [0; 2],
+        is_unique: u8::from(record.is_unique),
+        is_primary: u8::from(record.is_primary),
+        nulls_not_distinct: u8::from(record.nulls_not_distinct),
+        is_immediate: u8::from(record.is_immediate),
         attnums,
         type_oids,
         collation_oids,
     })
 }
 
-fn primary_key_for_row(primary_key_spec: &PrimaryKeySpec, row: &Row) -> Option<IndexKey> {
-    let mut parts = Vec::with_capacity(primary_key_spec.columns.len());
+fn index_key_for_row(index_spec: &UniqueIndexSpec, row: &Row) -> Option<IndexKey> {
+    let mut parts = Vec::with_capacity(index_spec.columns.len());
 
-    for column in &primary_key_spec.columns {
+    for column in &index_spec.columns {
         let cell = row.cells.get(column.column_index)?;
+        if cell.is_null && !index_spec.nulls_not_distinct {
+            return None;
+        }
         parts.push(index_key_part(column, cell)?);
     }
 
     Some(IndexKey(parts))
 }
 
-fn primary_key_for_datums(
-    primary_key_spec: &PrimaryKeySpec,
+fn index_key_for_datums(
+    index_spec: &UniqueIndexSpec,
     values: &[usize],
     is_null: &[u8],
 ) -> Option<IndexKey> {
-    if primary_key_spec.columns.len() != values.len() || values.len() != is_null.len() {
+    if index_spec.columns.len() != values.len() || values.len() != is_null.len() {
         return None;
     }
 
-    let mut parts = Vec::with_capacity(primary_key_spec.columns.len());
-    for (key_index, column) in primary_key_spec.columns.iter().enumerate() {
-        if is_null[key_index] != 0 {
-            parts.push(IndexKeyPart::Null);
-        } else if column.typbyval {
-            parts.push(IndexKeyPart::ByValue(values[key_index]));
+    let mut parts = Vec::with_capacity(index_spec.columns.len());
+    for (key_index, column) in index_spec.columns.iter().enumerate() {
+        let cell = if is_null[key_index] != 0 {
+            Cell::null()
         } else {
-            parts.push(IndexKeyPart::Bytes(byref_key_bytes(
-                values[key_index],
-                column.typlen,
-            )?));
+            Cell::by_value(values[key_index])
+        };
+        if cell.is_null && !index_spec.nulls_not_distinct {
+            return None;
         }
+        parts.push(index_key_part(column, &cell)?);
     }
 
     Some(IndexKey(parts))
 }
 
-fn index_key_part(column: &PrimaryKeyColumnSpec, cell: &Cell) -> Option<IndexKeyPart> {
+fn index_key_part(column: &IndexColumnSpec, cell: &Cell) -> Option<IndexKeyPart> {
     if cell.is_null {
         return Some(IndexKeyPart::Null);
     }
@@ -2139,25 +2263,6 @@ fn byref_key_bytes_from_cell(cell: &Cell, typlen: i16) -> Option<Vec<u8>> {
         return None;
     };
     (bytes.len() >= len).then(|| bytes[..len].to_vec())
-}
-
-fn byref_key_bytes(value: usize, typlen: i16) -> Option<Vec<u8>> {
-    if value == 0 {
-        return None;
-    }
-
-    let len = if typlen > 0 {
-        typlen as usize
-    } else if typlen == -1 {
-        varlena_payload_len(value)?
-    } else if typlen == -2 {
-        c_string_payload_len(value)?
-    } else {
-        return None;
-    };
-
-    let bytes = unsafe { slice::from_raw_parts(value as *const u8, len) };
-    Some(bytes.to_vec())
 }
 
 fn varlena_payload_len(value: usize) -> Option<usize> {
@@ -2428,10 +2533,8 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
         }
         return true;
     }
-    if let Some(relation) = primary_key_index_relation_by_name(&name) {
-        if relation.namespace.0 != namespace_oid {
-            return false;
-        }
+    let namespace = Oid(namespace_oid);
+    if let Some(relation) = primary_key_index_relation_by_name(&name, namespace) {
         let Some(index_oid) = primary_key_index_oid(&relation) else {
             return false;
         };
@@ -2440,12 +2543,9 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
         }
         return true;
     }
-    let Some(relation) = relation_by_name(&name) else {
+    let Some(relation) = relation_by_name_in_namespace(&name, namespace) else {
         return false;
     };
-    if relation.namespace.0 != namespace_oid {
-        return false;
-    }
 
     unsafe {
         *oid_out = relation.oid.0;
@@ -2570,6 +2670,31 @@ pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_oid(
     };
     unsafe {
         *oid_out = index_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_unique_index_oid(
+    relation_oid: u32,
+    index_position: usize,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let indexes = unique_index_records_for_relation_oid(Oid(relation_oid))
+        .into_iter()
+        .filter(|record| unique_index_spec_for_record(record).is_some())
+        .collect::<Vec<_>>();
+    let Some(index) = indexes.get(index_position) else {
+        return false;
+    };
+    unsafe {
+        *oid_out = index.index_oid.0;
     }
     true
 }
@@ -3205,7 +3330,7 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
-    let Some(relation) = primary_key_index_relation(Oid(index_relid)) else {
+    let Some(index_spec) = unique_index_spec_for_index_oid(Oid(index_relid)) else {
         return false;
     };
 
@@ -3220,13 +3345,63 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
         unsafe { slice::from_raw_parts(is_null, nkeys) }
     };
     let row = with_storage(|state, session| {
-        let primary_key_spec = state.primary_key_spec(relation.oid.0)?;
-        let key = primary_key_for_datums(&primary_key_spec, values, is_null)?;
-        Some(state.find_visible_row_by_primary_key(
+        let key = index_key_for_datums(&index_spec, values, is_null)?;
+        Some(state.find_visible_row_by_index_key(
             session,
-            relation.oid.0,
-            &primary_key_spec,
+            index_spec.relation_oid.0,
+            &index_spec,
             &key,
+        ))
+    })
+    .flatten();
+    let Some(row) = row else {
+        return false;
+    };
+    if !row_id_out.is_null() {
+        unsafe {
+            *row_id_out = row.row_id;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid value/null arrays for `nkeys` entries and a valid
+/// output pointer when `row_id_out` is non-null.
+pub unsafe extern "C" fn fastpg_rust_unique_index_conflict(
+    index_relid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    replacing_row_id: u64,
+    row_id_out: *mut u64,
+) -> bool {
+    if nkeys > 0 && (values.is_null() || is_null.is_null()) {
+        return false;
+    }
+    let Some(index_spec) = unique_index_spec_for_index_oid(Oid(index_relid)) else {
+        return false;
+    };
+    let values = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(values, nkeys) }
+    };
+    let is_null = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(is_null, nkeys) }
+    };
+    let row = with_storage(|state, session| {
+        let key = index_key_for_datums(&index_spec, values, is_null)?;
+        Some(state.find_visible_row_by_index_key_excluding(
+            session,
+            index_spec.relation_oid.0,
+            &index_spec,
+            &key,
+            Some(replacing_row_id),
         ))
     })
     .flatten();
@@ -3256,6 +3431,45 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
     row_id_out: *mut u64,
 ) -> bool {
     clear_last_storage_error();
+    unsafe {
+        relation_insert_impl(
+            relid, values, is_null, byval, value_lens, natts, row_id_out, true,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_relation_insert_unchecked(
+    relid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    row_id_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    unsafe {
+        relation_insert_impl(
+            relid, values, is_null, byval, value_lens, natts, row_id_out, false,
+        )
+    }
+}
+
+unsafe fn relation_insert_impl(
+    relid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    row_id_out: *mut u64,
+    check_unique: bool,
+) -> bool {
     let Some((values, is_null, byval, value_lens)) =
         (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
     else {
@@ -3295,9 +3509,8 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
         };
 
         let row = Row { row_id, cells };
-        let index_bytes = state
-            .primary_key_spec(relid)
-            .and_then(|primary_key_spec| primary_key_for_row(&primary_key_spec, &row))
+        let index_bytes = primary_index_spec_for_relation_oid(Oid(relid))
+            .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
             .unwrap_or(0);
         if let Err(error) = state.check_committed_projection_limit(session, index_bytes) {
@@ -3309,7 +3522,11 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
             segment.rewind_to(checkpoint);
             return Err(error);
         }
-        if state.has_primary_key_conflict(session, relid, &row, None) {
+        if check_unique
+            && state
+                .unique_index_conflict(session, relid, &row, None)
+                .is_some()
+        {
             let segment = session
                 .transaction_stack
                 .last_mut()
@@ -3357,6 +3574,45 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
     natts: usize,
 ) -> bool {
     clear_last_storage_error();
+    unsafe {
+        relation_update_impl(
+            relid, row_id, values, is_null, byval, value_lens, natts, true,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked(
+    relid: u32,
+    row_id: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+) -> bool {
+    clear_last_storage_error();
+    unsafe {
+        relation_update_impl(
+            relid, row_id, values, is_null, byval, value_lens, natts, false,
+        )
+    }
+}
+
+unsafe fn relation_update_impl(
+    relid: u32,
+    row_id: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    check_unique: bool,
+) -> bool {
     if row_id == 0 {
         return false;
     }
@@ -3396,9 +3652,8 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
             }
         };
         let row = Row { row_id, cells };
-        let index_bytes = state
-            .primary_key_spec(relid)
-            .and_then(|primary_key_spec| primary_key_for_row(&primary_key_spec, &row))
+        let index_bytes = primary_index_spec_for_relation_oid(Oid(relid))
+            .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
             .unwrap_or(0);
         if let Err(error) = state.check_committed_projection_limit(session, index_bytes) {
@@ -3410,7 +3665,11 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
             segment.rewind_to(checkpoint);
             return Err(error);
         }
-        if state.has_primary_key_conflict(session, relid, &row, Some(row_id)) {
+        if check_unique
+            && state
+                .unique_index_conflict(session, relid, &row, Some(row_id))
+                .is_some()
+        {
             let overlay = session
                 .transaction_stack
                 .last_mut()
@@ -3747,6 +4006,27 @@ fn chararray_datum(values: &[u8], region: &mut StorageRegion) -> Cell {
     byref_datum(&bytes, region)
 }
 
+fn textarray_datum(values: &[String], region: &mut StorageRegion) -> Cell {
+    let mut bytes = Vec::new();
+    push_u32_ne(&mut bytes, 0);
+    push_i32_ne(&mut bytes, 1);
+    push_i32_ne(&mut bytes, 0);
+    push_u32_ne(&mut bytes, TEXT_OID.0);
+    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
+    push_i32_ne(&mut bytes, 0);
+    for value in values {
+        while bytes.len() % 4 != 0 {
+            bytes.push(0);
+        }
+        let element_len = 4 + value.len();
+        push_u32_ne(&mut bytes, varlena_4b_header(element_len));
+        bytes.extend_from_slice(value.as_bytes());
+    }
+    let total_len = bytes.len();
+    bytes[0..4].copy_from_slice(&varlena_4b_header(total_len).to_ne_bytes());
+    byref_datum(&bytes, region)
+}
+
 fn parse_lsn(value: &str) -> Option<u64> {
     let (high, low) = value.split_once('/')?;
     let high = u64::from_str_radix(high, 16).ok()?;
@@ -3836,7 +4116,10 @@ fn catalog_value_to_cell(
             CHAR_ARRAY_OID => parse_pg_array_values(value, |part| part.as_bytes().first().copied())
                 .map(|values| chararray_datum(&values, region))
                 .unwrap_or_else(null_datum),
-            TEXT_ARRAY_OID | ACLITEM_ARRAY_OID | ANYARRAY_OID => null_datum(),
+            TEXT_ARRAY_OID => parse_pg_array_values(value, |part| Some(part.to_owned()))
+                .map(|values| textarray_datum(&values, region))
+                .unwrap_or_else(null_datum),
+            ACLITEM_ARRAY_OID | ANYARRAY_OID => null_datum(),
             _ => null_datum(),
         },
     }
@@ -4997,16 +5280,21 @@ mod tests {
         let mut index_relation = FastPgRustCatalogRelation {
             oid: 0,
             namespace_oid: 0,
+            owner_oid: 0,
             name: [0; NAMEDATALEN],
             column_count: 0,
             relkind: 0,
             has_primary_key: 0,
+            has_indexes: 0,
         };
         let mut index_info = FastPgRustPrimaryKeyIndexInfo {
             index_oid: 0,
             heap_oid: 0,
             key_count: 0,
-            _padding: [0; 2],
+            is_unique: 0,
+            is_primary: 0,
+            nulls_not_distinct: 0,
+            is_immediate: 0,
             attnums: [0; FASTPG_MAX_INDEX_KEYS],
             type_oids: [0; FASTPG_MAX_INDEX_KEYS],
             collation_oids: [0; FASTPG_MAX_INDEX_KEYS],

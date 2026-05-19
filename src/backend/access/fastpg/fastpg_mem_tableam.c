@@ -54,6 +54,13 @@ extern bool fastpg_rust_relation_insert(uint32_t relid,
 										const size_t *value_lens,
 										size_t natts,
 										uint64_t *row_id);
+extern bool fastpg_rust_relation_insert_unchecked(uint32_t relid,
+												  const uintptr_t *values,
+												  const uint8_t *isnull,
+												  const uint8_t *byval,
+												  const size_t *value_lens,
+												  size_t natts,
+												  uint64_t *row_id);
 extern bool fastpg_rust_relation_update(uint32_t relid,
 										uint64_t row_id,
 										const uintptr_t *values,
@@ -61,6 +68,13 @@ extern bool fastpg_rust_relation_update(uint32_t relid,
 										const uint8_t *byval,
 										const size_t *value_lens,
 										size_t natts);
+extern bool fastpg_rust_relation_update_unchecked(uint32_t relid,
+												  uint64_t row_id,
+												  const uintptr_t *values,
+												  const uint8_t *isnull,
+												  const uint8_t *byval,
+												  const size_t *value_lens,
+												  size_t natts);
 extern bool fastpg_rust_relation_delete(uint32_t relid, uint64_t row_id);
 extern bool fastpg_rust_relation_contains_row(uint32_t relid,
 											  uint64_t row_id);
@@ -83,6 +97,12 @@ extern bool fastpg_rust_primary_key_index_lookup(uint32_t index_relid,
 												 const uint8_t *isnull,
 												 size_t nkeys,
 												 uint64_t *row_id);
+extern bool fastpg_rust_unique_index_conflict(uint32_t index_relid,
+											  const uintptr_t *values,
+											  const uint8_t *isnull,
+											  size_t nkeys,
+											  uint64_t replacing_row_id,
+											  uint64_t *row_id);
 extern void fastpg_rust_xact_begin(void);
 extern void fastpg_rust_xact_commit(void);
 extern void fastpg_rust_xact_abort(void);
@@ -643,11 +663,54 @@ fastpg_mem_index_insert(Relation indexRelation,
 						bool indexUnchanged,
 						IndexInfo *indexInfo)
 {
-	/*
-	 * Rust table storage owns the primary-key map.  Executor calls still pass
-	 * through here once the index is planner-visible, so this AM is a no-op
-	 * writer rather than a second source of truth.
-	 */
+	if (checkUnique != UNIQUE_CHECK_NO &&
+		indexRelation->rd_index != NULL &&
+		indexRelation->rd_index->indisunique)
+	{
+		int			key_count =
+			IndexRelationGetNumberOfKeyAttributes(indexRelation);
+		uintptr_t	fastpg_values[FASTPG_MAX_INDEX_KEYS];
+		uint8_t		fastpg_isnull[FASTPG_MAX_INDEX_KEYS];
+		uint64_t	self_row_id = 0;
+		uint64_t	conflict_row_id = 0;
+
+		if (key_count <= 0 || key_count > FASTPG_MAX_INDEX_KEYS)
+			fastpg_mem_index_unsupported("unique indexes with invalid key count");
+		if (!fastpg_mem_tid_to_row_id(heap_tid, &self_row_id))
+			elog(ERROR, "fastpg_mem heap TID cannot be represented as a row id");
+		for (int index = 0; index < key_count; index++)
+		{
+			fastpg_values[index] = (uintptr_t) values[index];
+			fastpg_isnull[index] = isnull[index] ? 1 : 0;
+		}
+
+		if (fastpg_rust_unique_index_conflict((uint32_t) RelationGetRelid(indexRelation),
+											  fastpg_values,
+											  fastpg_isnull,
+											  (size_t) key_count,
+											  self_row_id,
+											  &conflict_row_id))
+		{
+			if (checkUnique == UNIQUE_CHECK_PARTIAL)
+				return false;
+			else
+			{
+				char	   *key_desc;
+
+				key_desc = BuildIndexValueDescription(indexRelation, values,
+													  isnull);
+				ereport(ERROR,
+						(errcode(ERRCODE_UNIQUE_VIOLATION),
+						 errmsg("duplicate key value violates unique constraint \"%s\"",
+								RelationGetRelationName(indexRelation)),
+						 key_desc ? errdetail("Key %s already exists.",
+											  key_desc) : 0,
+						 errtableconstraint(heapRelation,
+											RelationGetRelationName(indexRelation))));
+			}
+		}
+	}
+
 	return true;
 }
 
@@ -823,13 +886,13 @@ fastpg_mem_tuple_insert(Relation rel,
 	fastpg_mem_ensure_write_xact();
 	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
 								   &value_lens);
-	if (!fastpg_rust_relation_insert(RelationGetRelid(rel),
-									 values,
-									 isnull,
-									 byval,
-									 value_lens,
-									 tupdesc->natts,
-									 &row_id))
+	if (!fastpg_rust_relation_insert_unchecked(RelationGetRelid(rel),
+											   values,
+											   isnull,
+											   byval,
+											   value_lens,
+											   tupdesc->natts,
+											   &row_id))
 	{
 		pfree(values);
 		pfree(isnull);
@@ -943,13 +1006,13 @@ fastpg_mem_tuple_update(Relation rel,
 	fastpg_mem_ensure_write_xact();
 	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
 								   &value_lens);
-	if (!fastpg_rust_relation_update(RelationGetRelid(rel),
-									 row_id,
-									 values,
-									 isnull,
-									 byval,
-									 value_lens,
-									 tupdesc->natts))
+	if (!fastpg_rust_relation_update_unchecked(RelationGetRelid(rel),
+											   row_id,
+											   values,
+											   isnull,
+											   byval,
+											   value_lens,
+											   tupdesc->natts))
 	{
 		pfree(values);
 		pfree(isnull);

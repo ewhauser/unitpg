@@ -80,6 +80,100 @@ typedef struct
 StaticAssertDecl(MAX_BACKENDS * 2 <= PG_SNAPSHOT_MAX_NXIP,
 				 "possible overflow in pg_current_snapshot()");
 
+#ifdef USE_FASTPG
+typedef enum FastPgXidState
+{
+	FASTPG_XID_COMMITTED,
+	FASTPG_XID_ABORTED,
+	FASTPG_XID_IN_PROGRESS
+} FastPgXidState;
+
+typedef struct FastPgXidEntry
+{
+	FullTransactionId fxid;
+	FastPgXidState state;
+} FastPgXidEntry;
+
+#define FASTPG_XID_HISTORY 1024
+
+void fastpg_xid_begin(void);
+void fastpg_xid_commit(void);
+void fastpg_xid_rollback(void);
+
+static uint64 fastpg_next_fxid = 100;
+static bool fastpg_xid_assigned = false;
+static FullTransactionId fastpg_xid_current = {0};
+static FastPgXidEntry fastpg_xid_history[FASTPG_XID_HISTORY];
+static int fastpg_xid_history_next = 0;
+
+static FullTransactionId
+fastpg_make_fxid(uint64 value)
+{
+	return FullTransactionIdFromU64(value);
+}
+
+static void
+fastpg_record_xid(FullTransactionId fxid, FastPgXidState state)
+{
+	fastpg_xid_history[fastpg_xid_history_next].fxid = fxid;
+	fastpg_xid_history[fastpg_xid_history_next].state = state;
+	fastpg_xid_history_next =
+		(fastpg_xid_history_next + 1) % FASTPG_XID_HISTORY;
+}
+
+static bool
+fastpg_lookup_xid(FullTransactionId fxid, FastPgXidState *state)
+{
+	for (int i = 0; i < FASTPG_XID_HISTORY; i++)
+	{
+		if (FullTransactionIdEquals(fastpg_xid_history[i].fxid, fxid))
+		{
+			*state = fastpg_xid_history[i].state;
+			return true;
+		}
+	}
+
+	return false;
+}
+
+static FullTransactionId
+fastpg_current_fxid(void)
+{
+	if (!fastpg_xid_assigned)
+	{
+		fastpg_xid_current = fastpg_make_fxid(fastpg_next_fxid++);
+		fastpg_xid_assigned = true;
+	}
+
+	return fastpg_xid_current;
+}
+
+void
+fastpg_xid_begin(void)
+{
+	fastpg_xid_assigned = false;
+	fastpg_xid_current = InvalidFullTransactionId;
+}
+
+void
+fastpg_xid_commit(void)
+{
+	if (fastpg_xid_assigned)
+		fastpg_record_xid(fastpg_xid_current, FASTPG_XID_COMMITTED);
+	fastpg_xid_assigned = false;
+	fastpg_xid_current = InvalidFullTransactionId;
+}
+
+void
+fastpg_xid_rollback(void)
+{
+	if (fastpg_xid_assigned)
+		fastpg_record_xid(fastpg_xid_current, FASTPG_XID_ABORTED);
+	fastpg_xid_assigned = false;
+	fastpg_xid_current = InvalidFullTransactionId;
+}
+#endif
+
 
 /*
  * Helper to get a TransactionId from a 64-bit xid with wraparound detection.
@@ -334,6 +428,9 @@ bad_format:
 Datum
 pg_current_xact_id(PG_FUNCTION_ARGS)
 {
+#ifdef USE_FASTPG
+	PG_RETURN_FULLTRANSACTIONID(fastpg_current_fxid());
+#else
 	/*
 	 * Must prevent during recovery because if an xid is not assigned we try
 	 * to assign one, which would fail. Programs already rely on this function
@@ -343,6 +440,7 @@ pg_current_xact_id(PG_FUNCTION_ARGS)
 	PreventCommandDuringRecovery("pg_current_xact_id()");
 
 	PG_RETURN_FULLTRANSACTIONID(GetTopFullTransactionId());
+#endif
 }
 
 /*
@@ -352,12 +450,18 @@ pg_current_xact_id(PG_FUNCTION_ARGS)
 Datum
 pg_current_xact_id_if_assigned(PG_FUNCTION_ARGS)
 {
+#ifdef USE_FASTPG
+	if (!fastpg_xid_assigned)
+		PG_RETURN_NULL();
+	PG_RETURN_FULLTRANSACTIONID(fastpg_xid_current);
+#else
 	FullTransactionId topfxid = GetTopFullTransactionIdIfAny();
 
 	if (!FullTransactionIdIsValid(topfxid))
 		PG_RETURN_NULL();
 
 	PG_RETURN_FULLTRANSACTIONID(topfxid);
+#endif
 }
 
 /*
@@ -370,6 +474,21 @@ pg_current_xact_id_if_assigned(PG_FUNCTION_ARGS)
 Datum
 pg_current_snapshot(PG_FUNCTION_ARGS)
 {
+#ifdef USE_FASTPG
+	pg_snapshot *snap;
+	FullTransactionId current_fxid = fastpg_current_fxid();
+	FullTransactionId xmax = current_fxid;
+
+	FullTransactionIdAdvance(&xmax);
+	snap = palloc(PG_SNAPSHOT_SIZE(1));
+	snap->xmin = current_fxid;
+	snap->xmax = xmax;
+	snap->nxip = 1;
+	snap->xip[0] = current_fxid;
+	SET_VARSIZE(snap, PG_SNAPSHOT_SIZE(snap->nxip));
+
+	PG_RETURN_POINTER(snap);
+#else
 	pg_snapshot *snap;
 	uint32		nxip,
 				i;
@@ -410,6 +529,7 @@ pg_current_snapshot(PG_FUNCTION_ARGS)
 	SET_VARSIZE(snap, PG_SNAPSHOT_SIZE(snap->nxip));
 
 	PG_RETURN_POINTER(snap);
+#endif
 }
 
 /*
@@ -643,6 +763,41 @@ pg_xact_status(PG_FUNCTION_ARGS)
 	const char *status;
 	FullTransactionId fxid = PG_GETARG_FULLTRANSACTIONID(0);
 	TransactionId xid;
+
+#ifdef USE_FASTPG
+	FastPgXidState state;
+
+	if (U64FromFullTransactionId(fxid) > fastpg_next_fxid + 1000)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("transaction ID %" PRIu64 " is in the future",
+						U64FromFullTransactionId(fxid))));
+
+	xid = XidFromFullTransactionId(fxid);
+	if (xid == BootstrapTransactionId || xid == FrozenTransactionId)
+		PG_RETURN_TEXT_P(cstring_to_text("committed"));
+	if (xid == FirstNormalTransactionId)
+		PG_RETURN_NULL();
+	if (fastpg_xid_assigned && FullTransactionIdEquals(fxid, fastpg_xid_current))
+		PG_RETURN_TEXT_P(cstring_to_text("in progress"));
+	if (!fastpg_lookup_xid(fxid, &state))
+		PG_RETURN_NULL();
+
+	switch (state)
+	{
+		case FASTPG_XID_COMMITTED:
+			status = "committed";
+			break;
+		case FASTPG_XID_ABORTED:
+			status = "aborted";
+			break;
+		case FASTPG_XID_IN_PROGRESS:
+			status = "in progress";
+			break;
+	}
+
+	PG_RETURN_TEXT_P(cstring_to_text(status));
+#endif
 
 	/*
 	 * We must protect against concurrent truncation of clog entries to avoid

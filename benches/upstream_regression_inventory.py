@@ -274,6 +274,8 @@ class UpstreamRegressionInventory:
                 socket_path=socket_path,
             )
             run_record["commands"]["start"] = server["result"].as_json()
+            prelude = self.install_regression_prelude("fastpg", paths["client_bindir"], host, port, env, run_dir)
+            run_record["commands"]["prelude"] = prelude.as_json()
             case_results = self.run_cases("fastpg", paths["client_bindir"], host, port, env, run_dir)
             self.results["variants"]["fastpg"]["cases"] = case_results
             self.results["variants"]["fastpg"]["status"] = "ok"
@@ -329,6 +331,46 @@ class UpstreamRegressionInventory:
             ],
             run_dir,
             "create-database",
+            env=env,
+        )
+
+    def install_regression_prelude(
+        self,
+        variant: str,
+        bindir: Path,
+        host: str,
+        port: int,
+        env: dict[str, str],
+        run_dir: Path,
+    ) -> CommandResult:
+        return self.helper.checked_command(
+            variant,
+            "prelude",
+            [
+                str(bindir / "psql"),
+                "-h",
+                host,
+                "-p",
+                str(port),
+                "-U",
+                "postgres",
+                "-d",
+                self.args.database,
+                "-X",
+                "-q",
+                "-v",
+                "ON_ERROR_STOP=1",
+                "-c",
+                "CREATE FUNCTION pg_catalog.plpgsql_call_handler() RETURNS language_handler LANGUAGE c AS '$libdir/plpgsql'",
+                "-c",
+                "CREATE FUNCTION pg_catalog.plpgsql_inline_handler(internal) RETURNS void STRICT LANGUAGE c AS '$libdir/plpgsql'",
+                "-c",
+                "CREATE FUNCTION pg_catalog.plpgsql_validator(oid) RETURNS void STRICT LANGUAGE c AS '$libdir/plpgsql'",
+                "-c",
+                "CREATE TRUSTED LANGUAGE plpgsql HANDLER pg_catalog.plpgsql_call_handler INLINE pg_catalog.plpgsql_inline_handler VALIDATOR pg_catalog.plpgsql_validator",
+            ],
+            run_dir,
+            "regression-prelude",
             env=env,
         )
 
@@ -570,7 +612,8 @@ def short_temp_dir(prefix: str) -> Path:
 
 
 def normalize_output(output: str) -> str:
-    return output.replace("\r\n", "\n")
+    lines = output.replace("\r\n", "\n").splitlines(keepends=True)
+    return "".join(line for line in lines if not line.startswith("NOTICE:  "))
 
 
 def tail(output: str, lines: int = 40) -> str:

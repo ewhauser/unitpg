@@ -14,6 +14,7 @@
 #include "access/fastpg_catalog.h"
 #include "access/transam.h"
 #include "access/tupdesc.h"
+#include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_collation.h"
@@ -56,12 +57,20 @@
 #include "utils/snapshot.h"
 #include "utils/syscache.h"
 
+#ifdef USE_FASTPG
+extern void fastpg_xid_begin(void);
+extern void fastpg_xid_commit(void);
+extern void fastpg_xid_rollback(void);
+#endif
+
 typedef struct FastPgPgCoreParseResult
 {
 	bool		ok;
 	int			statement_count;
 	char		sqlstate[6];
 	char	   *message;
+	char	   *detail;
+	char	   *hint;
 	int			cursorpos;
 } FastPgPgCoreParseResult;
 
@@ -78,6 +87,8 @@ typedef struct FastPgPgCorePrepared
 	bool		ok;
 	char		sqlstate[6];
 	char	   *message;
+	char	   *detail;
+	char	   *hint;
 	int			cursorpos;
 	char	   *source_text;
 	List	   *raw_parsetrees;
@@ -122,6 +133,8 @@ typedef struct FastPgPgCoreExecuteResult
 	bool		ok;
 	char		sqlstate[6];
 	char	   *message;
+	char	   *detail;
+	char	   *hint;
 	int			cursorpos;
 	int			statement_count;
 	FastPgPgCoreExecuteStatement *statements;
@@ -211,6 +224,32 @@ fastpg_pgcore_ensure_execution_owner(void)
 			ResourceOwnerCreate(NULL, "fastpg pgcore resource owner");
 }
 
+static void
+fastpg_pgcore_release_error_resources(void)
+{
+	ResourceOwner owner = CurrentResourceOwner;
+
+	if (owner == NULL)
+		return;
+
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, false, true);
+	ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, false, true);
+	ResourceOwnerDelete(owner);
+	CurrentResourceOwner = NULL;
+	fastpg_pgcore_ensure_execution_owner();
+}
+
+static void
+fastpg_pgcore_start_statement_timestamp(void)
+{
+	SetCurrentStatementStartTimestamp();
+#ifdef USE_FASTPG
+	if (!fastpg_rust_xact_is_explicit())
+		FastPgSetCurrentTransactionStartTimestampToStatement();
+#endif
+}
+
 static FastPgPgCoreParseResult *
 fastpg_pgcore_parse_result_alloc(void)
 {
@@ -224,6 +263,8 @@ fastpg_pgcore_parse_result_alloc(void)
 	result->statement_count = 0;
 	result->sqlstate[0] = '\0';
 	result->message = NULL;
+	result->detail = NULL;
+	result->hint = NULL;
 	result->cursorpos = 0;
 
 	return result;
@@ -254,12 +295,16 @@ fastpg_pgcore_set_error(FastPgPgCoreParseResult *result, ErrorData *edata)
 
 	memcpy(result->sqlstate, sqlstate, sizeof(result->sqlstate));
 	result->message = fastpg_pgcore_strdup(message);
+	result->detail = fastpg_pgcore_strdup(edata->detail);
+	result->hint = fastpg_pgcore_strdup(edata->hint);
 	result->cursorpos = edata->cursorpos;
 }
 
 static void
 fastpg_pgcore_copy_error(char sqlstate_out[6],
 						 char **message_out,
+						 char **detail_out,
+						 char **hint_out,
 						 int *cursorpos_out,
 						 ErrorData *edata)
 {
@@ -269,6 +314,10 @@ fastpg_pgcore_copy_error(char sqlstate_out[6],
 	memcpy(sqlstate_out, sqlstate, 6);
 	free(*message_out);
 	*message_out = fastpg_pgcore_strdup(message);
+	free(*detail_out);
+	*detail_out = fastpg_pgcore_strdup(edata->detail);
+	free(*hint_out);
+	*hint_out = fastpg_pgcore_strdup(edata->hint);
 	*cursorpos_out = edata->cursorpos;
 }
 
@@ -279,6 +328,8 @@ fastpg_pgcore_set_prepared_error(FastPgPgCorePrepared *result,
 	result->ok = false;
 	fastpg_pgcore_copy_error(result->sqlstate,
 							 &result->message,
+							 &result->detail,
+							 &result->hint,
 							 &result->cursorpos,
 							 edata);
 }
@@ -290,6 +341,8 @@ fastpg_pgcore_set_execute_error(FastPgPgCoreExecuteResult *result,
 	result->ok = false;
 	fastpg_pgcore_copy_error(result->sqlstate,
 							 &result->message,
+							 &result->detail,
+							 &result->hint,
 							 &result->cursorpos,
 							 edata);
 }
@@ -422,18 +475,21 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 		case TRANS_STMT_BEGIN:
 		case TRANS_STMT_START:
 #ifdef USE_FASTPG
+			fastpg_xid_begin();
 			fastpg_rust_xact_begin();
 #endif
 			summary->command_tag = pstrdup("BEGIN");
 			break;
 		case TRANS_STMT_COMMIT:
 #ifdef USE_FASTPG
+			fastpg_xid_commit();
 			fastpg_rust_xact_commit();
 #endif
 			summary->command_tag = pstrdup("COMMIT");
 			break;
 		case TRANS_STMT_ROLLBACK:
 #ifdef USE_FASTPG
+			fastpg_xid_rollback();
 			fastpg_rust_xact_abort();
 #endif
 			summary->command_tag = pstrdup("ROLLBACK");
@@ -537,7 +593,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 
 	if (PlannedStmtRequiresSnapshot(statement))
 	{
-		PushActiveSnapshot(SnapshotAny);
+		PushActiveSnapshot(GetTransactionSnapshot());
 		snapshot_pushed = true;
 	}
 
@@ -801,6 +857,8 @@ fastpg_pgcore_parse_result_free(FastPgPgCoreParseResult *result)
 		return;
 
 	free(result->message);
+	free(result->detail);
+	free(result->hint);
 	free(result);
 }
 
@@ -830,6 +888,22 @@ fastpg_pgcore_parse_result_message(const FastPgPgCoreParseResult *result)
 	if (result == NULL || result->message == NULL)
 		return "PostgreSQL parser error";
 	return result->message;
+}
+
+const char *
+fastpg_pgcore_parse_result_detail(const FastPgPgCoreParseResult *result)
+{
+	if (result == NULL || result->detail == NULL)
+		return "";
+	return result->detail;
+}
+
+const char *
+fastpg_pgcore_parse_result_hint(const FastPgPgCoreParseResult *result)
+{
+	if (result == NULL || result->hint == NULL)
+		return "";
+	return result->hint;
 }
 
 int
@@ -908,6 +982,7 @@ fastpg_pgcore_prepare(const char *query)
 		FlushErrorState();
 		fastpg_pgcore_set_prepared_error(result, edata);
 		FreeErrorData(edata);
+		fastpg_pgcore_release_error_resources();
 	}
 	PG_END_TRY();
 
@@ -924,6 +999,8 @@ fastpg_pgcore_prepared_free(FastPgPgCorePrepared *prepared)
 	if (prepared->context != NULL)
 		MemoryContextDelete(prepared->context);
 	free(prepared->message);
+	free(prepared->detail);
+	free(prepared->hint);
 	free(prepared);
 }
 
@@ -947,6 +1024,22 @@ fastpg_pgcore_prepared_message(const FastPgPgCorePrepared *prepared)
 	if (prepared == NULL || prepared->message == NULL)
 		return "PostgreSQL prepare error";
 	return prepared->message;
+}
+
+const char *
+fastpg_pgcore_prepared_detail(const FastPgPgCorePrepared *prepared)
+{
+	if (prepared == NULL || prepared->detail == NULL)
+		return "";
+	return prepared->detail;
+}
+
+const char *
+fastpg_pgcore_prepared_hint(const FastPgPgCorePrepared *prepared)
+{
+	if (prepared == NULL || prepared->hint == NULL)
+		return "";
+	return prepared->hint;
 }
 
 int
@@ -1098,12 +1191,14 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 	QueryDesc  *query_desc = NULL;
 	DestReceiver *dest = NULL;
 	bool		snapshot_pushed = false;
+	volatile bool executor_started = false;
 
 	result = (FastPgPgCoreExecuteResult *) calloc(1, sizeof(FastPgPgCoreExecuteResult));
 	if (result == NULL)
 		return NULL;
 
 	fastpg_pgcore_enter();
+	fastpg_pgcore_start_statement_timestamp();
 	oldcontext = CurrentMemoryContext;
 	result->context = AllocSetContextCreate(TopMemoryContext,
 											"fastpg pgcore execute result",
@@ -1113,6 +1208,8 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 	{
 		memcpy(result->sqlstate, fastpg_pgcore_prepared_sqlstate(prepared), 6);
 		result->message = fastpg_pgcore_strdup(fastpg_pgcore_prepared_message(prepared));
+		result->detail = fastpg_pgcore_strdup(fastpg_pgcore_prepared_detail(prepared));
+		result->hint = fastpg_pgcore_strdup(fastpg_pgcore_prepared_hint(prepared));
 		result->cursorpos = fastpg_pgcore_prepared_cursorpos(prepared);
 		return result;
 	}
@@ -1122,7 +1219,6 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		ListCell   *lc;
 		int			statement_index = 0;
 		ParamListInfo params;
-		Snapshot	snapshot;
 
 		MemoryContextSwitchTo(result->context);
 		params = fastpg_pgcore_build_params(prepared,
@@ -1134,7 +1230,6 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		result->statement_count = list_length(prepared->planned_statements);
 		result->statements = palloc0_array(FastPgPgCoreExecuteStatement,
 										   result->statement_count);
-		snapshot = SnapshotAny;
 
 		foreach(lc, prepared->planned_statements)
 		{
@@ -1156,7 +1251,10 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 											  result->context);
 #ifdef USE_FASTPG
 				if (!fastpg_rust_xact_is_explicit())
+				{
+					fastpg_xid_commit();
 					fastpg_rust_xact_commit_if_implicit();
+				}
 #endif
 				continue;
 			}
@@ -1175,24 +1273,31 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 														 result->context);
 			query_desc = CreateQueryDesc(statement,
 										 prepared->source_text,
-										 snapshot,
+										 GetTransactionSnapshot(),
 										 InvalidSnapshot,
 										 dest,
 										 params,
 										 NULL,
 										 0);
 
+			PushActiveSnapshot(query_desc->snapshot);
+			snapshot_pushed = true;
 			ExecutorStart(query_desc, 0);
+			executor_started = true;
 			ExecutorRun(query_desc, ForwardScanDirection, 0);
 			ExecutorFinish(query_desc);
 			ExecutorEnd(query_desc);
-			query_desc->snapshot = InvalidSnapshot;
-			query_desc->crosscheck_snapshot = InvalidSnapshot;
+			executor_started = false;
 			FreeQueryDesc(query_desc);
 			query_desc = NULL;
+			PopActiveSnapshot();
+			snapshot_pushed = false;
 #ifdef USE_FASTPG
 			if (!fastpg_rust_xact_is_explicit())
+			{
+				fastpg_xid_commit();
 				fastpg_rust_xact_commit_if_implicit();
+			}
 #endif
 
 			dest->rDestroy(dest);
@@ -1207,26 +1312,33 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 	{
 		ErrorData  *edata;
 
+		MemoryContextSwitchTo(result->context);
+		edata = CopyErrorData();
+		FlushErrorState();
 		MemoryContextSwitchTo(oldcontext);
 		if (dest != NULL)
 			dest->rDestroy(dest);
-		if (snapshot_pushed)
-			PopActiveSnapshot();
 #ifdef USE_FASTPG
 		if (!fastpg_rust_xact_is_explicit())
+		{
+			fastpg_xid_rollback();
 			fastpg_rust_xact_abort_if_implicit();
+		}
 #endif
 		if (query_desc != NULL)
 		{
-			query_desc->snapshot = InvalidSnapshot;
-			query_desc->crosscheck_snapshot = InvalidSnapshot;
+			if (executor_started)
+			{
+				ExecutorEnd(query_desc);
+				executor_started = false;
+			}
 			FreeQueryDesc(query_desc);
 		}
-
-		edata = CopyErrorData();
-		FlushErrorState();
+		if (snapshot_pushed)
+			PopActiveSnapshot();
 		fastpg_pgcore_set_execute_error(result, edata);
 		FreeErrorData(edata);
+		fastpg_pgcore_release_error_resources();
 	}
 	PG_END_TRY();
 
@@ -1249,6 +1361,8 @@ fastpg_pgcore_execute_result_free(FastPgPgCoreExecuteResult *result)
 	if (result->context != NULL)
 		MemoryContextDelete(result->context);
 	free(result->message);
+	free(result->detail);
+	free(result->hint);
 	free(result);
 }
 
@@ -1272,6 +1386,22 @@ fastpg_pgcore_execute_result_message(const FastPgPgCoreExecuteResult *result)
 	if (result == NULL || result->message == NULL)
 		return "PostgreSQL execute error";
 	return result->message;
+}
+
+const char *
+fastpg_pgcore_execute_result_detail(const FastPgPgCoreExecuteResult *result)
+{
+	if (result == NULL || result->detail == NULL)
+		return "";
+	return result->detail;
+}
+
+const char *
+fastpg_pgcore_execute_result_hint(const FastPgPgCoreExecuteResult *result)
+{
+	if (result == NULL || result->hint == NULL)
+		return "";
+	return result->hint;
 }
 
 int

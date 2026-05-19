@@ -67,10 +67,12 @@ typedef struct FastPgRustCatalogRelation
 {
 	uint32_t	oid;
 	uint32_t	namespace_oid;
+	uint32_t	owner_oid;
 	char		name[NAMEDATALEN];
 	uint16_t	column_count;
 	uint8_t		relkind;
 	uint8_t		has_primary_key;
+	uint8_t		has_indexes;
 } FastPgRustCatalogRelation;
 
 typedef struct FastPgRustCatalogColumn
@@ -79,7 +81,9 @@ typedef struct FastPgRustCatalogColumn
 	uint32_t	type_oid;
 	int32_t		type_mod;
 	uint8_t		is_not_null;
-	uint8_t		_padding[3];
+	uint8_t		has_default;
+	uint8_t		generated;
+	uint8_t		_padding;
 } FastPgRustCatalogColumn;
 
 typedef struct FastPgRustPrimaryKeyIndexInfo
@@ -87,7 +91,10 @@ typedef struct FastPgRustPrimaryKeyIndexInfo
 	uint32_t	index_oid;
 	uint32_t	heap_oid;
 	uint16_t	key_count;
-	uint8_t		_padding[2];
+	uint8_t		is_unique;
+	uint8_t		is_primary;
+	uint8_t		nulls_not_distinct;
+	uint8_t		is_immediate;
 	int16_t		attnums[FASTPG_MAX_INDEX_KEYS];
 	uint32_t	type_oids[FASTPG_MAX_INDEX_KEYS];
 	uint32_t	collation_oids[FASTPG_MAX_INDEX_KEYS];
@@ -215,6 +222,9 @@ extern bool fastpg_rust_catalog_primary_key_index_info(uint32_t index_oid,
 													   FastPgRustPrimaryKeyIndexInfo *out);
 extern bool fastpg_rust_catalog_primary_key_index_oid(uint32_t relation_oid,
 													  uint32_t *oid_out);
+extern bool fastpg_rust_catalog_relation_unique_index_oid(uint32_t relation_oid,
+														 size_t index_position,
+														 uint32_t *oid_out);
 extern bool fastpg_rust_catalog_namespace_by_oid(uint32_t oid,
 												 FastPgRustCatalogNamespace *out);
 extern bool fastpg_rust_catalog_namespace_by_name(const char *name,

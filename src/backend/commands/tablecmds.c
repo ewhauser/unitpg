@@ -15,6 +15,9 @@
 #include "postgres.h"
 
 #include "access/attmap.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/gist.h"
 #include "access/heapam.h"
@@ -2301,8 +2304,19 @@ ExecuteTruncateGuts(List *explicit_rels,
 			/*
 			 * Reconstruct the indexes to match, and we're done.
 			 */
+#ifdef USE_FASTPG
+			{
+				FastPgRustCatalogRelation fastpg_relation;
+
+				if (!fastpg_rust_catalog_relation_by_oid((uint32_t) heap_relid,
+														 &fastpg_relation))
+					reindex_relation(NULL, heap_relid, REINDEX_REL_PROCESS_TOAST,
+									 &reindex_params);
+			}
+#else
 			reindex_relation(NULL, heap_relid, REINDEX_REL_PROCESS_TOAST,
 							 &reindex_params);
+#endif
 		}
 
 		pgstat_count_truncate(rel);
