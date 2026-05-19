@@ -89,6 +89,10 @@ extern void fastpg_rust_xact_abort(void);
 extern void fastpg_rust_subxact_begin(void);
 extern void fastpg_rust_subxact_commit(void);
 extern void fastpg_rust_subxact_abort(void);
+extern bool fastpg_rust_storage_last_error(char *sqlstate_out,
+										   size_t sqlstate_len,
+										   char *message_out,
+										   size_t message_len);
 
 static const TableAmRoutine fastpg_mem_methods;
 static const IndexAmRoutine fastpg_mem_index_methods;
@@ -120,6 +124,55 @@ fastpg_mem_index_unsupported(const char *operation)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("fastpg_mem primary-key index does not support %s",
 					operation)));
+}
+
+static int
+fastpg_mem_sqlstate_to_errcode(const char sqlstate[6])
+{
+	if (sqlstate == NULL ||
+		sqlstate[0] == '\0' ||
+		sqlstate[1] == '\0' ||
+		sqlstate[2] == '\0' ||
+		sqlstate[3] == '\0' ||
+		sqlstate[4] == '\0')
+		return ERRCODE_INTERNAL_ERROR;
+
+	return MAKE_SQLSTATE(sqlstate[0],
+						 sqlstate[1],
+						 sqlstate[2],
+						 sqlstate[3],
+						 sqlstate[4]);
+}
+
+static bool
+fastpg_mem_get_storage_error(char sqlstate[6], char message[256])
+{
+	memset(sqlstate, 0, 6);
+	memset(message, 0, 256);
+	return fastpg_rust_storage_last_error(sqlstate, 6, message, 256);
+}
+
+static void
+fastpg_mem_raise_storage_error(const char *fallback_message)
+{
+	char		sqlstate[6];
+	char		message[256];
+
+	if (fastpg_mem_get_storage_error(sqlstate, message))
+		ereport(ERROR,
+				(errcode(fastpg_mem_sqlstate_to_errcode(sqlstate)),
+				 errmsg("%s", message)));
+
+	elog(ERROR, "%s", fallback_message);
+}
+
+static bool
+fastpg_mem_has_storage_error(void)
+{
+	char		sqlstate[6];
+	char		message[256];
+
+	return fastpg_mem_get_storage_error(sqlstate, message);
 }
 
 static void
@@ -371,7 +424,7 @@ fastpg_mem_scan_begin(Relation rel,
 	scan->base.rs_flags = flags;
 	scan->scan_handle = fastpg_rust_scan_begin(RelationGetRelid(rel));
 	if (scan->scan_handle == 0)
-		elog(ERROR, "fastpg_mem failed to create Rust scan handle");
+		fastpg_mem_raise_storage_error("fastpg_mem failed to create Rust scan handle");
 
 	RelationIncrementReferenceCount(rel);
 
@@ -777,7 +830,13 @@ fastpg_mem_tuple_insert(Relation rel,
 									 value_lens,
 									 tupdesc->natts,
 									 &row_id))
-		elog(ERROR, "fastpg_mem failed to insert row into Rust storage");
+	{
+		pfree(values);
+		pfree(isnull);
+		pfree(byval);
+		pfree(value_lens);
+		fastpg_mem_raise_storage_error("fastpg_mem failed to insert row into Rust storage");
+	}
 
 	if (!fastpg_mem_row_id_to_tid(row_id, &slot->tts_tid))
 		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
@@ -896,6 +955,8 @@ fastpg_mem_tuple_update(Relation rel,
 		pfree(isnull);
 		pfree(byval);
 		pfree(value_lens);
+		if (fastpg_mem_has_storage_error())
+			fastpg_mem_raise_storage_error("fastpg_mem failed to update row in Rust storage");
 		fastpg_mem_fill_deleted_tmfd(otid, tmfd);
 		return TM_Deleted;
 	}

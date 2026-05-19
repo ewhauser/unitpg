@@ -4,26 +4,22 @@
 
 The pgbench comparison harness lives under `benches/`.
 
-Run the default comparison with:
+Run the default Rust-server comparison with:
 
 ```sh
-make -C benches pgbench-compare
+make -C benches pgbench
 ```
 
 For a quick smoke run, use:
 
 ```sh
-make -C benches pgbench-compare SCALE=1 TRANSACTIONS=1 RUNS=1
+make -C benches pgbench SCALE=1 TRANSACTIONS=1 RUNS=1
 ```
 
-The harness builds and temp-installs two release-mode Meson variants under
-`benches/.build/pgbench/`:
-
-- `normal`: `-Dfastpg=false`
-- `fastpg`: `-Dfastpg=true`
-
-It then starts a fresh local Postgres cluster for each run, executes pgbench,
-and writes JSON plus Markdown summaries under `benches/results/pgbench/<timestamp>/`.
+The harness builds the normal Postgres client/server tree under
+`benches/.build/pgbench/`, uses it as the pgbench client and normal baseline,
+then runs the fastpg side through the Rust single-process server. It writes JSON
+plus Markdown summaries under `benches/results/pgbench/<timestamp>/`.
 
 The default workload is:
 
@@ -38,65 +34,36 @@ RUNS=3
 PROTOCOL=simple
 MESON_BUILDTYPE=release
 RUST_BUILD_PROFILE=release
+RUST_PGCORE=full
 ```
 
 `INIT_STEPS=dtg` is intentional. pgbench built-in transaction scripts derive
 `:scale` from generated rows, so `dt` alone makes normal Postgres see scale `0`
 and abort before the workload starts.
 
-To run pgbench's fuller default initialization and TPC-B-like script:
+To run pgbench's fuller default initialization and TPC-B-like script against
+the full PostgreSQL parser/analyzer/rewriter/planner/executor facade:
 
 ```sh
-make -C benches pgbench-compare-strict
+make -C benches pgbench-tpcb
 ```
 
-To run the same pgbench driver against the Rust single-process server instead
-of the transitional Postgres tableam wrapper:
-
-```sh
-make -C benches pgbench-compare-rust-server
-```
-
-That target defaults to a release Rust build and links the Rust server against
-the local Postgres raw parser through `fastpg-pgcore`. The harness builds the
-normal Meson variant first, then passes that build directory to Cargo as
-`FASTPG_POSTGRES_BUILD_DIR`.
-
-To run the strict pgbench shape against the Rust server through the full
-PostgreSQL parser/analyzer/rewriter/planner/executor facade:
-
-```sh
-make -C benches pgbench-compare-rust-server-strict
-```
-
-That target uses `RUST_PGCORE=full`, builds the Rust server in release mode, and
-links it against a `-Dfastpg=true` Postgres backend build so the guarded virtual
-catalog hooks are available.
+The `pgbench` and `pgbench-tpcb` targets use `RUST_PGCORE=full`, build the Rust
+server in release mode, and link it against a `-Dfastpg=true` Postgres backend
+build so the guarded virtual catalog hooks are available. The default fastpg
+build includes the internal IPC guard.
 
 To temporarily run a quicker debug build:
 
 ```sh
-make -C benches pgbench-compare-rust-server RUST_BUILD_PROFILE=debug
-```
-
-To compare the Rust server without the in-process Postgres parser link:
-
-```sh
-make -C benches pgbench-compare-rust-server RUST_PGCORE=off
-```
-
-To use the full PostgreSQL execution path with the non-strict Rust-server
-target:
-
-```sh
-make -C benches pgbench-compare-rust-server RUST_PGCORE=full
+make -C benches pgbench RUST_BUILD_PROFILE=debug
 ```
 
 To capture a CPU flamegraph of the Rust server during the pgbench transaction
 run:
 
 ```sh
-make -C benches pgbench-profile-rust-server
+make -C benches profile
 ```
 
 The profiling target builds `fastpg-server` in release mode, starts the normal
@@ -110,13 +77,25 @@ benches/results/pgbench/<timestamp>/fastpg/run-<n>/profile/fastpg-server-flamegr
 To run and open the flamegraph immediately:
 
 ```sh
-make -C benches pgbench-profile-rust-server-open
+make -C benches profile-open
 ```
 
 To open the newest saved flamegraph:
 
 ```sh
-make -C benches pgbench-open-latest-flamegraph
+make -C benches profile-open-latest
+```
+
+To run the storage engine Criterion benchmarks:
+
+```sh
+make -C benches bench
+```
+
+For a quick Criterion smoke run:
+
+```sh
+make -C benches bench-smoke
 ```
 
 Useful profiling knobs:
@@ -145,18 +124,18 @@ Useful validation commands after harness edits:
 python3 -m py_compile benches/pgbench_compare.py
 python3 -m py_compile benches/open_latest_profile.py
 cargo test -p fastpg-storage
-make -C benches pgbench-compare-rust-server-strict
-make -C benches regression-compare-rust-server
+make -C benches pgbench-tpcb
+make -C benches regression
 ```
 
 ## SQL regression comparison harness
 
 The curated SQL regression harness also lives under `benches/`.
 
-Run the strict Rust-server SQL regression comparison with:
+Run the strict SQL regression comparison with:
 
 ```sh
-make -C benches regression-compare-rust-server
+make -C benches regression
 ```
 
 The harness builds/reuses the same normal Postgres client install as the
@@ -183,16 +162,16 @@ For compatibility inventory work where fastpg failures should be recorded
 without making the command fail:
 
 ```sh
-make -C benches regression-compare-rust-server-inventory
+make -C benches regression REGRESSION_SUITE=inventory REGRESSION_ALLOW_FAILURES=1
 ```
 
-That inventory target defaults to `benches/regression/inventory/`. It is for
-known compatibility gaps and exploratory upstream-regression reductions, not for
-the blocking correctness gate. Current inventory probes cover deeper
-`pg_attribute`/`pg_index` catalog scans, joins, and grouped aggregation.
+The inventory suite lives under `benches/regression/inventory/`. It is for
+known compatibility gaps, not for the blocking correctness gate. Current
+inventory probes cover deeper `pg_attribute`/`pg_index` catalog scans, joins,
+and grouped aggregation.
 
-To run the current Rust-server validation bundle:
+To run the current validation bundle:
 
 ```sh
-make -C benches validate-rust-server
+make -C benches validate
 ```

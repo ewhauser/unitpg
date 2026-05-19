@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::CStr;
 use std::os::raw::c_char;
 use std::slice;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
@@ -27,6 +28,12 @@ const NAMEDATALEN: usize = 64;
 const FASTPG_PROC_MAX_ARGS: usize = 8;
 const FASTPG_PROC_SOURCE_LEN: usize = 64;
 const FASTPG_MAX_INDEX_KEYS: usize = 32;
+const ROW_ARENA_DEFAULT_CHUNK_SIZE: usize = 4096;
+
+static NEXT_STORAGE_REGION_ID: AtomicU64 = AtomicU64::new(1);
+static STORAGE_ARENA_REWINDS: AtomicU64 = AtomicU64::new(0);
+static STORAGE_MEMORY_LIMIT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
+const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -209,14 +216,402 @@ pub struct RowId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct Cell {
-    value: usize,
     is_null: bool,
+    datum: StoredDatum,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StoredDatum {
+    ByValue(usize),
+    ByRef(ValueRef),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ValueRef {
+    region_id: StorageRegionId,
+    ptr: usize,
+    len: usize,
+}
+
+impl Cell {
+    fn by_value(value: usize) -> Self {
+        Self {
+            is_null: false,
+            datum: StoredDatum::ByValue(value),
+        }
+    }
+
+    fn by_ref(value_ref: ValueRef) -> Self {
+        Self {
+            is_null: false,
+            datum: StoredDatum::ByRef(value_ref),
+        }
+    }
+
+    fn null() -> Self {
+        Self {
+            is_null: true,
+            datum: StoredDatum::ByValue(0),
+        }
+    }
+
+    fn output_value(&self) -> usize {
+        match self.datum {
+            StoredDatum::ByValue(value) => value,
+            StoredDatum::ByRef(value_ref) => value_ref.ptr,
+        }
+    }
+
+    fn byref_bytes(&self) -> Option<&[u8]> {
+        let StoredDatum::ByRef(value_ref) = self.datum else {
+            return None;
+        };
+        if self.is_null {
+            return Some(&[]);
+        }
+        if value_ref.ptr == 0 && value_ref.len > 0 {
+            return None;
+        }
+        Some(if value_ref.len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(value_ref.ptr as *const u8, value_ref.len) }
+        })
+    }
+
+    fn copy_into(&self, region: &mut StorageRegion) -> Option<Self> {
+        if let Some(bytes) = self.byref_bytes() {
+            return Some(Self {
+                is_null: self.is_null,
+                datum: StoredDatum::ByRef(region.alloc_bytes(bytes)),
+            });
+        }
+        Some(*self)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Row {
     row_id: u64,
     cells: Vec<Cell>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct StorageRegionId(u64);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StorageRegionKind {
+    Committed,
+    Fixture,
+    Epoch,
+    Transaction,
+    Savepoint,
+    Scan,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct ArenaCheckpoint {
+    chunk_count: usize,
+    last_chunk_used: usize,
+    bytes_allocated: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct RegionCheckpoint {
+    arena: ArenaCheckpoint,
+    accounting: RegionAccounting,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RowArena {
+    chunks: Vec<ArenaChunk>,
+    bytes_allocated: usize,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArenaChunk {
+    bytes: Box<[u8]>,
+    used: usize,
+}
+
+impl ArenaChunk {
+    fn new(capacity: usize) -> Self {
+        Self {
+            bytes: vec![0; capacity].into_boxed_slice(),
+            used: 0,
+        }
+    }
+
+    fn remaining(&self) -> usize {
+        self.bytes.len().saturating_sub(self.used)
+    }
+
+    fn alloc_bytes(&mut self, bytes: &[u8]) -> Option<usize> {
+        if bytes.len() > self.remaining() {
+            return None;
+        }
+        let start = self.used;
+        let end = start.saturating_add(bytes.len());
+        self.bytes[start..end].copy_from_slice(bytes);
+        self.used = end;
+        Some(self.bytes[start..].as_ptr() as usize)
+    }
+}
+
+impl RowArena {
+    fn alloc_bytes(&mut self, bytes: &[u8]) -> usize {
+        if bytes.is_empty() {
+            return std::ptr::NonNull::<u8>::dangling().as_ptr() as usize;
+        }
+        if self
+            .chunks
+            .last()
+            .is_none_or(|chunk| chunk.remaining() < bytes.len())
+        {
+            self.chunks.push(ArenaChunk::new(
+                ROW_ARENA_DEFAULT_CHUNK_SIZE.max(bytes.len()),
+            ));
+        }
+        let ptr = self
+            .chunks
+            .last_mut()
+            .and_then(|chunk| chunk.alloc_bytes(bytes))
+            .expect("arena chunk was sized for allocation");
+        self.bytes_allocated = self.bytes_allocated.saturating_add(bytes.len());
+        ptr
+    }
+
+    fn checkpoint(&self) -> ArenaCheckpoint {
+        ArenaCheckpoint {
+            chunk_count: self.chunks.len(),
+            last_chunk_used: self.chunks.last().map_or(0, |chunk| chunk.used),
+            bytes_allocated: self.bytes_allocated,
+        }
+    }
+
+    fn rewind_to(&mut self, checkpoint: ArenaCheckpoint) {
+        self.chunks.truncate(checkpoint.chunk_count);
+        if let Some(chunk) = self.chunks.last_mut() {
+            chunk.used = checkpoint.last_chunk_used.min(chunk.bytes.len());
+        }
+        self.bytes_allocated = checkpoint.bytes_allocated;
+    }
+
+    fn append(&mut self, other: &mut RowArena) {
+        self.bytes_allocated = self.bytes_allocated.saturating_add(other.bytes_allocated);
+        self.chunks.append(&mut other.chunks);
+        other.bytes_allocated = 0;
+    }
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct RegionAccounting {
+    rows: usize,
+    row_bytes: usize,
+    byref_bytes: usize,
+    index_bytes: usize,
+    overhead_bytes: usize,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct StorageLimits {
+    max_committed_bytes: Option<usize>,
+    max_fixture_bytes: Option<usize>,
+    max_epoch_bytes: Option<usize>,
+    max_transaction_bytes: Option<usize>,
+    max_row_bytes: Option<usize>,
+    max_scan_bytes: Option<usize>,
+}
+
+impl RegionAccounting {
+    fn total_bytes(&self) -> usize {
+        self.row_bytes
+            .saturating_add(self.byref_bytes)
+            .saturating_add(self.index_bytes)
+            .saturating_add(self.overhead_bytes)
+    }
+
+    fn append(&mut self, other: &mut RegionAccounting) {
+        self.rows = self.rows.saturating_add(other.rows);
+        self.row_bytes = self.row_bytes.saturating_add(other.row_bytes);
+        self.byref_bytes = self.byref_bytes.saturating_add(other.byref_bytes);
+        self.index_bytes = self.index_bytes.saturating_add(other.index_bytes);
+        self.overhead_bytes = self.overhead_bytes.saturating_add(other.overhead_bytes);
+        *other = RegionAccounting::default();
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageRegion {
+    id: StorageRegionId,
+    kind: StorageRegionKind,
+    arena: RowArena,
+    accounting: RegionAccounting,
+}
+
+impl StorageRegion {
+    fn new(kind: StorageRegionKind) -> Self {
+        Self {
+            id: next_storage_region_id(),
+            kind,
+            arena: RowArena::default(),
+            accounting: RegionAccounting::default(),
+        }
+    }
+
+    fn alloc_bytes(&mut self, bytes: &[u8]) -> ValueRef {
+        let ptr = self.arena.alloc_bytes(bytes);
+        self.accounting.byref_bytes = self.accounting.byref_bytes.saturating_add(bytes.len());
+        self.accounting.overhead_bytes = self
+            .accounting
+            .overhead_bytes
+            .saturating_add(std::mem::size_of::<Box<[u8]>>());
+        ValueRef {
+            region_id: self.id,
+            ptr,
+            len: bytes.len(),
+        }
+    }
+
+    fn account_row(&mut self, row: &Row) {
+        self.accounting.rows = self.accounting.rows.saturating_add(1);
+        self.accounting.row_bytes = self
+            .accounting
+            .row_bytes
+            .saturating_add(estimated_row_bytes(row));
+    }
+
+    fn copy_row(&mut self, row: &Row) -> Option<Row> {
+        let mut cells = Vec::with_capacity(row.cells.len());
+        for cell in &row.cells {
+            cells.push(cell.copy_into(self)?);
+        }
+
+        let copied = Row {
+            row_id: row.row_id,
+            cells,
+        };
+        self.account_row(&copied);
+        Some(copied)
+    }
+
+    fn unaccount_row(&mut self, row: &Row) {
+        self.accounting.rows = self.accounting.rows.saturating_sub(1);
+        self.accounting.row_bytes = self
+            .accounting
+            .row_bytes
+            .saturating_sub(estimated_row_bytes(row));
+    }
+
+    fn account_index_key(&mut self, key: &IndexKey) {
+        self.accounting.index_bytes = self
+            .accounting
+            .index_bytes
+            .saturating_add(estimated_index_key_bytes(key));
+    }
+
+    fn unaccount_index_key(&mut self, key: &IndexKey) {
+        self.accounting.index_bytes = self
+            .accounting
+            .index_bytes
+            .saturating_sub(estimated_index_key_bytes(key));
+    }
+
+    fn checkpoint(&self) -> RegionCheckpoint {
+        RegionCheckpoint {
+            arena: self.arena.checkpoint(),
+            accounting: self.accounting.clone(),
+        }
+    }
+
+    fn rewind_to(&mut self, checkpoint: RegionCheckpoint) {
+        self.arena.rewind_to(checkpoint.arena);
+        self.accounting = checkpoint.accounting;
+        STORAGE_ARENA_REWINDS.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn append(&mut self, other: &mut StorageRegion) {
+        self.arena.append(&mut other.arena);
+        self.accounting.append(&mut other.accounting);
+    }
+
+    fn bytes(&self) -> usize {
+        self.accounting.total_bytes()
+    }
+
+    fn reset(&mut self) {
+        *self = StorageRegion::new(self.kind);
+    }
+}
+
+fn next_storage_region_id() -> StorageRegionId {
+    let id = NEXT_STORAGE_REGION_ID.fetch_add(1, Ordering::Relaxed);
+    StorageRegionId(id.max(1))
+}
+
+fn estimated_row_bytes(row: &Row) -> usize {
+    std::mem::size_of::<Row>().saturating_add(
+        row.cells
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Cell>()),
+    )
+}
+
+fn estimated_index_key_bytes(key: &IndexKey) -> usize {
+    std::mem::size_of::<IndexKey>()
+        .saturating_add(
+            key.0
+                .capacity()
+                .saturating_mul(std::mem::size_of::<IndexKeyPart>()),
+        )
+        .saturating_add(key.0.iter().fold(0usize, |total, part| match part {
+            IndexKeyPart::Bytes(bytes) => total.saturating_add(bytes.capacity()),
+            IndexKeyPart::Null | IndexKeyPart::ByValue(_) => total,
+        }))
+}
+
+fn estimated_input_row_bytes(is_null: &[u8], byval: &[u8], value_lens: &[usize]) -> usize {
+    let row_bytes = std::mem::size_of::<Row>()
+        .saturating_add(value_lens.len().saturating_mul(std::mem::size_of::<Cell>()));
+    let byref_bytes = value_lens
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| is_null[*index] == 0 && byval[*index] == 0)
+        .map(|(_, len)| len)
+        .copied()
+        .fold(0usize, usize::saturating_add);
+    let byref_overhead = value_lens
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| is_null[*index] == 0 && byval[*index] == 0)
+        .count()
+        .saturating_mul(std::mem::size_of::<Box<[u8]>>());
+    row_bytes
+        .saturating_add(byref_bytes)
+        .saturating_add(byref_overhead)
+}
+
+fn check_limit(
+    limit: Option<usize>,
+    current_bytes: usize,
+    additional_bytes: usize,
+    region: &str,
+) -> Result<(), CatalogError> {
+    let Some(limit) = limit else {
+        return Ok(());
+    };
+    if current_bytes.saturating_add(additional_bytes) <= limit {
+        return Ok(());
+    }
+    STORAGE_MEMORY_LIMIT_REJECTIONS.fetch_add(1, Ordering::Relaxed);
+    Err(CatalogError::new(
+        SQLSTATE_PROGRAM_LIMIT_EXCEEDED,
+        format!("fastpg memory limit exceeded for {region} storage"),
+    ))
+}
+
+fn limit_from_ffi(value: usize) -> Option<usize> {
+    (value != 0).then_some(value)
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -241,17 +636,78 @@ struct PrimaryKeySpec {
     columns: Vec<PrimaryKeyColumnSpec>,
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct RowSegment {
     rows: Vec<Row>,
-    payloads: Vec<Box<[u8]>>,
+    region: StorageRegion,
+}
+
+impl RowSegment {
+    fn new(kind: StorageRegionKind) -> Self {
+        Self {
+            rows: Vec::new(),
+            region: StorageRegion::new(kind),
+        }
+    }
+
+    fn alloc_bytes(&mut self, bytes: &[u8]) -> ValueRef {
+        self.region.alloc_bytes(bytes)
+    }
+
+    fn push_row(&mut self, row: Row) {
+        self.region.account_row(&row);
+        self.rows.push(row);
+    }
+
+    fn remove_row_id(&mut self, row_id: u64) {
+        self.remove_row_ids(&BTreeSet::from([row_id]));
+    }
+
+    fn remove_row_ids(&mut self, row_ids: &BTreeSet<u64>) {
+        if row_ids.is_empty() || self.rows.is_empty() {
+            return;
+        }
+
+        let mut retained = Vec::with_capacity(self.rows.len());
+        for row in self.rows.drain(..) {
+            if row_ids.contains(&row.row_id) {
+                self.region.unaccount_row(&row);
+            } else {
+                retained.push(row);
+            }
+        }
+        self.rows = retained;
+    }
+
+    fn append_from(&mut self, other: &mut RowSegment) {
+        self.rows.append(&mut other.rows);
+        self.region.append(&mut other.region);
+    }
+
+    fn bytes(&self) -> usize {
+        self.region.bytes()
+    }
+
+    fn checkpoint(&self) -> RegionCheckpoint {
+        self.region.checkpoint()
+    }
+
+    fn rewind_to(&mut self, checkpoint: RegionCheckpoint) {
+        self.region.rewind_to(checkpoint);
+    }
+}
+
+impl Default for RowSegment {
+    fn default() -> Self {
+        Self::new(StorageRegionKind::Transaction)
+    }
 }
 
 #[derive(Debug)]
 struct RelationRows {
     committed_row_ids: BTreeSet<u64>,
     committed_row_index: HashMap<u64, Row>,
-    committed_payloads: Vec<Box<[u8]>>,
+    committed_region: StorageRegion,
     primary_key_index: BTreeMap<IndexKey, u64>,
     next_row_id: u64,
 }
@@ -261,7 +717,7 @@ impl Default for RelationRows {
         Self {
             committed_row_ids: BTreeSet::new(),
             committed_row_index: HashMap::new(),
-            committed_payloads: Vec::new(),
+            committed_region: StorageRegion::new(StorageRegionKind::Committed),
             primary_key_index: BTreeMap::new(),
             next_row_id: 1,
         }
@@ -277,19 +733,100 @@ impl RelationRows {
         self.next_row_id = self.next_row_id.checked_add(1)?;
         Some(row_id)
     }
+
+    fn committed_bytes(&self) -> usize {
+        self.committed_region.bytes()
+    }
+
+    fn primary_key_index_bytes(&self) -> usize {
+        self.committed_region.accounting.index_bytes
+    }
+
+    fn insert_primary_key(&mut self, key: IndexKey, row_id: u64) {
+        if let Some((old_key, _)) = self.primary_key_index.remove_entry(&key) {
+            self.committed_region.unaccount_index_key(&old_key);
+        }
+        self.committed_region.account_index_key(&key);
+        self.primary_key_index.insert(key, row_id);
+    }
+
+    fn remove_primary_key(&mut self, key: &IndexKey) {
+        if let Some((old_key, _)) = self.primary_key_index.remove_entry(key) {
+            self.committed_region.unaccount_index_key(&old_key);
+        }
+    }
 }
 
-#[derive(Default, Debug)]
+#[derive(Debug)]
 struct TransactionOverlay {
+    region_kind: StorageRegionKind,
     relations: HashMap<u32, RowSegment>,
     deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+}
+
+impl TransactionOverlay {
+    fn new(region_kind: StorageRegionKind) -> Self {
+        Self {
+            region_kind,
+            relations: HashMap::new(),
+            deleted_row_ids: HashMap::new(),
+        }
+    }
+
+    fn transaction() -> Self {
+        Self::new(StorageRegionKind::Transaction)
+    }
+
+    fn savepoint() -> Self {
+        Self::new(StorageRegionKind::Savepoint)
+    }
+
+    fn row_segment_mut(&mut self, relid: u32) -> &mut RowSegment {
+        let region_kind = self.region_kind;
+        self.relations
+            .entry(relid)
+            .or_insert_with(|| RowSegment::new(region_kind))
+    }
+
+    fn bytes(&self) -> usize {
+        self.relations.values().map(RowSegment::bytes).sum()
+    }
+}
+
+impl Default for TransactionOverlay {
+    fn default() -> Self {
+        Self::transaction()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct ScanState {
     rows: Vec<Row>,
-    payloads: Vec<Box<[u8]>>,
+    region: StorageRegion,
     next_index: usize,
+}
+
+impl ScanState {
+    fn materialize(rows: Vec<Row>) -> Result<Self, CatalogError> {
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+        let rows = rows
+            .iter()
+            .map(|row| {
+                region
+                    .copy_row(row)
+                    .ok_or_else(|| invalid_ffi_argument("invalid stored by-reference cell".into()))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            rows,
+            region,
+            next_index: 0,
+        })
+    }
+
+    fn bytes(&self) -> usize {
+        self.region.bytes()
+    }
 }
 
 #[derive(Debug)]
@@ -297,6 +834,9 @@ struct StorageState {
     relations: HashMap<u32, RelationRows>,
     primary_key_specs: HashMap<u32, Option<PrimaryKeySpec>>,
     primary_key_generation: u64,
+    fixture_region: StorageRegion,
+    epoch_region: StorageRegion,
+    limits: StorageLimits,
 }
 
 impl Default for StorageState {
@@ -305,6 +845,9 @@ impl Default for StorageState {
             relations: HashMap::new(),
             primary_key_specs: HashMap::new(),
             primary_key_generation: fastpg_catalog::current_generation(),
+            fixture_region: StorageRegion::new(StorageRegionKind::Fixture),
+            epoch_region: StorageRegion::new(StorageRegionKind::Epoch),
+            limits: StorageLimits::default(),
         }
     }
 }
@@ -340,6 +883,7 @@ static DEFAULT_SESSION_STORAGE: OnceLock<SessionStorageHandle> = OnceLock::new()
 
 thread_local! {
     static CURRENT_SESSION_STORAGE: RefCell<Option<SessionStorageHandle>> = const { RefCell::new(None) };
+    static LAST_STORAGE_ERROR: RefCell<Option<CatalogError>> = const { RefCell::new(None) };
 }
 
 #[derive(Debug)]
@@ -381,6 +925,22 @@ fn current_session_storage() -> SessionStorageHandle {
         .unwrap_or_else(default_session_storage)
 }
 
+fn clear_last_storage_error() {
+    LAST_STORAGE_ERROR.with(|slot| {
+        slot.replace(None);
+    });
+}
+
+fn set_last_storage_error(error: CatalogError) {
+    LAST_STORAGE_ERROR.with(|slot| {
+        slot.replace(Some(error));
+    });
+}
+
+fn last_storage_error() -> Option<CatalogError> {
+    LAST_STORAGE_ERROR.with(|slot| slot.borrow().clone())
+}
+
 impl SessionStorage {
     fn allocate_scan_handle(&mut self) -> u64 {
         let handle = self.next_scan_handle;
@@ -393,13 +953,98 @@ impl SessionStorage {
 
     fn ensure_transaction(&mut self) {
         if self.transaction_stack.is_empty() {
-            self.transaction_stack.push(TransactionOverlay::default());
+            self.transaction_stack
+                .push(TransactionOverlay::transaction());
         }
         fastpg_catalog::begin_implicit_transaction();
+    }
+
+    fn transaction_bytes(&self) -> usize {
+        self.transaction_stack
+            .iter()
+            .map(TransactionOverlay::bytes)
+            .sum()
+    }
+
+    fn scan_bytes(&self) -> usize {
+        self.scans.values().map(ScanState::bytes).sum()
     }
 }
 
 impl StorageState {
+    fn committed_bytes(&self) -> usize {
+        self.relations
+            .values()
+            .map(RelationRows::committed_bytes)
+            .sum()
+    }
+
+    fn fixture_bytes(&self) -> usize {
+        self.fixture_region.bytes()
+    }
+
+    fn epoch_bytes(&self) -> usize {
+        self.epoch_region.bytes()
+    }
+
+    fn index_bytes(&self) -> usize {
+        self.relations
+            .values()
+            .map(RelationRows::primary_key_index_bytes)
+            .sum()
+    }
+
+    fn set_limits(&mut self, limits: StorageLimits) {
+        self.limits = limits;
+    }
+
+    fn reset_limits(&mut self) {
+        self.limits = StorageLimits::default();
+    }
+
+    fn discard_fixture_region(&mut self) {
+        self.fixture_region.reset();
+    }
+
+    fn discard_epoch_region(&mut self) {
+        self.epoch_region.reset();
+    }
+
+    fn check_row_limit(&self, bytes: usize) -> Result<(), CatalogError> {
+        check_limit(self.limits.max_row_bytes, 0, bytes, "row")
+    }
+
+    fn check_transaction_limit(
+        &self,
+        session: &SessionStorage,
+        additional_bytes: usize,
+    ) -> Result<(), CatalogError> {
+        check_limit(
+            self.limits.max_transaction_bytes,
+            session.transaction_bytes(),
+            additional_bytes,
+            "transaction",
+        )
+    }
+
+    fn check_committed_projection_limit(
+        &self,
+        session: &SessionStorage,
+        additional_bytes: usize,
+    ) -> Result<(), CatalogError> {
+        check_limit(
+            self.limits.max_committed_bytes,
+            self.committed_bytes()
+                .saturating_add(session.transaction_bytes()),
+            additional_bytes,
+            "committed",
+        )
+    }
+
+    fn check_scan_limit(&self, additional_bytes: usize) -> Result<(), CatalogError> {
+        check_limit(self.limits.max_scan_bytes, 0, additional_bytes, "scan")
+    }
+
     fn begin_explicit_transaction(&mut self, session: &mut SessionStorage) {
         if !session.explicit_transaction {
             self.commit_implicit_transaction(session);
@@ -636,6 +1281,7 @@ impl StorageState {
 
     fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
         let TransactionOverlay {
+            region_kind: _,
             relations,
             deleted_row_ids,
         } = overlay;
@@ -657,7 +1303,7 @@ impl StorageState {
             }
         }
 
-        for (relid, mut segment) in relations {
+        for (relid, segment) in relations {
             if segment.rows.is_empty() {
                 continue;
             }
@@ -665,18 +1311,24 @@ impl StorageState {
             let unchanged_row_ids = unchanged_primary_key_updates.get(&relid);
             let relation = self.relations.entry(relid).or_default();
             for row in &segment.rows {
-                relation.committed_row_ids.insert(row.row_id);
-                relation.committed_row_index.insert(row.row_id, row.clone());
-                if unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&row.row_id)) {
+                let committed_row = relation
+                    .committed_region
+                    .copy_row(row)
+                    .expect("stored by-reference cells must point to owned storage");
+                relation.committed_row_ids.insert(committed_row.row_id);
+                relation
+                    .committed_row_index
+                    .insert(committed_row.row_id, committed_row.clone());
+                if unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&committed_row.row_id))
+                {
                     continue;
                 }
                 if let Some(primary_key_spec) = &primary_key_spec
-                    && let Some(key) = primary_key_for_row(primary_key_spec, row)
+                    && let Some(key) = primary_key_for_row(primary_key_spec, &committed_row)
                 {
-                    relation.primary_key_index.insert(key, row.row_id);
+                    relation.insert_primary_key(key, committed_row.row_id);
                 }
             }
-            relation.committed_payloads.append(&mut segment.payloads);
         }
     }
 
@@ -698,6 +1350,7 @@ impl StorageState {
                 let Some(row) = relation.committed_row_index.remove(row_id) else {
                     continue;
                 };
+                relation.committed_region.unaccount_row(&row);
                 let Some(primary_key_spec) = primary_key_spec else {
                     continue;
                 };
@@ -709,7 +1362,7 @@ impl StorageState {
                     continue;
                 }
                 if let Some(key) = primary_key_for_row(primary_key_spec, &row) {
-                    relation.primary_key_index.remove(&key);
+                    relation.remove_primary_key(&key);
                 }
             }
         }
@@ -744,16 +1397,13 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
         if segment.rows.is_empty() {
             continue;
         }
-        let parent_segment = parent.relations.entry(relid).or_default();
-        parent_segment.rows.append(&mut segment.rows);
-        parent_segment.payloads.append(&mut segment.payloads);
+        let parent_segment = parent.row_segment_mut(relid);
+        parent_segment.append_from(&mut segment);
     }
 }
 
 fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet<u64>) {
-    segment
-        .rows
-        .retain(|row| !deleted_row_ids.contains(&row.row_id));
+    segment.remove_row_ids(deleted_row_ids);
 }
 
 fn find_row_in_segment(segment: &RowSegment, row_id: u64) -> Option<&Row> {
@@ -772,10 +1422,10 @@ fn primary_key_unchanged(primary_key_spec: &PrimaryKeySpec, old_row: &Row, new_r
             return old_cell.is_null == new_cell.is_null;
         }
         if column.typbyval {
-            return old_cell.value == new_cell.value;
+            return old_cell.output_value() == new_cell.output_value();
         }
-        byref_key_bytes(old_cell.value, column.typlen)
-            == byref_key_bytes(new_cell.value, column.typlen)
+        byref_key_bytes_from_cell(old_cell, column.typlen)
+            == byref_key_bytes_from_cell(new_cell, column.typlen)
     })
 }
 
@@ -1449,11 +2099,16 @@ fn primary_key_for_datums(
 
     let mut parts = Vec::with_capacity(primary_key_spec.columns.len());
     for (key_index, column) in primary_key_spec.columns.iter().enumerate() {
-        let cell = Cell {
-            value: values[key_index],
-            is_null: is_null[key_index] != 0,
-        };
-        parts.push(index_key_part(column, &cell)?);
+        if is_null[key_index] != 0 {
+            parts.push(IndexKeyPart::Null);
+        } else if column.typbyval {
+            parts.push(IndexKeyPart::ByValue(values[key_index]));
+        } else {
+            parts.push(IndexKeyPart::Bytes(byref_key_bytes(
+                values[key_index],
+                column.typlen,
+            )?));
+        }
     }
 
     Some(IndexKey(parts))
@@ -1465,11 +2120,25 @@ fn index_key_part(column: &PrimaryKeyColumnSpec, cell: &Cell) -> Option<IndexKey
     }
 
     if column.typbyval {
-        return Some(IndexKeyPart::ByValue(cell.value));
+        return Some(IndexKeyPart::ByValue(cell.output_value()));
     }
 
-    let bytes = byref_key_bytes(cell.value, column.typlen)?;
+    let bytes = byref_key_bytes_from_cell(cell, column.typlen)?;
     Some(IndexKeyPart::Bytes(bytes))
+}
+
+fn byref_key_bytes_from_cell(cell: &Cell, typlen: i16) -> Option<Vec<u8>> {
+    let bytes = cell.byref_bytes()?;
+    let len = if typlen > 0 {
+        typlen as usize
+    } else if typlen == -1 {
+        varlena_payload_len(cell.output_value())?
+    } else if typlen == -2 {
+        c_string_payload_len(cell.output_value())?
+    } else {
+        return None;
+    };
+    (bytes.len() >= len).then(|| bytes[..len].to_vec())
 }
 
 fn byref_key_bytes(value: usize, typlen: i16) -> Option<Vec<u8>> {
@@ -2378,7 +3047,7 @@ pub extern "C" fn fastpg_rust_subxact_begin() {
         session.ensure_transaction();
         session
             .transaction_stack
-            .push(TransactionOverlay::default());
+            .push(TransactionOverlay::savepoint());
         fastpg_catalog::begin_subtransaction();
     });
 }
@@ -2416,6 +3085,109 @@ pub extern "C" fn fastpg_rust_relation_row_count(relid: u32) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_contains_row(relid: u32, row_id: u64) -> bool {
     with_storage(|state, session| state.find_visible_row(session, relid, row_id).is_some())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_committed_bytes() -> usize {
+    with_storage(|state, _session| state.committed_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_fixture_bytes() -> usize {
+    with_storage(|state, _session| state.fixture_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_epoch_bytes() -> usize {
+    with_storage(|state, _session| state.epoch_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_transaction_bytes() -> usize {
+    with_storage(|_state, session| session.transaction_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_scan_bytes() -> usize {
+    with_storage(|_state, session| session.scan_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_index_bytes() -> usize {
+    with_storage(|state, _session| state.index_bytes())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_arena_rewinds() -> u64 {
+    STORAGE_ARENA_REWINDS.load(Ordering::Relaxed)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_memory_limit_rejections() -> u64 {
+    STORAGE_MEMORY_LIMIT_REJECTIONS.load(Ordering::Relaxed)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_set_limits(
+    max_committed_bytes: usize,
+    max_fixture_bytes: usize,
+    max_epoch_bytes: usize,
+    max_transaction_bytes: usize,
+    max_row_bytes: usize,
+    max_scan_bytes: usize,
+) {
+    with_storage(|state, _session| {
+        state.set_limits(StorageLimits {
+            max_committed_bytes: limit_from_ffi(max_committed_bytes),
+            max_fixture_bytes: limit_from_ffi(max_fixture_bytes),
+            max_epoch_bytes: limit_from_ffi(max_epoch_bytes),
+            max_transaction_bytes: limit_from_ffi(max_transaction_bytes),
+            max_row_bytes: limit_from_ffi(max_row_bytes),
+            max_scan_bytes: limit_from_ffi(max_scan_bytes),
+        });
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_reset_limits() {
+    with_storage(|state, _session| state.reset_limits());
+    clear_last_storage_error();
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_discard_fixture_region() {
+    with_storage(|state, _session| state.discard_fixture_region());
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_storage_discard_epoch_region() {
+    with_storage(|state, _session| state.discard_epoch_region());
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers when they are non-null.
+pub unsafe extern "C" fn fastpg_rust_storage_last_error(
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let Some(error) = last_storage_error() else {
+        return false;
+    };
+    unsafe {
+        write_catalog_error(
+            sqlstate_out,
+            sqlstate_len,
+            message_out,
+            message_len,
+            &error.sqlstate,
+            &error.message,
+        );
+    }
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -2483,54 +3255,91 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
+    clear_last_storage_error();
     let Some((values, is_null, byval, value_lens)) =
         (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
     else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays".to_owned()));
         return false;
     };
 
-    with_storage(|state, session| {
+    let result = with_storage(|state, session| -> Result<bool, CatalogError> {
+        let estimated_row_bytes = estimated_input_row_bytes(is_null, byval, value_lens);
+        state.check_row_limit(estimated_row_bytes)?;
+        state.check_transaction_limit(session, estimated_row_bytes)?;
+        state.check_committed_projection_limit(session, estimated_row_bytes)?;
+
         let row_id = match state.relations.entry(relid).or_default().allocate_row_id() {
             Some(row_id) => row_id,
-            None => return false,
+            None => return Ok(false),
         };
 
         session.ensure_transaction();
-        let cells = {
+        let (cells, checkpoint) = {
             let segment = session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured")
-                .relations
-                .entry(relid)
-                .or_default();
+                .row_segment_mut(relid);
+            let checkpoint = segment.checkpoint();
 
             match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
-                Some(cells) => cells,
-                None => return false,
+                Some(cells) => (cells, checkpoint),
+                None => {
+                    segment.rewind_to(checkpoint);
+                    return Err(invalid_ffi_argument(
+                        "invalid by-reference row input".to_owned(),
+                    ));
+                }
             }
         };
 
         let row = Row { row_id, cells };
+        let index_bytes = state
+            .primary_key_spec(relid)
+            .and_then(|primary_key_spec| primary_key_for_row(&primary_key_spec, &row))
+            .map(|key| estimated_index_key_bytes(&key))
+            .unwrap_or(0);
+        if let Err(error) = state.check_committed_projection_limit(session, index_bytes) {
+            let segment = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured")
+                .row_segment_mut(relid);
+            segment.rewind_to(checkpoint);
+            return Err(error);
+        }
         if state.has_primary_key_conflict(session, relid, &row, None) {
-            return false;
+            let segment = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured")
+                .row_segment_mut(relid);
+            segment.rewind_to(checkpoint);
+            return Ok(false);
         }
 
         let segment = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured")
-            .relations
-            .entry(relid)
-            .or_default();
-        segment.rows.push(row);
+            .row_segment_mut(relid);
+        segment.push_row(row);
         if !row_id_out.is_null() {
             unsafe {
                 *row_id_out = row_id;
             }
         }
-        true
-    })
+        Ok(true)
+    });
+
+    match result {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            set_last_storage_error(error);
+            false
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2547,35 +3356,68 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
     value_lens: *const usize,
     natts: usize,
 ) -> bool {
+    clear_last_storage_error();
     if row_id == 0 {
         return false;
     }
     let Some((values, is_null, byval, value_lens)) =
         (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
     else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays".to_owned()));
         return false;
     };
 
-    with_storage(|state, session| {
+    let result = with_storage(|state, session| -> Result<bool, CatalogError> {
         if state.find_visible_row(session, relid, row_id).is_none() {
-            return false;
+            return Ok(false);
         }
 
+        let estimated_row_bytes = estimated_input_row_bytes(is_null, byval, value_lens);
+        state.check_row_limit(estimated_row_bytes)?;
+        state.check_transaction_limit(session, estimated_row_bytes)?;
+        state.check_committed_projection_limit(session, estimated_row_bytes)?;
+
         session.ensure_transaction();
-        let cells = {
+        let (cells, checkpoint) = {
             let overlay = session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured");
-            let segment = overlay.relations.entry(relid).or_default();
+            let segment = overlay.row_segment_mut(relid);
+            let checkpoint = segment.checkpoint();
             match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
-                Some(cells) => cells,
-                None => return false,
+                Some(cells) => (cells, checkpoint),
+                None => {
+                    segment.rewind_to(checkpoint);
+                    return Err(invalid_ffi_argument(
+                        "invalid by-reference row input".to_owned(),
+                    ));
+                }
             }
         };
         let row = Row { row_id, cells };
+        let index_bytes = state
+            .primary_key_spec(relid)
+            .and_then(|primary_key_spec| primary_key_for_row(&primary_key_spec, &row))
+            .map(|key| estimated_index_key_bytes(&key))
+            .unwrap_or(0);
+        if let Err(error) = state.check_committed_projection_limit(session, index_bytes) {
+            let overlay = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured");
+            let segment = overlay.row_segment_mut(relid);
+            segment.rewind_to(checkpoint);
+            return Err(error);
+        }
         if state.has_primary_key_conflict(session, relid, &row, Some(row_id)) {
-            return false;
+            let overlay = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured");
+            let segment = overlay.row_segment_mut(relid);
+            segment.rewind_to(checkpoint);
+            return Ok(false);
         }
 
         let overlay = session
@@ -2587,11 +3429,19 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
             .entry(relid)
             .or_default()
             .insert(row_id);
-        let segment = overlay.relations.entry(relid).or_default();
-        segment.rows.retain(|row| row.row_id != row_id);
-        segment.rows.push(row);
-        true
-    })
+        let segment = overlay.row_segment_mut(relid);
+        segment.remove_row_id(row_id);
+        segment.push_row(row);
+        Ok(true)
+    });
+
+    match result {
+        Ok(updated) => updated,
+        Err(error) => {
+            set_last_storage_error(error);
+            false
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2616,7 +3466,7 @@ pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
             .or_default()
             .insert(row_id);
         if let Some(segment) = overlay.relations.get_mut(&relid) {
-            segment.rows.retain(|row| row.row_id != row_id);
+            segment.remove_row_id(row_id);
         }
         true
     })
@@ -2671,18 +3521,12 @@ fn copy_cells_to_segment(
     let mut cells = Vec::with_capacity(values.len());
     for index in 0..values.len() {
         if is_null[index] != 0 {
-            cells.push(Cell {
-                value: 0,
-                is_null: true,
-            });
+            cells.push(Cell::null());
             continue;
         }
 
         if byval[index] != 0 {
-            cells.push(Cell {
-                value: values[index],
-                is_null: false,
-            });
+            cells.push(Cell::by_value(values[index]));
             continue;
         }
 
@@ -2690,27 +3534,18 @@ fn copy_cells_to_segment(
         if values[index] == 0 && len > 0 {
             return None;
         }
-        let bytes = if len == 0 {
-            Vec::new().into_boxed_slice()
+        let source = if len == 0 {
+            &[]
         } else {
-            let source = unsafe { slice::from_raw_parts(values[index] as *const u8, len) };
-            source.to_vec().into_boxed_slice()
+            unsafe { slice::from_raw_parts(values[index] as *const u8, len) }
         };
-        let value = bytes.as_ptr() as usize;
-        segment.payloads.push(bytes);
-        cells.push(Cell {
-            value,
-            is_null: false,
-        });
+        cells.push(Cell::by_ref(segment.alloc_bytes(source)));
     }
     Some(cells)
 }
 
 fn datum(value: usize) -> Cell {
-    Cell {
-        value,
-        is_null: false,
-    }
+    Cell::by_value(value)
 }
 
 fn int2_datum(value: i16) -> Cell {
@@ -2726,10 +3561,7 @@ fn int8_datum(value: i64) -> Cell {
 }
 
 fn null_datum() -> Cell {
-    Cell {
-        value: 0,
-        is_null: true,
-    }
+    Cell::null()
 }
 
 fn bool_datum(value: bool) -> Cell {
@@ -2748,7 +3580,11 @@ fn float8_datum(value: f64) -> Cell {
     datum(value.to_bits() as usize)
 }
 
-fn name_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
+fn byref_datum(bytes: &[u8], region: &mut StorageRegion) -> Cell {
+    Cell::by_ref(region.alloc_bytes(bytes))
+}
+
+fn name_datum(value: &str, region: &mut StorageRegion) -> Cell {
     let mut bytes = [0u8; NAMEDATALEN];
     for (index, byte) in value
         .as_bytes()
@@ -2759,8 +3595,7 @@ fn name_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
     {
         bytes[index] = byte;
     }
-    payloads.push(bytes.to_vec().into_boxed_slice());
-    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+    byref_datum(&bytes, region)
 }
 
 fn varlena_4b_header(size: usize) -> u32 {
@@ -2852,7 +3687,7 @@ fn parse_pg_array_values<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> O
         .collect()
 }
 
-fn int2vector_datum(values: &[i16], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+fn int2vector_datum(values: &[i16], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
     push_u32_ne(&mut bytes, varlena_4b_header(total_len));
@@ -2864,11 +3699,10 @@ fn int2vector_datum(values: &[i16], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     for value in values {
         push_i16_ne(&mut bytes, *value);
     }
-    payloads.push(bytes.into_boxed_slice());
-    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+    byref_datum(&bytes, region)
 }
 
-fn oidvector_datum(values: &[u32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+fn oidvector_datum(values: &[u32], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
     push_u32_ne(&mut bytes, varlena_4b_header(total_len));
@@ -2880,11 +3714,10 @@ fn oidvector_datum(values: &[u32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     for value in values {
         push_u32_ne(&mut bytes, *value);
     }
-    payloads.push(bytes.into_boxed_slice());
-    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+    byref_datum(&bytes, region)
 }
 
-fn int4array_datum(values: &[i32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+fn int4array_datum(values: &[i32], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
     push_u32_ne(&mut bytes, varlena_4b_header(total_len));
@@ -2896,11 +3729,10 @@ fn int4array_datum(values: &[i32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     for value in values {
         push_i32_ne(&mut bytes, *value);
     }
-    payloads.push(bytes.into_boxed_slice());
-    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+    byref_datum(&bytes, region)
 }
 
-fn chararray_datum(values: &[u8], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+fn chararray_datum(values: &[u8], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + values.len();
     let mut bytes = Vec::with_capacity(total_len);
     push_u32_ne(&mut bytes, varlena_4b_header(total_len));
@@ -2912,8 +3744,7 @@ fn chararray_datum(values: &[u8], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     for value in values {
         push_i8(&mut bytes, *value as i8);
     }
-    payloads.push(bytes.into_boxed_slice());
-    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+    byref_datum(&bytes, region)
 }
 
 fn parse_lsn(value: &str) -> Option<u64> {
@@ -2923,15 +3754,14 @@ fn parse_lsn(value: &str) -> Option<u64> {
     Some((high << 32) | low)
 }
 
-fn text_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
-    payloads.push(postgres_text_payload(value.as_bytes()));
-    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+fn text_datum(value: &str, region: &mut StorageRegion) -> Cell {
+    byref_datum(&postgres_text_payload(value.as_bytes()), region)
 }
 
 fn catalog_value_to_cell(
     column: &fastpg_catalog::StaticCatalogColumn,
     value: &CatalogValue,
-    payloads: &mut Vec<Box<[u8]>>,
+    region: &mut StorageRegion,
 ) -> Cell {
     match value {
         CatalogValue::Null => null_datum(),
@@ -2941,16 +3771,16 @@ fn catalog_value_to_cell(
         CatalogValue::Int32(value) => int4_datum(*value),
         CatalogValue::Float32(value) => float4_datum(*value),
         CatalogValue::Oid(value) => datum(value.0 as usize),
-        CatalogValue::Name(value) => name_datum(value, payloads),
-        CatalogValue::Text(value) => text_datum(value, payloads),
+        CatalogValue::Name(value) => name_datum(value, region),
+        CatalogValue::Text(value) => text_datum(value, region),
         CatalogValue::OidVector(values) => {
             let values = values.iter().map(|oid| oid.0).collect::<Vec<_>>();
-            oidvector_datum(&values, payloads)
+            oidvector_datum(&values, region)
         }
-        CatalogValue::Int2Vector(values) => int2vector_datum(values, payloads),
+        CatalogValue::Int2Vector(values) => int2vector_datum(values, region),
         CatalogValue::Raw(value) => match column.type_oid {
-            NAME_OID => name_datum(value, payloads),
-            TEXT_OID | PG_NODE_TREE_OID => text_datum(value, payloads),
+            NAME_OID => name_datum(value, region),
+            TEXT_OID | PG_NODE_TREE_OID => text_datum(value, region),
             _ if column.type_name.starts_with("reg") => {
                 fastpg_catalog::resolve_generated_catalog_oid_name(value)
                     .map(|value| datum(value.0 as usize))
@@ -2985,26 +3815,26 @@ fn catalog_value_to_cell(
                     .split_whitespace()
                     .filter_map(|part| part.parse::<u32>().ok())
                     .collect::<Vec<_>>();
-                oidvector_datum(&values, payloads)
+                oidvector_datum(&values, region)
             }
             INT2VECTOR_OID => {
                 let values = value
                     .split_whitespace()
                     .filter_map(|part| part.parse::<i16>().ok())
                     .collect::<Vec<_>>();
-                int2vector_datum(&values, payloads)
+                int2vector_datum(&values, region)
             }
             INT2_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<i16>().ok())
-                .map(|values| int2vector_datum(&values, payloads))
+                .map(|values| int2vector_datum(&values, region))
                 .unwrap_or_else(null_datum),
             INT4_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<i32>().ok())
-                .map(|values| int4array_datum(&values, payloads))
+                .map(|values| int4array_datum(&values, region))
                 .unwrap_or_else(null_datum),
             OID_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<u32>().ok())
-                .map(|values| oidvector_datum(&values, payloads))
+                .map(|values| oidvector_datum(&values, region))
                 .unwrap_or_else(null_datum),
             CHAR_ARRAY_OID => parse_pg_array_values(value, |part| part.as_bytes().first().copied())
-                .map(|values| chararray_datum(&values, payloads))
+                .map(|values| chararray_datum(&values, region))
                 .unwrap_or_else(null_datum),
             TEXT_ARRAY_OID | ACLITEM_ARRAY_OID | ANYARRAY_OID => null_datum(),
             _ => null_datum(),
@@ -3014,49 +3844,58 @@ fn catalog_value_to_cell(
 
 fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
     let table = static_catalog_by_relation_oid(relation_oid)?;
-    let mut payloads = Vec::new();
-    let rows = catalog_rows(relation_oid)
-        .into_iter()
-        .filter_map(|catalog_row| {
-            if catalog_row.values.len() != table.columns.len() {
-                return None;
-            }
-            Some(Row {
-                row_id: catalog_row.row_id,
-                cells: table
-                    .columns
-                    .iter()
-                    .zip(catalog_row.values.iter())
-                    .map(|(column, value)| catalog_value_to_cell(column, value, &mut payloads))
-                    .collect(),
-            })
-        })
-        .collect();
+    let mut region = StorageRegion::new(StorageRegionKind::Scan);
+    let mut rows = Vec::new();
+    for catalog_row in catalog_rows(relation_oid) {
+        if catalog_row.values.len() != table.columns.len() {
+            continue;
+        }
+        let row = Row {
+            row_id: catalog_row.row_id,
+            cells: table
+                .columns
+                .iter()
+                .zip(catalog_row.values.iter())
+                .map(|(column, value)| catalog_value_to_cell(column, value, &mut region))
+                .collect(),
+        };
+        region.account_row(&row);
+        rows.push(row);
+    }
     Some(ScanState {
         rows,
-        payloads,
+        region,
         next_index: 0,
     })
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
+    clear_last_storage_error();
     let virtual_scan =
         virtual_catalog_by_relation_oid(Oid(relid)).and_then(|_| catalog_scan_state(Oid(relid)));
 
-    with_storage(|state, session| {
-        let scan = virtual_scan.unwrap_or_else(|| {
-            state.relations.entry(relid).or_default();
-            ScanState {
-                rows: state.visible_rows(session, relid),
-                payloads: Vec::new(),
-                next_index: 0,
+    let result = with_storage(|state, session| -> Result<u64, CatalogError> {
+        let scan = match virtual_scan {
+            Some(scan) => scan,
+            None => {
+                state.relations.entry(relid).or_default();
+                ScanState::materialize(state.visible_rows(session, relid))?
             }
-        });
+        };
+        state.check_scan_limit(scan.bytes())?;
         let handle = session.allocate_scan_handle();
         session.scans.insert(handle, scan);
-        handle
-    })
+        Ok(handle)
+    });
+
+    match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            set_last_storage_error(error);
+            0
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -3171,7 +4010,7 @@ unsafe fn copy_row_to_outputs(
         unsafe { slice::from_raw_parts_mut(is_null_out, natts) }
     };
     for (index, cell) in row.cells.iter().enumerate() {
-        values_out[index] = cell.value;
+        values_out[index] = cell.output_value();
         is_null_out[index] = u8::from(cell.is_null);
     }
 
@@ -3201,12 +4040,14 @@ mod tests {
 
     impl Drop for TestGuard {
         fn drop(&mut self) {
+            fastpg_rust_storage_reset_limits();
             fastpg_rust_xact_abort();
         }
     }
 
     fn test_guard() -> TestGuard {
         let guard = TEST_LOCK.lock().expect("test lock poisoned");
+        fastpg_rust_storage_reset_limits();
         fastpg_rust_xact_abort();
         clear_primary_key_index_info_cache();
         TestGuard { _guard: guard }
@@ -3378,6 +4219,24 @@ mod tests {
         }
     }
 
+    unsafe fn insert_byref(relid: u32, payload: &[u8], row_id: &mut u64) -> bool {
+        let values = [payload.as_ptr() as usize];
+        let nulls = [0u8];
+        let byval = [0u8];
+        let value_lens = [payload.len()];
+        unsafe {
+            fastpg_rust_relation_insert(
+                relid,
+                values.as_ptr(),
+                nulls.as_ptr(),
+                byval.as_ptr(),
+                value_lens.as_ptr(),
+                1,
+                row_id,
+            )
+        }
+    }
+
     unsafe fn update_byval(relid: u32, row_id: u64, values: &[usize], is_null: &[u8]) -> bool {
         let byval = vec![1u8; values.len()];
         let value_lens = vec![0usize; values.len()];
@@ -3407,6 +4266,28 @@ mod tests {
             )
         };
         found.then_some((values, nulls))
+    }
+
+    fn last_storage_error_for_test() -> Option<(String, String)> {
+        let mut sqlstate = [0 as c_char; 6];
+        let mut message = [0 as c_char; 256];
+        let found = unsafe {
+            fastpg_rust_storage_last_error(
+                sqlstate.as_mut_ptr(),
+                sqlstate.len(),
+                message.as_mut_ptr(),
+                message.len(),
+            )
+        };
+        found.then(|| {
+            let sqlstate = unsafe { CStr::from_ptr(sqlstate.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            let message = unsafe { CStr::from_ptr(message.as_ptr()) }
+                .to_string_lossy()
+                .into_owned();
+            (sqlstate, message)
+        })
     }
 
     #[test]
@@ -3862,6 +4743,219 @@ mod tests {
     }
 
     #[test]
+    fn byref_bytes_are_accounted_and_promoted_on_commit() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+        let payload = b"owned by transaction arena";
+        let committed_before = fastpg_rust_storage_committed_bytes();
+
+        assert_eq!(fastpg_rust_storage_transaction_bytes(), 0);
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byref(relid, payload, &mut row_id));
+        }
+        assert!(fastpg_rust_storage_transaction_bytes() >= payload.len());
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_storage_transaction_bytes(), 0);
+        assert!(fastpg_rust_storage_committed_bytes() >= committed_before + payload.len());
+
+        let mut values_out = [0usize; 1];
+        let mut nulls_out = [0u8; 1];
+        unsafe {
+            assert!(fastpg_rust_fetch_row(
+                relid,
+                row_id,
+                values_out.as_mut_ptr(),
+                nulls_out.as_mut_ptr(),
+                1,
+            ));
+            assert_eq!(
+                slice::from_raw_parts(values_out[0] as *const u8, payload.len()),
+                payload
+            );
+        }
+        assert_eq!(nulls_out, [0]);
+    }
+
+    #[test]
+    fn savepoint_abort_drops_nested_arena_bytes() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut parent_row_id = 0;
+        let mut nested_row_id = 0;
+        let parent_payload = b"parent arena bytes";
+        let nested_payload = b"nested savepoint arena bytes";
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byref(relid, parent_payload, &mut parent_row_id));
+        }
+        let parent_bytes = fastpg_rust_storage_transaction_bytes();
+        assert!(parent_bytes >= parent_payload.len());
+
+        fastpg_rust_subxact_begin();
+        unsafe {
+            assert!(insert_byref(relid, nested_payload, &mut nested_row_id));
+        }
+        assert!(fastpg_rust_storage_transaction_bytes() > parent_bytes);
+        fastpg_rust_subxact_abort();
+
+        assert_eq!(fastpg_rust_storage_transaction_bytes(), parent_bytes);
+        assert!(fastpg_rust_relation_contains_row(relid, parent_row_id));
+        assert!(!fastpg_rust_relation_contains_row(relid, nested_row_id));
+        fastpg_rust_xact_commit();
+        assert_eq!(fastpg_rust_storage_transaction_bytes(), 0);
+    }
+
+    #[test]
+    fn scan_materialization_bytes_are_released_on_scan_end() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+        let payload = b"scan-owned copy";
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byref(relid, payload, &mut row_id));
+        }
+        fastpg_rust_xact_commit();
+        assert_eq!(fastpg_rust_storage_scan_bytes(), 0);
+
+        let scan = fastpg_rust_scan_begin(relid);
+        assert!(fastpg_rust_storage_scan_bytes() >= payload.len());
+        fastpg_rust_scan_end(scan);
+        assert_eq!(fastpg_rust_storage_scan_bytes(), 0);
+    }
+
+    #[test]
+    fn row_memory_limit_rejects_insert_with_sqlstate() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+        let rejections_before = fastpg_rust_storage_memory_limit_rejections();
+
+        fastpg_rust_storage_set_limits(0, 0, 0, 0, 1, 0);
+        unsafe {
+            assert!(!insert_byref(
+                relid,
+                b"too large for row limit",
+                &mut row_id
+            ));
+        }
+
+        assert_eq!(row_id, 0);
+        assert_eq!(fastpg_rust_storage_transaction_bytes(), 0);
+        assert_eq!(
+            fastpg_rust_storage_memory_limit_rejections(),
+            rejections_before + 1
+        );
+        assert_eq!(
+            last_storage_error_for_test(),
+            Some((
+                "54000".to_owned(),
+                "fastpg memory limit exceeded for row storage".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn transaction_memory_limit_rejects_insert_with_sqlstate() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        fastpg_rust_storage_set_limits(0, 0, 0, 1, 0, 0);
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(!insert_byref(
+                relid,
+                b"too large for transaction limit",
+                &mut row_id
+            ));
+        }
+
+        assert_eq!(row_id, 0);
+        assert_eq!(fastpg_rust_storage_transaction_bytes(), 0);
+        assert_eq!(
+            last_storage_error_for_test(),
+            Some((
+                "54000".to_owned(),
+                "fastpg memory limit exceeded for transaction storage".to_owned()
+            ))
+        );
+        fastpg_rust_xact_abort();
+    }
+
+    #[test]
+    fn committed_memory_limit_rejects_projected_insert_with_sqlstate() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        fastpg_rust_storage_set_limits(1, 0, 0, 0, 0, 0);
+        unsafe {
+            assert!(!insert_byref(
+                relid,
+                b"too large for committed limit",
+                &mut row_id
+            ));
+        }
+
+        assert_eq!(row_id, 0);
+        assert_eq!(
+            last_storage_error_for_test(),
+            Some((
+                "54000".to_owned(),
+                "fastpg memory limit exceeded for committed storage".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn scan_memory_limit_rejects_materialization_with_sqlstate() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut row_id = 0;
+
+        unsafe {
+            assert!(insert_byref(
+                relid,
+                b"too large for scan limit",
+                &mut row_id
+            ));
+        }
+        fastpg_rust_storage_set_limits(0, 0, 0, 0, 0, 1);
+
+        assert_eq!(fastpg_rust_scan_begin(relid), 0);
+        assert_eq!(fastpg_rust_storage_scan_bytes(), 0);
+        assert_eq!(
+            last_storage_error_for_test(),
+            Some((
+                "54000".to_owned(),
+                "fastpg memory limit exceeded for scan storage".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn primary_key_index_bytes_are_accounted() {
+        let _guard = test_guard();
+        let (relid, _index_oid) = install_primary_key_test_catalog();
+        let before_index_bytes = fastpg_rust_storage_index_bytes();
+        let mut row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[7], &[0], &mut row_id));
+        }
+        fastpg_rust_xact_commit();
+
+        assert!(fastpg_rust_storage_index_bytes() > before_index_bytes);
+    }
+
+    #[test]
     fn logical_row_ids_exceed_u16_capacity() {
         let _guard = test_guard();
         let relid = next_relid();
@@ -3929,9 +5023,9 @@ mod tests {
             ));
         }
         assert_eq!(index_relation.relkind, b'i');
-        assert_eq!(index_relation.column_count, 1);
         assert_eq!(index_info.heap_oid, relid);
         assert_eq!(index_info.key_count, 1);
+        assert!(index_relation.column_count >= index_info.key_count);
         assert_eq!(index_info.attnums[0], 1);
         assert_eq!(index_info.type_oids[0], INT4_OID.0);
 
