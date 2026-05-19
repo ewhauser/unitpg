@@ -34,6 +34,8 @@
 #include <stdint.h>
 #include <string.h>
 
+#define FASTPG_MEM_STACK_NATTS 64
+
 typedef struct FastPgMemScanDesc
 {
 	TableScanDescData base;
@@ -487,15 +489,18 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 {
 	FastPgMemScanDesc *scan = (FastPgMemScanDesc *) sscan;
 	int			natts = slot->tts_tupleDescriptor->natts;
+	uintptr_t	stack_values[FASTPG_MEM_STACK_NATTS];
+	uint8_t		stack_isnull[FASTPG_MEM_STACK_NATTS];
 	uintptr_t  *values;
 	uint8_t    *isnull;
 	uint64_t	row_id = 0;
 	bool		found;
+	bool		heap_buffers = natts > FASTPG_MEM_STACK_NATTS;
 
 	ExecClearTuple(slot);
 
-	values = palloc0_array(uintptr_t, natts);
-	isnull = palloc0_array(uint8_t, natts);
+	values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
+	isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
 
 	while ((found = fastpg_rust_scan_next(scan->scan_handle,
 										  ScanDirectionIsBackward(direction) ? 0 : 1,
@@ -516,8 +521,11 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 		ExecClearTuple(slot);
 	}
 
-	pfree(values);
-	pfree(isnull);
+	if (heap_buffers)
+	{
+		pfree(values);
+		pfree(isnull);
+	}
 
 	return found;
 }
@@ -568,17 +576,20 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 								   TupleTableSlot *slot)
 {
 	int			natts = slot->tts_tupleDescriptor->natts;
+	uintptr_t	stack_values[FASTPG_MEM_STACK_NATTS];
+	uint8_t		stack_isnull[FASTPG_MEM_STACK_NATTS];
 	uintptr_t  *values;
 	uint8_t    *isnull;
 	uint64_t	row_id;
 	bool		found;
+	bool		heap_buffers = natts > FASTPG_MEM_STACK_NATTS;
 
 	if (!fastpg_mem_tid_to_row_id(tid, &row_id))
 		return false;
 
 	ExecClearTuple(slot);
-	values = palloc0_array(uintptr_t, natts);
-	isnull = palloc0_array(uint8_t, natts);
+	values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
+	isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
 	found = fastpg_rust_fetch_row(RelationGetRelid(rel),
 								  row_id,
 								  values,
@@ -586,8 +597,11 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 								  natts);
 	if (found)
 		fastpg_mem_store_virtual_tuple(rel, slot, values, isnull, row_id);
-	pfree(values);
-	pfree(isnull);
+	if (heap_buffers)
+	{
+		pfree(values);
+		pfree(isnull);
+	}
 
 	return found;
 }
