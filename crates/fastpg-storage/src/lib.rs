@@ -20,9 +20,9 @@ use fastpg_catalog::{
     index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_count,
-    relation_oid_for_index_oid, static_catalog_by_name, static_catalog_by_relation_oid,
-    type_by_name, unique_index_records_for_relation_oid, upsert_catalog_row,
-    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    relation_oid_by_name_in_namespace, relation_oid_for_index_oid, static_catalog_by_name,
+    static_catalog_by_relation_oid, type_by_name, unique_index_records_for_relation_oid,
+    upsert_catalog_row, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -2712,6 +2712,12 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
         return true;
     }
     let namespace = Oid(namespace_oid);
+    if let Some(relation_oid) = relation_oid_by_name_in_namespace(&name, namespace) {
+        unsafe {
+            *oid_out = relation_oid.0;
+        }
+        return true;
+    }
     if let Some(relation) = primary_key_index_relation_by_name(&name, namespace) {
         let Some(index_oid) = primary_key_index_oid(&relation) else {
             return false;
@@ -2721,14 +2727,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
         }
         return true;
     }
-    let Some(relation) = relation_by_name_in_namespace(&name, namespace) else {
-        return false;
-    };
-
-    unsafe {
-        *oid_out = relation.oid.0;
-    }
-    true
+    false
 }
 
 #[unsafe(no_mangle)]

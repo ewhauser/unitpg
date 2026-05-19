@@ -1665,6 +1665,31 @@ pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Relat
     })
 }
 
+pub fn relation_oid_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Oid> {
+    let name = normalize_identifier(name);
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_string(table, row, "relname")
+                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
+                && static_row_column_oid(table, row, "relnamespace")
+                    .is_some_and(|row_namespace| row_namespace == namespace)
+        },
+        |row| {
+            let row_name = catalog_row_value(table, row, "relname")
+                .and_then(catalog_value_string)
+                .is_some_and(|row_name| normalize_identifier(&row_name) == name);
+            let row_namespace = catalog_row_value(table, row, "relnamespace")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_namespace| row_namespace == namespace);
+            row_name && row_namespace
+        },
+    )
+    .into_iter()
+    .find_map(|row| catalog_row_value(table, &row, "oid").and_then(catalog_value_oid))
+}
+
 pub fn relations() -> Vec<RelationRecord> {
     let Some(table) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID) else {
         return Vec::new();
@@ -2234,6 +2259,10 @@ mod tests {
         assert_eq!(
             relation_by_name("pgbench_accounts").unwrap().oid,
             relation.oid
+        );
+        assert_eq!(
+            relation_oid_by_name_in_namespace("pgbench_accounts", PUBLIC_NAMESPACE_OID),
+            Some(relation.oid)
         );
         assert_eq!(
             relation_by_oid(relation.oid).unwrap().name,
