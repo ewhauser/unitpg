@@ -16,7 +16,7 @@
  *	  should go into their respective files, not here.
  *
  *-------------------------------------------------------------------------
- */
+	 */
 
 #include "postgres.h"
 
@@ -26,7 +26,6 @@
 #include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
-#include "catalog/pg_namespace.h"
 #include "pgstat.h"
 #include "storage/lmgr.h"
 #include "storage/lock.h"
@@ -37,26 +36,7 @@
 static bool
 FastPgRelationOidExists(Oid relationId)
 {
-	FastPgRustCatalogRelation fastpg_relation;
-
-	return fastpg_rust_catalog_relation_by_oid((uint32_t) relationId,
-											   &fastpg_relation);
-}
-
-static bool
-FastPgRangeVarExists(const RangeVar *relation)
-{
-	uint32_t	fastpg_oid;
-
-	if (relation == NULL || relation->relname == NULL)
-		return false;
-	if (relation->schemaname != NULL &&
-		strcmp(relation->schemaname, "public") != 0)
-		return false;
-
-	return fastpg_rust_catalog_relation_oid_by_name(relation->relname,
-													(uint32_t) PG_PUBLIC_NAMESPACE,
-													&fastpg_oid);
+	return fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relationId);
 }
 #endif
 
@@ -74,7 +54,7 @@ FastPgRangeVarExists(const RangeVar *relation)
  *		NB: a "relation" is anything with a pg_class entry.  The caller is
  *		expected to check whether the relkind is something it can handle.
  * ----------------
- */
+	 */
 Relation
 relation_open(Oid relationId, LOCKMODE lockmode)
 {
@@ -202,11 +182,8 @@ relation_openrv(const RangeVar *relation, LOCKMODE lockmode)
 	 * should be reasonably up-to-date already.  (XXX this all could stand to
 	 * be redesigned, but for the moment we'll keep doing this like it's been
 	 * done historically.)
-	 */
+ */
 	if (lockmode != NoLock
-#ifdef USE_FASTPG
-		&& !FastPgRangeVarExists(relation)
-#endif
 		)
 		AcceptInvalidationMessages();
 
@@ -235,11 +212,8 @@ relation_openrv_extended(const RangeVar *relation, LOCKMODE lockmode,
 	/*
 	 * Check for shared-cache-inval messages before trying to open the
 	 * relation.  See comments in relation_openrv().
-	 */
+ */
 	if (lockmode != NoLock
-#ifdef USE_FASTPG
-		&& !FastPgRangeVarExists(relation)
-#endif
 		)
 		AcceptInvalidationMessages();
 
