@@ -958,11 +958,22 @@ fastpg_pgcore_prepare(const char *query)
 #else
 			cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif
-			result->query = parse_analyze_varparams(rawstmt,
-													result->source_text,
-													&result->parameter_type_oids,
-													&result->parameter_count,
-													NULL);
+			if (strchr(result->source_text, '$') == NULL)
+			{
+				result->query = parse_analyze_fixedparams(rawstmt,
+														 result->source_text,
+														 NULL,
+														 0,
+														 NULL);
+			}
+			else
+			{
+				result->query = parse_analyze_varparams(rawstmt,
+														result->source_text,
+														&result->parameter_type_oids,
+														&result->parameter_count,
+														NULL);
+			}
 			fastpg_pgcore_capture_analyze_fields(result);
 			result->querytrees = pg_rewrite_query(copyObject(result->query));
 			result->planned_statements = pg_plan_queries(copyObject(result->querytrees),
