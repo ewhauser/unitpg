@@ -847,6 +847,7 @@ struct TransactionOverlay {
     region_kind: StorageRegionKind,
     relations: HashMap<u32, RowSegment>,
     deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+    pending_primary_key_rebuilds: BTreeSet<u32>,
 }
 
 impl TransactionOverlay {
@@ -855,6 +856,7 @@ impl TransactionOverlay {
             region_kind,
             relations: HashMap::new(),
             deleted_row_ids: HashMap::new(),
+            pending_primary_key_rebuilds: BTreeSet::new(),
         }
     }
 
@@ -871,6 +873,10 @@ impl TransactionOverlay {
         self.relations
             .entry(relid)
             .or_insert_with(|| RowSegment::new(region_kind))
+    }
+
+    fn mark_primary_key_rebuild(&mut self, relid: u32) {
+        self.pending_primary_key_rebuilds.insert(relid);
     }
 
     fn bytes(&self) -> usize {
@@ -1040,6 +1046,14 @@ impl SessionStorage {
         fastpg_catalog::begin_implicit_transaction();
     }
 
+    fn mark_primary_key_rebuild(&mut self, relid: u32) {
+        self.ensure_transaction();
+        self.transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured")
+            .mark_primary_key_rebuild(relid);
+    }
+
     fn transaction_bytes(&self) -> usize {
         self.transaction_stack
             .iter()
@@ -1136,11 +1150,13 @@ impl StorageState {
     }
 
     fn commit_explicit_transaction(&mut self, session: &mut SessionStorage) {
+        let mut pending_primary_key_rebuilds = BTreeSet::new();
         while !session.transaction_stack.is_empty() {
-            self.commit_top_overlay(session);
+            pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
         fastpg_catalog::commit_explicit_transaction();
         session.explicit_transaction = false;
+        self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
     }
 
     fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
@@ -1153,10 +1169,12 @@ impl StorageState {
         if session.explicit_transaction {
             return;
         }
+        let mut pending_primary_key_rebuilds = BTreeSet::new();
         while !session.transaction_stack.is_empty() {
-            self.commit_top_overlay(session);
+            pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
         fastpg_catalog::commit_implicit_transaction();
+        self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
     }
 
     fn abort_implicit_transaction(&mut self, session: &mut SessionStorage) {
@@ -1363,15 +1381,16 @@ impl StorageState {
         }
     }
 
-    fn commit_top_overlay(&mut self, session: &mut SessionStorage) {
+    fn commit_top_overlay(&mut self, session: &mut SessionStorage) -> BTreeSet<u32> {
         let Some(overlay) = session.transaction_stack.pop() else {
-            return;
+            return BTreeSet::new();
         };
 
         if let Some(parent) = session.transaction_stack.last_mut() {
             merge_overlay_into_overlay(parent, overlay);
+            BTreeSet::new()
         } else {
-            self.commit_overlay_to_relations(overlay);
+            self.commit_overlay_to_relations(overlay)
         }
     }
 
@@ -1379,11 +1398,12 @@ impl StorageState {
         &session.transaction_stack
     }
 
-    fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
+    fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) -> BTreeSet<u32> {
         let TransactionOverlay {
             region_kind: _,
             relations,
             deleted_row_ids,
+            pending_primary_key_rebuilds,
         } = overlay;
         let mut unchanged_primary_key_updates: HashMap<u32, BTreeSet<u64>> = HashMap::new();
 
@@ -1446,6 +1466,40 @@ impl StorageState {
                 }
             }
         }
+
+        pending_primary_key_rebuilds
+    }
+
+    fn rebuild_primary_key_indexes(&mut self, relation_oids: &BTreeSet<u32>) {
+        for relid in relation_oids {
+            self.rebuild_primary_key_index(*relid);
+        }
+    }
+
+    fn rebuild_primary_key_index(&mut self, relid: u32) {
+        let Some(relation) = self.relations.get_mut(&relid) else {
+            return;
+        };
+
+        let old_keys = std::mem::take(&mut relation.primary_key_index);
+        for key in old_keys.into_keys() {
+            relation.committed_region.unaccount_index_key(&key);
+        }
+
+        let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid)) else {
+            return;
+        };
+        let index_entries = relation
+            .committed_row_ids
+            .iter()
+            .filter_map(|row_id| {
+                let row = relation.committed_row_index.get(row_id)?;
+                index_key_for_row(&index_spec, row).map(|key| (key, *row_id))
+            })
+            .collect::<Vec<_>>();
+        for (key, row_id) in index_entries {
+            relation.insert_primary_key(key, row_id);
+        }
     }
 
     fn remove_committed_entries(
@@ -1495,7 +1549,14 @@ fn committed_contains_row_id(relation: &RelationRows, row_id: u64) -> bool {
 }
 
 fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: TransactionOverlay) {
-    for (relid, deleted_row_ids) in overlay.deleted_row_ids {
+    let TransactionOverlay {
+        region_kind: _,
+        relations,
+        deleted_row_ids,
+        pending_primary_key_rebuilds,
+    } = overlay;
+
+    for (relid, deleted_row_ids) in deleted_row_ids {
         if deleted_row_ids.is_empty() {
             continue;
         }
@@ -1509,13 +1570,17 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
             .extend(deleted_row_ids);
     }
 
-    for (relid, mut segment) in overlay.relations {
+    for (relid, mut segment) in relations {
         if segment.rows.is_empty() {
             continue;
         }
         let parent_segment = parent.row_segment_mut(relid);
         parent_segment.append_from(&mut segment);
     }
+
+    parent
+        .pending_primary_key_rebuilds
+        .extend(pending_primary_key_rebuilds);
 }
 
 fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet<u64>) {
@@ -1576,6 +1641,37 @@ fn clear_primary_key_index_info_cache() {
 
 fn catalog_mutation_invalidates_primary_key_cache(relation_oid: u32) -> bool {
     matches!(relation_oid, 1249 | 1259 | 2606 | 2610)
+}
+
+fn pg_index_heap_relation_from_upsert(relation_oid: u32, values: &[Option<String>]) -> Option<u32> {
+    let table = static_catalog_by_name("pg_index")?;
+    if table.oid.0 != relation_oid {
+        return None;
+    }
+    let indrelid_index = table
+        .columns
+        .iter()
+        .position(|column| column.name == "indrelid")?;
+    values.get(indrelid_index)?.as_deref()?.parse::<u32>().ok()
+}
+
+fn pg_index_heap_relation_from_delete(relation_oid: u32, row_id: u64) -> Option<u32> {
+    let table = static_catalog_by_name("pg_index")?;
+    if table.oid.0 != relation_oid {
+        return None;
+    }
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        if row.row_id != row_id {
+            return None;
+        }
+        catalog_row_value(table, &row, "indrelid")
+            .and_then(catalog_value_oid)
+            .map(|oid| oid.0)
+    })
+}
+
+fn mark_primary_key_rebuild(relid: u32) {
+    with_storage(|_state, session| session.mark_primary_key_rebuild(relid));
 }
 
 fn cached_primary_key_index_info(index_oid: Oid) -> Option<FastPgRustPrimaryKeyIndexInfo> {
@@ -3181,9 +3277,13 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
     let result = (|| {
         let values = unsafe { nullable_c_str_array_to_strings(values, is_null, natts) }
             .map_err(invalid_ffi_argument)?;
+        let pending_primary_key_rebuild = pg_index_heap_relation_from_upsert(relation_oid, &values);
         let row_id = upsert_catalog_row(Oid(relation_oid), row_id, values)?;
         if catalog_mutation_invalidates_primary_key_cache(relation_oid) {
             clear_primary_key_index_info_cache();
+        }
+        if let Some(relid) = pending_primary_key_rebuild {
+            mark_primary_key_rebuild(relid);
         }
         if !row_id_out.is_null() {
             unsafe {
@@ -3198,9 +3298,13 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64) -> bool {
+    let pending_primary_key_rebuild = pg_index_heap_relation_from_delete(relation_oid, row_id);
     let ok = delete_catalog_row(Oid(relation_oid), row_id).is_ok();
     if ok && catalog_mutation_invalidates_primary_key_cache(relation_oid) {
         clear_primary_key_index_info_cache();
+    }
+    if ok && let Some(relid) = pending_primary_key_rebuild {
+        mark_primary_key_rebuild(relid);
     }
     ok
 }
@@ -4466,6 +4570,7 @@ mod tests {
     use super::*;
     use fastpg_catalog::{builtin_namespaces, static_catalog_by_name, upsert_catalog_row};
     use std::collections::BTreeMap;
+    use std::ffi::CString;
     use std::ptr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -4508,6 +4613,47 @@ mod tests {
             .map(|column| values.get(column.name).cloned())
             .collect::<Vec<_>>();
         upsert_catalog_row(table.oid, row_id, row).expect("upsert catalog row")
+    }
+
+    fn upsert_named_catalog_row_via_ffi(
+        table_name: &str,
+        row_id: u64,
+        values: &[(&str, &str)],
+    ) -> u64 {
+        let table = static_catalog_by_name(table_name).expect("catalog table");
+        let values = values
+            .iter()
+            .map(|(column, value)| (*column, (*value).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let c_values = table
+            .columns
+            .iter()
+            .map(|column| {
+                values
+                    .get(column.name)
+                    .map(|value| CString::new(value.as_str()).expect("catalog value has no NUL"))
+            })
+            .collect::<Vec<_>>();
+        let value_ptrs = c_values
+            .iter()
+            .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+            .collect::<Vec<_>>();
+        let nulls = c_values
+            .iter()
+            .map(|value| u8::from(value.is_none()))
+            .collect::<Vec<_>>();
+        let mut row_id_out = 0;
+        unsafe {
+            assert!(fastpg_rust_catalog_upsert_row(
+                table.oid.0,
+                row_id,
+                value_ptrs.as_ptr(),
+                nulls.as_ptr(),
+                value_ptrs.len(),
+                &mut row_id_out,
+            ));
+        }
+        row_id_out
     }
 
     fn install_primary_key_test_catalog() -> (u32, Oid) {
@@ -5392,6 +5538,178 @@ mod tests {
         fastpg_rust_xact_commit();
 
         assert!(fastpg_rust_storage_index_bytes() > before_index_bytes);
+    }
+
+    #[test]
+    fn primary_key_index_backfills_rows_inserted_before_index_catalog() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let type_oid = relid + 100_000;
+        let index_oid = Oid(relid + 200_000);
+        let constraint_oid = relid + 300_000;
+        let mut first_row_id = 0;
+        let mut second_row_id = 0;
+
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid.to_string()),
+                ("relname", "late_pk_storage"),
+                ("relnamespace", "2200"),
+                ("reltype", &type_oid.to_string()),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid.to_string()),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_type",
+            type_oid as u64,
+            &[
+                ("oid", &type_oid.to_string()),
+                ("typname", "late_pk_storage"),
+                ("typnamespace", "2200"),
+                ("typowner", "10"),
+                ("typlen", "-1"),
+                ("typbyval", "f"),
+                ("typtype", "c"),
+                ("typcategory", "C"),
+                ("typisdefined", "t"),
+                ("typdelim", ","),
+                ("typrelid", &relid.to_string()),
+                ("typalign", "d"),
+                ("typstorage", "x"),
+            ],
+        );
+        for (attnum, name) in [(1, "id"), (2, "value")] {
+            upsert_named_catalog_row(
+                "pg_attribute",
+                0,
+                &[
+                    ("attrelid", &relid.to_string()),
+                    ("attname", name),
+                    ("atttypid", "23"),
+                    ("attlen", "4"),
+                    ("attnum", &attnum.to_string()),
+                    ("atttypmod", "-1"),
+                    ("attbyval", "t"),
+                    ("attalign", "i"),
+                    ("attstorage", "p"),
+                    ("attnotnull", if attnum == 1 { "t" } else { "f" }),
+                    ("attisdropped", "f"),
+                ],
+            );
+        }
+        fastpg_rust_xact_commit_if_implicit();
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1, 10], &[0, 0], &mut first_row_id));
+            assert!(insert_byval(relid, &[2, 20], &[0, 0], &mut second_row_id));
+        }
+        fastpg_rust_xact_commit();
+        let before_index_bytes = fastpg_rust_storage_index_bytes();
+
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid.to_string()),
+                ("relname", "late_pk_storage"),
+                ("relnamespace", "2200"),
+                ("reltype", &type_oid.to_string()),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid.to_string()),
+                ("relhasindex", "t"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", &index_oid.0.to_string()),
+                ("relname", "late_pk_storage_pkey"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "403"),
+                ("relfilenode", &index_oid.0.to_string()),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", &index_oid.0.to_string()),
+                ("attname", "id"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "t"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row_via_ffi(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", &index_oid.0.to_string()),
+                ("indrelid", &relid.to_string()),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "t"),
+                ("indisprimary", "t"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_constraint",
+            constraint_oid as u64,
+            &[
+                ("oid", &constraint_oid.to_string()),
+                ("conname", "late_pk_storage_pkey"),
+                ("connamespace", "2200"),
+                ("contype", "p"),
+                ("conrelid", &relid.to_string()),
+                ("conindid", &index_oid.0.to_string()),
+                ("conkey", "1"),
+            ],
+        );
+        fastpg_rust_xact_commit_if_implicit();
+        assert!(fastpg_rust_storage_index_bytes() > before_index_bytes);
+
+        let mut found_row_id = 0;
+        unsafe {
+            assert!(fastpg_rust_primary_key_index_lookup(
+                index_oid.0,
+                [2usize].as_ptr(),
+                [0u8].as_ptr(),
+                1,
+                &mut found_row_id,
+            ));
+        }
+        assert_eq!(found_row_id, second_row_id);
+        assert_ne!(first_row_id, second_row_id);
     }
 
     #[test]
