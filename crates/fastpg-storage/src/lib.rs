@@ -3433,7 +3433,16 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert(
     clear_last_storage_error();
     unsafe {
         relation_insert_impl(
-            relid, values, is_null, byval, value_lens, natts, row_id_out, true,
+            RawRowInput {
+                relid,
+                values,
+                is_null,
+                byval,
+                value_lens,
+                natts,
+            },
+            row_id_out,
+            UniqueCheck::Enforce,
         )
     }
 }
@@ -3455,24 +3464,50 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert_unchecked(
     clear_last_storage_error();
     unsafe {
         relation_insert_impl(
-            relid, values, is_null, byval, value_lens, natts, row_id_out, false,
+            RawRowInput {
+                relid,
+                values,
+                is_null,
+                byval,
+                value_lens,
+                natts,
+            },
+            row_id_out,
+            UniqueCheck::Skip,
         )
     }
 }
 
-unsafe fn relation_insert_impl(
+#[derive(Clone, Copy)]
+struct RawRowInput {
     relid: u32,
     values: *const usize,
     is_null: *const u8,
     byval: *const u8,
     value_lens: *const usize,
     natts: usize,
+}
+
+#[derive(Clone, Copy)]
+enum UniqueCheck {
+    Enforce,
+    Skip,
+}
+
+unsafe fn relation_insert_impl(
+    input: RawRowInput,
     row_id_out: *mut u64,
-    check_unique: bool,
+    unique_check: UniqueCheck,
 ) -> bool {
-    let Some((values, is_null, byval, value_lens)) =
-        (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
-    else {
+    let Some((values, is_null, byval, value_lens)) = (unsafe {
+        row_input_arrays(
+            input.values,
+            input.is_null,
+            input.byval,
+            input.value_lens,
+            input.natts,
+        )
+    }) else {
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays".to_owned()));
         return false;
     };
@@ -3483,7 +3518,12 @@ unsafe fn relation_insert_impl(
         state.check_transaction_limit(session, estimated_row_bytes)?;
         state.check_committed_projection_limit(session, estimated_row_bytes)?;
 
-        let row_id = match state.relations.entry(relid).or_default().allocate_row_id() {
+        let row_id = match state
+            .relations
+            .entry(input.relid)
+            .or_default()
+            .allocate_row_id()
+        {
             Some(row_id) => row_id,
             None => return Ok(false),
         };
@@ -3494,7 +3534,7 @@ unsafe fn relation_insert_impl(
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured")
-                .row_segment_mut(relid);
+                .row_segment_mut(input.relid);
             let checkpoint = segment.checkpoint();
 
             match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
@@ -3509,7 +3549,7 @@ unsafe fn relation_insert_impl(
         };
 
         let row = Row { row_id, cells };
-        let index_bytes = primary_index_spec_for_relation_oid(Oid(relid))
+        let index_bytes = primary_index_spec_for_relation_oid(Oid(input.relid))
             .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
             .unwrap_or(0);
@@ -3518,20 +3558,20 @@ unsafe fn relation_insert_impl(
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured")
-                .row_segment_mut(relid);
+                .row_segment_mut(input.relid);
             segment.rewind_to(checkpoint);
             return Err(error);
         }
-        if check_unique
+        if matches!(unique_check, UniqueCheck::Enforce)
             && state
-                .unique_index_conflict(session, relid, &row, None)
+                .unique_index_conflict(session, input.relid, &row, None)
                 .is_some()
         {
             let segment = session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured")
-                .row_segment_mut(relid);
+                .row_segment_mut(input.relid);
             segment.rewind_to(checkpoint);
             return Ok(false);
         }
@@ -3540,7 +3580,7 @@ unsafe fn relation_insert_impl(
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured")
-            .row_segment_mut(relid);
+            .row_segment_mut(input.relid);
         segment.push_row(row);
         if !row_id_out.is_null() {
             unsafe {
@@ -3576,7 +3616,16 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
     clear_last_storage_error();
     unsafe {
         relation_update_impl(
-            relid, row_id, values, is_null, byval, value_lens, natts, true,
+            RawRowInput {
+                relid,
+                values,
+                is_null,
+                byval,
+                value_lens,
+                natts,
+            },
+            row_id,
+            UniqueCheck::Enforce,
         )
     }
 }
@@ -3598,33 +3647,42 @@ pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked(
     clear_last_storage_error();
     unsafe {
         relation_update_impl(
-            relid, row_id, values, is_null, byval, value_lens, natts, false,
+            RawRowInput {
+                relid,
+                values,
+                is_null,
+                byval,
+                value_lens,
+                natts,
+            },
+            row_id,
+            UniqueCheck::Skip,
         )
     }
 }
 
-unsafe fn relation_update_impl(
-    relid: u32,
-    row_id: u64,
-    values: *const usize,
-    is_null: *const u8,
-    byval: *const u8,
-    value_lens: *const usize,
-    natts: usize,
-    check_unique: bool,
-) -> bool {
+unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: UniqueCheck) -> bool {
     if row_id == 0 {
         return false;
     }
-    let Some((values, is_null, byval, value_lens)) =
-        (unsafe { row_input_arrays(values, is_null, byval, value_lens, natts) })
-    else {
+    let Some((values, is_null, byval, value_lens)) = (unsafe {
+        row_input_arrays(
+            input.values,
+            input.is_null,
+            input.byval,
+            input.value_lens,
+            input.natts,
+        )
+    }) else {
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays".to_owned()));
         return false;
     };
 
     let result = with_storage(|state, session| -> Result<bool, CatalogError> {
-        if state.find_visible_row(session, relid, row_id).is_none() {
+        if state
+            .find_visible_row(session, input.relid, row_id)
+            .is_none()
+        {
             return Ok(false);
         }
 
@@ -3639,7 +3697,7 @@ unsafe fn relation_update_impl(
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured");
-            let segment = overlay.row_segment_mut(relid);
+            let segment = overlay.row_segment_mut(input.relid);
             let checkpoint = segment.checkpoint();
             match copy_cells_to_segment(segment, values, is_null, byval, value_lens) {
                 Some(cells) => (cells, checkpoint),
@@ -3652,7 +3710,7 @@ unsafe fn relation_update_impl(
             }
         };
         let row = Row { row_id, cells };
-        let index_bytes = primary_index_spec_for_relation_oid(Oid(relid))
+        let index_bytes = primary_index_spec_for_relation_oid(Oid(input.relid))
             .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
             .unwrap_or(0);
@@ -3661,20 +3719,20 @@ unsafe fn relation_update_impl(
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured");
-            let segment = overlay.row_segment_mut(relid);
+            let segment = overlay.row_segment_mut(input.relid);
             segment.rewind_to(checkpoint);
             return Err(error);
         }
-        if check_unique
+        if matches!(unique_check, UniqueCheck::Enforce)
             && state
-                .unique_index_conflict(session, relid, &row, Some(row_id))
+                .unique_index_conflict(session, input.relid, &row, Some(row_id))
                 .is_some()
         {
             let overlay = session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured");
-            let segment = overlay.row_segment_mut(relid);
+            let segment = overlay.row_segment_mut(input.relid);
             segment.rewind_to(checkpoint);
             return Ok(false);
         }
@@ -3685,10 +3743,10 @@ unsafe fn relation_update_impl(
             .expect("transaction was just ensured");
         overlay
             .deleted_row_ids
-            .entry(relid)
+            .entry(input.relid)
             .or_default()
             .insert(row_id);
-        let segment = overlay.row_segment_mut(relid);
+        let segment = overlay.row_segment_mut(input.relid);
         segment.remove_row_id(row_id);
         segment.push_row(row);
         Ok(true)
