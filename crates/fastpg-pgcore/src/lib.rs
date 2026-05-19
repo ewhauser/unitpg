@@ -1,5 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::borrow::Cow;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawParseSummary {
     pub statement_count: usize,
@@ -99,7 +101,7 @@ pub struct PgCoreCopyIn {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionStatement {
-    pub command_tag: String,
+    pub command_tag: Cow<'static, str>,
     pub fields: Vec<PgCoreField>,
     pub rows: Vec<Vec<PgCoreValue>>,
     pub copy_in: Option<PgCoreCopyIn>,
@@ -208,6 +210,7 @@ impl Portal {
 
 #[cfg(feature = "postgres-linked")]
 mod inner {
+    use std::borrow::Cow;
     use std::ffi::{CStr, CString, c_char};
     use std::ptr;
     use std::ptr::NonNull;
@@ -511,6 +514,32 @@ mod inner {
         if value.is_empty() { None } else { Some(value) }
     }
 
+    unsafe fn command_tag(value: *const c_char) -> Cow<'static, str> {
+        if value.is_null() {
+            return Cow::Borrowed("");
+        }
+
+        let value = unsafe { CStr::from_ptr(value) };
+        match value.to_bytes() {
+            b"" => Cow::Borrowed(""),
+            b"BEGIN" => Cow::Borrowed("BEGIN"),
+            b"COMMIT" => Cow::Borrowed("COMMIT"),
+            b"COPY" => Cow::Borrowed("COPY"),
+            b"CREATE TABLE" => Cow::Borrowed("CREATE TABLE"),
+            b"DELETE" => Cow::Borrowed("DELETE"),
+            b"DROP TABLE" => Cow::Borrowed("DROP TABLE"),
+            b"INSERT" => Cow::Borrowed("INSERT"),
+            b"MERGE" => Cow::Borrowed("MERGE"),
+            b"RELEASE" => Cow::Borrowed("RELEASE"),
+            b"ROLLBACK" => Cow::Borrowed("ROLLBACK"),
+            b"SAVEPOINT" => Cow::Borrowed("SAVEPOINT"),
+            b"SELECT" => Cow::Borrowed("SELECT"),
+            b"TRUNCATE TABLE" => Cow::Borrowed("TRUNCATE TABLE"),
+            b"UPDATE" => Cow::Borrowed("UPDATE"),
+            _ => Cow::Owned(value.to_string_lossy().into_owned()),
+        }
+    }
+
     #[derive(Clone, Debug)]
     pub struct PgCoreSession;
 
@@ -764,7 +793,7 @@ mod inner {
                         .collect::<Vec<_>>();
                     ExecutionStatement {
                         command_tag: unsafe {
-                            c_string(fastpg_pgcore_execute_statement_command_tag(
+                            command_tag(fastpg_pgcore_execute_statement_command_tag(
                                 self.as_ptr(),
                                 statement_index,
                             ))

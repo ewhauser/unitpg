@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -58,7 +59,7 @@ pub enum QueryExecution {
     Empty,
     Rows(QueryResult),
     Command {
-        tag: String,
+        tag: Cow<'static, str>,
         rows: usize,
     },
     CopyIn(CopyTarget),
@@ -426,12 +427,11 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn result_fields(&self, statement: &BoundStatement) -> Vec<Column> {
-        if let BoundStatement::SelectColumnWhereInt { table, column, .. } = statement {
-            if let Some(data_type) =
+        if let BoundStatement::SelectColumnWhereInt { table, column, .. } = statement
+            && let Some(data_type) =
                 self.with_read_tables(|tables| tables.get(table)?.column_type(column))
-            {
-                return vec![Column::new(column, data_type)];
-            }
+        {
+            return vec![Column::new(column, data_type)];
         }
 
         result_fields_for_statement(statement)
@@ -521,7 +521,7 @@ impl QueryExecutor {
             return undefined_table(&missing);
         }
         QueryExecution::Command {
-            tag: "DROP TABLE".to_owned(),
+            tag: "DROP TABLE".into(),
             rows: 0,
         }
     }
@@ -536,11 +536,11 @@ impl QueryExecutor {
             true
         }) {
             QueryExecution::Command {
-                tag: "CREATE TABLE".to_owned(),
+                tag: "CREATE TABLE".into(),
                 rows: 0,
             }
         } else {
-            return execution_error("42P07", format!("relation \"{name}\" already exists"));
+            execution_error("42P07", format!("relation \"{name}\" already exists"))
         }
     }
 
@@ -559,7 +559,7 @@ impl QueryExecutor {
         }
 
         QueryExecution::Command {
-            tag: "TRUNCATE TABLE".to_owned(),
+            tag: "TRUNCATE TABLE".into(),
             rows: 0,
         }
     }
@@ -568,7 +568,7 @@ impl QueryExecutor {
     fn execute_begin(&self) -> QueryExecution {
         self.begin_session_transaction();
         QueryExecution::Command {
-            tag: "BEGIN".to_owned(),
+            tag: "BEGIN".into(),
             rows: 0,
         }
     }
@@ -577,7 +577,7 @@ impl QueryExecutor {
     fn execute_commit(&self) -> QueryExecution {
         self.commit_session_transaction();
         QueryExecution::Command {
-            tag: "COMMIT".to_owned(),
+            tag: "COMMIT".into(),
             rows: 0,
         }
     }
@@ -586,7 +586,7 @@ impl QueryExecutor {
     fn execute_rollback(&self) -> QueryExecution {
         self.rollback_session_transaction();
         QueryExecution::Command {
-            tag: "ROLLBACK".to_owned(),
+            tag: "ROLLBACK".into(),
             rows: 0,
         }
     }
@@ -623,7 +623,7 @@ impl QueryExecutor {
 
         match result {
             Ok(rows) => QueryExecution::Command {
-                tag: "UPDATE".to_owned(),
+                tag: "UPDATE".into(),
                 rows,
             },
             Err(message) if message.starts_with("relation ") => execution_error("42P01", message),
@@ -647,7 +647,7 @@ impl QueryExecutor {
 
         match result {
             Ok(()) => QueryExecution::Command {
-                tag: "INSERT".to_owned(),
+                tag: "INSERT".into(),
                 rows: 1,
             },
             Err(message) if message.starts_with("relation ") => execution_error("42P01", message),
@@ -1160,7 +1160,7 @@ mod tests {
                 &[]
             ),
             QueryExecution::Command {
-                tag: "CREATE TABLE".to_owned(),
+                tag: "CREATE TABLE".into(),
                 rows: 0,
             }
         );
@@ -1193,7 +1193,7 @@ mod tests {
                 &[]
             ),
             QueryExecution::Command {
-                tag: "UPDATE".to_owned(),
+                tag: "UPDATE".into(),
                 rows: 1,
             }
         );
@@ -1216,7 +1216,7 @@ mod tests {
         assert_eq!(
             session_a.execute("create table session_rows(id int)", &[]),
             QueryExecution::Command {
-                tag: "CREATE TABLE".to_owned(),
+                tag: "CREATE TABLE".into(),
                 rows: 0,
             }
         );
@@ -1224,14 +1224,14 @@ mod tests {
         assert_eq!(
             session_a.execute("begin", &[]),
             QueryExecution::Command {
-                tag: "BEGIN".to_owned(),
+                tag: "BEGIN".into(),
                 rows: 0,
             }
         );
         assert_eq!(
             session_a.execute("insert into session_rows values (1)", &[]),
             QueryExecution::Command {
-                tag: "INSERT".to_owned(),
+                tag: "INSERT".into(),
                 rows: 1,
             }
         );
@@ -1242,7 +1242,7 @@ mod tests {
         assert_eq!(
             session_a.execute("rollback", &[]),
             QueryExecution::Command {
-                tag: "ROLLBACK".to_owned(),
+                tag: "ROLLBACK".into(),
                 rows: 0,
             }
         );
@@ -1295,14 +1295,14 @@ mod tests {
                 &[]
             ),
             QueryExecution::Command {
-                tag: "CREATE TABLE".to_owned(),
+                tag: "CREATE TABLE".into(),
                 rows: 0,
             }
         );
         assert_eq!(
             executor.execute(&format!("drop table if exists {table}"), &[]),
             QueryExecution::Command {
-                tag: "DROP TABLE".to_owned(),
+                tag: "DROP TABLE".into(),
                 rows: 0,
             }
         );
