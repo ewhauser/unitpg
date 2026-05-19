@@ -553,6 +553,21 @@ fn visible_session_overlays() -> Vec<CatalogOverlay> {
     }
 }
 
+pub fn has_uncommitted_catalog_changes() -> bool {
+    let session = current_catalog_session();
+    match session.lock() {
+        Ok(session) => session
+            .transaction_stack
+            .iter()
+            .any(|overlay| !overlay.is_empty()),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .transaction_stack
+            .iter()
+            .any(|overlay| !overlay.is_empty()),
+    }
+}
+
 fn ensure_catalog_transaction(session: &mut CatalogSession) {
     if session.transaction_stack.is_empty() {
         session.transaction_stack.push(CatalogOverlay::default());

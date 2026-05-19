@@ -16,15 +16,16 @@ use fastpg_catalog::{
     VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
     builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row,
-    index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
-    primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
-    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
-    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_exists,
-    relation_oid_for_index_oid, relation_summary_by_name_in_namespace, relation_summary_by_oid,
-    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
-    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
-    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    builtin_operators_by_name, catalog_row_value, catalog_rows, current_generation,
+    delete_catalog_row, has_uncommitted_catalog_changes, index_record_by_index_oid,
+    index_records_for_relation_oid, lookup_type, primary_key_index_oid_for_relation_oid,
+    primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
+    relation_by_oid, relation_column_by_attnum, relation_column_count,
+    relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
+    relation_summary_by_name_in_namespace, relation_summary_by_oid, static_catalog_by_name,
+    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
+    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -1598,6 +1599,22 @@ fn primary_key_unchanged(primary_key_spec: &UniqueIndexSpec, old_row: &Row, new_
 static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
 static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<Mutex<HashMap<u32, Option<CachedUniqueIndex>>>> =
     OnceLock::new();
+static RELATION_OID_BY_NAME_CACHE: OnceLock<Mutex<RelationOidByNameCache>> = OnceLock::new();
+
+#[derive(Debug)]
+struct RelationOidByNameCache {
+    generation: u64,
+    entries: HashMap<u32, HashMap<String, Option<u32>>>,
+}
+
+impl Default for RelationOidByNameCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: HashMap::new(),
+        }
+    }
+}
 
 fn storage() -> &'static Mutex<StorageState> {
     STORAGE.get_or_init(|| Mutex::new(StorageState::default()))
@@ -1605,6 +1622,58 @@ fn storage() -> &'static Mutex<StorageState> {
 
 fn primary_key_index_info_cache() -> &'static Mutex<HashMap<u32, Option<CachedUniqueIndex>>> {
     PRIMARY_KEY_INDEX_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn relation_oid_by_name_cache() -> &'static Mutex<RelationOidByNameCache> {
+    RELATION_OID_BY_NAME_CACHE.get_or_init(|| Mutex::new(RelationOidByNameCache::default()))
+}
+
+fn relation_oid_by_name_cache_lookup(name: &str, namespace_oid: u32) -> Option<Option<u32>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    let generation = current_generation();
+    let mut cache = relation_oid_by_name_cache()
+        .lock()
+        .expect("relation oid by name cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache
+        .entries
+        .get(&namespace_oid)
+        .and_then(|entries| entries.get(name).copied())
+}
+
+fn relation_oid_by_name_cache_store(name: &str, namespace_oid: u32, oid: Option<u32>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    let generation = current_generation();
+    let mut cache = relation_oid_by_name_cache()
+        .lock()
+        .expect("relation oid by name cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache
+        .entries
+        .entry(namespace_oid)
+        .or_default()
+        .insert(name.to_owned(), oid);
+}
+
+#[cfg(test)]
+fn clear_relation_oid_by_name_cache() {
+    if let Some(cache) = RELATION_OID_BY_NAME_CACHE.get() {
+        let mut cache = cache
+            .lock()
+            .expect("relation oid by name cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+    }
 }
 
 fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStorage) -> R) -> R {
@@ -2683,25 +2752,31 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return false;
     };
-    if let Some(relation) = virtual_catalog_by_name(&name, Oid(namespace_oid)) {
-        unsafe {
-            *oid_out = relation.relation_oid.0;
+    if let Some(cached_oid) = relation_oid_by_name_cache_lookup(&name, namespace_oid) {
+        if let Some(cached_oid) = cached_oid {
+            unsafe {
+                *oid_out = cached_oid;
+            }
+            return true;
         }
-        return true;
+        return false;
     }
-    let namespace = Oid(namespace_oid);
-    if let Some(relation_oid) = relation_oid_by_name_in_namespace(&name, namespace) {
+    let oid = if let Some(relation) = virtual_catalog_by_name(&name, Oid(namespace_oid)) {
+        Some(relation.relation_oid.0)
+    } else {
+        let namespace = Oid(namespace_oid);
+        relation_oid_by_name_in_namespace(&name, namespace)
+            .map(|relation_oid| relation_oid.0)
+            .or_else(|| {
+                let relation = primary_key_index_relation_by_name(&name, namespace)?;
+                let index_oid = primary_key_index_oid(&relation)?;
+                Some(index_oid.0)
+            })
+    };
+    relation_oid_by_name_cache_store(&name, namespace_oid, oid);
+    if let Some(oid) = oid {
         unsafe {
-            *oid_out = relation_oid.0;
-        }
-        return true;
-    }
-    if let Some(relation) = primary_key_index_relation_by_name(&name, namespace) {
-        let Some(index_oid) = primary_key_index_oid(&relation) else {
-            return false;
-        };
-        unsafe {
-            *oid_out = index_oid.0;
+            *oid_out = oid;
         }
         return true;
     }
@@ -4580,7 +4655,9 @@ unsafe fn copy_row_to_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastpg_catalog::{builtin_namespaces, static_catalog_by_name, upsert_catalog_row};
+    use fastpg_catalog::{
+        PUBLIC_NAMESPACE_OID, builtin_namespaces, static_catalog_by_name, upsert_catalog_row,
+    };
     use std::collections::BTreeMap;
     use std::ffi::CString;
     use std::ptr;
@@ -4606,6 +4683,7 @@ mod tests {
         fastpg_rust_storage_reset_limits();
         fastpg_rust_xact_abort();
         clear_primary_key_index_info_cache();
+        clear_relation_oid_by_name_cache();
         TestGuard { _guard: guard }
     }
 
@@ -4666,6 +4744,15 @@ mod tests {
             ));
         }
         row_id_out
+    }
+
+    fn relation_oid_by_name_via_ffi(name: &str, namespace_oid: u32) -> Option<u32> {
+        let name = CString::new(name).expect("relation name has no NUL");
+        let mut oid = 0;
+        unsafe {
+            fastpg_rust_catalog_relation_oid_by_name(name.as_ptr(), namespace_oid, &mut oid)
+                .then_some(oid)
+        }
     }
 
     fn install_primary_key_test_catalog() -> (u32, Oid) {
@@ -5136,6 +5223,49 @@ mod tests {
             assert_eq!(fastpg_rust_relation_row_count(relid), 1);
             assert!(fastpg_rust_relation_contains_row(relid, row_id));
         }
+    }
+
+    #[test]
+    fn relation_name_cache_skips_uncommitted_catalog_overlays() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let relation_name = format!("cache_visible_{relid}");
+        let relid_text = relid.to_string();
+        let namespace_text = PUBLIC_NAMESPACE_OID.0.to_string();
+
+        assert_eq!(
+            relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
+            None
+        );
+
+        fastpg_rust_xact_begin();
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid_text),
+                ("relname", &relation_name),
+                ("relnamespace", &namespace_text),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid_text),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "0"),
+            ],
+        );
+        assert_eq!(
+            relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
+            Some(relid)
+        );
+
+        fastpg_rust_xact_abort();
+        assert_eq!(
+            relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
+            None
+        );
     }
 
     #[test]
