@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 
 use std::fmt::Debug;
+use std::io;
+use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -24,6 +26,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use tokio::sync::Semaphore;
 
 #[derive(Debug)]
 pub struct FastPgServerHandlers {
@@ -44,6 +47,45 @@ impl FastPgServerHandlers {
     pub fn with_server_state(server: Arc<ServerState>) -> Self {
         Self {
             handler: Arc::new(FastPgWireHandler::with_server_state(server)),
+        }
+    }
+
+    pub fn with_execution_concurrency(max_concurrency: NonZeroUsize) -> Self {
+        Self {
+            handler: Arc::new(
+                FastPgWireHandler::with_server_version_and_execution_concurrency(
+                    fastpg_compat::DEFAULT_SERVER_VERSION,
+                    max_concurrency,
+                ),
+            ),
+        }
+    }
+
+    pub fn with_server_version_and_execution_concurrency(
+        server_version: impl Into<String>,
+        max_concurrency: NonZeroUsize,
+    ) -> Self {
+        Self {
+            handler: Arc::new(
+                FastPgWireHandler::with_server_version_and_execution_concurrency(
+                    server_version,
+                    max_concurrency,
+                ),
+            ),
+        }
+    }
+
+    pub fn with_server_state_and_execution_concurrency(
+        server: Arc<ServerState>,
+        max_concurrency: NonZeroUsize,
+    ) -> Self {
+        Self {
+            handler: Arc::new(
+                FastPgWireHandler::with_server_state_and_execution_concurrency(
+                    server,
+                    max_concurrency,
+                ),
+            ),
         }
     }
 }
@@ -78,18 +120,81 @@ impl PgWireServerHandlers for FastPgServerHandlers {
 pub struct FastPgWireHandler {
     server: Arc<ServerState>,
     query_parser: Arc<NoopQueryParser>,
+    execution: ExecutionDispatcher,
 }
 
 impl FastPgWireHandler {
     pub fn new(server_version: impl Into<String>) -> Self {
-        Self::with_server_state(Arc::new(ServerState::new(server_version)))
+        Self::with_server_version_and_execution_concurrency(
+            server_version,
+            default_execution_concurrency(),
+        )
     }
 
     pub fn with_server_state(server: Arc<ServerState>) -> Self {
+        Self::with_server_state_and_execution_concurrency(server, default_execution_concurrency())
+    }
+
+    pub fn with_server_version_and_execution_concurrency(
+        server_version: impl Into<String>,
+        max_concurrency: NonZeroUsize,
+    ) -> Self {
+        Self::with_server_state_and_execution_concurrency(
+            Arc::new(ServerState::new(server_version)),
+            max_concurrency,
+        )
+    }
+
+    pub fn with_server_state_and_execution_concurrency(
+        server: Arc<ServerState>,
+        max_concurrency: NonZeroUsize,
+    ) -> Self {
         Self {
             server,
             query_parser: Arc::new(NoopQueryParser::new()),
+            execution: ExecutionDispatcher::new(max_concurrency),
         }
+    }
+
+    async fn describe_query(
+        &self,
+        session: Arc<SessionState>,
+        query: String,
+    ) -> PgWireResult<Option<QueryDescription>> {
+        self.execution
+            .run_blocking(move || session.describe(&query))
+            .await
+    }
+
+    async fn execute_query(
+        &self,
+        session: Arc<SessionState>,
+        query: String,
+        parameters: Vec<Value>,
+    ) -> PgWireResult<QueryExecution> {
+        self.execution
+            .run_blocking(move || session.execute(&query, &parameters))
+            .await
+    }
+
+    async fn push_copy_data(&self, session: Arc<SessionState>, data: Vec<u8>) -> PgWireResult<()> {
+        self.execution
+            .run_blocking(move || session.push_copy_data(&data))
+            .await?
+            .map_err(copy_data_error)
+    }
+
+    async fn finish_copy(&self, session: Arc<SessionState>) -> PgWireResult<usize> {
+        self.execution
+            .run_blocking(move || session.finish_active_copy())
+            .await?
+            .map_err(copy_data_error)
+    }
+
+    async fn abort_copy(&self, session: Arc<SessionState>) -> PgWireResult<()> {
+        self.execution
+            .run_blocking(move || session.abort_active_copy())
+            .await
     }
 }
 
@@ -128,7 +233,9 @@ impl SimpleQueryHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        let execution = session.execute(query, &[]);
+        let execution = self
+            .execute_query(session.clone(), query.to_owned(), vec![])
+            .await?;
         remember_copy_target(&session, &execution);
         Ok(vec![execution_to_response(execution, FieldFormat::Text)?])
     }
@@ -154,7 +261,10 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        let Some(description) = session.describe(&target.statement) else {
+        let Some(description) = self
+            .describe_query(session, target.statement.clone())
+            .await?
+        else {
             return Ok(DescribeStatementResponse::new(vec![], vec![]));
         };
 
@@ -175,7 +285,10 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        let Some(description) = session.describe(&target.statement.statement) else {
+        let Some(description) = self
+            .describe_query(session, target.statement.statement.clone())
+            .await?
+        else {
             return Ok(DescribePortalResponse::new(vec![]));
         };
 
@@ -197,12 +310,14 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        let query = &portal.statement.statement;
-        let parameters = match session.describe(query) {
+        let query = portal.statement.statement.clone();
+        let parameters = match self.describe_query(session.clone(), query.clone()).await? {
             Some(description) => decode_parameters(portal, &description)?,
             None => vec![],
         };
-        let execution = session.execute(query, &parameters);
+        let execution = self
+            .execute_query(session.clone(), query, parameters)
+            .await?;
         remember_copy_target(&session, &execution);
 
         execution_to_response(execution, portal.result_column_format.format_for(0))
@@ -218,9 +333,8 @@ impl CopyHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        session
-            .push_copy_data(copy_data.data.as_ref())
-            .map_err(copy_data_error)?;
+        self.push_copy_data(session, copy_data.data.as_ref().to_vec())
+            .await?;
         Ok(())
     }
 
@@ -231,7 +345,7 @@ impl CopyHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        let rows = session.finish_active_copy().map_err(copy_data_error)?;
+        let rows = self.finish_copy(session).await?;
 
         client
             .send(PgWireBackendMessage::CommandComplete(
@@ -251,13 +365,57 @@ impl CopyHandler for FastPgWireHandler {
             Ok(session) => session,
             Err(error) => return error,
         };
-        session.abort_active_copy();
+        if let Err(error) = self.abort_copy(session).await {
+            return error;
+        }
         PgWireError::UserError(Box::new(ErrorInfo::new(
             "ERROR".to_owned(),
             "57014".to_owned(),
             format!("COPY cancelled by client: {}", fail.message),
         )))
     }
+}
+
+fn default_execution_concurrency() -> NonZeroUsize {
+    std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
+}
+
+#[derive(Clone, Debug)]
+struct ExecutionDispatcher {
+    permits: Arc<Semaphore>,
+}
+
+impl ExecutionDispatcher {
+    fn new(max_concurrency: NonZeroUsize) -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(max_concurrency.get())),
+        }
+    }
+
+    async fn run_blocking<R>(
+        &self,
+        operation: impl FnOnce() -> R + Send + 'static,
+    ) -> PgWireResult<R>
+    where
+        R: Send + 'static,
+    {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(api_io_error)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            operation()
+        })
+        .await
+        .map_err(api_io_error)
+    }
+}
+
+fn api_io_error(error: impl std::error::Error + Send + Sync + 'static) -> PgWireError {
+    PgWireError::ApiError(Box::new(io::Error::other(error)))
 }
 
 fn session_for_client<C>(client: &C) -> PgWireResult<Arc<SessionState>>
@@ -506,6 +664,9 @@ fn copy_data_error(message: String) -> PgWireError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
     use pgwire::messages::response::CommandComplete;
 
     use super::*;
@@ -548,5 +709,36 @@ mod tests {
         };
         let command_complete = CommandComplete::from(tag);
         command_complete.tag
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn execution_dispatcher_caps_concurrent_blocking_work() {
+        let dispatcher = ExecutionDispatcher::new(NonZeroUsize::new(2).unwrap());
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut tasks = Vec::new();
+
+        for _ in 0..8 {
+            let dispatcher = dispatcher.clone();
+            let active = active.clone();
+            let max_active = max_active.clone();
+            tasks.push(tokio::spawn(async move {
+                dispatcher
+                    .run_blocking(move || {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_active.fetch_max(current, Ordering::SeqCst);
+                        std::thread::sleep(Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    })
+                    .await
+                    .unwrap();
+            }));
+        }
+
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        assert_eq!(max_active.load(Ordering::SeqCst), 2);
     }
 }

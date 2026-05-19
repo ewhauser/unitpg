@@ -18,3 +18,4 @@ fastpg-session.workspace = true
 fastpg-types.workspace = true
 futures.workspace = true
 pgwire.workspace = true
+tokio.workspace = true

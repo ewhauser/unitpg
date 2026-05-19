@@ -518,6 +518,7 @@ dependencies = [
  "fastpg-types",
  "futures",
  "pgwire",
+ "tokio",
 ]
 
 [[package]]
