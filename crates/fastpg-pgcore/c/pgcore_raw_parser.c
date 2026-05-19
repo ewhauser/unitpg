@@ -42,6 +42,7 @@
 #include "pgtime.h"
 #include "postmaster/postmaster.h"
 #include "tcop/cmdtag.h"
+#include "tcop/dest.h"
 #include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -1280,8 +1281,11 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 #endif
 
 			fastpg_pgcore_ensure_execution_owner();
-			dest = fastpg_pgcore_create_capture_receiver(summary,
-														 result->context);
+			if (statement->commandType != CMD_SELECT && !statement->hasReturning)
+				dest = None_Receiver;
+			else
+				dest = fastpg_pgcore_create_capture_receiver(summary,
+															 result->context);
 			query_desc = CreateQueryDesc(statement,
 										 prepared->source_text,
 										 GetTransactionSnapshot(),
