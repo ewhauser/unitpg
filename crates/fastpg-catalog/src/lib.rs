@@ -980,12 +980,24 @@ fn static_row_column_i16(
     static_row_column_value(table, row, column_name).and_then(|value| catalog_value_i16(&value))
 }
 
-fn static_row_column_string(
+fn static_row_column_identifier_matches(
     table: &StaticCatalogTable,
     row: &StaticCatalogRow,
     column_name: &str,
-) -> Option<String> {
-    static_row_column_value(table, row, column_name).and_then(|value| catalog_value_string(&value))
+    normalized: &str,
+) -> bool {
+    static_row_column_value(table, row, column_name)
+        .is_some_and(|value| catalog_value_identifier_matches(&value, normalized))
+}
+
+fn catalog_row_identifier_matches(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    column_name: &str,
+    normalized: &str,
+) -> bool {
+    catalog_row_value(table, row, column_name)
+        .is_some_and(|value| catalog_value_identifier_matches(value, normalized))
 }
 
 fn catalog_rows_matching_static<StaticMatches, RowMatches>(
@@ -1273,6 +1285,14 @@ fn catalog_value_string(value: &CatalogValue) -> Option<String> {
         }
         _ => None,
     }
+}
+
+fn catalog_value_identifier_matches(value: &CatalogValue, normalized: &str) -> bool {
+    let candidate = match value {
+        CatalogValue::Name(value) | CatalogValue::Text(value) | CatalogValue::Raw(value) => value,
+        _ => return false,
+    };
+    candidate == normalized || normalize_identifier(candidate) == normalized
 }
 
 pub fn btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
@@ -1732,20 +1752,12 @@ pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
     let mut matches = catalog_rows_matching_static(
         table.oid,
-        |table, row| {
-            static_row_column_string(table, row, "relname")
-                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
-        },
-        |row| {
-            catalog_row_value(table, row, "relname")
-                .and_then(catalog_value_string)
-                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
-        },
+        |table, row| static_row_column_identifier_matches(table, row, "relname", &name),
+        |row| catalog_row_identifier_matches(table, row, "relname", &name),
     )
     .into_iter()
     .filter_map(|row| {
-        let row_name = catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
-        if normalize_identifier(&row_name) != name {
+        if !catalog_row_identifier_matches(table, &row, "relname", &name) {
             return None;
         }
         relation_record_from_pg_class_row(&row)
@@ -1765,15 +1777,12 @@ pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Relat
     catalog_rows_matching_static(
         table.oid,
         |table, row| {
-            static_row_column_string(table, row, "relname")
-                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
+            static_row_column_identifier_matches(table, row, "relname", &name)
                 && static_row_column_oid(table, row, "relnamespace")
                     .is_some_and(|row_namespace| row_namespace == namespace)
         },
         |row| {
-            let row_name = catalog_row_value(table, row, "relname")
-                .and_then(catalog_value_string)
-                .is_some_and(|row_name| normalize_identifier(&row_name) == name);
+            let row_name = catalog_row_identifier_matches(table, row, "relname", &name);
             let row_namespace = catalog_row_value(table, row, "relnamespace")
                 .and_then(catalog_value_oid)
                 .is_some_and(|row_namespace| row_namespace == namespace);
@@ -1782,8 +1791,7 @@ pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Relat
     )
     .into_iter()
     .find_map(|row| {
-        let row_name = catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
-        if normalize_identifier(&row_name) != name {
+        if !catalog_row_identifier_matches(table, &row, "relname", &name) {
             return None;
         }
         let row_namespace =
@@ -1801,15 +1809,12 @@ pub fn relation_oid_by_name_in_namespace(name: &str, namespace: Oid) -> Option<O
     catalog_rows_matching_static(
         table.oid,
         |table, row| {
-            static_row_column_string(table, row, "relname")
-                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
+            static_row_column_identifier_matches(table, row, "relname", &name)
                 && static_row_column_oid(table, row, "relnamespace")
                     .is_some_and(|row_namespace| row_namespace == namespace)
         },
         |row| {
-            let row_name = catalog_row_value(table, row, "relname")
-                .and_then(catalog_value_string)
-                .is_some_and(|row_name| normalize_identifier(&row_name) == name);
+            let row_name = catalog_row_identifier_matches(table, row, "relname", &name);
             let row_namespace = catalog_row_value(table, row, "relnamespace")
                 .and_then(catalog_value_oid)
                 .is_some_and(|row_namespace| row_namespace == namespace);
