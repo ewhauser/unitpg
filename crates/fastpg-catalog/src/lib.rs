@@ -972,6 +972,14 @@ fn static_row_column_bool(
     static_row_column_value(table, row, column_name).and_then(|value| catalog_value_bool(&value))
 }
 
+fn static_row_column_i16(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    column_name: &str,
+) -> Option<i16> {
+    static_row_column_value(table, row, column_name).and_then(|value| catalog_value_i16(&value))
+}
+
 fn static_row_column_string(
     table: &StaticCatalogTable,
     row: &StaticCatalogRow,
@@ -1334,50 +1342,86 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
         },
     )
     .into_iter()
-    .filter_map(|row| {
-        let attrelid = catalog_row_value(table, &row, "attrelid").and_then(catalog_value_oid)?;
-        if attrelid != relation_oid {
-            return None;
-        }
-        let attnum = catalog_row_value(table, &row, "attnum").and_then(catalog_value_i16)?;
-        if attnum <= 0 {
-            return None;
-        }
-        let attisdropped = catalog_row_value(table, &row, "attisdropped")
-            .and_then(catalog_value_bool)
-            .unwrap_or(false);
-        if attisdropped {
-            return None;
-        }
-        let name = catalog_row_value(table, &row, "attname").and_then(catalog_value_string)?;
-        let type_oid = catalog_row_value(table, &row, "atttypid").and_then(catalog_value_oid)?;
-        let type_mod = catalog_row_value(table, &row, "atttypmod")
-            .and_then(catalog_value_i32)
-            .unwrap_or(-1);
-        let is_not_null = catalog_row_value(table, &row, "attnotnull")
-            .and_then(catalog_value_bool)
-            .unwrap_or(false);
-        let has_default = catalog_row_value(table, &row, "atthasdef")
-            .and_then(catalog_value_bool)
-            .unwrap_or(false);
-        let generated = catalog_row_value(table, &row, "attgenerated")
-            .and_then(catalog_value_u8)
-            .unwrap_or(0);
-        Some((
-            attnum,
-            ColumnRecord {
-                name: normalize_identifier(&name),
-                type_oid,
-                type_mod,
-                is_not_null,
-                has_default,
-                generated,
-            },
-        ))
-    })
+    .filter_map(|row| column_record_from_pg_attribute_row(table, &row, relation_oid))
     .collect::<Vec<_>>();
     columns.sort_by_key(|(attnum, _)| *attnum);
     columns.into_iter().map(|(_, column)| column).collect()
+}
+
+fn column_record_from_pg_attribute_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    relation_oid: Oid,
+) -> Option<(i16, ColumnRecord)> {
+    let attrelid = catalog_row_value(table, row, "attrelid").and_then(catalog_value_oid)?;
+    if attrelid != relation_oid {
+        return None;
+    }
+    let attnum = catalog_row_value(table, row, "attnum").and_then(catalog_value_i16)?;
+    if attnum <= 0 {
+        return None;
+    }
+    let attisdropped = catalog_row_value(table, row, "attisdropped")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    if attisdropped {
+        return None;
+    }
+    let name = catalog_row_value(table, row, "attname").and_then(catalog_value_string)?;
+    let type_oid = catalog_row_value(table, row, "atttypid").and_then(catalog_value_oid)?;
+    let type_mod = catalog_row_value(table, row, "atttypmod")
+        .and_then(catalog_value_i32)
+        .unwrap_or(-1);
+    let is_not_null = catalog_row_value(table, row, "attnotnull")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    let has_default = catalog_row_value(table, row, "atthasdef")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    let generated = catalog_row_value(table, row, "attgenerated")
+        .and_then(catalog_value_u8)
+        .unwrap_or(0);
+    Some((
+        attnum,
+        ColumnRecord {
+            name: normalize_identifier(&name),
+            type_oid,
+            type_mod,
+            is_not_null,
+            has_default,
+            generated,
+        },
+    ))
+}
+
+pub fn relation_column_by_attnum(relation_oid: Oid, attnum: i16) -> Option<ColumnRecord> {
+    if attnum <= 0 {
+        return None;
+    }
+    let table = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)?;
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "attrelid")
+                .is_some_and(|attrelid| attrelid == relation_oid)
+                && static_row_column_i16(table, row, "attnum")
+                    .is_some_and(|row_attnum| row_attnum == attnum)
+        },
+        |row| {
+            let relation_matches = catalog_row_value(table, row, "attrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|attrelid| attrelid == relation_oid);
+            let attnum_matches = catalog_row_value(table, row, "attnum")
+                .and_then(catalog_value_i16)
+                .is_some_and(|row_attnum| row_attnum == attnum);
+            relation_matches && attnum_matches
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
+        let (row_attnum, column) = column_record_from_pg_attribute_row(table, &row, relation_oid)?;
+        (row_attnum == attnum).then_some(column)
+    })
 }
 
 fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
@@ -2363,6 +2407,10 @@ mod tests {
         assert_eq!(relation_summary.column_count, 2);
         assert!(!relation_summary.has_indexes);
         assert!(!relation_summary.has_primary_key);
+        assert_eq!(
+            relation_column_by_attnum(relation.oid, 1).unwrap().name,
+            "aid"
+        );
         upsert_named_catalog_row(
             "pg_class",
             relation_oid.0 as u64,

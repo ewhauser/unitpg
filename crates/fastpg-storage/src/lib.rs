@@ -19,9 +19,9 @@ use fastpg_catalog::{
     builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row,
     index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
-    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_count,
-    relation_oid_by_name_in_namespace, relation_oid_for_index_oid, relation_summary_by_oid,
-    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
+    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_for_index_oid,
+    relation_summary_by_oid, static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
     unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
     virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
@@ -1412,15 +1412,7 @@ impl StorageState {
             if deleted_row_ids.is_empty() {
                 continue;
             }
-            let primary_key_spec = relation_by_oid(Oid(*relid)).and_then(|relation| {
-                primary_key_spec_for_relation(&relation).map(|columns| UniqueIndexSpec {
-                    index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
-                    relation_oid: relation.oid,
-                    is_primary: true,
-                    nulls_not_distinct: true,
-                    columns,
-                })
-            });
+            let primary_key_spec = primary_index_spec_for_relation_oid(Oid(*relid));
             let unchanged_row_ids = self.remove_committed_entries(
                 *relid,
                 primary_key_spec.as_ref(),
@@ -1436,15 +1428,7 @@ impl StorageState {
             if segment.rows.is_empty() {
                 continue;
             }
-            let primary_key_spec = relation_by_oid(Oid(relid)).and_then(|relation| {
-                primary_key_spec_for_relation(&relation).map(|columns| UniqueIndexSpec {
-                    index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
-                    relation_oid: relation.oid,
-                    is_primary: true,
-                    nulls_not_distinct: true,
-                    columns,
-                })
-            });
+            let primary_key_spec = primary_index_spec_for_relation_oid(Oid(relid));
             let unchanged_row_ids = unchanged_primary_key_updates.get(&relid);
             let relation = self.relations.entry(relid).or_default();
             for row in &segment.rows {
@@ -2215,33 +2199,7 @@ fn invalid_ffi_argument(message: String) -> CatalogError {
     CatalogError::new("22023", message)
 }
 
-fn primary_key_spec_for_relation(
-    relation: &fastpg_catalog::RelationRecord,
-) -> Option<Vec<IndexColumnSpec>> {
-    if relation.primary_key.is_empty() {
-        return None;
-    }
-
-    let mut columns = Vec::with_capacity(relation.primary_key.len());
-    for primary_key_column in &relation.primary_key {
-        let column_index = relation
-            .columns
-            .iter()
-            .position(|column| &column.name == primary_key_column)?;
-        let column = relation.columns.get(column_index)?;
-        let pg_type = lookup_type(column.type_oid)?;
-        columns.push(IndexColumnSpec {
-            column_index,
-            typbyval: pg_type.typbyval,
-            typlen: pg_type.typlen,
-        });
-    }
-
-    Some(columns)
-}
-
 fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
-    let relation = relation_by_oid(record.relation_oid)?;
     if !record.is_unique || !record.is_valid || !record.is_ready || !record.is_live {
         return None;
     }
@@ -2251,7 +2209,7 @@ fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<
             return None;
         }
         let column_index = usize::try_from(*attnum - 1).ok()?;
-        let column = relation.columns.get(column_index)?;
+        let column = relation_column_by_attnum(record.relation_oid, *attnum)?;
         let pg_type = lookup_type(column.type_oid)?;
         columns.push(IndexColumnSpec {
             column_index,
@@ -2286,15 +2244,9 @@ fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec
 }
 
 fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
-    let relation = relation_by_oid(relation_oid)?;
-    let columns = primary_key_spec_for_relation(&relation)?;
-    Some(UniqueIndexSpec {
-        index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
-        relation_oid: relation.oid,
-        is_primary: true,
-        nulls_not_distinct: true,
-        columns,
-    })
+    let index_oid = primary_key_index_oid_for_relation_oid(relation_oid)?;
+    let index_spec = unique_index_spec_for_index_oid(index_oid)?;
+    index_spec.is_primary.then_some(index_spec)
 }
 
 fn primary_key_index_oid(relation: &fastpg_catalog::RelationRecord) -> Option<Oid> {
