@@ -37,6 +37,8 @@ PROFILE_COMPONENT_ORDER = [
     "Runtime / memory",
     "Other",
 ]
+PROFILE_HOTSPOT_LIMIT = 40
+PROFILE_COMPONENT_CAPTURE_LIMIT = 25
 PROFILE_COMPONENT_MARKDOWN_LIMIT = 3
 PROFILE_COMPONENT_HTML_LIMIT = 8
 
@@ -896,6 +898,7 @@ class PgBenchCompare:
         )
         if profile_path.exists():
             profiler["profile_record"]["hotspots"] = profile_hotspots(profile_path)
+            profiler["profile_record"]["component_hotspots"] = profile_component_hotspots(profile_path)
         (profiler["profile_dir"] / "profile-stop.command.json").write_text(
             json.dumps(result.as_json(), indent=2) + "\n"
         )
@@ -1228,7 +1231,11 @@ def is_postgres_client_backend(command: str) -> bool:
     return not any(name in lowered for name in auxiliary_processes)
 
 
-def profile_hotspots(profile_path: Path, limit: int = 40) -> list[dict[str, Any]]:
+def profile_hotspots(profile_path: Path, limit: int = PROFILE_HOTSPOT_LIMIT) -> list[dict[str, Any]]:
+    return profile_frame_hotspots(profile_path)[:limit]
+
+
+def profile_frame_hotspots(profile_path: Path) -> list[dict[str, Any]]:
     text = read_text(profile_path)
     by_name: dict[str, dict[str, Any]] = {}
     for raw_title in SVG_TITLE_RE.findall(text):
@@ -1247,7 +1254,14 @@ def profile_hotspots(profile_path: Path, limit: int = 40) -> list[dict[str, Any]
         previous = by_name.get(name)
         if previous is None or hotspot["percent"] > previous["percent"]:
             by_name[name] = hotspot
-    return sorted(by_name.values(), key=lambda value: value["percent"], reverse=True)[:limit]
+    return sorted(by_name.values(), key=lambda value: value["percent"], reverse=True)
+
+
+def profile_component_hotspots(
+    profile_path: Path,
+    limit_per_component: int = PROFILE_COMPONENT_CAPTURE_LIMIT,
+) -> dict[str, list[dict[str, Any]]]:
+    return profile_hotspots_by_component(profile_frame_hotspots(profile_path), limit_per_component)
 
 
 def profile_component(name: str) -> str:
@@ -1278,6 +1292,7 @@ def profile_component(name: str) -> str:
         for token in (
             "raw_parser",
             "base_yy",
+            "core_yylex",
             "scanner_yy",
             "pg_parse_query",
             "parse_analyze",
@@ -1287,6 +1302,8 @@ def profile_component(name: str) -> str:
             "transform",
             "analyze",
             "settargettable",
+            "addrangetableentry",
+            "make_op",
         )
     ):
         return "Parsing / analysis"
@@ -1303,12 +1320,31 @@ def profile_component(name: str) -> str:
             "set_plan_refs",
             "create_plan",
             "create_index_paths",
+            "build_index_paths",
+            "create_index_path",
+            "finalize_plan",
             "standard_qp_callback",
             "set_rel_pathlist",
+            "set_plan_references",
             "add_base_rels",
             "build_simple_rel",
             "get_relation_info",
             "get_index_paths",
+            "deconstruct_jointree",
+            "distribute_quals_to_rels",
+            "set_baserel_size_estimates",
+            "build_base_rel_tlists",
+            "eval_const_expressions",
+            "expression_tree_mutator",
+            "cost_",
+            "selectivity",
+            "eqsel",
+            "pg_rewrite_query",
+            "queryrewrite",
+            "rewritequery",
+            "_copyquery",
+            "_copyrangetblentry",
+            "_copyalias",
         )
     ):
         return "Planning / rewrite"
@@ -1326,9 +1362,17 @@ def profile_component(name: str) -> str:
             "relation_by_oid",
             "relation_record",
             "relationidgetrelation",
+            "relation_open",
+            "relation_close",
+            "relationclose",
+            "relationincrementreferencecount",
+            "relationbuild",
+            "rangevargetrelid",
+            "index_open",
             "searchsyscache",
             "builddesc",
             "namespace",
+            "table_open",
         )
     ):
         return "Catalog / metadata"
@@ -1345,6 +1389,8 @@ def profile_component(name: str) -> str:
             "heap_",
             "heapam",
             "heapget",
+            "heaptuplesatisfies",
+            "mvcc",
             "table_",
             "tableam",
             "bt",
@@ -1384,6 +1430,9 @@ def profile_component(name: str) -> str:
         token in lowered
         for token in (
             "portalrun",
+            "portalstart",
+            "portaldrop",
+            "createportal",
             "processquery",
             "executor",
             "exec",
@@ -1414,17 +1463,24 @@ def profile_component(name: str) -> str:
             "pfree",
             "memcpy",
             "memmove",
+            "memset",
             "bzero",
+            "_xzm",
         )
     ):
         return "Runtime / memory"
     return "Other"
 
 
-def profile_hotspots_by_component(hotspots: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+def profile_hotspots_by_component(
+    hotspots: list[dict[str, Any]],
+    limit_per_component: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
     grouped = {component: [] for component in PROFILE_COMPONENT_ORDER}
     for hotspot in hotspots:
-        grouped[profile_component(str(hotspot["name"]))].append(hotspot)
+        component = profile_component(str(hotspot["name"]))
+        if limit_per_component is None or len(grouped[component]) < limit_per_component:
+            grouped[component].append(hotspot)
     return grouped
 
 
@@ -1491,6 +1547,31 @@ def profile_records_by_variant(results: dict[str, Any]) -> dict[str, dict[str, A
                 records[variant_name] = profile
                 break
     return records
+
+
+def profile_components_from_record(profile: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    if profile is None:
+        return {component: [] for component in PROFILE_COMPONENT_ORDER}
+
+    path = profile.get("path")
+    if path:
+        profile_path = Path(str(path))
+        if profile_path.exists():
+            return profile_component_hotspots(profile_path)
+
+    stored_components = profile.get("component_hotspots")
+    if isinstance(stored_components, dict):
+        grouped = {component: [] for component in PROFILE_COMPONENT_ORDER}
+        for component in PROFILE_COMPONENT_ORDER:
+            hotspots = stored_components.get(component, [])
+            if isinstance(hotspots, list):
+                grouped[component] = hotspots[:PROFILE_COMPONENT_CAPTURE_LIMIT]
+        return grouped
+
+    return profile_hotspots_by_component(
+        profile.get("hotspots", []),
+        PROFILE_COMPONENT_CAPTURE_LIMIT,
+    )
 
 
 def effective_init_steps(init_steps: str | None) -> str:
@@ -1598,14 +1679,15 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
         if all(name in profiles for name in ("normal", "fastpg")):
             normal_hotspots = profiles["normal"].get("hotspots", [])
             fastpg_hotspots = profiles["fastpg"].get("hotspots", [])
-            normal_components = profile_hotspots_by_component(normal_hotspots)
-            fastpg_components = profile_hotspots_by_component(fastpg_hotspots)
+            normal_components = profile_components_from_record(profiles["normal"])
+            fastpg_components = profile_components_from_record(profiles["fastpg"])
 
             lines.extend(["### Component Hotspots", ""])
             lines.append(
-                "Inclusive flamegraph percentages are not additive; each cell shows the top "
-                "captured frames in that component. Sample deltas compare the displayed "
-                "fastpg frames against the displayed normal Postgres frames."
+                "Inclusive flamegraph percentages are not additive. The component table scans "
+                "all captured flamegraph frames and each cell shows the top frames in that "
+                "component. Sample deltas compare the displayed fastpg frames against the "
+                "displayed normal Postgres frames."
             )
             lines.append("")
             lines.append("| component | normal Postgres | fastpg Rust server | fastpg +/- displayed samples |")
@@ -1772,10 +1854,8 @@ def render_component_table_html(
     normal: dict[str, Any] | None,
     fastpg: dict[str, Any] | None,
 ) -> str:
-    normal_hotspots = normal.get("hotspots", []) if normal else []
-    fastpg_hotspots = fastpg.get("hotspots", []) if fastpg else []
-    normal_components = profile_hotspots_by_component(normal_hotspots)
-    fastpg_components = profile_hotspots_by_component(fastpg_hotspots)
+    normal_components = profile_components_from_record(normal)
+    fastpg_components = profile_components_from_record(fastpg)
     rows = []
     for component in PROFILE_COMPONENT_ORDER:
         normal_component_hotspots = normal_components[component]
@@ -1803,10 +1883,10 @@ def render_component_table_html(
         return ""
     return (
         "<h2>Component view</h2>"
-        "<p class=\"note\">Inclusive flamegraph percentages are not additive; each cell shows "
-        "the top captured frames in that component, with the largest frame listed as the "
-        "component peak. Sample delta is the displayed fastpg frame samples minus the "
-        "displayed normal Postgres frame samples.</p>"
+        "<p class=\"note\">Inclusive flamegraph percentages are not additive. This table scans "
+        "all captured flamegraph frames and each cell shows the top frames in that component, "
+        "with the largest frame listed as the component peak. Sample delta is the displayed "
+        "fastpg frame samples minus the displayed normal Postgres frame samples.</p>"
         "<table class=\"component-table\"><thead><tr><th>component</th>"
         "<th>normal Postgres</th><th>fastpg Rust server</th><th>fastpg +/- displayed samples</th>"
         "</tr></thead><tbody>"
@@ -1833,7 +1913,7 @@ def html_component_hotspots(
     limit: int = PROFILE_COMPONENT_HTML_LIMIT,
 ) -> str:
     if not hotspots:
-        return "<span class=\"muted\">No top frame captured.</span>"
+        return "<span class=\"muted\">No frame captured in this component.</span>"
     peak = hotspots[0]
     items = []
     for hotspot in hotspots[:limit]:
