@@ -1749,11 +1749,15 @@ def profile_component(name: str) -> str:
             "commit",
             "rollback",
             "abort",
-            "wal",
             "xlog",
             "clog",
             "subtrans",
-            "lock",
+            "lockacquire",
+            "lockrelease",
+            "lockrelation",
+            "procreleaselocks",
+            "deadlock",
+            "lwlock",
         )
     ):
         return "Transactions / WAL"
@@ -1793,6 +1797,8 @@ def profile_component(name: str) -> str:
             "memmove",
             "memset",
             "bzero",
+            "clock_gettime",
+            "clock_gettime_nsec_np",
             "_xzm",
         )
     ):
@@ -1820,6 +1826,7 @@ def is_profile_noise(name: str) -> bool:
         "std::sys::backtrace",
         "std::thread::local::LocalKey<",
         "tokio::runtime::context::",
+        "tokio::runtime::runtime::Runtime::block_on",
         "tokio::runtime::scheduler::current_thread::Context::",
         "tokio::runtime::scheduler::current_thread::CoreGuard",
         "tokio::runtime::task::harness::Harness<",
