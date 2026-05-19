@@ -230,6 +230,7 @@ mod inner {
     static PGCORE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+    const STACK_SQL_BUFFER_LEN: usize = 1024;
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
         PgCoreLaneMetrics {
@@ -447,12 +448,33 @@ mod inner {
         ) -> *const c_char;
     }
 
+    fn check_sql(sql: &str) -> Result<(), PgCoreError> {
+        if sql.as_bytes().contains(&0) {
+            return Err(PgCoreError::new(
+                "22023",
+                "query contains an embedded NUL byte",
+                0,
+            ));
+        }
+        Ok(())
+    }
+
+    fn with_c_sql<R>(sql: &str, f: impl FnOnce(*const c_char) -> R) -> R {
+        let bytes = sql.as_bytes();
+        if bytes.len() < STACK_SQL_BUFFER_LEN {
+            let mut buffer = [0u8; STACK_SQL_BUFFER_LEN];
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            return f(buffer.as_ptr().cast());
+        }
+        let c_sql = CString::new(sql).expect("checked SQL string does not contain embedded NULs");
+        f(c_sql.as_ptr())
+    }
+
     pub fn raw_parse(sql: &str) -> Result<RawParseSummary, PgCoreError> {
-        let c_sql = CString::new(sql)
-            .map_err(|_| PgCoreError::new("22023", "query contains an embedded NUL byte", 0))?;
+        check_sql(sql)?;
         let _guard = enter_pgcore_lane("raw_parse");
 
-        let result = unsafe { fastpg_pgcore_raw_parse(c_sql.as_ptr()) };
+        let result = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_raw_parse(c_sql) });
         let Some(result) = NonNull::new(result) else {
             return Err(PgCoreError::new(
                 "XX000",
@@ -550,10 +572,9 @@ mod inner {
         }
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
-            let c_sql = CString::new(sql)
-                .map_err(|_| PgCoreError::new("22023", "query contains an embedded NUL byte", 0))?;
+            check_sql(sql)?;
             let _guard = enter_pgcore_lane("prepare");
-            let prepared = unsafe { fastpg_pgcore_prepare(c_sql.as_ptr()) };
+            let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
             let Some(prepared) = NonNull::new(prepared) else {
                 return Err(PgCoreError::new(
                     "XX000",
