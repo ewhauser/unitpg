@@ -417,6 +417,30 @@ impl CatalogOverlay {
             }
         }
     }
+
+    fn apply_to_filtered_values<T, F>(
+        &self,
+        relation_oid: Oid,
+        rows: &mut BTreeMap<u64, T>,
+        row_matches: &F,
+    ) where
+        F: Fn(&CatalogRow) -> Option<T>,
+    {
+        if let Some(tombstones) = self.tombstones.get(&relation_oid.0) {
+            for row_id in tombstones {
+                rows.remove(row_id);
+            }
+        }
+        if let Some(overlay_rows) = self.rows.get(&relation_oid.0) {
+            for (row_id, row) in overlay_rows {
+                if let Some(value) = row_matches(row) {
+                    rows.insert(*row_id, value);
+                } else {
+                    rows.remove(row_id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -986,8 +1010,24 @@ fn static_row_column_identifier_matches(
     column_name: &str,
     normalized: &str,
 ) -> bool {
-    static_row_column_value(table, row, column_name)
-        .is_some_and(|value| catalog_value_identifier_matches(&value, normalized))
+    let Some(column_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == column_name)
+    else {
+        return false;
+    };
+    match row.values.get(column_index).copied() {
+        Some(StaticCatalogValue::Raw(candidate)) => {
+            candidate == normalized || normalize_identifier(candidate) == normalized
+        }
+        Some(value) => table
+            .columns
+            .get(column_index)
+            .map(|column| static_value_to_catalog_value(column, value))
+            .is_some_and(|value| catalog_value_identifier_matches(&value, normalized)),
+        None => false,
+    }
 }
 
 fn catalog_row_identifier_matches(
@@ -1333,6 +1373,54 @@ fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
     )
     .into_iter()
     .next()
+}
+
+fn pg_class_static_oid_by_name_in_namespace(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    name: &str,
+    namespace: Oid,
+) -> Option<Oid> {
+    let row_name_matches = static_row_column_identifier_matches(table, row, "relname", name);
+    let row_namespace_matches = static_row_column_oid(table, row, "relnamespace")
+        .is_some_and(|row_namespace| row_namespace == namespace);
+    if !row_name_matches || !row_namespace_matches {
+        return None;
+    }
+    static_row_column_oid(table, row, "oid")
+}
+
+fn pg_class_row_oid_by_name_in_namespace(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    name: &str,
+    namespace: Oid,
+) -> Option<Oid> {
+    let row_name_matches = catalog_row_identifier_matches(table, row, "relname", name);
+    let row_namespace_matches = catalog_row_value(table, row, "relnamespace")
+        .and_then(catalog_value_oid)
+        .is_some_and(|row_namespace| row_namespace == namespace);
+    if !row_name_matches || !row_namespace_matches {
+        return None;
+    }
+    catalog_row_value(table, row, "oid").and_then(catalog_value_oid)
+}
+
+fn pg_class_static_oid_exists(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    oid: Oid,
+) -> Option<()> {
+    static_row_column_oid(table, row, "oid")
+        .is_some_and(|row_oid| row_oid == oid)
+        .then_some(())
+}
+
+fn pg_class_row_oid_exists(table: &StaticCatalogTable, row: &CatalogRow, oid: Oid) -> Option<()> {
+    catalog_row_value(table, row, "oid")
+        .and_then(catalog_value_oid)
+        .is_some_and(|row_oid| row_oid == oid)
+        .then_some(())
 }
 
 fn catalog_value_int2_vector(value: &CatalogValue) -> Option<Vec<i16>> {
@@ -1812,23 +1900,26 @@ pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Relat
 pub fn relation_oid_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Oid> {
     let name = normalize_identifier(name);
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
-    catalog_rows_matching_static(
-        table.oid,
-        |table, row| {
-            static_row_column_identifier_matches(table, row, "relname", &name)
-                && static_row_column_oid(table, row, "relnamespace")
-                    .is_some_and(|row_namespace| row_namespace == namespace)
-        },
-        |row| {
-            let row_name = catalog_row_identifier_matches(table, row, "relname", &name);
-            let row_namespace = catalog_row_value(table, row, "relnamespace")
-                .and_then(catalog_value_oid)
-                .is_some_and(|row_namespace| row_namespace == namespace);
-            row_name && row_namespace
-        },
-    )
-    .into_iter()
-    .find_map(|row| catalog_row_value(table, &row, "oid").and_then(catalog_value_oid))
+    let session_overlays = visible_session_overlays();
+    with_catalog_read(|state| {
+        let mut rows = BTreeMap::<u64, Oid>::new();
+        for row in table.rows {
+            if let Some(oid) =
+                pg_class_static_oid_by_name_in_namespace(table, row, &name, namespace)
+            {
+                rows.insert(row.row_id, oid);
+            }
+        }
+        let row_matches =
+            |row: &CatalogRow| pg_class_row_oid_by_name_in_namespace(table, row, &name, namespace);
+        state
+            .overlay
+            .apply_to_filtered_values(table.oid, &mut rows, &row_matches);
+        for overlay in &session_overlays {
+            overlay.apply_to_filtered_values(table.oid, &mut rows, &row_matches);
+        }
+        rows.into_values().next()
+    })
 }
 
 pub fn relations() -> Vec<RelationRecord> {
@@ -1846,7 +1937,26 @@ pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
 }
 
 pub fn relation_oid_exists(oid: Oid) -> bool {
-    relation_pg_class_row_by_oid(oid).is_some()
+    let Some(table) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID) else {
+        return false;
+    };
+    let session_overlays = visible_session_overlays();
+    with_catalog_read(|state| {
+        let mut rows = BTreeMap::<u64, ()>::new();
+        for row in table.rows {
+            if pg_class_static_oid_exists(table, row, oid).is_some() {
+                rows.insert(row.row_id, ());
+            }
+        }
+        let row_matches = |row: &CatalogRow| pg_class_row_oid_exists(table, row, oid);
+        state
+            .overlay
+            .apply_to_filtered_values(table.oid, &mut rows, &row_matches);
+        for overlay in &session_overlays {
+            overlay.apply_to_filtered_values(table.oid, &mut rows, &row_matches);
+        }
+        !rows.is_empty()
+    })
 }
 
 pub fn relation_summary_by_oid(oid: Oid) -> Option<RelationSummaryRecord> {
@@ -2409,6 +2519,7 @@ mod tests {
             relation_by_name("pgbench_accounts").unwrap().oid,
             relation.oid
         );
+        assert!(relation_oid_exists(relation.oid));
         assert_eq!(
             relation_oid_by_name_in_namespace("pgbench_accounts", PUBLIC_NAMESPACE_OID),
             Some(relation.oid)
@@ -2549,6 +2660,7 @@ mod tests {
         commit_implicit_transaction();
         assert!(current_generation() > after_primary_key_generation);
         assert!(relation_by_name("pgbench_accounts").is_none());
+        assert!(!relation_oid_exists(relation.oid));
         assert!(!catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
             value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")
         }));
