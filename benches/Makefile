@@ -22,9 +22,15 @@ PROFILE_TOOL ?= flamegraph
 PROFILE_PHASE ?= run
 PROFILE_OPEN ?= 0
 PROFILE_WARMUP_SECONDS ?= 0.1
+PROFILE_HYPERFINE ?= 1
+PROFILE_HYPERFINE_RUNS ?= 1
+PROFILE_HYPERFINE_WARMUP ?= 0
+PROFILE_SERVER_MEMORY ?= 1
 CRITERION_ARGS ?=
 CLIPPY_ARGS ?= --workspace --all-targets
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
+PROFILE_HYPERFINE_FLAG := $(if $(filter 1 true yes,$(PROFILE_HYPERFINE)),--profile-hyperfine,)
+PROFILE_SERVER_MEMORY_FLAG := $(if $(filter 1 true yes,$(PROFILE_SERVER_MEMORY)),--profile-server-memory,)
 REGRESSION_CASES_ARG := $(if $(REGRESSION_CASES_DIR),--cases-dir "$(REGRESSION_CASES_DIR)",)
 REGRESSION_ALLOW_FAILURES_ARG := $(if $(filter 1 true yes,$(REGRESSION_ALLOW_FAILURES)),--allow-fastpg-failures,)
 
@@ -55,6 +61,10 @@ PGBENCH_PROFILE_ARGS = \
 	--profile-tool "$(PROFILE_TOOL)" \
 	--profile-phase "$(PROFILE_PHASE)" \
 	--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" \
+	--profile-hyperfine-runs "$(PROFILE_HYPERFINE_RUNS)" \
+	--profile-hyperfine-warmup "$(PROFILE_HYPERFINE_WARMUP)" \
+	$(PROFILE_HYPERFINE_FLAG) \
+	$(PROFILE_SERVER_MEMORY_FLAG) \
 	$(PROFILE_OPEN_FLAG)
 
 .PHONY: pgbench pgbench-simple-indexed pgbench-tpcb profile profile-open profile-side-by-side profile-open-latest
@@ -110,7 +120,12 @@ profile-side-by-side:
 		--profile-fastpg-rust-server \
 		--profile-tool "$(PROFILE_TOOL)" \
 		--profile-phase "run" \
-		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" $(PROFILE_OPEN_FLAG)
+		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" \
+		--profile-hyperfine-runs "$(PROFILE_HYPERFINE_RUNS)" \
+		--profile-hyperfine-warmup "$(PROFILE_HYPERFINE_WARMUP)" \
+		$(PROFILE_HYPERFINE_FLAG) \
+		$(PROFILE_SERVER_MEMORY_FLAG) \
+		$(PROFILE_OPEN_FLAG)
 
 profile-open-latest:
 	$(PYTHON) open_latest_profile.py

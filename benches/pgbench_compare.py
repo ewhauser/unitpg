@@ -9,10 +9,13 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -70,6 +73,90 @@ class CommandResult:
         }
 
 
+class ProcessMemorySampler:
+    def __init__(self, pid: int, interval_seconds: float = 0.1):
+        self.pid = pid
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._samples: list[int] = []
+
+    def __enter__(self) -> "ProcessMemorySampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            rss_kb = process_rss_kb(self.pid)
+            if rss_kb is not None:
+                self._samples.append(rss_kb * 1024)
+            self._stop.wait(self.interval_seconds)
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if not self._samples:
+            return {
+                "pid": self.pid,
+                "sample_count": 0,
+                "interval_seconds": self.interval_seconds,
+            }
+        return {
+            "pid": self.pid,
+            "sample_count": len(self._samples),
+            "interval_seconds": self.interval_seconds,
+            "first_rss_bytes": self._samples[0],
+            "last_rss_bytes": self._samples[-1],
+            "max_rss_bytes": max(self._samples),
+        }
+
+
+class PostgresBackendMemorySampler:
+    def __init__(self, postmaster_pid: int, interval_seconds: float = 0.1):
+        self.postmaster_pid = postmaster_pid
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._samples: list[int] = []
+
+    def __enter__(self) -> "PostgresBackendMemorySampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            backend_pid = postgres_backend_child_pid(self.postmaster_pid)
+            if backend_pid is not None:
+                rss_kb = process_rss_kb(backend_pid)
+                if rss_kb is not None:
+                    self._samples.append(rss_kb * 1024)
+            self._stop.wait(self.interval_seconds)
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if not self._samples:
+            return {
+                "postmaster_pid": self.postmaster_pid,
+                "sample_count": 0,
+                "interval_seconds": self.interval_seconds,
+            }
+        return {
+            "postmaster_pid": self.postmaster_pid,
+            "sample_count": len(self._samples),
+            "interval_seconds": self.interval_seconds,
+            "first_rss_bytes": self._samples[0],
+            "last_rss_bytes": self._samples[-1],
+            "max_rss_bytes": max(self._samples),
+        }
+
+
 class BenchmarkFailure(Exception):
     def __init__(self, variant: str, phase: str, result: CommandResult, output_dir: Path):
         self.variant = variant
@@ -117,6 +204,10 @@ class PgBenchCompare:
                 "profile_phase": args.profile_phase,
                 "profile_open": args.profile_open,
                 "profile_warmup_seconds": args.profile_warmup_seconds,
+                "profile_hyperfine": args.profile_hyperfine,
+                "profile_hyperfine_runs": args.profile_hyperfine_runs,
+                "profile_hyperfine_warmup": args.profile_hyperfine_warmup,
+                "profile_server_memory": args.profile_server_memory,
             },
             "workload": workload_metadata(args.builtin, args.init_steps),
             "warnings": workload_warnings(args.init_steps),
@@ -419,7 +510,7 @@ class PgBenchCompare:
 
             if self.should_profile_normal_postgres(variant) and self.args.profile_phase == "run":
                 postmaster_pid = read_postmaster_pid(data_dir)
-                bench, profiler = self.run_profiled_postgres_pgbench(
+                bench, profiler, server_memory = self.run_profiled_postgres_pgbench(
                     variant.name,
                     self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
                     postmaster_pid,
@@ -427,6 +518,8 @@ class PgBenchCompare:
                     env,
                 )
                 run_record["commands"]["profile_start"] = profiler["result"].as_json()
+                if server_memory is not None:
+                    run_record.setdefault("memory", {})["pgbench_run"] = server_memory
             else:
                 bench = self.checked_command(
                     variant.name,
@@ -438,6 +531,24 @@ class PgBenchCompare:
                 )
             run_record["commands"]["pgbench_run"] = bench.as_json()
             run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
+            if profiler is not None:
+                profile_result = self.finish_profiler(profiler, run_dir)
+                run_record["commands"]["profile_stop"] = profile_result.as_json()
+                run_record["profile"] = profiler["profile_record"]
+                profiler = None
+                if profile_result.returncode != 0:
+                    raise BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
+            if self.args.profile_hyperfine:
+                hyperfine = self.run_hyperfine_pgbench(
+                    variant.name,
+                    self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
+                    run_dir,
+                    env,
+                    memory_pid=None,
+                    memory_postmaster_pid=read_postmaster_pid(data_dir),
+                )
+                run_record["commands"]["hyperfine"] = hyperfine["result"].as_json()
+                run_record["hyperfine"] = hyperfine["record"]
             return run_record
         finally:
             active_failure = sys.exc_info()[0] is not None
@@ -530,16 +641,45 @@ class PgBenchCompare:
                 profiler = self.start_rust_profiler(variant.name, server, run_dir)
                 run_record["commands"]["profile_start"] = profiler["result"].as_json()
 
-            bench = self.checked_command(
-                variant.name,
-                "pgbench-run",
-                self.pgbench_run_command(paths["client_bindir"], host, port),
-                run_dir,
-                "pgbench-run",
-                env=env,
+            memory_sampler = (
+                ProcessMemorySampler(server["process"].pid)
+                if self.args.profile_server_memory
+                else None
             )
+            if memory_sampler is not None:
+                memory_sampler.__enter__()
+            try:
+                bench = self.checked_command(
+                    variant.name,
+                    "pgbench-run",
+                    self.pgbench_run_command(paths["client_bindir"], host, port),
+                    run_dir,
+                    "pgbench-run",
+                    env=env,
+                )
+            finally:
+                if memory_sampler is not None:
+                    run_record.setdefault("memory", {})["pgbench_run"] = memory_sampler.stop()
             run_record["commands"]["pgbench_run"] = bench.as_json()
             run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
+            if profiler is not None:
+                profile_result = self.finish_rust_profiler(profiler, run_dir)
+                run_record["commands"]["profile_stop"] = profile_result.as_json()
+                run_record["profile"] = profiler["profile_record"]
+                profiler = None
+                if profile_result.returncode != 0:
+                    raise BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
+            if self.args.profile_hyperfine:
+                hyperfine = self.run_hyperfine_pgbench(
+                    variant.name,
+                    self.pgbench_run_command(paths["client_bindir"], host, port),
+                    run_dir,
+                    env,
+                    memory_pid=server["process"].pid,
+                    memory_postmaster_pid=None,
+                )
+                run_record["commands"]["hyperfine"] = hyperfine["result"].as_json()
+                run_record["hyperfine"] = hyperfine["record"]
             return run_record
         finally:
             active_failure = sys.exc_info()[0] is not None
@@ -680,7 +820,7 @@ class PgBenchCompare:
         postmaster_pid: int,
         output_dir: Path,
         env: dict[str, str],
-    ) -> tuple[CommandResult, dict[str, Any]]:
+    ) -> tuple[CommandResult, dict[str, Any], dict[str, Any] | None]:
         output_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = output_dir / "pgbench-run.stdout"
         stderr_path = output_dir / "pgbench-run.stderr"
@@ -696,6 +836,8 @@ class PgBenchCompare:
             stderr=stderr_file,
         )
         profiler: dict[str, Any] | None = None
+        memory_sampler: ProcessMemorySampler | None = None
+        server_memory: dict[str, Any] | None = None
         try:
             backend_pid = wait_for_postgres_backend(postmaster_pid, pgbench_process)
             if backend_pid is None:
@@ -727,8 +869,17 @@ class PgBenchCompare:
                 "normal-postgres-flamegraph.svg",
                 "normal Postgres pgbench backend",
             )
+            memory_sampler = (
+                ProcessMemorySampler(backend_pid)
+                if self.args.profile_server_memory
+                else None
+            )
+            if memory_sampler is not None:
+                memory_sampler.__enter__()
             pgbench_process.wait()
         finally:
+            if memory_sampler is not None:
+                server_memory = memory_sampler.stop()
             stdout_file.close()
             stderr_file.close()
 
@@ -744,7 +895,85 @@ class PgBenchCompare:
         if result.returncode != 0:
             raise BenchmarkFailure(variant, "pgbench-run", result, output_dir)
         assert profiler is not None
-        return result, profiler
+        return result, profiler, server_memory
+
+    def run_hyperfine_pgbench(
+        self,
+        variant: str,
+        pgbench_command: list[str],
+        output_dir: Path,
+        env: dict[str, str],
+        *,
+        memory_pid: int | None,
+        memory_postmaster_pid: int | None,
+    ) -> dict[str, Any]:
+        hyperfine = shutil.which("hyperfine")
+        if hyperfine is None:
+            raise BenchmarkFailure(
+                variant,
+                "hyperfine",
+                CommandResult(["hyperfine"], str(self.source_root), 1, "", "missing hyperfine", 0.0),
+                output_dir,
+            )
+
+        json_path = output_dir / "hyperfine.json"
+        command = [
+            hyperfine,
+            "--style",
+            "none",
+            "--runs",
+            str(self.args.profile_hyperfine_runs),
+            "--warmup",
+            str(self.args.profile_hyperfine_warmup),
+            "--export-json",
+            str(json_path),
+            "--command-name",
+            f"{variant} pgbench run",
+            shlex.join(pgbench_command),
+        ]
+        started = time.monotonic()
+        memory_sampler: ProcessMemorySampler | PostgresBackendMemorySampler | None = None
+        if self.args.profile_server_memory:
+            if memory_pid is not None:
+                memory_sampler = ProcessMemorySampler(memory_pid)
+            elif memory_postmaster_pid is not None:
+                memory_sampler = PostgresBackendMemorySampler(memory_postmaster_pid)
+        if memory_sampler is not None:
+            memory_sampler.__enter__()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.source_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        finally:
+            server_memory = memory_sampler.stop() if memory_sampler is not None else None
+
+        result = CommandResult(
+            command,
+            str(self.source_root),
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            time.monotonic() - started,
+        )
+        (output_dir / "hyperfine.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
+        (output_dir / "hyperfine.stdout").write_text(completed.stdout)
+        (output_dir / "hyperfine.stderr").write_text(completed.stderr)
+        if result.returncode != 0:
+            raise BenchmarkFailure(variant, "hyperfine", result, output_dir)
+
+        record: dict[str, Any] = {
+            "path": str(json_path),
+            "summary": parse_hyperfine_summary(json_path),
+        }
+        if server_memory is not None:
+            record["server_memory"] = server_memory
+        return {"result": result, "record": record}
 
     def start_rust_profiler(
         self,
@@ -793,6 +1022,7 @@ class PgBenchCompare:
             text=True,
             stdout=stdout_file,
             stderr=stderr_file,
+            start_new_session=(os.name != "nt"),
         )
         if self.args.profile_warmup_seconds > 0:
             time.sleep(self.args.profile_warmup_seconds)
@@ -867,12 +1097,20 @@ class PgBenchCompare:
         return command, output
 
     def finish_rust_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
-        return self.finish_profiler(profiler, output_dir)
+        return self.finish_profiler(profiler, output_dir, stop_running=True)
 
-    def finish_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
+    def finish_profiler(
+        self,
+        profiler: dict[str, Any],
+        output_dir: Path,
+        *,
+        stop_running: bool = False,
+    ) -> CommandResult:
         started = time.monotonic()
         process = profiler["process"]
         command = ["wait-profile", f"pid={process.pid}"]
+        if stop_running and process.poll() is None:
+            interrupt_process_group(process)
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -1084,6 +1322,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=1.0,
         help="seconds to wait after starting the profiler before running pgbench",
     )
+    parser.add_argument(
+        "--profile-hyperfine",
+        action="store_true",
+        help="run a hyperfine timing pass against the already-started server",
+    )
+    parser.add_argument(
+        "--profile-hyperfine-runs",
+        type=int,
+        default=1,
+        help="number of hyperfine timing runs when --profile-hyperfine is set",
+    )
+    parser.add_argument(
+        "--profile-hyperfine-warmup",
+        type=int,
+        default=0,
+        help="number of hyperfine warmup runs when --profile-hyperfine is set",
+    )
+    parser.add_argument(
+        "--profile-server-memory",
+        action="store_true",
+        help="sample server RSS during profiled pgbench and hyperfine runs",
+    )
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
@@ -1093,6 +1353,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:
         parser.error("--profile-warmup-seconds must be non-negative")
+    if args.profile_hyperfine_runs < 1:
+        parser.error("--profile-hyperfine-runs must be at least 1")
+    if args.profile_hyperfine_warmup < 0:
+        parser.error("--profile-hyperfine-warmup must be non-negative")
     return args
 
 
@@ -1165,6 +1429,35 @@ def read_text(path: Path) -> str:
         return path.read_text()
     except FileNotFoundError:
         return ""
+
+
+def process_rss_kb(pid: int) -> int | None:
+    ps = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(pid)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if ps.returncode != 0:
+        return None
+    output = ps.stdout.strip()
+    if not output:
+        return None
+    try:
+        return int(output.splitlines()[-1].strip())
+    except ValueError:
+        return None
+
+
+def interrupt_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGINT)
+        else:
+            process.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        return
 
 
 def read_postmaster_pid(data_dir: Path) -> int:
@@ -1553,6 +1846,26 @@ def parse_pgbench_metrics(stdout: str) -> dict[str, float | None]:
     }
 
 
+def parse_hyperfine_summary(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text())
+    results = data.get("results", [])
+    if not results:
+        return {}
+    result = results[0]
+    memory_values = [int(value) for value in result.get("memory_usage_byte", []) if value is not None]
+    return {
+        "mean_seconds": result.get("mean"),
+        "stddev_seconds": result.get("stddev"),
+        "median_seconds": result.get("median"),
+        "min_seconds": result.get("min"),
+        "max_seconds": result.get("max"),
+        "user_seconds": result.get("user"),
+        "system_seconds": result.get("system"),
+        "runs": len(result.get("times", [])),
+        "command_max_rss_bytes": max(memory_values) if memory_values else None,
+    }
+
+
 def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
     tps_values = [
         run.get("metrics", {}).get("tps_without_initial_connection")
@@ -1575,6 +1888,32 @@ def speedup_ratio(fastpg_tps: float | None, normal_tps: float | None) -> float |
     if fastpg_tps is None or normal_tps in (None, 0):
         return None
     return fastpg_tps / normal_tps
+
+
+def first_run_for_variant(results: dict[str, Any], variant_name: str) -> dict[str, Any] | None:
+    runs = results.get("variants", {}).get(variant_name, {}).get("runs", [])
+    return runs[0] if runs else None
+
+
+def run_metric_value(run: dict[str, Any] | None, path: tuple[str, ...]) -> Any:
+    value: Any = run
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def metric_delta(fastpg: float | int | None, normal: float | int | None) -> float | None:
+    if fastpg is None or normal is None:
+        return None
+    return float(fastpg) - float(normal)
+
+
+def metric_ratio(fastpg: float | int | None, normal: float | int | None) -> float | None:
+    if fastpg is None or normal in (None, 0):
+        return None
+    return float(fastpg) / float(normal)
 
 
 def profile_records_by_variant(results: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -1728,6 +2067,30 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
         )
         lines.extend(["## Comparison", "", f"- fastpg/normal median TPS ratio: `{ratio}`", ""])
 
+    metric_rows = [
+        row
+        for row in profile_run_metric_rows(results)
+        if row["normal"] is not None or row["fastpg"] is not None
+    ]
+    if metric_rows:
+        lines.extend(["## Run Metrics", ""])
+        lines.append(
+            "Wall-time rows come from pgbench and, when enabled, hyperfine. Memory rows are "
+            "RSS measurements for the measured command/server process, not stack-level "
+            "allocation traces."
+        )
+        lines.append("")
+        lines.append("| metric | normal Postgres | fastpg Rust server | fastpg - normal | fastpg / normal |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for row in metric_rows:
+            unit = str(row["unit"])
+            lines.append(
+                f"| {row['label']} | {format_metric_value(row['normal'], unit)} | "
+                f"{format_metric_value(row['fastpg'], unit)} | "
+                f"{format_metric_delta(row['delta'], unit)} | {format_metric_ratio(row['ratio'])} |"
+            )
+        lines.append("")
+
     profiles = profile_records_by_variant(results)
     if profiles:
         lines.extend(["## Profiles", ""])
@@ -1842,6 +2205,134 @@ def format_sample_delta_cell(delta: int) -> str:
     return f"`{sign}{delta:,}` samples"
 
 
+def profile_run_metric_rows(results: dict[str, Any]) -> list[dict[str, Any]]:
+    normal_run = first_run_for_variant(results, "normal")
+    fastpg_run = first_run_for_variant(results, "fastpg")
+    profiles = profile_records_by_variant(results)
+
+    def add_row(label: str, unit: str, normal: Any, fastpg: Any) -> dict[str, Any]:
+        return {
+            "label": label,
+            "unit": unit,
+            "normal": normal,
+            "fastpg": fastpg,
+            "delta": metric_delta(fastpg, normal),
+            "ratio": metric_ratio(fastpg, normal),
+        }
+
+    return [
+        add_row(
+            "pgbench average latency",
+            "milliseconds",
+            run_metric_value(normal_run, ("metrics", "latency_average_ms")),
+            run_metric_value(fastpg_run, ("metrics", "latency_average_ms")),
+        ),
+        add_row(
+            "pgbench TPS",
+            "float",
+            run_metric_value(normal_run, ("metrics", "tps_without_initial_connection")),
+            run_metric_value(fastpg_run, ("metrics", "tps_without_initial_connection")),
+        ),
+        add_row(
+            "pgbench command wall time",
+            "seconds",
+            run_metric_value(normal_run, ("commands", "pgbench_run", "seconds")),
+            run_metric_value(fastpg_run, ("commands", "pgbench_run", "seconds")),
+        ),
+        add_row(
+            "hyperfine mean wall time",
+            "seconds",
+            run_metric_value(normal_run, ("hyperfine", "summary", "mean_seconds")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "mean_seconds")),
+        ),
+        add_row(
+            "hyperfine median wall time",
+            "seconds",
+            run_metric_value(normal_run, ("hyperfine", "summary", "median_seconds")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "median_seconds")),
+        ),
+        add_row(
+            "hyperfine stddev",
+            "seconds",
+            run_metric_value(normal_run, ("hyperfine", "summary", "stddev_seconds")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "stddev_seconds")),
+        ),
+        add_row(
+            "hyperfine command max RSS",
+            "bytes",
+            run_metric_value(normal_run, ("hyperfine", "summary", "command_max_rss_bytes")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "command_max_rss_bytes")),
+        ),
+        add_row(
+            "server max RSS during pgbench",
+            "bytes",
+            run_metric_value(normal_run, ("memory", "pgbench_run", "max_rss_bytes")),
+            run_metric_value(fastpg_run, ("memory", "pgbench_run", "max_rss_bytes")),
+        ),
+        add_row(
+            "server max RSS during hyperfine",
+            "bytes",
+            run_metric_value(normal_run, ("hyperfine", "server_memory", "max_rss_bytes")),
+            run_metric_value(fastpg_run, ("hyperfine", "server_memory", "max_rss_bytes")),
+        ),
+        add_row(
+            "profile samples",
+            "samples",
+            profile_total_samples_from_record(profiles.get("normal")),
+            profile_total_samples_from_record(profiles.get("fastpg")),
+        ),
+    ]
+
+
+def format_metric_value(value: Any, unit: str) -> str:
+    if value is None:
+        return ""
+    if unit == "bytes":
+        return format_bytes(float(value))
+    if unit == "seconds":
+        return f"{float(value):.3f} s"
+    if unit == "milliseconds":
+        return f"{float(value):.3f} ms"
+    if unit == "samples":
+        return f"{int(value):,}"
+    return f"{float(value):.3f}"
+
+
+def format_metric_delta(value: Any, unit: str) -> str:
+    if value is None:
+        return ""
+    sign = "+" if float(value) > 0 else ""
+    if unit == "bytes":
+        return f"{sign}{format_bytes(float(value))}"
+    if unit == "seconds":
+        return f"{sign}{float(value):.3f} s"
+    if unit == "milliseconds":
+        return f"{sign}{float(value):.3f} ms"
+    if unit == "samples":
+        return f"{sign}{int(value):,}"
+    return f"{sign}{float(value):.3f}"
+
+
+def format_metric_ratio(value: Any) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.3f}x"
+
+
+def format_bytes(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    units = ("B", "KiB", "MiB", "GiB")
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{sign}{value:.0f} {unit}"
+    return f"{sign}{value:.2f} {unit}"
+
+
 def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -> str:
     profiles = profile_records_by_variant(results)
     normal = profiles.get("normal")
@@ -1877,6 +2368,7 @@ def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -
 </head>
 <body>
   <h1>pgbench profile comparison</h1>
+  {render_run_metrics_html(results)}
   <div class=\"profiles\">
     <section class=\"profile\">
       <h2>normal Postgres</h2>
@@ -1914,6 +2406,44 @@ def profile_sample_summary(profile: dict[str, Any] | None) -> str:
     if total_samples is None:
         return ""
     return f'<p class="note">total profile samples: {total_samples:,}</p>'
+
+
+def render_run_metrics_html(results: dict[str, Any]) -> str:
+    rows = []
+    for row in profile_run_metric_rows(results):
+        unit = str(row["unit"])
+        normal = format_metric_value(row["normal"], unit)
+        fastpg = format_metric_value(row["fastpg"], unit)
+        if not normal and not fastpg:
+            continue
+        rows.append(
+            "<tr>"
+            f"<th scope=\"row\">{html.escape(str(row['label']))}</th>"
+            f"<td>{html_metric_value(normal)}</td>"
+            f"<td>{html_metric_value(fastpg)}</td>"
+            f"<td>{html_metric_value(format_metric_delta(row['delta'], unit))}</td>"
+            f"<td>{html_metric_value(format_metric_ratio(row['ratio']))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<h2>Run metrics</h2>"
+        "<p class=\"note\">Wall-time rows come from pgbench and, when enabled, hyperfine. "
+        "Memory rows are RSS measurements for the measured command/server process; they are "
+        "allocation-pressure indicators, not stack-level allocation traces.</p>"
+        "<table><thead><tr><th>metric</th><th>normal Postgres</th>"
+        "<th>fastpg Rust server</th><th>fastpg - normal</th><th>fastpg / normal</th>"
+        "</tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def html_metric_value(value: str) -> str:
+    if not value:
+        return "<span class=\"muted\">not captured</span>"
+    return html.escape(value)
 
 
 def render_component_table_html(
