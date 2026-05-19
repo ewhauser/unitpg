@@ -381,6 +381,30 @@ impl CatalogOverlay {
             }
         }
     }
+
+    fn apply_to_filtered_rows<F>(
+        &self,
+        relation_oid: Oid,
+        rows: &mut BTreeMap<u64, CatalogRow>,
+        row_matches: &F,
+    ) where
+        F: Fn(&CatalogRow) -> bool,
+    {
+        if let Some(tombstones) = self.tombstones.get(&relation_oid.0) {
+            for row_id in tombstones {
+                rows.remove(row_id);
+            }
+        }
+        if let Some(overlay_rows) = self.rows.get(&relation_oid.0) {
+            for (row_id, row) in overlay_rows {
+                if row_matches(row) {
+                    rows.insert(*row_id, row.as_ref().clone());
+                } else {
+                    rows.remove(row_id);
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -906,6 +930,78 @@ fn static_row_to_catalog_row(table: &StaticCatalogTable, row: &StaticCatalogRow)
     }
 }
 
+fn static_row_column_value(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    column_name: &str,
+) -> Option<CatalogValue> {
+    let column_index = table
+        .columns
+        .iter()
+        .position(|column| column.name == column_name)?;
+    let column = table.columns.get(column_index)?;
+    let value = row.values.get(column_index).copied()?;
+    Some(static_value_to_catalog_value(column, value))
+}
+
+fn static_row_column_oid(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    column_name: &str,
+) -> Option<Oid> {
+    static_row_column_value(table, row, column_name).and_then(|value| catalog_value_oid(&value))
+}
+
+fn static_row_column_bool(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    column_name: &str,
+) -> Option<bool> {
+    static_row_column_value(table, row, column_name).and_then(|value| catalog_value_bool(&value))
+}
+
+fn static_row_column_string(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    column_name: &str,
+) -> Option<String> {
+    static_row_column_value(table, row, column_name).and_then(|value| catalog_value_string(&value))
+}
+
+fn catalog_rows_matching_static<StaticMatches, RowMatches>(
+    relation_oid: Oid,
+    static_matches: StaticMatches,
+    row_matches: RowMatches,
+) -> Vec<CatalogRow>
+where
+    StaticMatches: Fn(&StaticCatalogTable, &StaticCatalogRow) -> bool,
+    RowMatches: Fn(&CatalogRow) -> bool,
+{
+    let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
+        return Vec::new();
+    };
+    let session_overlays = visible_session_overlays();
+    with_catalog_read(|state| {
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+        for row in table.rows {
+            if !static_matches(table, row) {
+                continue;
+            }
+            let catalog_row = static_row_to_catalog_row(table, row);
+            if row_matches(&catalog_row) {
+                rows.insert(row.row_id, catalog_row);
+            }
+        }
+        state
+            .overlay
+            .apply_to_filtered_rows(relation_oid, &mut rows, &row_matches);
+        for overlay in &session_overlays {
+            overlay.apply_to_filtered_rows(relation_oid, &mut rows, &row_matches);
+        }
+        rows.into_values().collect()
+    })
+}
+
 pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
     let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
         return Vec::new();
@@ -1186,11 +1282,17 @@ pub fn current_generation() -> u64 {
 
 fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
-    catalog_rows(table.oid).into_iter().find(|row| {
-        catalog_row_value(table, row, "oid")
-            .and_then(catalog_value_oid)
-            .is_some_and(|row_oid| row_oid == oid)
-    })
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| static_row_column_oid(table, row, "oid").is_some_and(|row_oid| row_oid == oid),
+        |row| {
+            catalog_row_value(table, row, "oid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_oid| row_oid == oid)
+        },
+    )
+    .into_iter()
+    .next()
 }
 
 fn catalog_value_int2_vector(value: &CatalogValue) -> Option<Vec<i16>> {
@@ -1207,52 +1309,61 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
     let Some(table) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID) else {
         return Vec::new();
     };
-    let mut columns = catalog_rows(table.oid)
-        .into_iter()
-        .filter_map(|row| {
-            let attrelid =
-                catalog_row_value(table, &row, "attrelid").and_then(catalog_value_oid)?;
-            if attrelid != relation_oid {
-                return None;
-            }
-            let attnum = catalog_row_value(table, &row, "attnum").and_then(catalog_value_i16)?;
-            if attnum <= 0 {
-                return None;
-            }
-            let attisdropped = catalog_row_value(table, &row, "attisdropped")
-                .and_then(catalog_value_bool)
-                .unwrap_or(false);
-            if attisdropped {
-                return None;
-            }
-            let name = catalog_row_value(table, &row, "attname").and_then(catalog_value_string)?;
-            let type_oid =
-                catalog_row_value(table, &row, "atttypid").and_then(catalog_value_oid)?;
-            let type_mod = catalog_row_value(table, &row, "atttypmod")
-                .and_then(catalog_value_i32)
-                .unwrap_or(-1);
-            let is_not_null = catalog_row_value(table, &row, "attnotnull")
-                .and_then(catalog_value_bool)
-                .unwrap_or(false);
-            let has_default = catalog_row_value(table, &row, "atthasdef")
-                .and_then(catalog_value_bool)
-                .unwrap_or(false);
-            let generated = catalog_row_value(table, &row, "attgenerated")
-                .and_then(catalog_value_u8)
-                .unwrap_or(0);
-            Some((
-                attnum,
-                ColumnRecord {
-                    name: normalize_identifier(&name),
-                    type_oid,
-                    type_mod,
-                    is_not_null,
-                    has_default,
-                    generated,
-                },
-            ))
-        })
-        .collect::<Vec<_>>();
+    let mut columns = catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "attrelid")
+                .is_some_and(|attrelid| attrelid == relation_oid)
+        },
+        |row| {
+            catalog_row_value(table, row, "attrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|attrelid| attrelid == relation_oid)
+        },
+    )
+    .into_iter()
+    .filter_map(|row| {
+        let attrelid = catalog_row_value(table, &row, "attrelid").and_then(catalog_value_oid)?;
+        if attrelid != relation_oid {
+            return None;
+        }
+        let attnum = catalog_row_value(table, &row, "attnum").and_then(catalog_value_i16)?;
+        if attnum <= 0 {
+            return None;
+        }
+        let attisdropped = catalog_row_value(table, &row, "attisdropped")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+        if attisdropped {
+            return None;
+        }
+        let name = catalog_row_value(table, &row, "attname").and_then(catalog_value_string)?;
+        let type_oid = catalog_row_value(table, &row, "atttypid").and_then(catalog_value_oid)?;
+        let type_mod = catalog_row_value(table, &row, "atttypmod")
+            .and_then(catalog_value_i32)
+            .unwrap_or(-1);
+        let is_not_null = catalog_row_value(table, &row, "attnotnull")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+        let has_default = catalog_row_value(table, &row, "atthasdef")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+        let generated = catalog_row_value(table, &row, "attgenerated")
+            .and_then(catalog_value_u8)
+            .unwrap_or(0);
+        Some((
+            attnum,
+            ColumnRecord {
+                name: normalize_identifier(&name),
+                type_oid,
+                type_mod,
+                is_not_null,
+                has_default,
+                generated,
+            },
+        ))
+    })
+    .collect::<Vec<_>>();
     columns.sort_by_key(|(attnum, _)| *attnum);
     columns.into_iter().map(|(_, column)| column).collect()
 }
@@ -1302,7 +1413,20 @@ fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
 
 pub fn index_record_by_index_oid(index_oid: Oid) -> Option<IndexRecord> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
-    catalog_rows(table.oid).into_iter().find_map(|row| {
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "indexrelid")
+                .is_some_and(|row_index_oid| row_index_oid == index_oid)
+        },
+        |row| {
+            catalog_row_value(table, row, "indexrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_index_oid| row_index_oid == index_oid)
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
         let record = pg_index_record_from_row(&row)?;
         (record.index_oid == index_oid).then_some(record)
     })
@@ -1312,13 +1436,24 @@ pub fn index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
     let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
         return Vec::new();
     };
-    catalog_rows(table.oid)
-        .into_iter()
-        .filter_map(|row| {
-            let record = pg_index_record_from_row(&row)?;
-            (record.relation_oid == relation_oid).then_some(record)
-        })
-        .collect()
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "indrelid")
+                .is_some_and(|indrelid| indrelid == relation_oid)
+        },
+        |row| {
+            catalog_row_value(table, row, "indrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|indrelid| indrelid == relation_oid)
+        },
+    )
+    .into_iter()
+    .filter_map(|row| {
+        let record = pg_index_record_from_row(&row)?;
+        (record.relation_oid == relation_oid).then_some(record)
+    })
+    .collect()
 }
 
 pub fn unique_index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
@@ -1334,10 +1469,20 @@ pub fn relation_oid_for_index_oid(index_oid: Oid) -> Option<Oid> {
 
 fn primary_key_pg_index_row(relation_oid: Oid) -> Option<CatalogRow> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
-    catalog_rows(table.oid).into_iter().find(|row| {
-        pg_index_record_from_row(row)
-            .is_some_and(|record| record.relation_oid == relation_oid && record.is_primary)
-    })
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "indrelid")
+                .is_some_and(|indrelid| indrelid == relation_oid)
+                && static_row_column_bool(table, row, "indisprimary").unwrap_or(false)
+        },
+        |row| {
+            pg_index_record_from_row(row)
+                .is_some_and(|record| record.relation_oid == relation_oid && record.is_primary)
+        },
+    )
+    .into_iter()
+    .next()
 }
 
 pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> {
@@ -1356,7 +1501,20 @@ fn primary_key_constraint_oid_for_relation(
     index_oid: Option<Oid>,
 ) -> Option<Oid> {
     let table = static_catalog_by_relation_oid(PG_CONSTRAINT_RELATION_OID)?;
-    catalog_rows(table.oid).into_iter().find_map(|row| {
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "conrelid")
+                .is_some_and(|conrelid| conrelid == relation_oid)
+        },
+        |row| {
+            catalog_row_value(table, row, "conrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|conrelid| conrelid == relation_oid)
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
         let conrelid = catalog_row_value(table, &row, "conrelid").and_then(catalog_value_oid)?;
         if conrelid != relation_oid {
             return None;
@@ -1442,17 +1600,27 @@ fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord>
 pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
-    let mut matches = catalog_rows(table.oid)
-        .into_iter()
-        .filter_map(|row| {
-            let row_name =
-                catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
-            if normalize_identifier(&row_name) != name {
-                return None;
-            }
-            relation_record_from_pg_class_row(&row)
-        })
-        .collect::<Vec<_>>();
+    let mut matches = catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_string(table, row, "relname")
+                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
+        },
+        |row| {
+            catalog_row_value(table, row, "relname")
+                .and_then(catalog_value_string)
+                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
+        },
+    )
+    .into_iter()
+    .filter_map(|row| {
+        let row_name = catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
+        if normalize_identifier(&row_name) != name {
+            return None;
+        }
+        relation_record_from_pg_class_row(&row)
+    })
+    .collect::<Vec<_>>();
     matches.sort_by_key(|relation| match relation.namespace {
         PUBLIC_NAMESPACE_OID => 0,
         PG_CATALOG_NAMESPACE_OID => 1,
@@ -1464,7 +1632,26 @@ pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
 pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
-    catalog_rows(table.oid).into_iter().find_map(|row| {
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_string(table, row, "relname")
+                .is_some_and(|row_name| normalize_identifier(&row_name) == name)
+                && static_row_column_oid(table, row, "relnamespace")
+                    .is_some_and(|row_namespace| row_namespace == namespace)
+        },
+        |row| {
+            let row_name = catalog_row_value(table, row, "relname")
+                .and_then(catalog_value_string)
+                .is_some_and(|row_name| normalize_identifier(&row_name) == name);
+            let row_namespace = catalog_row_value(table, row, "relnamespace")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_namespace| row_namespace == namespace);
+            row_name && row_namespace
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
         let row_name = catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
         if normalize_identifier(&row_name) != name {
             return None;

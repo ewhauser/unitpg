@@ -405,6 +405,10 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         profile_phase="run",
         profile_open=False,
         profile_warmup_seconds=0.0,
+        profile_hyperfine=False,
+        profile_hyperfine_runs=1,
+        profile_hyperfine_warmup=0,
+        profile_server_memory=False,
     )
 
 
