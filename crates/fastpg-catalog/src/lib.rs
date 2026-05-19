@@ -461,6 +461,22 @@ impl Default for CatalogState {
 }
 
 static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
+static PRIMARY_KEY_INDEX_OID_CACHE: OnceLock<Mutex<PrimaryKeyIndexOidCache>> = OnceLock::new();
+
+#[derive(Debug)]
+struct PrimaryKeyIndexOidCache {
+    generation: u64,
+    entries: BTreeMap<u32, Option<Oid>>,
+}
+
+impl Default for PrimaryKeyIndexOidCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: BTreeMap::new(),
+        }
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct CatalogSession {
@@ -1375,6 +1391,40 @@ pub fn current_generation() -> u64 {
     with_catalog_read(|state| state.generation)
 }
 
+fn primary_key_index_oid_cache() -> &'static Mutex<PrimaryKeyIndexOidCache> {
+    PRIMARY_KEY_INDEX_OID_CACHE.get_or_init(|| Mutex::new(PrimaryKeyIndexOidCache::default()))
+}
+
+fn primary_key_index_oid_cache_lookup(relation_oid: Oid) -> Option<Option<Oid>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    let generation = current_generation();
+    let mut cache = primary_key_index_oid_cache()
+        .lock()
+        .expect("primary key index OID cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache.entries.get(&relation_oid.0).copied()
+}
+
+fn primary_key_index_oid_cache_store(relation_oid: Oid, index_oid: Option<Oid>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    let generation = current_generation();
+    let mut cache = primary_key_index_oid_cache()
+        .lock()
+        .expect("primary key index OID cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache.entries.insert(relation_oid.0, index_oid);
+}
+
 fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
     catalog_rows_matching_static(
@@ -1734,6 +1784,15 @@ fn primary_key_pg_index_row(relation_oid: Oid) -> Option<CatalogRow> {
 }
 
 pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> {
+    if let Some(cached) = primary_key_index_oid_cache_lookup(relation_oid) {
+        return cached;
+    }
+    let result = primary_key_index_oid_for_relation_oid_uncached(relation_oid);
+    primary_key_index_oid_cache_store(relation_oid, result);
+    result
+}
+
+fn primary_key_index_oid_for_relation_oid_uncached(relation_oid: Oid) -> Option<Oid> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
     let session_overlays = visible_session_overlays();
     with_catalog_read(|state| {
