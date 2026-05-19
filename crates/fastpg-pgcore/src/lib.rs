@@ -619,6 +619,12 @@ mod inner {
             &self,
             params: &[PgCoreParam],
         ) -> Result<ExecutionResult, PgCoreError> {
+            if params.is_empty() {
+                let _guard = enter_pgcore_lane("execute");
+                let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
+                return execution_result_from_ptr(result);
+            }
+
             let param_count = i32::try_from(params.len()).map_err(|_| {
                 PgCoreError::new("54000", "too many parameters for PostgreSQL execution", 0)
             })?;
@@ -659,43 +665,41 @@ mod inner {
             }
 
             let _guard = enter_pgcore_lane("execute");
-            let result = if params.is_empty() {
-                unsafe { fastpg_pgcore_execute(self.as_ptr()) }
-            } else {
-                unsafe {
-                    fastpg_pgcore_execute_params(
-                        self.as_ptr(),
-                        parameter_values.as_ptr(),
-                        parameter_is_null.as_ptr(),
-                        parameter_datums.as_ptr(),
-                        parameter_is_datum.as_ptr(),
-                        param_count,
-                    )
-                }
+            let result = unsafe {
+                fastpg_pgcore_execute_params(
+                    self.as_ptr(),
+                    parameter_values.as_ptr(),
+                    parameter_is_null.as_ptr(),
+                    parameter_datums.as_ptr(),
+                    parameter_is_datum.as_ptr(),
+                    param_count,
+                )
             };
-            let Some(result) = NonNull::new(result) else {
-                return Err(PgCoreError::new(
-                    "XX000",
-                    "PostgreSQL execute returned a null result",
-                    0,
-                ));
-            };
-            let result = ExecuteResult(result);
-            if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
-                Ok(result.to_execution_result())
-            } else {
-                Err(PgCoreError::with_fields(
-                    unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
-                    unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr()))
-                    },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr()))
-                    },
-                    unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
-                ))
-            }
+            execution_result_from_ptr(result)
+        }
+    }
+
+    fn execution_result_from_ptr(
+        result: *mut FastPgPgCoreExecuteResult,
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let Some(result) = NonNull::new(result) else {
+            return Err(PgCoreError::new(
+                "XX000",
+                "PostgreSQL execute returned a null result",
+                0,
+            ));
+        };
+        let result = ExecuteResult(result);
+        if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
+            Ok(result.to_execution_result())
+        } else {
+            Err(PgCoreError::with_fields(
+                unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
+                unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr())) },
+                unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
+            ))
         }
     }
 
