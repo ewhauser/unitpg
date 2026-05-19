@@ -109,12 +109,12 @@ make -C benches bench-smoke
 Useful profiling knobs:
 
 ```text
-PROFILE_TRANSACTIONS=500
+PROFILE_TRANSACTIONS=50000
 PROFILE_RUNS=1
 PROFILE_TOOL=flamegraph
 PROFILE_PHASE=run
 PROFILE_OPEN=0
-PROFILE_WARMUP_SECONDS=1.0
+PROFILE_WARMUP_SECONDS=0.1
 ```
 
 The harness treats normal Postgres failures as harness failures. It treats
