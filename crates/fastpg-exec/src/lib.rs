@@ -2,13 +2,8 @@
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 use std::collections::BTreeMap;
-#[cfg(feature = "postgres-execution")]
-use std::collections::HashMap;
 use std::sync::Arc;
-#[cfg(any(
-    feature = "postgres-execution",
-    all(feature = "mini-sql-testkit", not(feature = "postgres-execution"))
-))]
+#[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
 use std::sync::Mutex;
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -114,41 +109,10 @@ pub struct QueryExecutor {
     #[cfg(feature = "postgres-execution")]
     pgcore_session: PgCoreSession,
     #[cfg(feature = "postgres-execution")]
-    prepared_cache: Arc<Mutex<HashMap<String, Arc<CachedPgCoreStatement>>>>,
-    #[cfg(feature = "postgres-execution")]
     storage_session: fastpg_storage::SessionStorageHandle,
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     transaction: Mutex<SessionTransaction>,
 }
-
-#[cfg(feature = "postgres-execution")]
-#[derive(Debug)]
-struct CachedPgCoreStatement {
-    statement: PreparedStatement,
-    description: QueryDescription,
-    catalog_generation: u64,
-}
-
-#[cfg(feature = "postgres-execution")]
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct RewrittenPgCoreQuery {
-    sql: &'static str,
-    parameters: Vec<Value>,
-}
-
-#[cfg(feature = "postgres-execution")]
-const PGBENCH_SELECT_ACCOUNT: &str = "SELECT abalance FROM pgbench_accounts WHERE aid = $1";
-#[cfg(feature = "postgres-execution")]
-const PGBENCH_UPDATE_ACCOUNT: &str =
-    "UPDATE pgbench_accounts SET abalance = abalance + $1 WHERE aid = $2";
-#[cfg(feature = "postgres-execution")]
-const PGBENCH_UPDATE_TELLER: &str =
-    "UPDATE pgbench_tellers SET tbalance = tbalance + $1 WHERE tid = $2";
-#[cfg(feature = "postgres-execution")]
-const PGBENCH_UPDATE_BRANCH: &str =
-    "UPDATE pgbench_branches SET bbalance = bbalance + $1 WHERE bid = $2";
-#[cfg(feature = "postgres-execution")]
-const PGBENCH_INSERT_HISTORY: &str = "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)";
 
 impl QueryExecutor {
     pub fn new(server_version: impl Into<String>) -> Self {
@@ -162,7 +126,6 @@ impl QueryExecutor {
             Self {
                 shared,
                 pgcore_session: PgCoreSession::with_storage_session(storage_session.clone()),
-                prepared_cache: Arc::new(Mutex::new(HashMap::new())),
                 storage_session,
             }
         }
@@ -289,103 +252,35 @@ impl QueryExecutor {
     fn describe_pgcore(&self, sql: &str) -> Option<QueryDescription> {
         self.prepare_pgcore(sql)
             .ok()
-            .map(|cached| cached.description.clone())
+            .map(|statement| query_description_from_pgcore(&statement))
     }
 
     #[cfg(feature = "postgres-execution")]
     fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
-        let rewritten = rewrite_pgbench_simple_query(sql, parameters);
-        let prepare_sql = rewritten.as_ref().map_or(sql, |query| query.sql);
-        let parameter_values = rewritten
-            .as_ref()
-            .map_or(parameters, |query| query.parameters.as_slice());
-
-        let cached = match self.prepare_pgcore(prepare_sql) {
-            Ok(cached) => cached,
+        let statement = match self.prepare_pgcore(sql) {
+            Ok(statement) => statement,
             Err(error) => return pgcore_error_execution(error),
         };
-        let parameters = parameter_values
+        let parameters = parameters
             .iter()
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
 
         let execution_result = {
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
-            cached.statement.execute_with_params(&parameters)
+            statement.execute_with_params(&parameters)
         };
 
         match execution_result {
-            Ok(result) => {
-                let execution = pgcore_execution_to_query_execution(result);
-                if invalidates_pgcore_cache(&execution) {
-                    self.clear_pgcore_cache();
-                }
-                execution
-            }
+            Ok(result) => pgcore_execution_to_query_execution(result),
             Err(error) => pgcore_error_execution(error),
         }
     }
 
     #[cfg(feature = "postgres-execution")]
-    fn prepare_pgcore(
-        &self,
-        sql: &str,
-    ) -> Result<Arc<CachedPgCoreStatement>, fastpg_pgcore::PgCoreError> {
-        if !should_cache_pgcore_statement(sql) {
-            return self.prepare_uncached_pgcore(sql);
-        }
-
-        let cache_key = pgcore_cache_key(sql);
-        let catalog_generation = fastpg_catalog::current_generation();
-        let stale = {
-            let mut cache = self
-                .prepared_cache
-                .lock()
-                .expect("fastpg prepared statement cache mutex poisoned");
-            if let Some(cached) = cache.get(&cache_key).cloned() {
-                if cached.catalog_generation == catalog_generation {
-                    return Ok(cached);
-                }
-                cache.remove(&cache_key)
-            } else {
-                None
-            }
-        };
-        drop(stale);
-
-        let cached = self.prepare_uncached_pgcore(sql)?;
-        if cached.catalog_generation == catalog_generation {
-            self.prepared_cache
-                .lock()
-                .expect("fastpg prepared statement cache mutex poisoned")
-                .insert(cache_key, cached.clone());
-        }
-
-        Ok(cached)
-    }
-
-    #[cfg(feature = "postgres-execution")]
-    fn prepare_uncached_pgcore(
-        &self,
-        sql: &str,
-    ) -> Result<Arc<CachedPgCoreStatement>, fastpg_pgcore::PgCoreError> {
-        let catalog_generation = fastpg_catalog::current_generation();
+    fn prepare_pgcore(&self, sql: &str) -> Result<PreparedStatement, fastpg_pgcore::PgCoreError> {
         let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
-        let statement = self.pgcore_session.prepare(sql)?;
-        let description = query_description_from_pgcore(&statement);
-        Ok(Arc::new(CachedPgCoreStatement {
-            statement,
-            description,
-            catalog_generation,
-        }))
-    }
-
-    #[cfg(feature = "postgres-execution")]
-    fn clear_pgcore_cache(&self) {
-        self.prepared_cache
-            .lock()
-            .expect("fastpg prepared statement cache mutex poisoned")
-            .clear();
+        self.pgcore_session.prepare(sql)
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -862,172 +757,6 @@ fn query_description_from_pgcore(statement: &PreparedStatement) -> QueryDescript
 }
 
 #[cfg(feature = "postgres-execution")]
-fn should_cache_pgcore_statement(sql: &str) -> bool {
-    let normalized = pgcore_cache_key(sql);
-    normalized.contains('$')
-        || matches!(
-            normalized.as_str(),
-            "begin" | "commit" | "end" | "rollback" | "begin transaction" | "commit transaction"
-        )
-}
-
-#[cfg(feature = "postgres-execution")]
-fn pgcore_cache_key(sql: &str) -> String {
-    sql.trim().trim_end_matches(';').trim().to_ascii_lowercase()
-}
-
-#[cfg(feature = "postgres-execution")]
-fn invalidates_pgcore_cache(execution: &QueryExecution) -> bool {
-    let QueryExecution::Command { tag, .. } = execution else {
-        return false;
-    };
-    matches!(
-        tag.split_whitespace().next(),
-        Some("ALTER" | "CREATE" | "DROP" | "TRUNCATE" | "VACUUM")
-    )
-}
-
-#[cfg(feature = "postgres-execution")]
-fn rewrite_pgbench_simple_query(sql: &str, parameters: &[Value]) -> Option<RewrittenPgCoreQuery> {
-    if !parameters.is_empty() {
-        return None;
-    }
-
-    let trimmed = sql.trim().trim_end_matches(';').trim();
-    rewrite_pgbench_update_or_select(trimmed).or_else(|| rewrite_pgbench_insert_history(trimmed))
-}
-
-#[cfg(feature = "postgres-execution")]
-fn rewrite_pgbench_update_or_select(sql: &str) -> Option<RewrittenPgCoreQuery> {
-    let mut tokens = sql.split_ascii_whitespace();
-    let first = tokens.next()?;
-
-    if first.eq_ignore_ascii_case("select") {
-        if !tokens.next()?.eq_ignore_ascii_case("abalance")
-            || !tokens.next()?.eq_ignore_ascii_case("from")
-            || !tokens.next()?.eq_ignore_ascii_case("pgbench_accounts")
-            || !tokens.next()?.eq_ignore_ascii_case("where")
-            || !tokens.next()?.eq_ignore_ascii_case("aid")
-            || tokens.next()? != "="
-        {
-            return None;
-        }
-        let aid = parse_i32_token(tokens.next()?)?;
-        if tokens.next().is_some() {
-            return None;
-        }
-        return Some(RewrittenPgCoreQuery {
-            sql: PGBENCH_SELECT_ACCOUNT,
-            parameters: vec![Value::Int4(aid)],
-        });
-    }
-
-    if !first.eq_ignore_ascii_case("update") {
-        return None;
-    }
-
-    let table = tokens.next()?;
-    if !tokens.next()?.eq_ignore_ascii_case("set") {
-        return None;
-    }
-    let target_column = tokens.next()?;
-    if tokens.next()? != "=" {
-        return None;
-    }
-    let source_column = tokens.next()?;
-    if tokens.next()? != "+" {
-        return None;
-    }
-    let delta = parse_i32_token(tokens.next()?)?;
-    if !tokens.next()?.eq_ignore_ascii_case("where") {
-        return None;
-    }
-    let key_column = tokens.next()?;
-    if tokens.next()? != "=" {
-        return None;
-    }
-    let key = parse_i32_token(tokens.next()?)?;
-    if tokens.next().is_some() {
-        return None;
-    }
-
-    let template = if table.eq_ignore_ascii_case("pgbench_accounts")
-        && target_column.eq_ignore_ascii_case("abalance")
-        && source_column.eq_ignore_ascii_case("abalance")
-        && key_column.eq_ignore_ascii_case("aid")
-    {
-        PGBENCH_UPDATE_ACCOUNT
-    } else if table.eq_ignore_ascii_case("pgbench_tellers")
-        && target_column.eq_ignore_ascii_case("tbalance")
-        && source_column.eq_ignore_ascii_case("tbalance")
-        && key_column.eq_ignore_ascii_case("tid")
-    {
-        PGBENCH_UPDATE_TELLER
-    } else if table.eq_ignore_ascii_case("pgbench_branches")
-        && target_column.eq_ignore_ascii_case("bbalance")
-        && source_column.eq_ignore_ascii_case("bbalance")
-        && key_column.eq_ignore_ascii_case("bid")
-    {
-        PGBENCH_UPDATE_BRANCH
-    } else {
-        return None;
-    };
-
-    Some(RewrittenPgCoreQuery {
-        sql: template,
-        parameters: vec![Value::Int4(delta), Value::Int4(key)],
-    })
-}
-
-#[cfg(feature = "postgres-execution")]
-fn rewrite_pgbench_insert_history(sql: &str) -> Option<RewrittenPgCoreQuery> {
-    if !starts_with_ignore_ascii_case(sql, "insert into pgbench_history") {
-        return None;
-    }
-    let values_index = find_ignore_ascii_case(sql, "values")?;
-    let values = sql[values_index + "values".len()..].trim();
-    let values = values.strip_prefix('(')?.strip_suffix(')')?;
-    let mut fields = values.split(',').map(str::trim);
-    let tid = fields.next()?;
-    let bid = fields.next()?;
-    let aid = fields.next()?;
-    let delta = fields.next()?;
-    let mtime = fields.next()?;
-    if fields.next().is_some() || !mtime.eq_ignore_ascii_case("current_timestamp") {
-        return None;
-    }
-    Some(RewrittenPgCoreQuery {
-        sql: PGBENCH_INSERT_HISTORY,
-        parameters: vec![
-            Value::Int4(parse_i32_token(tid)?),
-            Value::Int4(parse_i32_token(bid)?),
-            Value::Int4(parse_i32_token(aid)?),
-            Value::Int4(parse_i32_token(delta)?),
-        ],
-    })
-}
-
-#[cfg(feature = "postgres-execution")]
-fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
-    value
-        .get(..prefix.len())
-        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(prefix))
-}
-
-#[cfg(feature = "postgres-execution")]
-fn find_ignore_ascii_case(value: &str, needle: &str) -> Option<usize> {
-    value
-        .as_bytes()
-        .windows(needle.len())
-        .position(|candidate| candidate.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-#[cfg(feature = "postgres-execution")]
-fn parse_i32_token(token: &str) -> Option<i32> {
-    token.trim().parse::<i32>().ok()
-}
-
-#[cfg(feature = "postgres-execution")]
 fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryExecution {
     let Some(statement) = result.statements.into_iter().next() else {
         return QueryExecution::Empty;
@@ -1396,46 +1125,6 @@ mod tests {
         assert_eq!(sqlstate, "0A000");
         assert!(message.contains("mini SQL executor is only available"));
         assert!(executor.copy_text_line("smoke", "1").is_err());
-    }
-
-    #[cfg(feature = "postgres-execution")]
-    #[test]
-    fn rewrites_pgbench_simple_literals_to_parameterized_pgcore_queries() {
-        assert_eq!(
-            rewrite_pgbench_simple_query(
-                "UPDATE pgbench_accounts SET abalance = abalance + -17 WHERE aid = 42",
-                &[],
-            ),
-            Some(RewrittenPgCoreQuery {
-                sql: PGBENCH_UPDATE_ACCOUNT,
-                parameters: vec![Value::Int4(-17), Value::Int4(42)],
-            })
-        );
-        assert_eq!(
-            rewrite_pgbench_simple_query(
-                "SELECT abalance FROM pgbench_accounts WHERE aid = 42",
-                &[]
-            ),
-            Some(RewrittenPgCoreQuery {
-                sql: PGBENCH_SELECT_ACCOUNT,
-                parameters: vec![Value::Int4(42)],
-            })
-        );
-        assert_eq!(
-            rewrite_pgbench_simple_query(
-                "INSERT INTO pgbench_history (tid, bid, aid, delta, mtime) VALUES (1, 2, 42, -17, CURRENT_TIMESTAMP)",
-                &[],
-            ),
-            Some(RewrittenPgCoreQuery {
-                sql: PGBENCH_INSERT_HISTORY,
-                parameters: vec![
-                    Value::Int4(1),
-                    Value::Int4(2),
-                    Value::Int4(42),
-                    Value::Int4(-17),
-                ],
-            })
-        );
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
