@@ -18,10 +18,11 @@ use fastpg_catalog::{
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
     builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row,
     index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
-    primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
-    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
-    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_for_index_oid,
-    relation_summary_by_oid, static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    primary_key_index_oid_for_relation_oid, primary_key_index_record_for_relation_oid,
+    primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
+    relation_by_oid, relation_column_by_attnum, relation_column_count,
+    relation_oid_by_name_in_namespace, relation_oid_for_index_oid, relation_summary_by_oid,
+    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
     unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
     virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
@@ -2244,8 +2245,8 @@ fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec
 }
 
 fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
-    let index_oid = primary_key_index_oid_for_relation_oid(relation_oid)?;
-    let index_spec = unique_index_spec_for_index_oid(index_oid)?;
+    let record = primary_key_index_record_for_relation_oid(relation_oid)?;
+    let index_spec = unique_index_spec_for_record(&record)?;
     index_spec.is_primary.then_some(index_spec)
 }
 

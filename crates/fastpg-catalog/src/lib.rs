@@ -1605,6 +1605,12 @@ pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> 
     catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid)
 }
 
+pub fn primary_key_index_record_for_relation_oid(relation_oid: Oid) -> Option<IndexRecord> {
+    let row = primary_key_pg_index_row(relation_oid)?;
+    let record = pg_index_record_from_row(&row)?;
+    (record.relation_oid == relation_oid && record.is_primary).then_some(record)
+}
+
 pub fn primary_key_relation_oid_for_index_oid(index_oid: Oid) -> Option<Oid> {
     let record = index_record_by_index_oid(index_oid)?;
     record.is_primary.then_some(record.relation_oid)
@@ -2506,6 +2512,12 @@ mod tests {
         assert_eq!(
             unique_index_oids_for_relation_oid(relation.oid),
             vec![index_oid]
+        );
+        assert_eq!(
+            primary_key_index_record_for_relation_oid(relation.oid)
+                .unwrap()
+                .index_oid,
+            index_oid
         );
         let relation_summary = relation_summary_by_oid(relation.oid).unwrap();
         assert_eq!(relation_summary.column_count, 2);
