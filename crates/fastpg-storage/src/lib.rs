@@ -907,10 +907,10 @@ struct ScanState {
 }
 
 impl ScanState {
-    fn materialize(rows: Vec<Row>) -> Result<Self, CatalogError> {
+    fn materialize<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Result<Self, CatalogError> {
         let mut region = StorageRegion::new(StorageRegionKind::Scan);
         let rows = rows
-            .iter()
+            .into_iter()
             .map(|row| {
                 region
                     .copy_row(row)
@@ -1259,6 +1259,34 @@ impl StorageState {
             }
         }
         rows.into_values().collect()
+    }
+
+    fn visible_scan_state(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+    ) -> Result<ScanState, CatalogError> {
+        let mut rows = BTreeMap::new();
+        if let Some(relation) = self.relations.get(&relid) {
+            for row_id in &relation.committed_row_ids {
+                if let Some(row) = relation.committed_row_index.get(row_id) {
+                    rows.insert(*row_id, row);
+                }
+            }
+        }
+        for overlay in self.visible_overlay_stack(session) {
+            if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
+                for row_id in deleted_row_ids {
+                    rows.remove(row_id);
+                }
+            }
+            if let Some(segment) = overlay.relations.get(&relid) {
+                for row in &segment.rows {
+                    rows.insert(row.row_id, row);
+                }
+            }
+        }
+        ScanState::materialize(rows.into_values())
     }
 
     fn find_visible_row(&self, session: &SessionStorage, relid: u32, row_id: u64) -> Option<Row> {
@@ -4606,7 +4634,7 @@ pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
             Some(scan) => scan,
             None => {
                 state.relations.entry(relid).or_default();
-                ScanState::materialize(state.visible_rows(session, relid))?
+                state.visible_scan_state(session, relid)?
             }
         };
         state.check_scan_limit(scan.bytes())?;
