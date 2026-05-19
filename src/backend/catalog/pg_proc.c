@@ -715,6 +715,10 @@ ProcedureCreate(const char *procedureName,
 	table_close(rel, RowExclusiveLock);
 
 	/* Verify function body */
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		languageValidator = InvalidOid;
+#endif
 	if (OidIsValid(languageValidator))
 	{
 		ArrayType  *set_items = NULL;

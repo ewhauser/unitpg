@@ -497,6 +497,15 @@ heapam_relation_set_new_filelocator(Relation rel,
 {
 	SMgrRelation srel;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		*freezeXid = FirstNormalTransactionId;
+		*minmulti = FirstMultiXactId;
+		return;
+	}
+#endif
+
 	/*
 	 * Initialize to the minimum XID that could put tuples in the table. We
 	 * know that no xacts older than RecentXmin are still running, so that

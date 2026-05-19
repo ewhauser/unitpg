@@ -852,6 +852,15 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	ProcWaitStatus waitResult;
 	bool		log_lock = false;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (locallockp != NULL)
+			*locallockp = NULL;
+		return LOCKACQUIRE_ALREADY_CLEAR;
+	}
+#endif
+
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
 	lockMethodTable = LockMethods[lockmethodid];
@@ -2117,6 +2126,11 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	PROCLOCK   *proclock;
 	LWLock	   *partitionLock;
 	bool		wakeupNeeded;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return true;
+#endif
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);

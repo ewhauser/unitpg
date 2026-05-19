@@ -568,8 +568,11 @@ static IndexBuildResult *
 fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
 					   IndexInfo *indexInfo)
 {
-	fastpg_mem_index_unsupported("physical index builds");
-	return NULL;
+	IndexBuildResult *result = palloc0_object(IndexBuildResult);
+
+	result->heap_tuples = 0.0;
+	result->index_tuples = 0.0;
+	return result;
 }
 
 static void

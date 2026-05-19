@@ -1038,6 +1038,26 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 
 	att->atttypid = oidtypeid;
 
+#ifdef USE_FASTPG
+	{
+		FastPgRustCatalogType fastpg_type;
+
+		if (fastpg_rust_catalog_type_by_oid((uint32_t) oidtypeid,
+											&fastpg_type))
+		{
+			att->attlen = fastpg_type.typlen;
+			att->attbyval = fastpg_type.typbyval != 0;
+			att->attalign = (char) fastpg_type.typalign;
+			att->attstorage = (char) fastpg_type.typstorage;
+			att->attcompression = InvalidCompressionMethod;
+			att->attcollation = fastpg_type.typcollation;
+
+			populate_compact_attribute(desc, attributeNumber - 1);
+			return;
+		}
+	}
+#endif
+
 	/*
 	 * Our goal here is to support just enough types to let basic builtin
 	 * commands work without catalog access - e.g. so that we can do certain

@@ -529,6 +529,11 @@ PredicateLockingNeededForRelation(Relation relation)
 static inline bool
 SerializationNeededForRead(Relation relation, Snapshot snapshot)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return false;
+#endif
+
 	/* Nothing to do if this is not a serializable transaction */
 	if (MySerializableXact == InvalidSerializableXact)
 		return false;
@@ -573,6 +578,11 @@ SerializationNeededForRead(Relation relation, Snapshot snapshot)
 static inline bool
 SerializationNeededForWrite(Relation relation)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return false;
+#endif
+
 	/* Nothing to do if this is not a serializable transaction */
 	if (MySerializableXact == InvalidSerializableXact)
 		return false;
@@ -1610,6 +1620,11 @@ GetSafeSnapshotBlockingPids(int blocked_pid, int *output, int output_size)
 Snapshot
 GetSerializableTransactionSnapshot(Snapshot snapshot)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return snapshot;
+#endif
+
 	Assert(IsolationIsSerializable());
 
 	/*
@@ -1652,6 +1667,11 @@ SetSerializableTransactionSnapshot(Snapshot snapshot,
 								   VirtualTransactionId *sourcevxid,
 								   int sourcepid)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	Assert(IsolationIsSerializable());
 
 	/*
@@ -3051,6 +3071,11 @@ DropAllPredicateLocksFromTable(Relation relation, bool transfer)
 void
 TransferPredicateLocksToHeapRelation(Relation relation)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	DropAllPredicateLocksFromTable(relation, true);
 }
 
@@ -3244,6 +3269,12 @@ ReleasePredicateLocks(bool isCommit, bool isReadOnlySafe)
 	bool		needToClear;
 	SERIALIZABLEXACT *roXact;
 	dlist_mutable_iter iter;
+	bool		topLevelIsDeclaredReadOnly;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 
 	/*
 	 * We can't trust XactReadOnly here, because a transaction which started
@@ -3254,7 +3285,6 @@ ReleasePredicateLocks(bool isCommit, bool isReadOnlySafe)
 	 * get some cleanup logic right which is based on whether the transaction
 	 * was declared READ ONLY at the top level.
 	 */
-	bool		topLevelIsDeclaredReadOnly;
 
 	/* We can't be both committing and releasing early due to RO_SAFE. */
 	Assert(!(isCommit && isReadOnlySafe));
@@ -4353,6 +4383,11 @@ CheckTableForSerializableConflictIn(Relation relation)
 	Oid			heapId;
 	int			i;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	/*
 	 * Bail out quickly if there are no serializable transactions running.
 	 * It's safe to check this without taking locks because the caller is
@@ -4632,6 +4667,11 @@ void
 PreCommit_CheckForSerializationFailure(void)
 {
 	dlist_iter	near_iter;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 
 	if (MySerializableXact == InvalidSerializableXact)
 		return;

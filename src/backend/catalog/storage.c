@@ -148,6 +148,12 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	}
 
 	srel = smgropen(rlocator, procNumber);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return srel;
+#endif
+
 	smgrcreate(srel, MAIN_FORKNUM, false);
 
 	if (needs_wal)
@@ -207,6 +213,11 @@ void
 RelationDropStorage(Relation rel)
 {
 	PendingRelDelete *pending;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 
 	/* Add the relation to the list of stuff to delete at commit */
 	pending = (PendingRelDelete *)

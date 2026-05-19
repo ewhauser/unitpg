@@ -40,8 +40,12 @@
 #include "parser/parser.h"
 #include "pgtime.h"
 #include "postmaster/postmaster.h"
+#include "tcop/cmdtag.h"
+#include "tcop/pquery.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/elog.h"
+#include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -130,6 +134,9 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 	MemoryContext context;
 } FastPgPgCoreCaptureDestReceiver;
 
+static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteStatement *statement,
+														   MemoryContext context);
+
 static bool fastpg_pgcore_initialized = false;
 
 /*
@@ -163,6 +170,7 @@ fastpg_pgcore_init_once(void)
 
 	MyProcPid = getpid();
 	MemoryContextInit();
+	InitializeGUCOptions();
 	pg_timezone_initialize();
 	RelationCacheInitialize();
 	InitCatalogCache();
@@ -347,283 +355,6 @@ fastpg_pgcore_rangevar_name(const RangeVar *relation)
 	return relation->relname;
 }
 
-static const char *
-fastpg_pgcore_drop_object_name(const Node *object)
-{
-	const List *names;
-	const Node *last;
-
-	if (object == NULL || !IsA(object, List))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports simple DROP TABLE names")));
-	names = (const List *) object;
-	if (list_length(names) < 1 || list_length(names) > 2)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports unqualified or public DROP TABLE names")));
-	if (list_length(names) == 2)
-	{
-		const Node *schema = linitial(names);
-
-		if (!IsA(schema, String) || pg_strcasecmp(strVal(schema), "public") != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports public schema relations")));
-	}
-	last = llast(names);
-	if (!IsA(last, String))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports simple DROP TABLE names")));
-	return strVal(last);
-}
-
-static const char *
-fastpg_pgcore_type_name_leaf(const TypeName *type_name)
-{
-	const Node *last;
-
-	if (type_name == NULL)
-		return NULL;
-	if (type_name->names == NIL)
-		return NULL;
-	last = llast(type_name->names);
-	if (!IsA(last, String))
-		return NULL;
-	return strVal(last);
-}
-
-static Oid
-fastpg_pgcore_type_name_namespace_oid(const TypeName *type_name)
-{
-	const Node *schema;
-
-	if (type_name == NULL || type_name->names == NIL)
-		return InvalidOid;
-	if (list_length(type_name->names) == 1)
-		return InvalidOid;
-	if (list_length(type_name->names) != 2)
-		return InvalidOid;
-
-	schema = linitial(type_name->names);
-	if (!IsA(schema, String))
-		return InvalidOid;
-	if (pg_strcasecmp(strVal(schema), "pg_catalog") == 0)
-		return PG_CATALOG_NAMESPACE;
-	if (pg_strcasecmp(strVal(schema), "public") == 0)
-		return PG_PUBLIC_NAMESPACE;
-	return InvalidOid;
-}
-
-static Oid
-fastpg_pgcore_type_name_oid(const TypeName *type_name)
-{
-	const char *name;
-
-	if (type_name == NULL)
-		return InvalidOid;
-	if (OidIsValid(type_name->typeOid))
-	{
-#ifdef USE_FASTPG
-		FastPgRustCatalogType type_record;
-
-		if (type_name->arrayBounds != NIL &&
-			fastpg_rust_catalog_type_by_oid((uint32_t) type_name->typeOid,
-											&type_record) &&
-			OidIsValid((Oid) type_record.typarray))
-			return (Oid) type_record.typarray;
-#endif
-		return type_name->typeOid;
-	}
-
-	name = fastpg_pgcore_type_name_leaf(type_name);
-	if (name == NULL)
-		return InvalidOid;
-
-#ifdef USE_FASTPG
-	{
-		FastPgRustCatalogType type_record;
-		Oid			namespace_oid =
-			fastpg_pgcore_type_name_namespace_oid(type_name);
-
-		if (OidIsValid(namespace_oid))
-		{
-			if (fastpg_rust_catalog_type_by_name(name,
-												 (uint32_t) namespace_oid,
-												 &type_record))
-			{
-				if (type_name->arrayBounds != NIL &&
-					OidIsValid((Oid) type_record.typarray))
-					return (Oid) type_record.typarray;
-				return (Oid) type_record.oid;
-			}
-			return InvalidOid;
-		}
-
-		if (fastpg_rust_catalog_type_by_name(name,
-											 (uint32_t) PG_CATALOG_NAMESPACE,
-											 &type_record))
-		{
-			if (type_name->arrayBounds != NIL &&
-				OidIsValid((Oid) type_record.typarray))
-				return (Oid) type_record.typarray;
-			return (Oid) type_record.oid;
-		}
-		if (fastpg_rust_catalog_type_by_name(name,
-											 (uint32_t) PG_PUBLIC_NAMESPACE,
-											 &type_record))
-		{
-			if (type_name->arrayBounds != NIL &&
-				OidIsValid((Oid) type_record.typarray))
-				return (Oid) type_record.typarray;
-			return (Oid) type_record.oid;
-		}
-		return InvalidOid;
-	}
-#else
-	return InvalidOid;
-#endif
-}
-
-static const char *
-fastpg_pgcore_name_list_leaf(const List *names, const char *object_kind)
-{
-	const Node *last;
-
-	if (names == NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports simple %s names",
-						object_kind)));
-	if (list_length(names) < 1 || list_length(names) > 2)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports unqualified or public %s names",
-						object_kind)));
-	if (list_length(names) == 2)
-	{
-		const Node *schema = linitial(names);
-
-		if (!IsA(schema, String) ||
-			pg_strcasecmp(strVal(schema), "public") != 0)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports public schema %s names",
-							object_kind)));
-	}
-
-	last = llast(names);
-	if (!IsA(last, String))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports simple %s names",
-						object_kind)));
-	return strVal(last);
-}
-
-static void
-fastpg_pgcore_ensure_supported_type(const char *column_name, Oid type_oid)
-{
-#ifdef USE_FASTPG
-	FastPgRustCatalogType type_record;
-
-	if (!OidIsValid(type_oid) ||
-		!fastpg_rust_catalog_type_by_oid((uint32_t) type_oid, &type_record))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore does not support column \"%s\" type OID %u",
-						column_name != NULL ? column_name : "",
-						type_oid)));
-#else
-	if (!OidIsValid(type_oid))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore does not support column \"%s\" type OID %u",
-						column_name != NULL ? column_name : "",
-						type_oid)));
-#endif
-}
-
-static void
-fastpg_pgcore_call_create_relation(const char *relation_name,
-								   const char **column_names,
-								   const uint32_t *type_oids,
-								   const int32_t *type_mods,
-								   const uint8_t *not_nulls,
-								   size_t column_count,
-								   bool if_not_exists)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_create_relation(relation_name,
-											 column_names,
-											 type_oids,
-											 type_mods,
-											 not_nulls,
-											 column_count,
-											 if_not_exists,
-											 sqlstate,
-											 sizeof(sqlstate),
-											 message,
-											 sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
-static void
-fastpg_pgcore_call_drop_relation(const char *relation_name, bool missing_ok)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_drop_relation(relation_name,
-										   missing_ok,
-										   sqlstate,
-										   sizeof(sqlstate),
-										   message,
-										   sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
-static void
-fastpg_pgcore_call_truncate_relation(const char *relation_name)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_truncate_relation(relation_name,
-											   sqlstate,
-											   sizeof(sqlstate),
-											   message,
-											   sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
 static size_t
 fastpg_pgcore_call_relation_column_count(const char *relation_name)
 {
@@ -650,685 +381,10 @@ fastpg_pgcore_call_relation_column_count(const char *relation_name)
 }
 
 static void
-fastpg_pgcore_call_add_primary_key(const char *relation_name,
-								   const char **column_names,
-								   size_t column_count)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_add_primary_key(relation_name,
-											 column_names,
-											 column_count,
-											 sqlstate,
-											 sizeof(sqlstate),
-											 message,
-											 sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
-static void
-fastpg_pgcore_call_create_type(const char *type_name,
-							   uint8_t kind,
-							   Oid subtype_oid,
-							   Oid collation_oid,
-							   const char **labels,
-							   size_t label_count,
-							   const char **column_names,
-							   const uint32_t *column_type_oids,
-							   const int32_t *column_type_mods,
-							   size_t column_count)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_create_type(type_name,
-										 kind,
-										 (uint32_t) subtype_oid,
-										 (uint32_t) collation_oid,
-										 labels,
-										 label_count,
-										 column_names,
-										 column_type_oids,
-										 column_type_mods,
-										 column_count,
-										 sqlstate,
-										 sizeof(sqlstate),
-										 message,
-										 sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
-static void
-fastpg_pgcore_call_create_function(const char *function_name,
-								   Oid return_type_oid,
-								   const uint32_t *arg_type_oids,
-								   size_t arg_count,
-								   Oid language_oid,
-								   bool is_strict,
-								   bool leakproof,
-								   bool returns_set,
-								   uint8_t volatility,
-								   uint8_t parallel,
-								   const char *source)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_create_function(function_name,
-											 (uint32_t) return_type_oid,
-											 arg_type_oids,
-											 arg_count,
-											 (uint32_t) language_oid,
-											 is_strict ? 1 : 0,
-											 leakproof ? 1 : 0,
-											 returns_set ? 1 : 0,
-											 volatility,
-											 parallel,
-											 source,
-											 sqlstate,
-											 sizeof(sqlstate),
-											 message,
-											 sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
-static void
-fastpg_pgcore_call_create_opclass(const char *opclass_name,
-								  const char *method_name,
-								  Oid input_type_oid,
-								  bool is_default)
-{
-	char		sqlstate[6] = "";
-	char		message[256] = "";
-	bool		ok;
-
-#ifdef USE_FASTPG
-	ok = fastpg_rust_catalog_create_opclass(opclass_name,
-											method_name,
-											(uint32_t) input_type_oid,
-											is_default ? 1 : 0,
-											sqlstate,
-											sizeof(sqlstate),
-											message,
-											sizeof(message));
-#else
-	ok = false;
-	strlcpy(sqlstate, "0A000", sizeof(sqlstate));
-	strlcpy(message, "fastpg pgcore catalog DDL requires a USE_FASTPG build", sizeof(message));
-#endif
-	if (!ok)
-		fastpg_pgcore_raise_rust_catalog_error(sqlstate, message);
-}
-
-static Oid
-fastpg_pgcore_collation_name_oid(const List *names)
-{
-	const Node *last;
-	const char *name;
-
-	if (names == NIL)
-		return InvalidOid;
-	last = llast(names);
-	if (!IsA(last, String))
-		return DEFAULT_COLLATION_OID;
-	name = strVal(last);
-	if (pg_strcasecmp(name, "C") == 0)
-		return C_COLLATION_OID;
-	if (pg_strcasecmp(name, "default") == 0)
-		return DEFAULT_COLLATION_OID;
-	if (pg_strcasecmp(name, "POSIX") == 0)
-		return 951;
-	return DEFAULT_COLLATION_OID;
-}
-
-static uint8_t
-fastpg_pgcore_function_volatility(const char *value)
-{
-	if (value == NULL)
-		return 'v';
-	if (pg_strcasecmp(value, "immutable") == 0)
-		return 'i';
-	if (pg_strcasecmp(value, "stable") == 0)
-		return 's';
-	return 'v';
-}
-
-static uint8_t
-fastpg_pgcore_function_parallel(const char *value)
-{
-	if (value == NULL)
-		return 'u';
-	if (pg_strcasecmp(value, "safe") == 0)
-		return 's';
-	if (pg_strcasecmp(value, "restricted") == 0)
-		return 'r';
-	return 'u';
-}
-
-static Oid
-fastpg_pgcore_function_language_oid(const char *value)
-{
-	if (value == NULL)
-		return SQLlanguageId;
-	if (pg_strcasecmp(value, "internal") == 0)
-		return INTERNALlanguageId;
-	if (pg_strcasecmp(value, "c") == 0)
-		return ClanguageId;
-	return SQLlanguageId;
-}
-
-static const char *
-fastpg_pgcore_defelem_source(DefElem *defel)
-{
-	List	   *values;
-	Node	   *first;
-
-	if (defel->arg == NULL)
-		return "";
-	if (!IsA(defel->arg, List))
-		return defGetString(defel);
-
-	values = (List *) defel->arg;
-	if (values == NIL)
-		return "";
-	first = linitial(values);
-	if (first != NULL && IsA(first, String))
-		return strVal(first);
-	return defGetString(defel);
-}
-
-static void
-fastpg_pgcore_execute_define_stmt(const DefineStmt *stmt,
-								  FastPgPgCoreExecuteStatement *summary)
-{
-	const char *type_name;
-
-	if (stmt->kind != OBJECT_TYPE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports CREATE TYPE define statements")));
-
-	type_name = fastpg_pgcore_name_list_leaf(stmt->defnames, "type");
-	fastpg_pgcore_call_create_type(type_name,
-								   stmt->definition == NIL ? 's' : 'b',
-								   InvalidOid,
-								   InvalidOid,
-								   NULL,
-								   0,
-								   NULL,
-								   NULL,
-								   NULL,
-								   0);
-	summary->command_tag = pstrdup("CREATE TYPE");
-}
-
-static void
-fastpg_pgcore_execute_create_enum_stmt(const CreateEnumStmt *stmt,
-									   FastPgPgCoreExecuteStatement *summary)
-{
-	const char *type_name =
-		fastpg_pgcore_name_list_leaf(stmt->typeName, "type");
-	const char **labels;
-	ListCell   *lc;
-	int			label_count = list_length(stmt->vals);
-	int			label_index = 0;
-
-	labels = palloc0_array(const char *, label_count);
-	foreach(lc, stmt->vals)
-	{
-		Node	   *label = lfirst(lc);
-
-		if (!IsA(label, String))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports string enum labels")));
-		labels[label_index++] = strVal(label);
-	}
-
-	fastpg_pgcore_call_create_type(type_name,
-								   'e',
-								   InvalidOid,
-								   InvalidOid,
-								   labels,
-								   (size_t) label_count,
-								   NULL,
-								   NULL,
-								   NULL,
-								   0);
-	summary->command_tag = pstrdup("CREATE TYPE");
-}
-
-static void
-fastpg_pgcore_execute_create_range_stmt(const CreateRangeStmt *stmt,
-										FastPgPgCoreExecuteStatement *summary)
-{
-	const char *type_name =
-		fastpg_pgcore_name_list_leaf(stmt->typeName, "type");
-	Oid			subtype_oid = InvalidOid;
-	Oid			collation_oid = InvalidOid;
-	ListCell   *lc;
-
-	foreach(lc, stmt->params)
-	{
-		DefElem    *defel = lfirst_node(DefElem, lc);
-
-		if (pg_strcasecmp(defel->defname, "subtype") == 0)
-			subtype_oid = fastpg_pgcore_type_name_oid(defGetTypeName(defel));
-		else if (pg_strcasecmp(defel->defname, "collation") == 0)
-			collation_oid =
-				fastpg_pgcore_collation_name_oid(defGetQualifiedName(defel));
-	}
-
-	fastpg_pgcore_ensure_supported_type(type_name, subtype_oid);
-	fastpg_pgcore_call_create_type(type_name,
-								   'r',
-								   subtype_oid,
-								   collation_oid,
-								   NULL,
-								   0,
-								   NULL,
-								   NULL,
-								   NULL,
-								   0);
-	summary->command_tag = pstrdup("CREATE TYPE");
-}
-
-static void
-fastpg_pgcore_execute_composite_type_stmt(const CompositeTypeStmt *stmt,
-										  FastPgPgCoreExecuteStatement *summary)
-{
-	const char *type_name = fastpg_pgcore_rangevar_name(stmt->typevar);
-	const char **column_names;
-	uint32_t   *type_oids;
-	int32_t    *type_mods;
-	ListCell   *lc;
-	int			column_count = 0;
-	int			column_index = 0;
-
-	foreach(lc, stmt->coldeflist)
-	{
-		Node	   *elt = lfirst(lc);
-
-		if (IsA(elt, ColumnDef))
-			column_count++;
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore CREATE TYPE AS only supports column definitions")));
-	}
-
-	column_names = palloc0_array(const char *, column_count);
-	type_oids = palloc0_array(uint32_t, column_count);
-	type_mods = palloc0_array(int32_t, column_count);
-
-	foreach(lc, stmt->coldeflist)
-	{
-		ColumnDef  *column = lfirst_node(ColumnDef, lc);
-		Oid			type_oid = fastpg_pgcore_type_name_oid(column->typeName);
-
-		fastpg_pgcore_ensure_supported_type(column->colname, type_oid);
-		column_names[column_index] = column->colname;
-		type_oids[column_index] = (uint32_t) type_oid;
-		type_mods[column_index] =
-			column->typeName != NULL ? column->typeName->typemod : -1;
-		column_index++;
-	}
-
-	fastpg_pgcore_call_create_type(type_name,
-								   'c',
-								   InvalidOid,
-								   InvalidOid,
-								   NULL,
-								   0,
-								   column_names,
-								   type_oids,
-								   type_mods,
-								   (size_t) column_count);
-	summary->command_tag = pstrdup("CREATE TYPE");
-}
-
-static bool
-fastpg_pgcore_function_parameter_is_input(const FunctionParameter *parameter)
-{
-	return parameter->mode != FUNC_PARAM_OUT &&
-		parameter->mode != FUNC_PARAM_TABLE;
-}
-
-static bool
-fastpg_pgcore_function_parameter_is_output(const FunctionParameter *parameter)
-{
-	return parameter->mode == FUNC_PARAM_OUT ||
-		parameter->mode == FUNC_PARAM_INOUT ||
-		parameter->mode == FUNC_PARAM_TABLE;
-}
-
-static void
-fastpg_pgcore_execute_create_function_stmt(const CreateFunctionStmt *stmt,
-										   FastPgPgCoreExecuteStatement *summary)
-{
-	const char *function_name =
-		fastpg_pgcore_name_list_leaf(stmt->funcname, "function");
-	uint32_t   *arg_type_oids;
-	Oid			return_type_oid = InvalidOid;
-	Oid			language_oid = SQLlanguageId;
-	bool		is_strict = false;
-	bool		leakproof = false;
-	bool		returns_set = false;
-	bool		has_output_parameter = false;
-	bool		has_table_parameter = false;
-	uint8_t		volatility = 'v';
-	uint8_t		parallel = 'u';
-	const char *source = "";
-	ListCell   *lc;
-	int			arg_count = 0;
-	int			arg_index = 0;
-
-	foreach(lc, stmt->parameters)
-	{
-		FunctionParameter *parameter = lfirst_node(FunctionParameter, lc);
-
-		if (fastpg_pgcore_function_parameter_is_input(parameter))
-			arg_count++;
-		if (fastpg_pgcore_function_parameter_is_output(parameter))
-			has_output_parameter = true;
-		if (parameter->mode == FUNC_PARAM_TABLE)
-			has_table_parameter = true;
-	}
-
-	arg_type_oids = palloc0_array(uint32_t, arg_count);
-	foreach(lc, stmt->parameters)
-	{
-		FunctionParameter *parameter = lfirst_node(FunctionParameter, lc);
-		Oid			type_oid;
-
-		if (!fastpg_pgcore_function_parameter_is_input(parameter))
-			continue;
-		type_oid = fastpg_pgcore_type_name_oid(parameter->argType);
-		fastpg_pgcore_ensure_supported_type(parameter->name, type_oid);
-		arg_type_oids[arg_index++] = (uint32_t) type_oid;
-	}
-
-	if (stmt->returnType != NULL)
-	{
-		return_type_oid = fastpg_pgcore_type_name_oid(stmt->returnType);
-		returns_set = stmt->returnType->setof;
-	}
-	else if (has_output_parameter)
-	{
-		return_type_oid = RECORDOID;
-		returns_set = has_table_parameter;
-	}
-	else
-		return_type_oid = VOIDOID;
-	fastpg_pgcore_ensure_supported_type(function_name, return_type_oid);
-
-	foreach(lc, stmt->options)
-	{
-		DefElem    *defel = lfirst_node(DefElem, lc);
-
-		if (pg_strcasecmp(defel->defname, "language") == 0)
-			language_oid =
-				fastpg_pgcore_function_language_oid(defGetString(defel));
-		else if (pg_strcasecmp(defel->defname, "strict") == 0)
-			is_strict = defGetBoolean(defel);
-		else if (pg_strcasecmp(defel->defname, "leakproof") == 0)
-			leakproof = defGetBoolean(defel);
-		else if (pg_strcasecmp(defel->defname, "volatility") == 0)
-			volatility =
-				fastpg_pgcore_function_volatility(defGetString(defel));
-		else if (pg_strcasecmp(defel->defname, "parallel") == 0)
-			parallel =
-				fastpg_pgcore_function_parallel(defGetString(defel));
-		else if (pg_strcasecmp(defel->defname, "as") == 0)
-			source = fastpg_pgcore_defelem_source(defel);
-	}
-	if (source[0] == '\0' && stmt->sql_body != NULL)
-		source = nodeToString(stmt->sql_body);
-
-	fastpg_pgcore_call_create_function(function_name,
-									   return_type_oid,
-									   arg_type_oids,
-									   (size_t) arg_count,
-									   language_oid,
-									   is_strict,
-									   leakproof,
-									   returns_set,
-									   volatility,
-									   parallel,
-									   source);
-	summary->command_tag =
-		pstrdup(stmt->is_procedure ? "CREATE PROCEDURE" : "CREATE FUNCTION");
-}
-
-static void
-fastpg_pgcore_execute_create_opclass_stmt(const CreateOpClassStmt *stmt,
-										  FastPgPgCoreExecuteStatement *summary)
-{
-	const char *opclass_name =
-		fastpg_pgcore_name_list_leaf(stmt->opclassname, "operator class");
-	Oid			input_type_oid = fastpg_pgcore_type_name_oid(stmt->datatype);
-
-	fastpg_pgcore_ensure_supported_type(opclass_name, input_type_oid);
-	fastpg_pgcore_call_create_opclass(opclass_name,
-									  stmt->amname,
-									  input_type_oid,
-									  stmt->isDefault);
-	summary->command_tag = pstrdup("CREATE OPERATOR CLASS");
-}
-
-static void
-fastpg_pgcore_execute_create_stmt(const CreateStmt *stmt,
-								  FastPgPgCoreExecuteStatement *summary)
-{
-	const char *relation_name = fastpg_pgcore_rangevar_name(stmt->relation);
-	const char **column_names;
-	uint32_t   *type_oids;
-	int32_t    *type_mods;
-	uint8_t    *not_nulls;
-	ListCell   *lc;
-	int			column_count = 0;
-	int			column_index = 0;
-
-	foreach(lc, stmt->tableElts)
-	{
-		Node	   *elt = lfirst(lc);
-
-		if (IsA(elt, ColumnDef))
-			column_count++;
-		else
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore CREATE TABLE only supports column definitions")));
-	}
-
-	column_names = palloc0_array(const char *, column_count);
-	type_oids = palloc0_array(uint32_t, column_count);
-	type_mods = palloc0_array(int32_t, column_count);
-	not_nulls = palloc0_array(uint8_t, column_count);
-
-	foreach(lc, stmt->tableElts)
-	{
-		ColumnDef  *column = lfirst_node(ColumnDef, lc);
-		Oid			type_oid = fastpg_pgcore_type_name_oid(column->typeName);
-
-		fastpg_pgcore_ensure_supported_type(column->colname, type_oid);
-		column_names[column_index] = column->colname;
-		type_oids[column_index] = (uint32_t) type_oid;
-		type_mods[column_index] =
-			column->typeName != NULL ? column->typeName->typemod : -1;
-		not_nulls[column_index] = column->is_not_null ? 1 : 0;
-		column_index++;
-	}
-
-	fastpg_pgcore_call_create_relation(relation_name,
-									   column_names,
-									   type_oids,
-									   type_mods,
-									   not_nulls,
-									   (size_t) column_count,
-									   stmt->if_not_exists);
-	summary->command_tag = pstrdup("CREATE TABLE");
-}
-
-static void
-fastpg_pgcore_execute_drop_stmt(const DropStmt *stmt,
-								FastPgPgCoreExecuteStatement *summary)
-{
-	ListCell   *lc;
-
-	if (stmt->removeType != OBJECT_TABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports DROP TABLE utility statements")));
-
-	foreach(lc, stmt->objects)
-		fastpg_pgcore_call_drop_relation(fastpg_pgcore_drop_object_name(lfirst(lc)),
-										 stmt->missing_ok);
-	summary->command_tag = pstrdup("DROP TABLE");
-}
-
-static void
-fastpg_pgcore_execute_truncate_stmt(const TruncateStmt *stmt,
-									FastPgPgCoreExecuteStatement *summary)
-{
-	ListCell   *lc;
-
-	foreach(lc, stmt->relations)
-	{
-		RangeVar   *relation = lfirst_node(RangeVar, lc);
-
-		fastpg_pgcore_call_truncate_relation(fastpg_pgcore_rangevar_name(relation));
-	}
-	summary->command_tag = pstrdup("TRUNCATE TABLE");
-}
-
-static void
-fastpg_pgcore_execute_vacuum_stmt(const VacuumStmt *stmt,
-								  FastPgPgCoreExecuteStatement *summary)
-{
-	summary->command_tag = pstrdup(stmt->is_vacuumcmd ? "VACUUM" : "ANALYZE");
-}
-
-static void
 fastpg_pgcore_execute_noop_utility(const char *command_tag,
 								   FastPgPgCoreExecuteStatement *summary)
 {
 	summary->command_tag = pstrdup(command_tag);
-}
-
-static void
-fastpg_pgcore_execute_alter_table_stmt(const AlterTableStmt *stmt,
-									   FastPgPgCoreExecuteStatement *summary)
-{
-	const char *relation_name;
-	ListCell   *lc;
-
-	if (stmt->objtype != OBJECT_TABLE)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only supports ALTER TABLE utility statements")));
-
-	relation_name = fastpg_pgcore_rangevar_name(stmt->relation);
-	foreach(lc, stmt->cmds)
-	{
-		AlterTableCmd *cmd = lfirst_node(AlterTableCmd, lc);
-		Constraint *constraint;
-		const char **column_names;
-		ListCell   *key_lc;
-		int			column_index = 0;
-
-		if (cmd->subtype != AT_AddConstraint || cmd->def == NULL ||
-			!IsA(cmd->def, Constraint))
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports ALTER TABLE ADD PRIMARY KEY or UNIQUE")));
-
-		constraint = (Constraint *) cmd->def;
-		if (constraint->contype != CONSTR_PRIMARY &&
-			constraint->contype != CONSTR_UNIQUE)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore only supports ALTER TABLE ADD PRIMARY KEY or UNIQUE")));
-
-		column_names = palloc0_array(const char *, list_length(constraint->keys));
-		foreach(key_lc, constraint->keys)
-		{
-			Node	   *key = lfirst(key_lc);
-
-			if (!IsA(key, String))
-				ereport(ERROR,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("fastpg pgcore only supports column primary or unique keys")));
-			column_names[column_index++] = strVal(key);
-		}
-		if (constraint->contype == CONSTR_PRIMARY)
-			fastpg_pgcore_call_add_primary_key(relation_name,
-											   column_names,
-											   (size_t) column_index);
-	}
-	summary->command_tag = pstrdup("ALTER TABLE");
-}
-
-static bool
-fastpg_pgcore_is_builtin_index_access_method(const char *access_method)
-{
-	return pg_strcasecmp(access_method, DEFAULT_INDEX_TYPE) == 0 ||
-		pg_strcasecmp(access_method, "hash") == 0 ||
-		pg_strcasecmp(access_method, "gist") == 0 ||
-		pg_strcasecmp(access_method, "spgist") == 0 ||
-		pg_strcasecmp(access_method, "gin") == 0 ||
-		pg_strcasecmp(access_method, "brin") == 0;
-}
-
-static void
-fastpg_pgcore_execute_index_stmt(const IndexStmt *stmt,
-								 FastPgPgCoreExecuteStatement *summary)
-{
-	const char *access_method =
-		stmt->accessMethod != NULL ? stmt->accessMethod : DEFAULT_INDEX_TYPE;
-	const char *relation_name;
-
-	if (!fastpg_pgcore_is_builtin_index_access_method(access_method))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore only accepts CREATE INDEX for built-in PostgreSQL index access methods")));
-	if (stmt->excludeOpNames != NIL)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore does not support exclusion indexes")));
-	if (stmt->concurrent)
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("fastpg pgcore does not support CREATE INDEX CONCURRENTLY")));
-
-	relation_name = fastpg_pgcore_rangevar_name(stmt->relation);
-	(void) fastpg_pgcore_call_relation_column_count(relation_name);
-	summary->command_tag = pstrdup("CREATE INDEX");
 }
 
 static void
@@ -1409,90 +465,111 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 	}
 }
 
-static void
-fastpg_pgcore_execute_utility(Node *utility_stmt,
-							  FastPgPgCoreExecuteStatement *summary)
+static bool
+fastpg_pgcore_utility_is_copy_stdin_bridge(Node *utility_stmt)
+{
+	CopyStmt   *stmt;
+
+	if (!IsA(utility_stmt, CopyStmt))
+		return false;
+	stmt = (CopyStmt *) utility_stmt;
+	return stmt->is_from &&
+		stmt->filename == NULL &&
+		!stmt->is_program &&
+		stmt->query == NULL &&
+		stmt->relation != NULL;
+}
+
+static bool
+fastpg_pgcore_should_noop_utility(Node *utility_stmt)
 {
 	switch (nodeTag(utility_stmt))
 	{
-		case T_CreateStmt:
-			fastpg_pgcore_execute_create_stmt((const CreateStmt *) utility_stmt,
-											  summary);
-			break;
-		case T_DropStmt:
-			fastpg_pgcore_execute_drop_stmt((const DropStmt *) utility_stmt,
-											summary);
-			break;
-		case T_TruncateStmt:
-			fastpg_pgcore_execute_truncate_stmt((const TruncateStmt *) utility_stmt,
-												summary);
-			break;
-		case T_VacuumStmt:
-			fastpg_pgcore_execute_vacuum_stmt((const VacuumStmt *) utility_stmt,
-											  summary);
-			break;
-		case T_VariableSetStmt:
-			fastpg_pgcore_execute_noop_utility("SET", summary);
-			break;
 		case T_GrantStmt:
-			fastpg_pgcore_execute_noop_utility("GRANT", summary);
-			break;
+		case T_GrantRoleStmt:
+		case T_AlterDefaultPrivilegesStmt:
 		case T_CreateTableSpaceStmt:
-			fastpg_pgcore_execute_noop_utility("CREATE TABLESPACE", summary);
-			break;
 		case T_DropTableSpaceStmt:
-			fastpg_pgcore_execute_noop_utility("DROP TABLESPACE", summary);
-			break;
+		case T_AlterTableSpaceOptionsStmt:
 		case T_CommentStmt:
-			fastpg_pgcore_execute_noop_utility("COMMENT", summary);
-			break;
-		case T_AlterTableStmt:
-			fastpg_pgcore_execute_alter_table_stmt((const AlterTableStmt *) utility_stmt,
-												   summary);
-			break;
-		case T_IndexStmt:
-			fastpg_pgcore_execute_index_stmt((const IndexStmt *) utility_stmt,
-											 summary);
-			break;
-		case T_TransactionStmt:
-			fastpg_pgcore_execute_transaction_stmt((const TransactionStmt *) utility_stmt,
-												   summary);
-			break;
-		case T_CopyStmt:
-			fastpg_pgcore_execute_copy_stmt((const CopyStmt *) utility_stmt,
-											summary);
-			break;
-		case T_DefineStmt:
-			fastpg_pgcore_execute_define_stmt((const DefineStmt *) utility_stmt,
-											  summary);
-			break;
-		case T_CreateEnumStmt:
-			fastpg_pgcore_execute_create_enum_stmt((const CreateEnumStmt *) utility_stmt,
-												   summary);
-			break;
-		case T_CreateRangeStmt:
-			fastpg_pgcore_execute_create_range_stmt((const CreateRangeStmt *) utility_stmt,
-													summary);
-			break;
-		case T_CompositeTypeStmt:
-			fastpg_pgcore_execute_composite_type_stmt((const CompositeTypeStmt *) utility_stmt,
-													  summary);
-			break;
-		case T_CreateFunctionStmt:
-			fastpg_pgcore_execute_create_function_stmt((const CreateFunctionStmt *) utility_stmt,
-													   summary);
-			break;
-		case T_CreateOpClassStmt:
-			fastpg_pgcore_execute_create_opclass_stmt((const CreateOpClassStmt *) utility_stmt,
-													  summary);
-			break;
+		case T_SecLabelStmt:
+		case T_VacuumStmt:
+			return true;
 		default:
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore does not yet support utility statement node %d",
-							(int) nodeTag(utility_stmt))));
-			break;
+			return false;
 	}
+}
+
+static void
+fastpg_pgcore_execute_utility(PlannedStmt *statement,
+							  const char *source_text,
+							  ParamListInfo params,
+							  FastPgPgCoreExecuteStatement *summary,
+							  MemoryContext result_context)
+{
+	Node	   *utility_stmt = statement->utilityStmt;
+	DestReceiver *dest = NULL;
+	QueryCompletion qc;
+	volatile bool snapshot_pushed = false;
+
+	if (fastpg_pgcore_utility_is_copy_stdin_bridge(utility_stmt))
+	{
+		fastpg_pgcore_execute_copy_stmt((const CopyStmt *) utility_stmt, summary);
+		return;
+	}
+
+	if (IsA(utility_stmt, TransactionStmt))
+	{
+		fastpg_pgcore_execute_transaction_stmt((const TransactionStmt *) utility_stmt,
+											   summary);
+		return;
+	}
+
+	if (fastpg_pgcore_should_noop_utility(utility_stmt))
+	{
+		fastpg_pgcore_execute_noop_utility(CreateCommandName(utility_stmt), summary);
+		return;
+	}
+
+	InitializeQueryCompletion(&qc);
+	dest = fastpg_pgcore_create_capture_receiver(summary, result_context);
+	fastpg_pgcore_ensure_execution_owner();
+
+	if (PlannedStmtRequiresSnapshot(statement))
+	{
+		PushActiveSnapshot(SnapshotAny);
+		snapshot_pushed = true;
+	}
+
+	PG_TRY();
+	{
+		ProcessUtility(statement,
+					   source_text,
+					   false,
+					   PROCESS_UTILITY_TOPLEVEL,
+					   params,
+					   NULL,
+					   dest,
+					   &qc);
+
+		if (snapshot_pushed)
+			PopActiveSnapshot();
+		snapshot_pushed = false;
+	}
+	PG_CATCH();
+	{
+		if (snapshot_pushed)
+			PopActiveSnapshot();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	if (qc.commandTag != CMDTAG_UNKNOWN)
+		summary->command_tag = pstrdup(GetCommandTagName(qc.commandTag));
+	else
+		summary->command_tag = pstrdup(CreateCommandName(utility_stmt));
+
+	dest->rDestroy(dest);
 }
 
 #ifdef USE_FASTPG
@@ -2072,7 +1149,15 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 
 			if (statement->utilityStmt != NULL)
 			{
-				fastpg_pgcore_execute_utility(statement->utilityStmt, summary);
+				fastpg_pgcore_execute_utility(statement,
+											  prepared->source_text,
+											  params,
+											  summary,
+											  result->context);
+#ifdef USE_FASTPG
+				if (!fastpg_rust_xact_is_explicit())
+					fastpg_rust_xact_commit_if_implicit();
+#endif
 				continue;
 			}
 

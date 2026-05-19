@@ -161,6 +161,10 @@ static uint32 CatalogCacheComputeTupleHashValue(CatCache *cache, int nkeys,
 static inline bool CatalogCacheCompareTuple(const CatCache *cache, int nkeys,
 											const Datum *cachekeys,
 											const Datum *searchkeys);
+#ifdef USE_FASTPG
+static HeapTuple FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys,
+												 Datum *arguments);
+#endif
 
 #ifdef CATCACHE_STATS
 static void CatCachePrintStats(int code, Datum arg);
@@ -431,6 +435,15 @@ GetCCHashEqFuncs(Oid keytype, CCHashFN *hashfunc, RegProcedure *eqfunc, CCFastEq
 }
 
 #ifdef USE_FASTPG
+extern uint64_t fastpg_rust_scan_begin(uint32_t relid);
+extern void fastpg_rust_scan_end(uint64_t scan_handle);
+extern bool fastpg_rust_scan_next(uint64_t scan_handle,
+								  uint8_t forward,
+								  uintptr_t *values,
+								  uint8_t *isnull,
+								  size_t natts,
+								  uint64_t *row_id);
+
 static void
 FastPgTupleDescInitEntryWithTypmod(TupleDesc tupdesc, AttrNumber attrNumber,
 								   const char *attributeName, Oid oidtypeid,
@@ -1004,9 +1017,101 @@ FastPgBuildCastTuple(TupleDesc tupdesc, const FastPgRustCatalogCast *cast)
 	return heap_form_tuple(tupdesc, values, nulls);
 }
 
+static bool
+FastPgCatalogRowIdToTid(uint64_t row_id, ItemPointer tid)
+{
+	uint64_t	zero_index;
+	uint64_t	block;
+	OffsetNumber offset;
+
+	if (row_id == 0)
+		return false;
+
+	zero_index = row_id - 1;
+	block = zero_index / (uint64_t) MaxOffsetNumber;
+	if (block > UINT32_MAX)
+		return false;
+
+	offset = (OffsetNumber) (zero_index % (uint64_t) MaxOffsetNumber) +
+		FirstOffsetNumber;
+	ItemPointerSet(tid, (BlockNumber) block, offset);
+	return true;
+}
+
+static HeapTuple
+FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
+{
+	Datum	   *values;
+	uint8_t    *isnull;
+	uint64_t	scan_handle;
+	uint64_t	row_id = 0;
+	size_t		natts;
+	HeapTuple	tuple = NULL;
+
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) == 0)
+		return NULL;
+	if (cache->cc_tupdesc == NULL)
+		return NULL;
+
+	natts = (size_t) cache->cc_tupdesc->natts;
+	values = palloc0_array(Datum, natts);
+	isnull = palloc0_array(uint8_t, natts);
+	scan_handle = fastpg_rust_scan_begin((uint32_t) cache->cc_reloid);
+
+	while (fastpg_rust_scan_next(scan_handle,
+								 true,
+								 (uintptr_t *) values,
+								 isnull,
+								 natts,
+								 &row_id))
+	{
+		bool		matches = true;
+
+		for (int key_index = 0; key_index < nkeys; key_index++)
+		{
+			int			attnum = cache->cc_keyno[key_index];
+
+			if (attnum <= 0 || attnum > cache->cc_tupdesc->natts)
+			{
+				matches = false;
+				break;
+			}
+			if (isnull[attnum - 1] != 0 ||
+				!(cache->cc_fastequal[key_index]) (values[attnum - 1],
+												   arguments[key_index]))
+			{
+				matches = false;
+				break;
+			}
+		}
+
+		if (matches)
+		{
+			bool	   *nulls = palloc0_array(bool, natts);
+
+			for (size_t index = 0; index < natts; index++)
+				nulls[index] = isnull[index] != 0;
+			tuple = heap_form_tuple(cache->cc_tupdesc, values, nulls);
+			if (!FastPgCatalogRowIdToTid(row_id, &tuple->t_self))
+				elog(ERROR,
+					 "fastpg catalog row id %llu cannot be represented as a CTID",
+					 (unsigned long long) row_id);
+			break;
+		}
+	}
+
+	fastpg_rust_scan_end(scan_handle);
+	pfree(values);
+	pfree(isnull);
+	return tuple;
+}
+
 static HeapTuple
 FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 {
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
+		return FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
+
 	if (cache->cc_reloid == RelationRelationId)
 	{
 		FastPgRustCatalogRelation relation;
@@ -1230,7 +1335,7 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 		}
 	}
 
-	return NULL;
+	return FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
 }
 #endif
 

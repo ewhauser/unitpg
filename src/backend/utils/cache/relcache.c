@@ -1794,6 +1794,15 @@ InitIndexAmRoutine(Relation relation)
 {
 	MemoryContext oldctx;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster &&
+		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId)
+	{
+		relation->rd_indam = GetFastPgMemIndexAmRoutine();
+		return;
+	}
+#endif
+
 	/*
 	 * We formerly specified that the amhandler should return a palloc'd
 	 * struct.  That's now deprecated in favor of returning a pointer to a
@@ -2209,7 +2218,6 @@ UseFastPgMemTableAm(Relation relation)
 	return relation->rd_rel->relkind == RELKIND_RELATION &&
 		relation->rd_rel->relam == HEAP_TABLE_AM_OID &&
 		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
-		!IsCatalogNamespace(relnamespace) &&
 		!IsToastNamespace(relnamespace);
 }
 #endif

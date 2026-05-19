@@ -8,23 +8,24 @@ use std::slice;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    BPCHAR_OID, CatalogError, CatalogValue, ColumnRecord, CreateFunctionSpec, CreateTypeColumn,
-    CreateTypeKind, INT2_OID, INT2VECTOR_OID, INT4_OID, INT8_OID, NAME_OID, OID_OID, OIDVECTOR_OID,
-    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, TEXT_OID, TIMESTAMP_OID, VARCHAR_OID,
-    add_primary_key, btree_opclass_for_type as catalog_btree_opclass_for_type,
+    ACLITEM_ARRAY_OID, ANYARRAY_OID, BPCHAR_OID, CHAR_ARRAY_OID, CID_OID, CatalogError,
+    CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
+    INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
+    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, TEXT_ARRAY_OID, TEXT_OID, TID_OID, TIMESTAMP_OID,
+    VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
     builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_value, catalog_rows, create_function, create_opclass,
-    create_relation, create_type, drop_relation, lookup_type, relation_by_name, relation_by_oid,
-    relation_column_count, static_catalog_by_name, static_catalog_by_relation_oid,
-    truncate_relation, type_by_name, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row, lookup_type,
+    primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
+    relation_by_name, relation_by_oid, relation_column_count, static_catalog_by_name,
+    static_catalog_by_relation_oid, type_by_name, upsert_catalog_row, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
 const NAMEDATALEN: usize = 64;
 const FASTPG_PROC_MAX_ARGS: usize = 8;
 const FASTPG_PROC_SOURCE_LEN: usize = 64;
-const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
 const FASTPG_MAX_INDEX_KEYS: usize = 32;
 
 #[repr(C)]
@@ -314,6 +315,7 @@ pub struct SessionStorage {
     explicit_transaction: bool,
     scans: HashMap<u64, ScanState>,
     next_scan_handle: u64,
+    catalog_session: fastpg_catalog::CatalogSessionHandle,
 }
 
 impl Default for SessionStorage {
@@ -323,6 +325,7 @@ impl Default for SessionStorage {
             explicit_transaction: false,
             scans: HashMap::new(),
             next_scan_handle: 1,
+            catalog_session: fastpg_catalog::new_catalog_session(),
         }
     }
 }
@@ -342,11 +345,20 @@ thread_local! {
 #[derive(Debug)]
 pub struct SessionStorageGuard {
     previous: Option<SessionStorageHandle>,
+    _catalog_guard: fastpg_catalog::CatalogSessionGuard,
 }
 
 pub fn enter_session_storage(handle: SessionStorageHandle) -> SessionStorageGuard {
+    let catalog_session = match handle.lock() {
+        Ok(session) => session.catalog_session.clone(),
+        Err(poisoned) => poisoned.into_inner().catalog_session.clone(),
+    };
+    let catalog_guard = fastpg_catalog::enter_catalog_session(catalog_session);
     let previous = CURRENT_SESSION_STORAGE.with(|slot| slot.replace(Some(handle)));
-    SessionStorageGuard { previous }
+    SessionStorageGuard {
+        previous,
+        _catalog_guard: catalog_guard,
+    }
 }
 
 impl Drop for SessionStorageGuard {
@@ -383,6 +395,7 @@ impl SessionStorage {
         if self.transaction_stack.is_empty() {
             self.transaction_stack.push(TransactionOverlay::default());
         }
+        fastpg_catalog::begin_implicit_transaction();
     }
 }
 
@@ -392,6 +405,7 @@ impl StorageState {
             self.commit_implicit_transaction(session);
         }
         session.ensure_transaction();
+        fastpg_catalog::begin_explicit_transaction();
         session.explicit_transaction = true;
     }
 
@@ -399,11 +413,13 @@ impl StorageState {
         while !session.transaction_stack.is_empty() {
             self.commit_top_overlay(session);
         }
+        fastpg_catalog::commit_explicit_transaction();
         session.explicit_transaction = false;
     }
 
     fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
         session.transaction_stack.clear();
+        fastpg_catalog::abort_explicit_transaction();
         session.explicit_transaction = false;
     }
 
@@ -414,11 +430,13 @@ impl StorageState {
         while !session.transaction_stack.is_empty() {
             self.commit_top_overlay(session);
         }
+        fastpg_catalog::commit_implicit_transaction();
     }
 
     fn abort_implicit_transaction(&mut self, session: &mut SessionStorage) {
         if !session.explicit_transaction {
             session.transaction_stack.clear();
+            fastpg_catalog::abort_implicit_transaction();
         }
     }
 
@@ -589,26 +607,6 @@ impl StorageState {
 
     fn invalidate_primary_key_spec(&mut self, relid: u32) {
         self.primary_key_specs.remove(&relid);
-    }
-
-    fn rebuild_primary_key_index(&mut self, relid: u32) {
-        self.invalidate_primary_key_spec(relid);
-        let primary_key_spec = self.primary_key_spec(relid);
-        let Some(relation) = self.relations.get_mut(&relid) else {
-            return;
-        };
-
-        relation.primary_key_index.clear();
-        for row_id in &relation.committed_row_ids {
-            let Some(row) = relation.committed_row_index.get(row_id) else {
-                continue;
-            };
-            if let Some(primary_key_spec) = &primary_key_spec
-                && let Some(key) = primary_key_for_row(primary_key_spec, row)
-            {
-                relation.primary_key_index.insert(key, *row_id);
-            }
-        }
     }
 
     fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
@@ -817,6 +815,10 @@ fn clear_primary_key_index_info_cache() {
     }
 }
 
+fn catalog_mutation_invalidates_primary_key_cache(relation_oid: u32) -> bool {
+    matches!(relation_oid, 1249 | 1259 | 2606 | 2610)
+}
+
 fn cached_primary_key_index_info(index_oid: Oid) -> Option<FastPgRustPrimaryKeyIndexInfo> {
     let cached = match primary_key_index_info_cache().lock() {
         Ok(cache) => cache.get(&index_oid.0).copied(),
@@ -849,50 +851,30 @@ unsafe fn c_str_to_string(value: *const c_char) -> Result<String, String> {
         .map_err(|error| format!("invalid UTF-8 string: {error}"))
 }
 
-unsafe fn c_str_array_to_strings(
+unsafe fn nullable_c_str_array_to_strings(
     values: *const *const c_char,
+    is_null: *const u8,
     len: usize,
-) -> Result<Vec<String>, String> {
+) -> Result<Vec<Option<String>>, String> {
     if len == 0 {
         return Ok(Vec::new());
     }
-    if values.is_null() {
-        return Err("null string array pointer".to_owned());
+    if values.is_null() || is_null.is_null() {
+        return Err("null catalog row array pointer".to_owned());
     }
-    unsafe { slice::from_raw_parts(values, len) }
+    let values = unsafe { slice::from_raw_parts(values, len) };
+    let is_null = unsafe { slice::from_raw_parts(is_null, len) };
+    values
         .iter()
-        .map(|value| unsafe { c_str_to_string(*value) })
+        .zip(is_null.iter())
+        .map(|(value, is_null)| {
+            if *is_null != 0 {
+                Ok(None)
+            } else {
+                unsafe { c_str_to_string(*value) }.map(Some)
+            }
+        })
         .collect()
-}
-
-unsafe fn u32_array<'a>(values: *const u32, len: usize) -> Result<&'a [u32], String> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if values.is_null() {
-        return Err("null OID array pointer".to_owned());
-    }
-    Ok(unsafe { slice::from_raw_parts(values, len) })
-}
-
-unsafe fn i32_array<'a>(values: *const i32, len: usize) -> Result<&'a [i32], String> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if values.is_null() {
-        return Err("null typmod array pointer".to_owned());
-    }
-    Ok(unsafe { slice::from_raw_parts(values, len) })
-}
-
-unsafe fn u8_array<'a>(values: *const u8, len: usize) -> Result<&'a [u8], String> {
-    if len == 0 {
-        return Ok(&[]);
-    }
-    if values.is_null() {
-        return Err("null flag array pointer".to_owned());
-    }
-    Ok(unsafe { slice::from_raw_parts(values, len) })
 }
 
 unsafe fn write_c_output(buffer: *mut c_char, buffer_len: usize, value: &str) {
@@ -943,7 +925,7 @@ fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatal
         namespace_oid: relation.namespace.0,
         name: fixed_c_name(&relation.name),
         column_count: relation.columns.len().min(u16::MAX as usize) as u16,
-        relkind: b'r',
+        relkind: relation.relkind,
         has_primary_key: u8::from(!relation.primary_key.is_empty()),
     }
 }
@@ -1376,33 +1358,27 @@ fn primary_key_spec(relation: &fastpg_catalog::RelationRecord) -> Option<Primary
 }
 
 fn primary_key_index_oid(relation: &fastpg_catalog::RelationRecord) -> Option<Oid> {
-    if relation.primary_key.is_empty() {
-        return None;
-    }
-    relation
-        .oid
-        .0
-        .checked_add(PRIMARY_KEY_INDEX_OID_OFFSET)
-        .map(Oid)
+    primary_key_index_oid_for_relation_oid(relation.oid)
 }
 
 fn primary_key_index_name(relation: &fastpg_catalog::RelationRecord) -> String {
+    if let Some(index_oid) = primary_key_index_oid(relation)
+        && let Some(index_relation) = relation_by_oid(index_oid)
+    {
+        return index_relation.name;
+    }
     format!("{}_pkey", relation.name)
 }
 
 fn primary_key_index_relation(index_oid: Oid) -> Option<fastpg_catalog::RelationRecord> {
-    let relation_oid = index_oid.0.checked_sub(PRIMARY_KEY_INDEX_OID_OFFSET)?;
-    let relation = relation_by_oid(Oid(relation_oid))?;
-    primary_key_index_oid(&relation)
-        .is_some_and(|primary_key_index_oid| primary_key_index_oid == index_oid)
-        .then_some(relation)
+    let relation_oid = primary_key_relation_oid_for_index_oid(index_oid)?;
+    relation_by_oid(relation_oid)
 }
 
 fn primary_key_index_relation_by_name(name: &str) -> Option<fastpg_catalog::RelationRecord> {
-    let relation_name = name.strip_suffix("_pkey")?;
-    let relation = relation_by_name(relation_name)?;
-    (!relation.primary_key.is_empty() && primary_key_index_name(&relation) == name)
-        .then_some(relation)
+    let index_relation = relation_by_name(name)?;
+    let relation_oid = primary_key_relation_oid_for_index_oid(index_relation.oid)?;
+    relation_by_oid(relation_oid)
 }
 
 fn primary_key_column(
@@ -2272,149 +2248,6 @@ pub unsafe extern "C" fn fastpg_rust_catalog_btree_opclass_for_type(
 ///
 /// C callers must pass valid output pointers where required; any C strings or
 /// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_create_relation(
-    name: *const c_char,
-    column_names: *const *const c_char,
-    type_oids: *const u32,
-    type_mods: *const i32,
-    not_nulls: *const u8,
-    column_count: usize,
-    if_not_exists: bool,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
-) -> bool {
-    let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
-            .map_err(invalid_ffi_argument)?;
-        let type_oids =
-            unsafe { u32_array(type_oids, column_count) }.map_err(invalid_ffi_argument)?;
-        let type_mods =
-            unsafe { i32_array(type_mods, column_count) }.map_err(invalid_ffi_argument)?;
-        let not_nulls =
-            unsafe { u8_array(not_nulls, column_count) }.map_err(invalid_ffi_argument)?;
-        let columns = column_names
-            .into_iter()
-            .enumerate()
-            .map(|(index, name)| {
-                ColumnRecord::new(
-                    name,
-                    Oid(type_oids[index]),
-                    type_mods[index],
-                    not_nulls[index] != 0,
-                )
-            })
-            .collect::<Vec<_>>();
-        let created = create_relation(&name, columns, if_not_exists)?;
-        if created.is_some() {
-            clear_primary_key_index_info_cache();
-        }
-        Ok::<(), CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_drop_relation(
-    name: *const c_char,
-    missing_ok: bool,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
-) -> bool {
-    let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let dropped = drop_relation(&name, missing_ok)?;
-        if let Some(relation) = dropped {
-            clear_primary_key_index_info_cache();
-            with_storage(|state, session| state.clear_relation(session, relation.oid.0));
-        }
-        Ok::<(), fastpg_catalog::CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_truncate_relation(
-    name: *const c_char,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
-) -> bool {
-    let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let relation = truncate_relation(&name)?;
-        with_storage(|state, session| state.clear_relation(session, relation.oid.0));
-        Ok::<(), fastpg_catalog::CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_count(
     name: *const c_char,
     count_out: *mut usize,
@@ -2459,228 +2292,41 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_count(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_add_primary_key(
-    name: *const c_char,
-    column_names: *const *const c_char,
-    column_count: usize,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
+/// C callers must pass valid row value and null arrays for `natts` entries.
+/// Non-null string pointers must contain valid UTF-8.
+pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
+    relation_oid: u32,
+    row_id: u64,
+    values: *const *const c_char,
+    is_null: *const u8,
+    natts: usize,
+    row_id_out: *mut u64,
 ) -> bool {
     let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
+        let values = unsafe { nullable_c_str_array_to_strings(values, is_null, natts) }
             .map_err(invalid_ffi_argument)?;
-        add_primary_key(&name, column_names)?;
+        let row_id = upsert_catalog_row(Oid(relation_oid), row_id, values)?;
+        if catalog_mutation_invalidates_primary_key_cache(relation_oid) {
+            clear_primary_key_index_info_cache();
+        }
+        if !row_id_out.is_null() {
+            unsafe {
+                *row_id_out = row_id;
+            }
+        }
+        Ok::<(), CatalogError>(())
+    })();
+
+    result.is_ok()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64) -> bool {
+    let ok = delete_catalog_row(Oid(relation_oid), row_id).is_ok();
+    if ok && catalog_mutation_invalidates_primary_key_cache(relation_oid) {
         clear_primary_key_index_info_cache();
-        if let Some(relation) = relation_by_name(&name) {
-            with_storage(|state, _session| state.rebuild_primary_key_index(relation.oid.0));
-        }
-        Ok::<(), CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
     }
-}
-
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_create_type(
-    name: *const c_char,
-    kind: u8,
-    subtype_oid: u32,
-    collation_oid: u32,
-    labels: *const *const c_char,
-    label_count: usize,
-    column_names: *const *const c_char,
-    column_type_oids: *const u32,
-    column_type_mods: *const i32,
-    column_count: usize,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
-) -> bool {
-    let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let kind = match kind {
-            b's' => CreateTypeKind::Shell,
-            b'b' => CreateTypeKind::Base,
-            b'e' => {
-                let labels = unsafe { c_str_array_to_strings(labels, label_count) }
-                    .map_err(invalid_ffi_argument)?;
-                CreateTypeKind::Enum { labels }
-            }
-            b'r' => CreateTypeKind::Range {
-                subtype: Oid(subtype_oid),
-                collation: Oid(collation_oid),
-            },
-            b'c' => {
-                let column_names = unsafe { c_str_array_to_strings(column_names, column_count) }
-                    .map_err(invalid_ffi_argument)?;
-                let column_type_oids = unsafe { u32_array(column_type_oids, column_count) }
-                    .map_err(invalid_ffi_argument)?;
-                let column_type_mods = unsafe { i32_array(column_type_mods, column_count) }
-                    .map_err(invalid_ffi_argument)?;
-                let columns = column_names
-                    .into_iter()
-                    .enumerate()
-                    .map(|(index, name)| CreateTypeColumn {
-                        name,
-                        type_oid: Oid(column_type_oids[index]),
-                        type_mod: column_type_mods[index],
-                    })
-                    .collect();
-                CreateTypeKind::Composite { columns }
-            }
-            other => {
-                return Err(CatalogError::new(
-                    "22023",
-                    format!("unknown CREATE TYPE kind byte {other}"),
-                ));
-            }
-        };
-        create_type(&name, kind)?;
-        Ok::<(), CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_create_function(
-    name: *const c_char,
-    return_type_oid: u32,
-    arg_type_oids: *const u32,
-    arg_count: usize,
-    language_oid: u32,
-    is_strict: u8,
-    leakproof: u8,
-    returns_set: u8,
-    volatility: u8,
-    parallel: u8,
-    source: *const c_char,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
-) -> bool {
-    let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let source = unsafe { c_str_to_string(source) }.map_err(invalid_ffi_argument)?;
-        let arg_type_oids =
-            unsafe { u32_array(arg_type_oids, arg_count) }.map_err(invalid_ffi_argument)?;
-        let arg_types = arg_type_oids.iter().copied().map(Oid).collect();
-        create_function(CreateFunctionSpec {
-            name,
-            return_type: Oid(return_type_oid),
-            arg_types,
-            language: Oid(language_oid),
-            strict: is_strict != 0,
-            leakproof: leakproof != 0,
-            returns_set: returns_set != 0,
-            volatility,
-            parallel,
-            source,
-        })?;
-        Ok::<(), CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
-    }
-}
-
-#[unsafe(no_mangle)]
-/// # Safety
-///
-/// C callers must pass valid output pointers where required; any C strings or
-/// arrays must be valid for reads of the specified length for the call.
-pub unsafe extern "C" fn fastpg_rust_catalog_create_opclass(
-    name: *const c_char,
-    method_name: *const c_char,
-    input_type_oid: u32,
-    is_default: u8,
-    sqlstate_out: *mut c_char,
-    sqlstate_len: usize,
-    message_out: *mut c_char,
-    message_len: usize,
-) -> bool {
-    let result = (|| {
-        let name = unsafe { c_str_to_string(name) }.map_err(invalid_ffi_argument)?;
-        let method_name = unsafe { c_str_to_string(method_name) }.map_err(invalid_ffi_argument)?;
-        create_opclass(&name, &method_name, Oid(input_type_oid), is_default != 0)?;
-        Ok::<(), CatalogError>(())
-    })();
-
-    match result {
-        Ok(()) => true,
-        Err(error) => {
-            unsafe {
-                write_catalog_error(
-                    sqlstate_out,
-                    sqlstate_len,
-                    message_out,
-                    message_len,
-                    &error.sqlstate,
-                    &error.message,
-                );
-            }
-            false
-        }
-    }
+    ok
 }
 
 #[unsafe(no_mangle)]
@@ -2733,6 +2379,7 @@ pub extern "C" fn fastpg_rust_subxact_begin() {
         session
             .transaction_stack
             .push(TransactionOverlay::default());
+        fastpg_catalog::begin_subtransaction();
     });
 }
 
@@ -2741,6 +2388,7 @@ pub extern "C" fn fastpg_rust_subxact_commit() {
     with_storage(|state, session| {
         if session.transaction_stack.len() > 1 {
             state.commit_top_overlay(session);
+            fastpg_catalog::commit_subtransaction();
         }
     });
 }
@@ -2750,6 +2398,7 @@ pub extern "C" fn fastpg_rust_subxact_abort() {
     with_storage(|_state, session| {
         if session.transaction_stack.len() > 1 {
             session.transaction_stack.pop();
+            fastpg_catalog::abort_subtransaction();
         }
     });
 }
@@ -3072,6 +2721,10 @@ fn int4_datum(value: i32) -> Cell {
     datum(value as usize)
 }
 
+fn int8_datum(value: i64) -> Cell {
+    datum(value as usize)
+}
+
 fn null_datum() -> Cell {
     Cell {
         value: 0,
@@ -3088,6 +2741,10 @@ fn char_datum(value: u8) -> Cell {
 }
 
 fn float4_datum(value: f32) -> Cell {
+    datum(value.to_bits() as usize)
+}
+
+fn float8_datum(value: f64) -> Cell {
     datum(value.to_bits() as usize)
 }
 
@@ -3130,6 +2787,71 @@ fn push_i16_ne(bytes: &mut Vec<u8>, value: i16) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
 
+fn push_i8(bytes: &mut Vec<u8>, value: i8) {
+    bytes.push(value as u8);
+}
+
+fn parse_pg_array_elements(value: &str) -> Option<Vec<Option<String>>> {
+    let body = value.strip_prefix('{')?.strip_suffix('}')?;
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut current_was_quoted = false;
+
+    for ch in body.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if quoted {
+            match ch {
+                '\\' => escaped = true,
+                '"' => quoted = false,
+                _ => current.push(ch),
+            }
+            continue;
+        }
+        match ch {
+            '"' => {
+                quoted = true;
+                current_was_quoted = true;
+            }
+            ',' => {
+                if !current_was_quoted && current == "NULL" {
+                    elements.push(None);
+                } else {
+                    elements.push(Some(std::mem::take(&mut current)));
+                }
+                current_was_quoted = false;
+            }
+            _ => current.push(ch),
+        }
+    }
+
+    if quoted || escaped {
+        return None;
+    }
+    if !current_was_quoted && current == "NULL" {
+        elements.push(None);
+    } else {
+        elements.push(Some(current));
+    }
+    Some(elements)
+}
+
+fn parse_pg_array_values<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> Option<Vec<T>> {
+    parse_pg_array_elements(value)?
+        .into_iter()
+        .map(|element| parse(element.as_deref()?))
+        .collect()
+}
+
 fn int2vector_datum(values: &[i16], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
@@ -3162,6 +2884,45 @@ fn oidvector_datum(values: &[u32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
     datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
 }
 
+fn int4array_datum(values: &[i32], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+    let total_len = 24 + std::mem::size_of_val(values);
+    let mut bytes = Vec::with_capacity(total_len);
+    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
+    push_i32_ne(&mut bytes, 1);
+    push_i32_ne(&mut bytes, 0);
+    push_u32_ne(&mut bytes, INT4_OID.0);
+    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
+    push_i32_ne(&mut bytes, 0);
+    for value in values {
+        push_i32_ne(&mut bytes, *value);
+    }
+    payloads.push(bytes.into_boxed_slice());
+    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+}
+
+fn chararray_datum(values: &[u8], payloads: &mut Vec<Box<[u8]>>) -> Cell {
+    let total_len = 24 + values.len();
+    let mut bytes = Vec::with_capacity(total_len);
+    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
+    push_i32_ne(&mut bytes, 1);
+    push_i32_ne(&mut bytes, 0);
+    push_u32_ne(&mut bytes, fastpg_catalog::CHAR_OID.0);
+    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
+    push_i32_ne(&mut bytes, 0);
+    for value in values {
+        push_i8(&mut bytes, *value as i8);
+    }
+    payloads.push(bytes.into_boxed_slice());
+    datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
+}
+
+fn parse_lsn(value: &str) -> Option<u64> {
+    let (high, low) = value.split_once('/')?;
+    let high = u64::from_str_radix(high, 16).ok()?;
+    let low = u64::from_str_radix(low, 16).ok()?;
+    Some((high << 32) | low)
+}
+
 fn text_datum(value: &str, payloads: &mut Vec<Box<[u8]>>) -> Cell {
     payloads.push(postgres_text_payload(value.as_bytes()));
     datum(payloads.last().expect("payload was just pushed").as_ptr() as usize)
@@ -3190,7 +2951,12 @@ fn catalog_value_to_cell(
         CatalogValue::Raw(value) => match column.type_oid {
             NAME_OID => name_datum(value, payloads),
             TEXT_OID | PG_NODE_TREE_OID => text_datum(value, payloads),
-            OID_OID => value
+            _ if column.type_name.starts_with("reg") => {
+                fastpg_catalog::resolve_generated_catalog_oid_name(value)
+                    .map(|value| datum(value.0 as usize))
+                    .unwrap_or_else(|| datum(0))
+            }
+            OID_OID | XID_OID | CID_OID => value
                 .parse::<u32>()
                 .map(|value| datum(value as usize))
                 .unwrap_or_else(|_| datum(0)),
@@ -3202,6 +2968,18 @@ fn catalog_value_to_cell(
                 .parse::<i32>()
                 .map(int4_datum)
                 .unwrap_or_else(|_| int4_datum(0)),
+            INT8_OID => value
+                .parse::<i64>()
+                .map(int8_datum)
+                .unwrap_or_else(|_| int8_datum(0)),
+            FLOAT8_OID => value
+                .parse::<f64>()
+                .map(float8_datum)
+                .unwrap_or_else(|_| float8_datum(0.0)),
+            TID_OID => null_datum(),
+            LSN_OID => parse_lsn(value)
+                .map(|value| datum(value as usize))
+                .unwrap_or_else(|| datum(0)),
             OIDVECTOR_OID => {
                 let values = value
                     .split_whitespace()
@@ -3216,6 +2994,19 @@ fn catalog_value_to_cell(
                     .collect::<Vec<_>>();
                 int2vector_datum(&values, payloads)
             }
+            INT2_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<i16>().ok())
+                .map(|values| int2vector_datum(&values, payloads))
+                .unwrap_or_else(null_datum),
+            INT4_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<i32>().ok())
+                .map(|values| int4array_datum(&values, payloads))
+                .unwrap_or_else(null_datum),
+            OID_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<u32>().ok())
+                .map(|values| oidvector_datum(&values, payloads))
+                .unwrap_or_else(null_datum),
+            CHAR_ARRAY_OID => parse_pg_array_values(value, |part| part.as_bytes().first().copied())
+                .map(|values| chararray_datum(&values, payloads))
+                .unwrap_or_else(null_datum),
+            TEXT_ARRAY_OID | ACLITEM_ARRAY_OID | ANYARRAY_OID => null_datum(),
             _ => null_datum(),
         },
     }
@@ -3395,7 +3186,8 @@ unsafe fn copy_row_to_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastpg_catalog::builtin_namespaces;
+    use fastpg_catalog::{builtin_namespaces, static_catalog_by_name, upsert_catalog_row};
+    use std::collections::BTreeMap;
     use std::ptr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -3422,6 +3214,152 @@ mod tests {
 
     fn next_relid() -> u32 {
         NEXT_RELID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn upsert_named_catalog_row(table_name: &str, row_id: u64, values: &[(&str, &str)]) -> u64 {
+        let table = static_catalog_by_name(table_name).expect("catalog table");
+        let values = values
+            .iter()
+            .map(|(column, value)| (*column, (*value).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let row = table
+            .columns
+            .iter()
+            .map(|column| values.get(column.name).cloned())
+            .collect::<Vec<_>>();
+        upsert_catalog_row(table.oid, row_id, row).expect("upsert catalog row")
+    }
+
+    fn install_primary_key_test_catalog() -> (u32, Oid) {
+        let relid = 50_100;
+        let type_oid = 50_101;
+        let index_oid = Oid(50_102);
+        let constraint_oid = 50_103;
+
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", "50100"),
+                ("relname", "pk_storage"),
+                ("relnamespace", "2200"),
+                ("reltype", "50101"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", "50100"),
+                ("relhasindex", "t"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_type",
+            type_oid as u64,
+            &[
+                ("oid", "50101"),
+                ("typname", "pk_storage"),
+                ("typnamespace", "2200"),
+                ("typowner", "10"),
+                ("typlen", "-1"),
+                ("typbyval", "f"),
+                ("typtype", "c"),
+                ("typcategory", "C"),
+                ("typisdefined", "t"),
+                ("typdelim", ","),
+                ("typrelid", "50100"),
+                ("typalign", "d"),
+                ("typstorage", "x"),
+            ],
+        );
+        for (attnum, name, type_oid, attlen, attbyval, attnotnull) in [
+            (1, "id", "23", "4", "t", "t"),
+            (2, "value", "23", "4", "t", "f"),
+        ] {
+            upsert_named_catalog_row(
+                "pg_attribute",
+                0,
+                &[
+                    ("attrelid", "50100"),
+                    ("attname", name),
+                    ("atttypid", type_oid),
+                    ("attlen", attlen),
+                    ("attnum", &attnum.to_string()),
+                    ("atttypmod", "-1"),
+                    ("attbyval", attbyval),
+                    ("attalign", "i"),
+                    ("attstorage", "p"),
+                    ("attnotnull", attnotnull),
+                    ("attisdropped", "f"),
+                ],
+            );
+        }
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", "50102"),
+                ("relname", "pk_storage_pkey"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "403"),
+                ("relfilenode", "50102"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50102"),
+                ("attname", "id"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "t"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", "50102"),
+                ("indrelid", "50100"),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "t"),
+                ("indisprimary", "t"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_constraint",
+            constraint_oid as u64,
+            &[
+                ("oid", "50103"),
+                ("conname", "pk_storage_pkey"),
+                ("connamespace", "2200"),
+                ("contype", "p"),
+                ("conrelid", "50100"),
+                ("conindid", "50102"),
+                ("conkey", "1"),
+            ],
+        );
+        fastpg_rust_xact_commit_if_implicit();
+        clear_primary_key_index_info_cache();
+        (relid, index_oid)
     }
 
     unsafe fn insert_byval(relid: u32, values: &[usize], is_null: &[u8], row_id: &mut u64) -> bool {
@@ -3956,20 +3894,10 @@ mod tests {
     #[test]
     fn primary_key_index_enforces_uniqueness_and_tracks_updates() {
         let _guard = test_guard();
-        create_relation(
-            "pk_storage",
-            vec![
-                ColumnRecord::new("id", INT4_OID, -1, true),
-                ColumnRecord::new("value", INT4_OID, -1, false),
-            ],
-            false,
-        )
-        .unwrap()
-        .unwrap();
-        add_primary_key("pk_storage", vec!["id".to_owned()]).unwrap();
+        let (relid, index_oid) = install_primary_key_test_catalog();
         let relation = relation_by_name("pk_storage").unwrap();
-        let index_oid = primary_key_index_oid(&relation).unwrap();
-        let relid = relation.oid.0;
+        assert_eq!(relation.oid.0, relid);
+        assert_eq!(primary_key_index_oid(&relation), Some(index_oid));
         let mut first_row_id = 0;
         let mut second_row_id = 0;
         let mut index_relation = FastPgRustCatalogRelation {

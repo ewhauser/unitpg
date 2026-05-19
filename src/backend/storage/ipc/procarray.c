@@ -2114,7 +2114,7 @@ Snapshot
 GetSnapshotData(Snapshot snapshot)
 {
 	ProcArrayStruct *arrayP = procArray;
-	TransactionId *other_xids = ProcGlobal->xids;
+	TransactionId *other_xids;
 	TransactionId xmin;
 	TransactionId xmax;
 	int			count = 0;
@@ -2130,6 +2130,24 @@ GetSnapshotData(Snapshot snapshot)
 	TransactionId replication_slot_catalog_xmin = InvalidTransactionId;
 
 	Assert(snapshot != NULL);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		snapshot->snapshot_type = SNAPSHOT_MVCC;
+		snapshot->xmin = FirstNormalTransactionId;
+		snapshot->xmax = MaxTransactionId;
+		snapshot->xcnt = 0;
+		snapshot->subxcnt = 0;
+		snapshot->suboverflowed = false;
+		snapshot->takenDuringRecovery = false;
+		snapshot->curcid = 0;
+		snapshot->snapXactCompletionCount = 0;
+		return snapshot;
+	}
+#endif
+
+	other_xids = ProcGlobal->xids;
 
 	/*
 	 * Allocating space for maxProcs xids is usually overkill; numProcs would

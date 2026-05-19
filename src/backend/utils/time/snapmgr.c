@@ -938,6 +938,11 @@ SnapshotResetXmin(void)
 {
 	Snapshot	minSnapshot;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	if (ActiveSnapshot != NULL)
 		return;
 

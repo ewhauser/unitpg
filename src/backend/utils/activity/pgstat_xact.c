@@ -13,6 +13,7 @@
 #include "postgres.h"
 
 #include "access/xact.h"
+#include "miscadmin.h"
 #include "pgstat.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
@@ -360,6 +361,11 @@ create_drop_transactional_internal(PgStat_Kind kind, Oid dboid, uint64 objid, bo
 void
 pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	if (pgstat_get_entry_ref(kind, dboid, objid, false, NULL))
 	{
 		ereport(WARNING,
@@ -383,5 +389,10 @@ pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 void
 pgstat_drop_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	create_drop_transactional_internal(kind, dboid, objid, /* create */ false);
 }

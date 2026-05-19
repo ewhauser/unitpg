@@ -15,6 +15,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -22,7 +25,133 @@
 #include "catalog/index.h"
 #include "catalog/indexing.h"
 #include "executor/executor.h"
+#include "fmgr.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
+
+#ifdef USE_FASTPG
+static bool
+FastPgCatalogRowIdToTid(uint64_t row_id, ItemPointer tid)
+{
+	uint64_t	zero_index;
+	uint64_t	block;
+	OffsetNumber offset;
+
+	if (row_id == 0)
+		return false;
+
+	zero_index = row_id - 1;
+	block = zero_index / (uint64_t) MaxOffsetNumber;
+	if (block > UINT32_MAX)
+		return false;
+
+	offset = (OffsetNumber) (zero_index % (uint64_t) MaxOffsetNumber) +
+		FirstOffsetNumber;
+	ItemPointerSet(tid, (BlockNumber) block, offset);
+	return true;
+}
+
+static bool
+FastPgCatalogTidToRowId(const ItemPointerData *tid, uint64_t *row_id)
+{
+	BlockNumber block = ItemPointerGetBlockNumber(tid);
+	OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
+
+	if (!OffsetNumberIsValid(offset))
+		return false;
+
+	*row_id = ((uint64_t) block * (uint64_t) MaxOffsetNumber) +
+		(uint64_t) offset;
+	return true;
+}
+
+static bool
+FastPgIsVirtualCatalog(Relation heapRel)
+{
+	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRel)) != 0;
+}
+
+static void
+FastPgCatalogTupleToTextArrays(Relation heapRel,
+							   HeapTuple tup,
+							   const char ***values_out,
+							   uint8_t **is_null_out,
+							   uint64_t *row_id_out)
+{
+	TupleDesc	tupdesc = RelationGetDescr(heapRel);
+	const char **values;
+	uint8_t    *is_null;
+
+	values = palloc0_array(const char *, tupdesc->natts);
+	is_null = palloc0_array(uint8_t, tupdesc->natts);
+
+	for (int index = 0; index < tupdesc->natts; index++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, index);
+		bool		null_value = false;
+		bool		type_is_varlena;
+		Oid			output_function;
+		Datum		value;
+
+		value = heap_getattr(tup, index + 1, tupdesc, &null_value);
+		if (null_value)
+		{
+			is_null[index] = 1;
+			continue;
+		}
+
+		if (row_id_out != NULL &&
+			attr->atttypid == OIDOID &&
+			strcmp(NameStr(attr->attname), "oid") == 0)
+			*row_id_out = DatumGetObjectId(value);
+
+		getTypeOutputInfo(attr->atttypid, &output_function, &type_is_varlena);
+		values[index] = OidOutputFunctionCall(output_function, value);
+	}
+
+	*values_out = values;
+	*is_null_out = is_null;
+}
+
+static void
+FastPgCatalogUpsertTuple(Relation heapRel, HeapTuple tup, uint64_t row_id)
+{
+	TupleDesc	tupdesc = RelationGetDescr(heapRel);
+	const char **values;
+	uint8_t    *is_null;
+	uint64_t	stored_row_id = row_id;
+
+	FastPgCatalogTupleToTextArrays(heapRel, tup, &values, &is_null, &stored_row_id);
+	if (!fastpg_rust_catalog_upsert_row((uint32_t) RelationGetRelid(heapRel),
+										stored_row_id,
+										values,
+										is_null,
+										(size_t) tupdesc->natts,
+										&stored_row_id))
+		elog(ERROR, "fastpg failed to capture catalog row for relation %u",
+			 RelationGetRelid(heapRel));
+	if (!FastPgCatalogRowIdToTid(stored_row_id, &tup->t_self))
+		elog(ERROR, "fastpg catalog row id %llu cannot be represented as a CTID",
+			 (unsigned long long) stored_row_id);
+}
+
+static void
+FastPgCatalogDeleteTuple(Relation heapRel, const ItemPointerData *tid)
+{
+	uint64_t	row_id;
+
+	if (!FastPgCatalogTidToRowId(tid, &row_id))
+		elog(ERROR,
+			 "fastpg catalog CTID (%u,%u) cannot be converted to a row id for relation %u",
+			 ItemPointerGetBlockNumberNoCheck(tid),
+			 ItemPointerGetOffsetNumberNoCheck(tid),
+			 RelationGetRelid(heapRel));
+	if (!fastpg_rust_catalog_delete_row((uint32_t) RelationGetRelid(heapRel), row_id))
+		elog(ERROR, "fastpg failed to delete catalog row %llu for relation %u",
+			 (unsigned long long) row_id,
+			 RelationGetRelid(heapRel));
+}
+#endif
 
 
 /*
@@ -44,6 +173,11 @@ CatalogOpenIndexes(Relation heapRel)
 {
 	ResultRelInfo *resultRelInfo;
 
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+		return NULL;
+#endif
+
 	resultRelInfo = makeNode(ResultRelInfo);
 	resultRelInfo->ri_RangeTableIndex = 0;	/* dummy */
 	resultRelInfo->ri_RelationDesc = heapRel;
@@ -60,6 +194,8 @@ CatalogOpenIndexes(Relation heapRel)
 void
 CatalogCloseIndexes(CatalogIndexState indstate)
 {
+	if (indstate == NULL)
+		return;
 	ExecCloseIndices(indstate);
 	pfree(indstate);
 }
@@ -84,6 +220,9 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	bool		onlySummarized = (updateIndexes == TU_Summarizing);
+
+	if (indstate == NULL)
+		return;
 
 	/*
 	 * HOT update does not require index inserts. But with asserts enabled we
@@ -236,6 +375,14 @@ CatalogTupleInsert(Relation heapRel, HeapTuple tup)
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+	{
+		FastPgCatalogUpsertTuple(heapRel, tup, 0);
+		return;
+	}
+#endif
+
 	indstate = CatalogOpenIndexes(heapRel);
 
 	simple_heap_insert(heapRel, tup);
@@ -258,6 +405,14 @@ CatalogTupleInsertWithInfo(Relation heapRel, HeapTuple tup,
 {
 	CatalogTupleCheckConstraints(heapRel, tup);
 
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+	{
+		FastPgCatalogUpsertTuple(heapRel, tup, 0);
+		return;
+	}
+#endif
+
 	simple_heap_insert(heapRel, tup);
 
 	CatalogIndexInsert(indstate, tup, TU_All);
@@ -276,6 +431,24 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 	/* Nothing to do */
 	if (ntuples <= 0)
 		return;
+
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+	{
+		for (int i = 0; i < ntuples; i++)
+		{
+			bool		should_free;
+			HeapTuple	tuple;
+
+			tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
+			tuple->t_tableOid = slot[i]->tts_tableOid;
+			FastPgCatalogUpsertTuple(heapRel, tuple, 0);
+			if (should_free)
+				heap_freetuple(tuple);
+		}
+		return;
+	}
+#endif
 
 	heap_multi_insert(heapRel, slot, ntuples,
 					  GetCurrentCommandId(true), 0, NULL);
@@ -317,6 +490,18 @@ CatalogTupleUpdate(Relation heapRel, const ItemPointerData *otid, HeapTuple tup)
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+	{
+		uint64_t	row_id;
+
+		if (!FastPgCatalogTidToRowId(otid, &row_id))
+			elog(ERROR, "fastpg catalog CTID cannot be converted to a row id");
+		FastPgCatalogUpsertTuple(heapRel, tup, row_id);
+		return;
+	}
+#endif
+
 	indstate = CatalogOpenIndexes(heapRel);
 
 	simple_heap_update(heapRel, otid, tup, &updateIndexes);
@@ -341,6 +526,18 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 
 	CatalogTupleCheckConstraints(heapRel, tup);
 
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+	{
+		uint64_t	row_id;
+
+		if (!FastPgCatalogTidToRowId(otid, &row_id))
+			elog(ERROR, "fastpg catalog CTID cannot be converted to a row id");
+		FastPgCatalogUpsertTuple(heapRel, tup, row_id);
+		return;
+	}
+#endif
+
 	simple_heap_update(heapRel, otid, tup, &updateIndexes);
 
 	CatalogIndexInsert(indstate, tup, updateIndexes);
@@ -364,5 +561,13 @@ CatalogTupleUpdateWithInfo(Relation heapRel, const ItemPointerData *otid, HeapTu
 void
 CatalogTupleDelete(Relation heapRel, const ItemPointerData *tid)
 {
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(heapRel))
+	{
+		FastPgCatalogDeleteTuple(heapRel, tid);
+		return;
+	}
+#endif
+
 	simple_heap_delete(heapRel, tid);
 }
