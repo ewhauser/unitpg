@@ -257,19 +257,17 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
-        let statement = match self.prepare_pgcore(sql) {
-            Ok(statement) => statement,
-            Err(error) => return pgcore_error_execution(error),
-        };
         let parameters = parameters
             .iter()
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
 
-        let execution_result = {
-            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
-            statement.execute_with_params(&parameters)
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        let statement = match self.pgcore_session.prepare(sql) {
+            Ok(statement) => statement,
+            Err(error) => return pgcore_error_execution(error),
         };
+        let execution_result = statement.execute_with_params(&parameters);
 
         match execution_result {
             Ok(result) => pgcore_execution_to_query_execution(result),
