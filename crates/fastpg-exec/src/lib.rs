@@ -107,7 +107,7 @@ impl QueryExecutorShared {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct QueryExecutor {
     #[allow(dead_code)]
     shared: Arc<QueryExecutorShared>,
@@ -117,6 +117,8 @@ pub struct QueryExecutor {
     prepared_cache: Arc<Mutex<HashMap<String, Arc<CachedPgCoreStatement>>>>,
     #[cfg(feature = "postgres-execution")]
     storage_session: fastpg_storage::SessionStorageHandle,
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    transaction: Mutex<SessionTransaction>,
 }
 
 #[cfg(feature = "postgres-execution")]
@@ -166,7 +168,10 @@ impl QueryExecutor {
         }
         #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
         {
-            Self { shared }
+            Self {
+                shared,
+                transaction: Mutex::new(SessionTransaction::default()),
+            }
         }
         #[cfg(not(any(feature = "postgres-execution", feature = "mini-sql-testkit")))]
         {
@@ -233,17 +238,13 @@ impl QueryExecutor {
                 return Ok(false);
             }
 
-            let mut database = self
-                .shared
-                .database
-                .lock()
-                .expect("fastpg database mutex poisoned");
-            let table = database
-                .tables
-                .get_mut(table)
-                .ok_or_else(|| format!("relation \"{table}\" does not exist"))?;
-            table.copy_text_row(line)?;
-            Ok(true)
+            self.with_write_tables(|tables| {
+                let table = tables
+                    .get_mut(table)
+                    .ok_or_else(|| format!("relation \"{table}\" does not exist"))?;
+                table.copy_text_row(line)?;
+                Ok(true)
+            })
         }
         #[cfg(not(any(feature = "postgres-execution", feature = "mini-sql-testkit")))]
         {
@@ -265,6 +266,22 @@ impl QueryExecutor {
         {
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
             fastpg_storage::abort_implicit_transaction();
+        }
+    }
+
+    pub fn close(&self) {
+        #[cfg(feature = "postgres-execution")]
+        {
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            if fastpg_storage::is_explicit_transaction() {
+                fastpg_storage::abort_explicit_transaction();
+            } else {
+                fastpg_storage::abort_implicit_transaction();
+            }
+        }
+        #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+        {
+            self.rollback_session_transaction();
         }
     }
 
@@ -372,6 +389,91 @@ impl QueryExecutor {
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    fn with_read_tables<R>(&self, f: impl FnOnce(&BTreeMap<String, Table>) -> R) -> R {
+        let transaction = self
+            .transaction
+            .lock()
+            .expect("fastpg session transaction mutex poisoned");
+        if let Some(tables) = transaction.tables.as_ref() {
+            return f(tables);
+        }
+        drop(transaction);
+
+        let database = self
+            .shared
+            .database
+            .lock()
+            .expect("fastpg database mutex poisoned");
+        f(&database.tables)
+    }
+
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    fn with_write_tables<R>(&self, f: impl FnOnce(&mut BTreeMap<String, Table>) -> R) -> R {
+        let mut transaction = self
+            .transaction
+            .lock()
+            .expect("fastpg session transaction mutex poisoned");
+        if transaction.tables.is_some() {
+            let tables = transaction
+                .tables
+                .as_mut()
+                .expect("checked transaction table presence");
+            return f(tables);
+        }
+        drop(transaction);
+
+        let mut database = self
+            .shared
+            .database
+            .lock()
+            .expect("fastpg database mutex poisoned");
+        f(&mut database.tables)
+    }
+
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    fn begin_session_transaction(&self) {
+        let mut transaction = self
+            .transaction
+            .lock()
+            .expect("fastpg session transaction mutex poisoned");
+        if transaction.tables.is_none() {
+            let database = self
+                .shared
+                .database
+                .lock()
+                .expect("fastpg database mutex poisoned");
+            transaction.tables = Some(database.tables.clone());
+        }
+    }
+
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    fn commit_session_transaction(&self) {
+        let tables = self
+            .transaction
+            .lock()
+            .expect("fastpg session transaction mutex poisoned")
+            .tables
+            .take();
+        if let Some(tables) = tables {
+            let mut database = self
+                .shared
+                .database
+                .lock()
+                .expect("fastpg database mutex poisoned");
+            database.tables = tables;
+        }
+    }
+
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    fn rollback_session_transaction(&self) {
+        self.transaction
+            .lock()
+            .expect("fastpg session transaction mutex poisoned")
+            .tables
+            .take();
+    }
+
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_bound(&self, statement: BoundStatement, parameters: &[Value]) -> QueryExecution {
         match statement {
             BoundStatement::SelectOne => QueryExecution::Rows(QueryResult::new(
@@ -438,12 +540,9 @@ impl QueryExecutor {
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn result_fields(&self, statement: &BoundStatement) -> Vec<Column> {
         if let BoundStatement::SelectColumnWhereInt { table, column, .. } = statement {
-            let database = self
-                .shared
-                .database
-                .lock()
-                .expect("fastpg database mutex poisoned");
-            if let Some(data_type) = database.column_type(table, column) {
+            if let Some(data_type) =
+                self.with_read_tables(|tables| tables.get(table)?.column_type(column))
+            {
                 return vec![Column::new(column, data_type)];
             }
         }
@@ -460,12 +559,7 @@ impl QueryExecutor {
         };
 
         let table = normalize_identifier(table);
-        let database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        if !database.tables.contains_key(&table) {
+        if !self.with_read_tables(|tables| tables.contains_key(&table)) {
             return undefined_table(&table);
         }
 
@@ -477,14 +571,8 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_pgbench_partition_info(&self) -> QueryExecution {
-        let database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let rows = database
-            .tables
-            .contains_key("pgbench_accounts")
+        let rows = self
+            .with_read_tables(|tables| tables.contains_key("pgbench_accounts"))
             .then(|| vec![Value::Int4(1), Value::Null, Value::Int8(0)])
             .into_iter()
             .collect::<Vec<_>>();
@@ -497,12 +585,9 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_count(&self, table: &str) -> QueryExecution {
-        let database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let Some(table) = database.tables.get(table) else {
+        let Some(row_count) =
+            self.with_read_tables(|tables| tables.get(table).map(|t| t.rows.len()))
+        else {
             return undefined_table(table);
         };
 
@@ -510,7 +595,7 @@ impl QueryExecutor {
             result_fields_for_statement(&BoundStatement::SelectCount {
                 table: String::new(),
             }),
-            vec![vec![Value::Int8(table.rows.len() as i64)]],
+            vec![vec![Value::Int8(row_count as i64)]],
         ))
     }
 
@@ -522,32 +607,31 @@ impl QueryExecutor {
         key_column: &str,
         key_value: i64,
     ) -> QueryExecution {
-        let database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let Some(table_ref) = database.tables.get(table) else {
-            return undefined_table(table);
-        };
+        let result = self.with_read_tables(|tables| {
+            tables
+                .get(table)
+                .ok_or_else(|| format!("relation \"{table}\" does not exist"))?
+                .select_column_where_int(column, key_column, key_value)
+        });
 
-        match table_ref.select_column_where_int(column, key_column, key_value) {
+        match result {
             Ok((field, rows)) => QueryExecution::Rows(QueryResult::new(vec![field], rows)),
+            Err(message) if message.starts_with("relation ") => execution_error("42P01", message),
             Err(message) => execution_error("42703", message),
         }
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_drop_tables(&self, if_exists: bool, names: &[String]) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        for name in names {
-            if database.tables.remove(name).is_none() && !if_exists {
-                return undefined_table(name);
+        if let Some(missing) = self.with_write_tables(|tables| {
+            for name in names {
+                if tables.remove(name).is_none() && !if_exists {
+                    return Some(name.clone());
+                }
             }
+            None
+        }) {
+            return undefined_table(&missing);
         }
         QueryExecution::Command {
             tag: "DROP TABLE".to_owned(),
@@ -557,34 +641,34 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_create_table(&self, name: String, columns: Vec<Column>) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        if database.tables.contains_key(&name) {
+        if self.with_write_tables(|tables| {
+            if tables.contains_key(&name) {
+                return false;
+            }
+            tables.insert(name.clone(), Table::new(columns));
+            true
+        }) {
+            QueryExecution::Command {
+                tag: "CREATE TABLE".to_owned(),
+                rows: 0,
+            }
+        } else {
             return execution_error("42P07", format!("relation \"{name}\" already exists"));
-        }
-
-        database.tables.insert(name, Table::new(columns));
-        QueryExecution::Command {
-            tag: "CREATE TABLE".to_owned(),
-            rows: 0,
         }
     }
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_truncate_tables(&self, names: &[String]) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        for name in names {
-            let Some(table) = database.tables.get_mut(name) else {
-                return undefined_table(name);
-            };
-            table.rows.clear();
+        if let Some(missing) = self.with_write_tables(|tables| {
+            for name in names {
+                let Some(table) = tables.get_mut(name) else {
+                    return Some(name.clone());
+                };
+                table.rows.clear();
+            }
+            None
+        }) {
+            return undefined_table(&missing);
         }
 
         QueryExecution::Command {
@@ -595,13 +679,7 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_begin(&self) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let snapshot = database.tables.clone();
-        database.snapshots.push(snapshot);
+        self.begin_session_transaction();
         QueryExecution::Command {
             tag: "BEGIN".to_owned(),
             rows: 0,
@@ -610,12 +688,7 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_commit(&self) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        database.snapshots.pop();
+        self.commit_session_transaction();
         QueryExecution::Command {
             tag: "COMMIT".to_owned(),
             rows: 0,
@@ -624,14 +697,7 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_rollback(&self) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        if let Some(snapshot) = database.snapshots.pop() {
-            database.tables = snapshot;
-        }
+        self.rollback_session_transaction();
         QueryExecution::Command {
             tag: "ROLLBACK".to_owned(),
             rows: 0,
@@ -640,18 +706,15 @@ impl QueryExecutor {
 
     #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
     fn execute_copy_from_stdin(&self, table: &str) -> QueryExecution {
-        let database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let Some(table_ref) = database.tables.get(table) else {
+        let Some(columns) =
+            self.with_read_tables(|tables| tables.get(table).map(|t| t.columns.len()))
+        else {
             return undefined_table(table);
         };
 
         QueryExecution::CopyIn(CopyTarget {
             table: table.to_owned(),
-            columns: table_ref.columns.len(),
+            columns,
         })
     }
 
@@ -664,20 +727,19 @@ impl QueryExecutor {
         key_column: &str,
         key_value: i64,
     ) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let Some(table_ref) = database.tables.get_mut(table) else {
-            return undefined_table(table);
-        };
+        let result = self.with_write_tables(|tables| {
+            tables
+                .get_mut(table)
+                .ok_or_else(|| format!("relation \"{table}\" does not exist"))?
+                .update_add_int(column, addend, key_column, key_value)
+        });
 
-        match table_ref.update_add_int(column, addend, key_column, key_value) {
+        match result {
             Ok(rows) => QueryExecution::Command {
                 tag: "UPDATE".to_owned(),
                 rows,
             },
+            Err(message) if message.starts_with("relation ") => execution_error("42P01", message),
             Err(message) => execution_error("42703", message),
         }
     }
@@ -689,20 +751,19 @@ impl QueryExecutor {
         columns: &[String],
         values: &[BoundExpression],
     ) -> QueryExecution {
-        let mut database = self
-            .shared
-            .database
-            .lock()
-            .expect("fastpg database mutex poisoned");
-        let Some(table_ref) = database.tables.get_mut(table) else {
-            return undefined_table(table);
-        };
+        let result = self.with_write_tables(|tables| {
+            tables
+                .get_mut(table)
+                .ok_or_else(|| format!("relation \"{table}\" does not exist"))?
+                .insert_values(columns, values)
+        });
 
-        match table_ref.insert_values(columns, values) {
+        match result {
             Ok(()) => QueryExecution::Command {
                 tag: "INSERT".to_owned(),
                 rows: 1,
             },
+            Err(message) if message.starts_with("relation ") => execution_error("42P01", message),
             Err(message) => execution_error("42601", message),
         }
     }
@@ -1059,14 +1120,12 @@ fn normalize_identifier(value: &str) -> String {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 struct DatabaseState {
     tables: BTreeMap<String, Table>,
-    snapshots: Vec<BTreeMap<String, Table>>,
 }
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
-impl DatabaseState {
-    fn column_type(&self, table: &str, column: &str) -> Option<PgType> {
-        self.tables.get(table)?.column_type(column)
-    }
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct SessionTransaction {
+    tables: Option<BTreeMap<String, Table>>,
 }
 
 #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
@@ -1466,6 +1525,54 @@ mod tests {
         );
     }
 
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    #[test]
+    fn explicit_transactions_are_per_executor() {
+        let shared = Arc::new(QueryExecutorShared::new("17.0-fastpg"));
+        let session_a = QueryExecutor::with_shared(shared.clone());
+        let session_b = QueryExecutor::with_shared(shared);
+
+        assert_eq!(
+            session_a.execute("create table session_rows(id int)", &[]),
+            QueryExecution::Command {
+                tag: "CREATE TABLE".to_owned(),
+                rows: 0,
+            }
+        );
+
+        assert_eq!(
+            session_a.execute("begin", &[]),
+            QueryExecution::Command {
+                tag: "BEGIN".to_owned(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            session_a.execute("insert into session_rows values (1)", &[]),
+            QueryExecution::Command {
+                tag: "INSERT".to_owned(),
+                rows: 1,
+            }
+        );
+
+        assert_eq!(count_rows(&session_a, "session_rows"), 1);
+        assert_eq!(count_rows(&session_b, "session_rows"), 0);
+
+        assert_eq!(
+            session_a.execute("rollback", &[]),
+            QueryExecution::Command {
+                tag: "ROLLBACK".to_owned(),
+                rows: 0,
+            }
+        );
+        assert_eq!(count_rows(&session_a, "session_rows"), 0);
+
+        session_a.execute("begin", &[]);
+        session_a.execute("insert into session_rows values (2)", &[]);
+        session_a.execute("commit", &[]);
+        assert_eq!(count_rows(&session_b, "session_rows"), 1);
+    }
+
     #[cfg(feature = "postgres-execution")]
     #[test]
     fn executes_select_one_through_pgcore() {
@@ -1609,5 +1716,18 @@ mod tests {
         };
         assert!(!server_version.is_empty());
         assert_ne!(server_version, "17.0-fastpg");
+    }
+
+    #[cfg(all(feature = "mini-sql-testkit", not(feature = "postgres-execution")))]
+    fn count_rows(executor: &QueryExecutor, table: &str) -> i64 {
+        let QueryExecution::Rows(result) =
+            executor.execute(&format!("select count(*) from {table}"), &[])
+        else {
+            panic!("expected count rows");
+        };
+        let Value::Int8(count) = &result.rows[0][0] else {
+            panic!("expected int8 count");
+        };
+        *count
     }
 }
