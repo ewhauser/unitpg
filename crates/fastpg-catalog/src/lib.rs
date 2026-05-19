@@ -52,6 +52,7 @@ const PG_CLASS_RELATION_OID: Oid = Oid(1259);
 const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
 const PG_TYPE_RELATION_OID: Oid = Oid(1247);
 const PG_PROC_RELATION_OID: Oid = Oid(1255);
+const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
@@ -338,13 +339,72 @@ impl CatalogError {
     }
 }
 
-#[derive(Clone, Debug, Default)]
-struct CatalogOverlay {
+#[derive(Clone, Debug, PartialEq)]
+struct RelationMeta {
+    row_id: u64,
+    oid: Oid,
+    type_oid: Oid,
+    namespace: Oid,
+    owner: Oid,
+    name: String,
+    relkind: u8,
+    relnatts: u16,
+    relhasindex: bool,
+    row: CatalogRow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ColumnMeta {
+    row_id: u64,
+    relation_oid: Oid,
+    attnum: i16,
+    record: ColumnRecord,
+    row: CatalogRow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct TypeMeta {
+    row_id: u64,
+    record: CatalogTypeRecord,
+    row: CatalogRow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct IndexMeta {
+    row_id: u64,
+    record: IndexRecord,
+    row: CatalogRow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ConstraintMeta {
+    row_id: u64,
+    oid: Oid,
+    name: String,
+    namespace: Oid,
+    relation_oid: Oid,
+    index_oid: Oid,
+    kind: u8,
+    key_attnums: Vec<i16>,
+    row: CatalogRow,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NamespaceMeta {
+    row_id: u64,
+    oid: Oid,
+    name: String,
+    owner: Oid,
+    row: CatalogRow,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CompatCatalogRows {
     rows: BTreeMap<u32, BTreeMap<u64, Arc<CatalogRow>>>,
     tombstones: BTreeMap<u32, BTreeSet<u64>>,
 }
 
-impl CatalogOverlay {
+impl CompatCatalogRows {
     fn is_empty(&self) -> bool {
         self.rows.values().all(BTreeMap::is_empty)
             && self.tombstones.values().all(BTreeSet::is_empty)
@@ -361,6 +421,12 @@ impl CatalogOverlay {
             .insert(row.row_id, Arc::new(row));
     }
 
+    fn untombstone(&mut self, relation_oid: Oid, row_id: u64) {
+        if let Some(tombstones) = self.tombstones.get_mut(&relation_oid.0) {
+            tombstones.remove(&row_id);
+        }
+    }
+
     fn delete(&mut self, relation_oid: Oid, row_id: u64) {
         self.rows.entry(relation_oid.0).or_default().remove(&row_id);
         self.tombstones
@@ -369,7 +435,7 @@ impl CatalogOverlay {
             .insert(row_id);
     }
 
-    fn merge(&mut self, other: CatalogOverlay) {
+    fn merge(&mut self, other: CompatCatalogRows) {
         for (relation_oid, tombstones) in other.tombstones {
             for row_id in tombstones {
                 self.delete(Oid(relation_oid), row_id);
@@ -394,69 +460,594 @@ impl CatalogOverlay {
             }
         }
     }
+}
 
-    fn apply_to_filtered_rows<F>(
-        &self,
-        relation_oid: Oid,
-        rows: &mut BTreeMap<u64, CatalogRow>,
-        row_matches: &F,
-    ) where
-        F: Fn(&CatalogRow) -> bool,
-    {
-        if let Some(tombstones) = self.tombstones.get(&relation_oid.0) {
-            for row_id in tombstones {
-                rows.remove(row_id);
-            }
-        }
-        if let Some(overlay_rows) = self.rows.get(&relation_oid.0) {
-            for (row_id, row) in overlay_rows {
-                if row_matches(row) {
-                    rows.insert(*row_id, row.as_ref().clone());
-                } else {
-                    rows.remove(row_id);
-                }
-            }
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CatalogSnapshot {
+    generation: u64,
+    namespaces: BTreeMap<u64, NamespaceMeta>,
+    namespace_oids: BTreeMap<u32, u64>,
+    namespace_names: BTreeMap<String, u64>,
+    relations: BTreeMap<u64, RelationMeta>,
+    relation_oids: BTreeMap<u32, u64>,
+    relation_names: BTreeMap<(u32, String), u64>,
+    columns: BTreeMap<u64, ColumnMeta>,
+    columns_by_relation: BTreeMap<u32, BTreeMap<i16, u64>>,
+    types: BTreeMap<u64, TypeMeta>,
+    type_oids: BTreeMap<u32, u64>,
+    type_names: BTreeMap<(u32, String), u64>,
+    indexes: BTreeMap<u64, IndexMeta>,
+    index_oids: BTreeMap<u32, u64>,
+    indexes_by_relation: BTreeMap<u32, Vec<u64>>,
+    constraints: BTreeMap<u64, ConstraintMeta>,
+    constraint_oids: BTreeMap<u32, u64>,
+    constraints_by_relation: BTreeMap<u32, Vec<u64>>,
+    compat_rows: CompatCatalogRows,
+}
+
+impl CatalogSnapshot {
+    fn new(generation: u64) -> Self {
+        Self {
+            generation,
+            ..Self::default()
         }
     }
 
-    fn apply_to_filtered_values<T, F>(
-        &self,
-        relation_oid: Oid,
-        rows: &mut BTreeMap<u64, T>,
-        row_matches: &F,
-    ) where
-        F: Fn(&CatalogRow) -> Option<T>,
-    {
-        if let Some(tombstones) = self.tombstones.get(&relation_oid.0) {
-            for row_id in tombstones {
-                rows.remove(row_id);
+    fn rebuild_indexes(&mut self) {
+        self.namespace_oids.clear();
+        self.namespace_names.clear();
+        for (row_id, namespace) in &self.namespaces {
+            self.namespace_oids.insert(namespace.oid.0, *row_id);
+            self.namespace_names
+                .insert(normalize_identifier(&namespace.name), *row_id);
+        }
+
+        self.relation_oids.clear();
+        self.relation_names.clear();
+        for (row_id, relation) in &self.relations {
+            self.relation_oids.insert(relation.oid.0, *row_id);
+            self.relation_names.insert(
+                (relation.namespace.0, normalize_identifier(&relation.name)),
+                *row_id,
+            );
+        }
+
+        self.columns_by_relation.clear();
+        for (row_id, column) in &self.columns {
+            self.columns_by_relation
+                .entry(column.relation_oid.0)
+                .or_default()
+                .insert(column.attnum, *row_id);
+        }
+
+        self.type_oids.clear();
+        self.type_names.clear();
+        for (row_id, pg_type) in &self.types {
+            self.type_oids.insert(pg_type.record.oid.0, *row_id);
+            self.type_names.insert(
+                (
+                    pg_type.record.namespace.0,
+                    normalize_identifier(&pg_type.record.name),
+                ),
+                *row_id,
+            );
+        }
+
+        self.index_oids.clear();
+        self.indexes_by_relation.clear();
+        for (row_id, index) in &self.indexes {
+            self.index_oids.insert(index.record.index_oid.0, *row_id);
+            self.indexes_by_relation
+                .entry(index.record.relation_oid.0)
+                .or_default()
+                .push(*row_id);
+        }
+
+        self.constraint_oids.clear();
+        self.constraints_by_relation.clear();
+        for (row_id, constraint) in &self.constraints {
+            self.constraint_oids.insert(constraint.oid.0, *row_id);
+            self.constraints_by_relation
+                .entry(constraint.relation_oid.0)
+                .or_default()
+                .push(*row_id);
+        }
+    }
+
+    fn relation_meta_by_oid(&self, oid: Oid) -> Option<&RelationMeta> {
+        self.relation_oids
+            .get(&oid.0)
+            .and_then(|row_id| self.relations.get(row_id))
+    }
+
+    fn relation_meta_by_name(&self, name: &str, namespace: Oid) -> Option<&RelationMeta> {
+        let name = normalize_identifier(name);
+        self.relation_names
+            .get(&(namespace.0, name))
+            .and_then(|row_id| self.relations.get(row_id))
+    }
+
+    fn type_meta_by_oid(&self, oid: Oid) -> Option<&TypeMeta> {
+        self.type_oids
+            .get(&oid.0)
+            .and_then(|row_id| self.types.get(row_id))
+    }
+
+    fn type_meta_by_name(&self, name: &str, namespace: Oid) -> Option<&TypeMeta> {
+        let name = canonical_catalog_type_name(name);
+        self.type_names
+            .get(&(namespace.0, name))
+            .and_then(|row_id| self.types.get(row_id))
+    }
+
+    fn index_meta_by_oid(&self, oid: Oid) -> Option<&IndexMeta> {
+        self.index_oids
+            .get(&oid.0)
+            .and_then(|row_id| self.indexes.get(row_id))
+    }
+
+    fn index_metas_for_relation(&self, relation_oid: Oid) -> Vec<&IndexMeta> {
+        self.indexes_by_relation
+            .get(&relation_oid.0)
+            .into_iter()
+            .flat_map(|row_ids| row_ids.iter())
+            .filter_map(|row_id| self.indexes.get(row_id))
+            .collect()
+    }
+
+    fn constraint_metas_for_relation(&self, relation_oid: Oid) -> Vec<&ConstraintMeta> {
+        self.constraints_by_relation
+            .get(&relation_oid.0)
+            .into_iter()
+            .flat_map(|row_ids| row_ids.iter())
+            .filter_map(|row_id| self.constraints.get(row_id))
+            .collect()
+    }
+
+    fn remove_relation_cascade(&mut self, row_id: u64) {
+        let Some(relation) = self.relations.remove(&row_id) else {
+            return;
+        };
+        let relation_oid = relation.oid;
+        let relation_oid_raw = relation_oid.0;
+
+        self.columns
+            .retain(|_, column| column.relation_oid != relation_oid);
+        self.types
+            .retain(|_, pg_type| pg_type.record.typrelid != relation_oid);
+        self.indexes.retain(|_, index| {
+            index.record.relation_oid != relation_oid && index.record.index_oid != relation_oid
+        });
+        self.constraints.retain(|_, constraint| {
+            constraint.relation_oid != relation_oid && constraint.index_oid != relation_oid
+        });
+
+        if relation.relkind == b'r' {
+            self.indexes
+                .retain(|_, index| index.record.relation_oid.0 != relation_oid_raw);
+            self.constraints
+                .retain(|_, constraint| constraint.relation_oid.0 != relation_oid_raw);
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+struct CatalogDraft {
+    namespaces: BTreeMap<u64, Option<NamespaceMeta>>,
+    relations: BTreeMap<u64, Option<RelationMeta>>,
+    columns: BTreeMap<u64, Option<ColumnMeta>>,
+    types: BTreeMap<u64, Option<TypeMeta>>,
+    indexes: BTreeMap<u64, Option<IndexMeta>>,
+    constraints: BTreeMap<u64, Option<ConstraintMeta>>,
+    compat_rows: CompatCatalogRows,
+}
+
+impl CatalogDraft {
+    fn is_empty(&self) -> bool {
+        self.namespaces.is_empty()
+            && self.relations.is_empty()
+            && self.columns.is_empty()
+            && self.types.is_empty()
+            && self.indexes.is_empty()
+            && self.constraints.is_empty()
+            && self.compat_rows.is_empty()
+    }
+
+    fn merge(&mut self, other: CatalogDraft) {
+        for (row_id, mutation) in &other.namespaces {
+            if mutation.is_some() {
+                self.compat_rows
+                    .untombstone(PG_NAMESPACE_RELATION_OID, *row_id);
             }
         }
-        if let Some(overlay_rows) = self.rows.get(&relation_oid.0) {
-            for (row_id, row) in overlay_rows {
-                if let Some(value) = row_matches(row) {
-                    rows.insert(*row_id, value);
-                } else {
-                    rows.remove(row_id);
+        for (row_id, mutation) in &other.relations {
+            if mutation.is_some() {
+                self.compat_rows.untombstone(PG_CLASS_RELATION_OID, *row_id);
+            }
+        }
+        for (row_id, mutation) in &other.columns {
+            if mutation.is_some() {
+                self.compat_rows
+                    .untombstone(PG_ATTRIBUTE_RELATION_OID, *row_id);
+            }
+        }
+        for (row_id, mutation) in &other.types {
+            if mutation.is_some() {
+                self.compat_rows.untombstone(PG_TYPE_RELATION_OID, *row_id);
+            }
+        }
+        for (row_id, mutation) in &other.indexes {
+            if mutation.is_some() {
+                self.compat_rows.untombstone(PG_INDEX_RELATION_OID, *row_id);
+            }
+        }
+        for (row_id, mutation) in &other.constraints {
+            if mutation.is_some() {
+                self.compat_rows
+                    .untombstone(PG_CONSTRAINT_RELATION_OID, *row_id);
+            }
+        }
+        self.namespaces.extend(other.namespaces);
+        self.relations.extend(other.relations);
+        self.columns.extend(other.columns);
+        self.types.extend(other.types);
+        self.indexes.extend(other.indexes);
+        self.constraints.extend(other.constraints);
+        self.compat_rows.merge(other.compat_rows);
+    }
+
+    fn apply_to_snapshot(&self, snapshot: &mut CatalogSnapshot) {
+        for (row_id, mutation) in &self.namespaces {
+            match mutation {
+                Some(namespace) => {
+                    snapshot.namespaces.insert(*row_id, namespace.clone());
+                }
+                None => {
+                    snapshot.namespaces.remove(row_id);
                 }
             }
         }
+
+        for (row_id, mutation) in &self.relations {
+            match mutation {
+                Some(relation) => {
+                    snapshot.relations.insert(*row_id, relation.clone());
+                }
+                None => {
+                    snapshot.remove_relation_cascade(*row_id);
+                }
+            }
+        }
+
+        for (row_id, mutation) in &self.columns {
+            match mutation {
+                Some(column) => {
+                    snapshot.columns.insert(*row_id, column.clone());
+                }
+                None => {
+                    snapshot.columns.remove(row_id);
+                }
+            }
+        }
+
+        for (row_id, mutation) in &self.types {
+            match mutation {
+                Some(pg_type) => {
+                    snapshot.types.insert(*row_id, pg_type.clone());
+                }
+                None => {
+                    snapshot.types.remove(row_id);
+                }
+            }
+        }
+
+        for (row_id, mutation) in &self.indexes {
+            match mutation {
+                Some(index) => {
+                    snapshot.indexes.insert(*row_id, index.clone());
+                }
+                None => {
+                    snapshot.indexes.remove(row_id);
+                }
+            }
+        }
+
+        for (row_id, mutation) in &self.constraints {
+            match mutation {
+                Some(constraint) => {
+                    snapshot.constraints.insert(*row_id, constraint.clone());
+                }
+                None => {
+                    snapshot.constraints.remove(row_id);
+                }
+            }
+        }
+
+        snapshot.compat_rows.merge(self.compat_rows.clone());
+        snapshot.rebuild_indexes();
     }
+
+    fn upsert_catalog_row(&mut self, table: &StaticCatalogTable, row: CatalogRow) {
+        let row_id = row.row_id;
+        let handled = match table.oid {
+            PG_NAMESPACE_RELATION_OID => namespace_meta_from_row(table, &row, row_id)
+                .map(|namespace| self.namespaces.insert(row_id, Some(namespace)))
+                .is_some(),
+            PG_CLASS_RELATION_OID => relation_meta_from_row(table, &row, row_id)
+                .map(|relation| self.relations.insert(row_id, Some(relation)))
+                .is_some(),
+            PG_ATTRIBUTE_RELATION_OID => column_meta_from_row(table, &row, row_id)
+                .map(|column| self.columns.insert(row_id, Some(column)))
+                .is_some(),
+            PG_TYPE_RELATION_OID => type_meta_from_row(table, &row, row_id)
+                .map(|pg_type| self.types.insert(row_id, Some(pg_type)))
+                .is_some(),
+            PG_INDEX_RELATION_OID => index_meta_from_row(table, &row, row_id)
+                .map(|index| self.indexes.insert(row_id, Some(index)))
+                .is_some(),
+            PG_CONSTRAINT_RELATION_OID => constraint_meta_from_row(table, &row, row_id)
+                .map(|constraint| self.constraints.insert(row_id, Some(constraint)))
+                .is_some(),
+            _ => false,
+        };
+        if handled {
+            self.compat_rows.untombstone(table.oid, row_id);
+        } else {
+            self.compat_rows.insert(row);
+        }
+    }
+
+    fn delete_catalog_row(&mut self, relation_oid: Oid, row_id: u64) {
+        match relation_oid {
+            PG_NAMESPACE_RELATION_OID => {
+                self.namespaces.insert(row_id, None);
+            }
+            PG_CLASS_RELATION_OID => {
+                self.relations.insert(row_id, None);
+            }
+            PG_ATTRIBUTE_RELATION_OID => {
+                self.columns.insert(row_id, None);
+            }
+            PG_TYPE_RELATION_OID => {
+                self.types.insert(row_id, None);
+            }
+            PG_INDEX_RELATION_OID => {
+                self.indexes.insert(row_id, None);
+            }
+            PG_CONSTRAINT_RELATION_OID => {
+                self.constraints.insert(row_id, None);
+            }
+            _ => {}
+        }
+        self.compat_rows.delete(relation_oid, row_id);
+    }
+}
+
+fn namespace_meta_from_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    row_id: u64,
+) -> Option<NamespaceMeta> {
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let name = catalog_row_value(table, row, "nspname").and_then(catalog_value_string)?;
+    let owner = catalog_row_value(table, row, "nspowner")
+        .and_then(catalog_value_oid)
+        .unwrap_or(POSTGRES_ROLE_OID);
+    Some(NamespaceMeta {
+        row_id,
+        oid,
+        name: normalize_identifier(&name),
+        owner,
+        row: row.clone(),
+    })
+}
+
+fn relation_meta_from_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    row_id: u64,
+) -> Option<RelationMeta> {
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let type_oid = catalog_row_value(table, row, "reltype")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
+    let namespace = catalog_row_value(table, row, "relnamespace")
+        .and_then(catalog_value_oid)
+        .unwrap_or(PUBLIC_NAMESPACE_OID);
+    let owner = catalog_row_value(table, row, "relowner")
+        .and_then(catalog_value_oid)
+        .unwrap_or(POSTGRES_ROLE_OID);
+    let name = catalog_row_value(table, row, "relname").and_then(catalog_value_string)?;
+    let relkind = catalog_row_value(table, row, "relkind")
+        .and_then(catalog_value_u8)
+        .unwrap_or(b'r');
+    let relnatts = catalog_row_value(table, row, "relnatts")
+        .and_then(catalog_value_i16)
+        .map(|value| value.max(0) as u16)
+        .unwrap_or(0);
+    let relhasindex = catalog_row_value(table, row, "relhasindex")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    Some(RelationMeta {
+        row_id,
+        oid,
+        type_oid,
+        namespace,
+        owner,
+        name: normalize_identifier(&name),
+        relkind,
+        relnatts,
+        relhasindex,
+        row: row.clone(),
+    })
+}
+
+fn column_meta_from_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    row_id: u64,
+) -> Option<ColumnMeta> {
+    let relation_oid = catalog_row_value(table, row, "attrelid").and_then(catalog_value_oid)?;
+    let (attnum, record) = column_record_from_pg_attribute_row(table, row, relation_oid)?;
+    Some(ColumnMeta {
+        row_id,
+        relation_oid,
+        attnum,
+        record,
+        row: row.clone(),
+    })
+}
+
+fn type_meta_from_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    row_id: u64,
+) -> Option<TypeMeta> {
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let name = catalog_row_value(table, row, "typname").and_then(catalog_value_string)?;
+    let record = CatalogTypeRecord {
+        oid,
+        name: canonical_catalog_type_name(&name),
+        namespace: catalog_row_value(table, row, "typnamespace")
+            .and_then(catalog_value_oid)
+            .unwrap_or(PG_CATALOG_NAMESPACE_OID),
+        owner: catalog_row_value(table, row, "typowner")
+            .and_then(catalog_value_oid)
+            .unwrap_or(POSTGRES_ROLE_OID),
+        typlen: catalog_row_value(table, row, "typlen")
+            .and_then(catalog_value_i16)
+            .unwrap_or(-1),
+        typbyval: catalog_row_value(table, row, "typbyval")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false),
+        typalign: catalog_row_value(table, row, "typalign")
+            .and_then(catalog_value_u8)
+            .unwrap_or(b'i'),
+        typdelim: catalog_row_value(table, row, "typdelim")
+            .and_then(catalog_value_u8)
+            .unwrap_or(b','),
+        typinput: catalog_row_value(table, row, "typinput")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typoutput: catalog_row_value(table, row, "typoutput")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typreceive: catalog_row_value(table, row, "typreceive")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typsend: catalog_row_value(table, row, "typsend")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typmodin: catalog_row_value(table, row, "typmodin")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typmodout: catalog_row_value(table, row, "typmodout")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typisdefined: catalog_row_value(table, row, "typisdefined")
+            .and_then(catalog_value_bool)
+            .unwrap_or(true),
+        typtype: catalog_row_value(table, row, "typtype")
+            .and_then(catalog_value_u8)
+            .unwrap_or(b'b'),
+        typcategory: catalog_row_value(table, row, "typcategory")
+            .and_then(catalog_value_u8)
+            .unwrap_or(b'U'),
+        typispreferred: catalog_row_value(table, row, "typispreferred")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false),
+        typrelid: catalog_row_value(table, row, "typrelid")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typelem: catalog_row_value(table, row, "typelem")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typarray: catalog_row_value(table, row, "typarray")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typbasetype: catalog_row_value(table, row, "typbasetype")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typtypmod: catalog_row_value(table, row, "typtypmod")
+            .and_then(catalog_value_i32)
+            .unwrap_or(-1),
+        typcollation: catalog_row_value(table, row, "typcollation")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typsubscript: catalog_row_value(table, row, "typsubscript")
+            .and_then(catalog_value_oid)
+            .unwrap_or(INVALID_OID),
+        typstorage: catalog_row_value(table, row, "typstorage")
+            .and_then(catalog_value_u8)
+            .unwrap_or(b'p'),
+    };
+    Some(TypeMeta {
+        row_id,
+        record,
+        row: row.clone(),
+    })
+}
+
+fn index_meta_from_row(
+    _table: &StaticCatalogTable,
+    row: &CatalogRow,
+    row_id: u64,
+) -> Option<IndexMeta> {
+    Some(IndexMeta {
+        row_id,
+        record: pg_index_record_from_row(row)?,
+        row: row.clone(),
+    })
+}
+
+fn constraint_meta_from_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    row_id: u64,
+) -> Option<ConstraintMeta> {
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let name = catalog_row_value(table, row, "conname")
+        .and_then(catalog_value_string)
+        .unwrap_or_default();
+    let namespace = catalog_row_value(table, row, "connamespace")
+        .and_then(catalog_value_oid)
+        .unwrap_or(PUBLIC_NAMESPACE_OID);
+    let relation_oid = catalog_row_value(table, row, "conrelid")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
+    let index_oid = catalog_row_value(table, row, "conindid")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
+    let kind = catalog_row_value(table, row, "contype")
+        .and_then(catalog_value_u8)
+        .unwrap_or(0);
+    let key_attnums = catalog_row_value(table, row, "conkey")
+        .and_then(catalog_value_int2_vector)
+        .unwrap_or_default();
+    Some(ConstraintMeta {
+        row_id,
+        oid,
+        name: normalize_identifier(&name),
+        namespace,
+        relation_oid,
+        index_oid,
+        kind,
+        key_attnums,
+        row: row.clone(),
+    })
 }
 
 #[derive(Debug)]
 struct CatalogState {
     next_overlay_row_ids: BTreeMap<u32, u64>,
-    overlay: CatalogOverlay,
-    generation: u64,
+    snapshot: CatalogSnapshot,
 }
 
 impl Default for CatalogState {
     fn default() -> Self {
         Self {
             next_overlay_row_ids: BTreeMap::new(),
-            overlay: CatalogOverlay::default(),
-            generation: 1,
+            snapshot: CatalogSnapshot::new(1),
         }
     }
 }
@@ -482,7 +1073,7 @@ impl Default for PrimaryKeyIndexOidCache {
 
 #[derive(Debug, Default)]
 pub struct CatalogSession {
-    transaction_stack: Vec<CatalogOverlay>,
+    transaction_stack: Vec<CatalogDraft>,
     explicit_transaction: bool,
 }
 
@@ -563,12 +1154,38 @@ fn with_catalog_session<R>(f: impl FnOnce(&mut CatalogSession) -> R) -> R {
     }
 }
 
-fn visible_session_overlays() -> Vec<CatalogOverlay> {
+fn visible_session_drafts() -> Vec<CatalogDraft> {
     let session = current_catalog_session();
     match session.lock() {
-        Ok(session) => session.transaction_stack.clone(),
-        Err(poisoned) => poisoned.into_inner().transaction_stack.clone(),
+        Ok(session) => session
+            .transaction_stack
+            .iter()
+            .filter(|draft| !draft.is_empty())
+            .cloned()
+            .collect(),
+        Err(poisoned) => poisoned
+            .into_inner()
+            .transaction_stack
+            .iter()
+            .filter(|draft| !draft.is_empty())
+            .cloned()
+            .collect(),
     }
+}
+
+fn with_visible_catalog_snapshot<R>(f: impl FnOnce(&CatalogSnapshot) -> R) -> R {
+    let session_drafts = visible_session_drafts();
+    if session_drafts.is_empty() {
+        return with_catalog_read(|state| f(&state.snapshot));
+    }
+
+    with_catalog_read(|state| {
+        let mut visible_snapshot = state.snapshot.clone();
+        for draft in session_drafts {
+            draft.apply_to_snapshot(&mut visible_snapshot);
+        }
+        f(&visible_snapshot)
+    })
 }
 
 pub fn has_uncommitted_catalog_changes() -> bool {
@@ -588,28 +1205,28 @@ pub fn has_uncommitted_catalog_changes() -> bool {
 
 fn ensure_catalog_transaction(session: &mut CatalogSession) {
     if session.transaction_stack.is_empty() {
-        session.transaction_stack.push(CatalogOverlay::default());
+        session.transaction_stack.push(CatalogDraft::default());
     }
 }
 
-fn commit_catalog_overlay(overlay: CatalogOverlay) {
-    if overlay.is_empty() {
+fn commit_catalog_draft(draft: CatalogDraft) {
+    if draft.is_empty() {
         return;
     }
     with_catalog(|state| {
-        state.overlay.merge(overlay);
+        draft.apply_to_snapshot(&mut state.snapshot);
         bump_generation(state);
     });
 }
 
-fn commit_top_catalog_overlay(session: &mut CatalogSession) {
-    let Some(overlay) = session.transaction_stack.pop() else {
+fn commit_top_catalog_draft(session: &mut CatalogSession) {
+    let Some(draft) = session.transaction_stack.pop() else {
         return;
     };
     if let Some(parent) = session.transaction_stack.last_mut() {
-        parent.merge(overlay);
+        parent.merge(draft);
     } else {
-        commit_catalog_overlay(overlay);
+        commit_catalog_draft(draft);
     }
 }
 
@@ -617,7 +1234,7 @@ pub fn begin_explicit_transaction() {
     with_catalog_session(|session| {
         if !session.explicit_transaction {
             while !session.transaction_stack.is_empty() {
-                commit_top_catalog_overlay(session);
+                commit_top_catalog_draft(session);
             }
         }
         ensure_catalog_transaction(session);
@@ -632,7 +1249,7 @@ pub fn begin_implicit_transaction() {
 pub fn commit_explicit_transaction() {
     with_catalog_session(|session| {
         while !session.transaction_stack.is_empty() {
-            commit_top_catalog_overlay(session);
+            commit_top_catalog_draft(session);
         }
         session.explicit_transaction = false;
     });
@@ -651,7 +1268,7 @@ pub fn commit_implicit_transaction() {
             return;
         }
         while !session.transaction_stack.is_empty() {
-            commit_top_catalog_overlay(session);
+            commit_top_catalog_draft(session);
         }
     });
 }
@@ -667,14 +1284,14 @@ pub fn abort_implicit_transaction() {
 pub fn begin_subtransaction() {
     with_catalog_session(|session| {
         ensure_catalog_transaction(session);
-        session.transaction_stack.push(CatalogOverlay::default());
+        session.transaction_stack.push(CatalogDraft::default());
     });
 }
 
 pub fn commit_subtransaction() {
     with_catalog_session(|session| {
         if session.transaction_stack.len() > 1 {
-            commit_top_catalog_overlay(session);
+            commit_top_catalog_draft(session);
         }
     });
 }
@@ -1075,52 +1692,65 @@ fn catalog_row_identifier_matches(
 
 fn catalog_rows_matching_static<StaticMatches, RowMatches>(
     relation_oid: Oid,
-    static_matches: StaticMatches,
+    _static_matches: StaticMatches,
     row_matches: RowMatches,
 ) -> Vec<CatalogRow>
 where
     StaticMatches: Fn(&StaticCatalogTable, &StaticCatalogRow) -> bool,
     RowMatches: Fn(&CatalogRow) -> bool,
 {
-    let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
+    if static_catalog_by_relation_oid(relation_oid).is_none() {
         return Vec::new();
-    };
-    let session_overlays = visible_session_overlays();
-    with_catalog_read(|state| {
-        let mut rows = BTreeMap::<u64, CatalogRow>::new();
-        for row in table.rows {
-            if !static_matches(table, row) {
-                continue;
-            }
-            let catalog_row = static_row_to_catalog_row(table, row);
-            if row_matches(&catalog_row) {
-                rows.insert(row.row_id, catalog_row);
-            }
-        }
-        state
-            .overlay
-            .apply_to_filtered_rows(relation_oid, &mut rows, &row_matches);
-        for overlay in &session_overlays {
-            overlay.apply_to_filtered_rows(relation_oid, &mut rows, &row_matches);
-        }
-        rows.into_values().collect()
-    })
+    }
+    catalog_rows(relation_oid)
+        .into_iter()
+        .filter(row_matches)
+        .collect()
 }
 
 pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
     let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
         return Vec::new();
     };
-    let session_overlays = visible_session_overlays();
-    with_catalog_read(|state| {
+    with_visible_catalog_snapshot(|snapshot| {
         let mut rows = BTreeMap::<u64, CatalogRow>::new();
         for row in table.rows {
             rows.insert(row.row_id, static_row_to_catalog_row(table, row));
         }
-        state.overlay.apply_to_rows(relation_oid, &mut rows);
-        for overlay in &session_overlays {
-            overlay.apply_to_rows(relation_oid, &mut rows);
+        match relation_oid {
+            PG_NAMESPACE_RELATION_OID => {
+                for namespace in snapshot.namespaces.values() {
+                    rows.insert(namespace.row_id, namespace.row.clone());
+                }
+            }
+            PG_CLASS_RELATION_OID => {
+                for relation in snapshot.relations.values() {
+                    rows.insert(relation.row_id, relation.row.clone());
+                }
+            }
+            PG_ATTRIBUTE_RELATION_OID => {
+                for column in snapshot.columns.values() {
+                    rows.insert(column.row_id, column.row.clone());
+                }
+            }
+            PG_TYPE_RELATION_OID => {
+                for pg_type in snapshot.types.values() {
+                    rows.insert(pg_type.row_id, pg_type.row.clone());
+                }
+            }
+            PG_INDEX_RELATION_OID => {
+                for index in snapshot.indexes.values() {
+                    rows.insert(index.row_id, index.row.clone());
+                }
+            }
+            PG_CONSTRAINT_RELATION_OID => {
+                for constraint in snapshot.constraints.values() {
+                    rows.insert(constraint.row_id, constraint.row.clone());
+                }
+            }
+            _ => {}
         }
+        snapshot.compat_rows.apply_to_rows(relation_oid, &mut rows);
         rows.into_values().collect()
     })
 }
@@ -1256,7 +1886,7 @@ pub fn upsert_catalog_row(
             .transaction_stack
             .last_mut()
             .expect("catalog transaction was just ensured")
-            .insert(row);
+            .upsert_catalog_row(table, row);
     });
     Ok(row_id)
 }
@@ -1277,7 +1907,7 @@ pub fn delete_catalog_row(relation_oid: Oid, row_id: u64) -> Result<(), CatalogE
             .transaction_stack
             .last_mut()
             .expect("catalog transaction was just ensured")
-            .delete(relation_oid, row_id);
+            .delete_catalog_row(relation_oid, row_id);
     });
     Ok(())
 }
@@ -1386,8 +2016,8 @@ fn static_btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
 }
 
 fn bump_generation(state: &mut CatalogState) {
-    state.generation = state.generation.saturating_add(1).max(1);
-    CATALOG_GENERATION.store(state.generation, Ordering::Relaxed);
+    state.snapshot.generation = state.snapshot.generation.saturating_add(1).max(1);
+    CATALOG_GENERATION.store(state.snapshot.generation, Ordering::Relaxed);
 }
 
 pub fn current_generation() -> u64 {
@@ -1443,21 +2073,6 @@ fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
     .next()
 }
 
-fn pg_class_static_oid_by_name_in_namespace(
-    table: &StaticCatalogTable,
-    row: &StaticCatalogRow,
-    name: &str,
-    namespace: Oid,
-) -> Option<Oid> {
-    let row_name_matches = static_row_column_identifier_matches(table, row, "relname", name);
-    let row_namespace_matches = static_row_column_oid(table, row, "relnamespace")
-        .is_some_and(|row_namespace| row_namespace == namespace);
-    if !row_name_matches || !row_namespace_matches {
-        return None;
-    }
-    static_row_column_oid(table, row, "oid")
-}
-
 fn pg_class_row_oid_by_name_in_namespace(
     table: &StaticCatalogTable,
     row: &CatalogRow,
@@ -1472,23 +2087,6 @@ fn pg_class_row_oid_by_name_in_namespace(
         return None;
     }
     catalog_row_value(table, row, "oid").and_then(catalog_value_oid)
-}
-
-fn pg_class_static_oid_exists(
-    table: &StaticCatalogTable,
-    row: &StaticCatalogRow,
-    oid: Oid,
-) -> Option<()> {
-    static_row_column_oid(table, row, "oid")
-        .is_some_and(|row_oid| row_oid == oid)
-        .then_some(())
-}
-
-fn pg_class_row_oid_exists(table: &StaticCatalogTable, row: &CatalogRow, oid: Oid) -> Option<()> {
-    catalog_row_value(table, row, "oid")
-        .and_then(catalog_value_oid)
-        .is_some_and(|row_oid| row_oid == oid)
-        .then_some(())
 }
 
 fn catalog_value_int2_vector(value: &CatalogValue) -> Option<Vec<i16>> {
@@ -1574,6 +2172,11 @@ pub fn relation_column_by_attnum(relation_oid: Oid, attnum: i16) -> Option<Colum
     if attnum <= 0 {
         return None;
     }
+    if let Some(column) = with_visible_catalog_snapshot(|snapshot| {
+        relation_column_from_snapshot(snapshot, relation_oid, attnum)
+    }) {
+        return Some(column);
+    }
     let table = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)?;
     catalog_rows_matching_static(
         table.oid,
@@ -1643,38 +2246,14 @@ fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
     })
 }
 
-fn pg_index_static_primary_index_oid(
-    table: &StaticCatalogTable,
-    row: &StaticCatalogRow,
-    relation_oid: Oid,
-) -> Option<Oid> {
-    let relation_matches = static_row_column_oid(table, row, "indrelid")
-        .is_some_and(|indrelid| indrelid == relation_oid);
-    let is_primary = static_row_column_bool(table, row, "indisprimary").unwrap_or(false);
-    if !relation_matches || !is_primary {
-        return None;
-    }
-    static_row_column_oid(table, row, "indexrelid")
-}
-
-fn pg_index_row_primary_index_oid(
-    table: &StaticCatalogTable,
-    row: &CatalogRow,
-    relation_oid: Oid,
-) -> Option<Oid> {
-    let relation_matches = catalog_row_value(table, row, "indrelid")
-        .and_then(catalog_value_oid)
-        .is_some_and(|indrelid| indrelid == relation_oid);
-    let is_primary = catalog_row_value(table, row, "indisprimary")
-        .and_then(catalog_value_bool)
-        .unwrap_or(false);
-    if !relation_matches || !is_primary {
-        return None;
-    }
-    catalog_row_value(table, row, "indexrelid").and_then(catalog_value_oid)
-}
-
 pub fn index_record_by_index_oid(index_oid: Oid) -> Option<IndexRecord> {
+    if let Some(index) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .index_meta_by_oid(index_oid)
+            .map(|index| index.record.clone())
+    }) {
+        return Some(index);
+    }
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
     catalog_rows_matching_static(
         table.oid,
@@ -1696,6 +2275,16 @@ pub fn index_record_by_index_oid(index_oid: Oid) -> Option<IndexRecord> {
 }
 
 pub fn index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
+    let typed_indexes = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .index_metas_for_relation(relation_oid)
+            .into_iter()
+            .map(|index| index.record.clone())
+            .collect::<Vec<_>>()
+    });
+    if !typed_indexes.is_empty() {
+        return typed_indexes;
+    }
     let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
         return Vec::new();
     };
@@ -1727,6 +2316,22 @@ pub fn unique_index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexReco
 }
 
 pub fn unique_index_oids_for_relation_oid(relation_oid: Oid) -> Vec<Oid> {
+    let typed_oids = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .index_metas_for_relation(relation_oid)
+            .into_iter()
+            .filter(|index| {
+                index.record.is_unique
+                    && index.record.is_valid
+                    && index.record.is_ready
+                    && index.record.is_live
+            })
+            .map(|index| index.record.index_oid)
+            .collect::<Vec<_>>()
+    });
+    if !typed_oids.is_empty() {
+        return typed_oids;
+    }
     let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
         return Vec::new();
     };
@@ -1796,28 +2401,22 @@ pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> 
 }
 
 fn primary_key_index_oid_for_relation_oid_uncached(relation_oid: Oid) -> Option<Oid> {
-    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
-    let session_overlays = visible_session_overlays();
-    with_catalog_read(|state| {
-        let mut rows = BTreeMap::<u64, Oid>::new();
-        for row in table.rows {
-            if let Some(index_oid) = pg_index_static_primary_index_oid(table, row, relation_oid) {
-                rows.insert(row.row_id, index_oid);
-            }
-        }
-        let row_matches =
-            |row: &CatalogRow| pg_index_row_primary_index_oid(table, row, relation_oid);
-        state
-            .overlay
-            .apply_to_filtered_values(table.oid, &mut rows, &row_matches);
-        for overlay in &session_overlays {
-            overlay.apply_to_filtered_values(table.oid, &mut rows, &row_matches);
-        }
-        rows.into_values().next()
-    })
+    if let Some(index) = with_visible_catalog_snapshot(|snapshot| {
+        primary_key_index_record_from_snapshot(snapshot, relation_oid)
+    }) {
+        return Some(index.index_oid);
+    }
+    primary_key_pg_index_row(relation_oid)
+        .and_then(|row| pg_index_record_from_row(&row))
+        .map(|record| record.index_oid)
 }
 
 pub fn primary_key_index_record_for_relation_oid(relation_oid: Oid) -> Option<IndexRecord> {
+    if let Some(index) = with_visible_catalog_snapshot(|snapshot| {
+        primary_key_index_record_from_snapshot(snapshot, relation_oid)
+    }) {
+        return Some(index);
+    }
     let row = primary_key_pg_index_row(relation_oid)?;
     let record = pg_index_record_from_row(&row)?;
     (record.relation_oid == relation_oid && record.is_primary).then_some(record)
@@ -1832,6 +2431,11 @@ fn primary_key_constraint_oid_for_relation(
     relation_oid: Oid,
     index_oid: Option<Oid>,
 ) -> Option<Oid> {
+    if let Some(oid) = with_visible_catalog_snapshot(|snapshot| {
+        primary_key_constraint_oid_from_snapshot(snapshot, relation_oid, index_oid)
+    }) {
+        return Some(oid);
+    }
     let table = static_catalog_by_relation_oid(PG_CONSTRAINT_RELATION_OID)?;
     catalog_rows_matching_static(
         table.oid,
@@ -1895,6 +2499,138 @@ fn relation_primary_key_from_pg_index(
         .collect::<Vec<_>>();
     let constraint_oid = primary_key_constraint_oid_for_relation(relation_oid, index_oid);
     (primary_key, constraint_oid)
+}
+
+fn relation_columns_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    relation_oid: Oid,
+) -> Vec<ColumnRecord> {
+    snapshot
+        .columns_by_relation
+        .get(&relation_oid.0)
+        .into_iter()
+        .flat_map(|columns| columns.values())
+        .filter_map(|row_id| snapshot.columns.get(row_id))
+        .map(|column| column.record.clone())
+        .collect()
+}
+
+fn relation_column_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    relation_oid: Oid,
+    attnum: i16,
+) -> Option<ColumnRecord> {
+    snapshot
+        .columns_by_relation
+        .get(&relation_oid.0)?
+        .get(&attnum)
+        .and_then(|row_id| snapshot.columns.get(row_id))
+        .map(|column| column.record.clone())
+}
+
+fn primary_key_index_record_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    relation_oid: Oid,
+) -> Option<IndexRecord> {
+    snapshot
+        .index_metas_for_relation(relation_oid)
+        .into_iter()
+        .find(|index| index.record.is_primary)
+        .map(|index| index.record.clone())
+}
+
+fn primary_key_constraint_oid_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    relation_oid: Oid,
+    index_oid: Option<Oid>,
+) -> Option<Oid> {
+    snapshot
+        .constraint_metas_for_relation(relation_oid)
+        .into_iter()
+        .find_map(|constraint| {
+            if constraint.kind != b'p' {
+                return None;
+            }
+            if let Some(index_oid) = index_oid
+                && constraint.index_oid != INVALID_OID
+                && constraint.index_oid != index_oid
+            {
+                return None;
+            }
+            Some(constraint.oid)
+        })
+}
+
+fn relation_primary_key_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    relation_oid: Oid,
+    columns: &[ColumnRecord],
+) -> (Vec<String>, Option<Oid>) {
+    let Some(index) = primary_key_index_record_from_snapshot(snapshot, relation_oid) else {
+        return (
+            Vec::new(),
+            primary_key_constraint_oid_from_snapshot(snapshot, relation_oid, None),
+        );
+    };
+    let primary_key = index
+        .key_attnums
+        .iter()
+        .filter_map(|attnum| {
+            if *attnum <= 0 {
+                return None;
+            }
+            columns
+                .get(usize::try_from(*attnum - 1).ok()?)
+                .map(|column| column.name.clone())
+        })
+        .collect::<Vec<_>>();
+    let constraint_oid =
+        primary_key_constraint_oid_from_snapshot(snapshot, relation_oid, Some(index.index_oid));
+    (primary_key, constraint_oid)
+}
+
+fn relation_record_from_meta(
+    snapshot: &CatalogSnapshot,
+    relation: &RelationMeta,
+) -> RelationRecord {
+    let columns = relation_columns_from_snapshot(snapshot, relation.oid);
+    let (primary_key, primary_key_constraint_oid) =
+        relation_primary_key_from_snapshot(snapshot, relation.oid, &columns);
+    RelationRecord {
+        oid: relation.oid,
+        type_oid: relation.type_oid,
+        namespace: relation.namespace,
+        owner: relation.owner,
+        name: relation.name.clone(),
+        relkind: relation.relkind,
+        columns,
+        primary_key,
+        primary_key_constraint_oid,
+    }
+}
+
+fn relation_summary_from_meta(
+    snapshot: &CatalogSnapshot,
+    relation: &RelationMeta,
+) -> RelationSummaryRecord {
+    let typed_columns = relation_columns_from_snapshot(snapshot, relation.oid);
+    let primary_key = primary_key_index_record_from_snapshot(snapshot, relation.oid);
+    let has_primary_key = primary_key.is_some();
+    let has_indexes = relation.relhasindex
+        || has_primary_key
+        || !snapshot.index_metas_for_relation(relation.oid).is_empty();
+    RelationSummaryRecord {
+        oid: relation.oid,
+        namespace: relation.namespace,
+        owner: relation.owner,
+        name: relation.name.clone(),
+        relkind: relation.relkind,
+        column_count: relation
+            .relnatts
+            .max(typed_columns.len().min(u16::MAX as usize) as u16),
+        has_primary_key,
+        has_indexes,
+    }
 }
 
 fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord> {
@@ -1967,6 +2703,22 @@ fn relation_summary_from_pg_class_row(row: &CatalogRow) -> Option<RelationSummar
 
 pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
+    if let Some(relation) = with_visible_catalog_snapshot(|snapshot| {
+        let mut matches = snapshot
+            .relations
+            .values()
+            .filter(|relation| relation.name == name)
+            .map(|relation| relation_record_from_meta(snapshot, relation))
+            .collect::<Vec<_>>();
+        matches.sort_by_key(|relation| match relation.namespace {
+            PUBLIC_NAMESPACE_OID => 0,
+            PG_CATALOG_NAMESPACE_OID => 1,
+            _ => 2,
+        });
+        matches.into_iter().next()
+    }) {
+        return Some(relation);
+    }
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
     let mut matches = catalog_rows_matching_static(
         table.oid,
@@ -1991,6 +2743,13 @@ pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
 
 pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
+    if let Some(relation) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .relation_meta_by_name(&name, namespace)
+            .map(|relation| relation_record_from_meta(snapshot, relation))
+    }) {
+        return Some(relation);
+    }
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
     catalog_rows_matching_static(
         table.oid,
@@ -2026,6 +2785,13 @@ pub fn relation_summary_by_name_in_namespace(
     namespace: Oid,
 ) -> Option<RelationSummaryRecord> {
     let name = normalize_identifier(name);
+    if let Some(relation) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .relation_meta_by_name(&name, namespace)
+            .map(|relation| relation_summary_from_meta(snapshot, relation))
+    }) {
+        return Some(relation);
+    }
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
     catalog_rows_matching_static(
         table.oid,
@@ -2058,67 +2824,65 @@ pub fn relation_summary_by_name_in_namespace(
 
 pub fn relation_oid_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Oid> {
     let name = normalize_identifier(name);
+    if let Some(relation_oid) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .relation_meta_by_name(&name, namespace)
+            .map(|relation| relation.oid)
+    }) {
+        return Some(relation_oid);
+    }
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
-    let session_overlays = visible_session_overlays();
-    with_catalog_read(|state| {
-        let mut rows = BTreeMap::<u64, Oid>::new();
-        for row in table.rows {
-            if let Some(oid) =
-                pg_class_static_oid_by_name_in_namespace(table, row, &name, namespace)
-            {
-                rows.insert(row.row_id, oid);
-            }
-        }
-        let row_matches =
-            |row: &CatalogRow| pg_class_row_oid_by_name_in_namespace(table, row, &name, namespace);
-        state
-            .overlay
-            .apply_to_filtered_values(table.oid, &mut rows, &row_matches);
-        for overlay in &session_overlays {
-            overlay.apply_to_filtered_values(table.oid, &mut rows, &row_matches);
-        }
-        rows.into_values().next()
-    })
+    catalog_rows(table.oid)
+        .into_iter()
+        .find_map(|row| pg_class_row_oid_by_name_in_namespace(table, &row, &name, namespace))
 }
 
 pub fn relations() -> Vec<RelationRecord> {
+    let mut dynamic_relations = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .relations
+            .values()
+            .map(|relation| {
+                let record = relation_record_from_meta(snapshot, relation);
+                (record.oid.0, record)
+            })
+            .collect::<BTreeMap<_, _>>()
+    });
     let Some(table) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID) else {
-        return Vec::new();
+        return dynamic_relations.into_values().collect();
     };
-    catalog_rows(table.oid)
+    for relation in catalog_rows(table.oid)
         .into_iter()
         .filter_map(|row| relation_record_from_pg_class_row(&row))
-        .collect()
+    {
+        dynamic_relations.insert(relation.oid.0, relation);
+    }
+    dynamic_relations.into_values().collect()
 }
 
 pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
+    if let Some(relation) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .relation_meta_by_oid(oid)
+            .map(|relation| relation_record_from_meta(snapshot, relation))
+    }) {
+        return Some(relation);
+    }
     relation_pg_class_row_by_oid(oid).and_then(|row| relation_record_from_pg_class_row(&row))
 }
 
 pub fn relation_oid_exists(oid: Oid) -> bool {
-    let Some(table) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID) else {
-        return false;
-    };
-    let session_overlays = visible_session_overlays();
-    with_catalog_read(|state| {
-        let mut rows = BTreeMap::<u64, ()>::new();
-        for row in table.rows {
-            if pg_class_static_oid_exists(table, row, oid).is_some() {
-                rows.insert(row.row_id, ());
-            }
-        }
-        let row_matches = |row: &CatalogRow| pg_class_row_oid_exists(table, row, oid);
-        state
-            .overlay
-            .apply_to_filtered_values(table.oid, &mut rows, &row_matches);
-        for overlay in &session_overlays {
-            overlay.apply_to_filtered_values(table.oid, &mut rows, &row_matches);
-        }
-        !rows.is_empty()
-    })
+    relation_by_oid(oid).is_some()
 }
 
 pub fn relation_summary_by_oid(oid: Oid) -> Option<RelationSummaryRecord> {
+    if let Some(relation) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .relation_meta_by_oid(oid)
+            .map(|relation| relation_summary_from_meta(snapshot, relation))
+    }) {
+        return Some(relation);
+    }
     relation_pg_class_row_by_oid(oid).and_then(|row| relation_summary_from_pg_class_row(&row))
 }
 
@@ -2137,7 +2901,7 @@ pub fn relation_column_count(name: &str) -> Result<usize, CatalogError> {
 pub fn clear_for_tests() {
     with_catalog(|state| {
         *state = CatalogState::default();
-        CATALOG_GENERATION.store(state.generation, Ordering::Relaxed);
+        CATALOG_GENERATION.store(state.snapshot.generation, Ordering::Relaxed);
     });
 }
 
@@ -2300,6 +3064,13 @@ pub fn lookup_type(oid: Oid) -> Option<CatalogTypeRecord> {
     if let Some(record) = lookup_builtin_type(oid) {
         return Some(record.into());
     }
+    if let Some(pg_type) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .type_meta_by_oid(oid)
+            .map(|pg_type| pg_type.record.clone())
+    }) {
+        return Some(pg_type);
+    }
 
     let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
     catalog_rows(PG_TYPE_RELATION_OID)
@@ -2312,6 +3083,13 @@ pub fn lookup_type(oid: Oid) -> Option<CatalogTypeRecord> {
 
 pub fn type_by_name(name: &str, namespace: Oid) -> Option<CatalogTypeRecord> {
     let canonical_name = canonical_catalog_type_name(name);
+    if let Some(pg_type) = with_visible_catalog_snapshot(|snapshot| {
+        snapshot
+            .type_meta_by_name(&canonical_name, namespace)
+            .map(|pg_type| pg_type.record.clone())
+    }) {
+        return Some(pg_type);
+    }
     let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
     catalog_rows(PG_TYPE_RELATION_OID)
         .into_iter()
