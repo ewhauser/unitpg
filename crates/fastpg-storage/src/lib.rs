@@ -21,10 +21,10 @@ use fastpg_catalog::{
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
     relation_column_count, relation_oid_by_name_in_namespace, relation_oid_exists,
-    relation_oid_for_index_oid, relation_summary_by_oid, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid,
+    relation_oid_for_index_oid, relation_summary_by_name_in_namespace, relation_summary_by_oid,
+    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -2704,6 +2704,42 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
             *oid_out = index_oid.0;
         }
         return true;
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_name(
+    name: *const c_char,
+    namespace_oid: u32,
+    out: *mut FastPgRustCatalogRelation,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
+    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+        return false;
+    };
+    let namespace = Oid(namespace_oid);
+    unsafe {
+        if let Some(relation) = virtual_catalog_by_name(&name, namespace) {
+            *out = virtual_catalog_relation_to_ffi(relation);
+            return true;
+        }
+        if let Some(relation) = relation_summary_by_name_in_namespace(&name, namespace) {
+            *out = relation_summary_to_ffi(&relation);
+            return true;
+        }
+        if let Some(relation) = primary_key_index_relation_by_name(&name, namespace)
+            && let Some(index_oid) = primary_key_index_oid(&relation)
+        {
+            *out = primary_key_index_to_ffi(&relation, index_oid);
+            return true;
+        }
     }
     false
 }

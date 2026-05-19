@@ -1944,6 +1944,41 @@ pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Relat
     })
 }
 
+pub fn relation_summary_by_name_in_namespace(
+    name: &str,
+    namespace: Oid,
+) -> Option<RelationSummaryRecord> {
+    let name = normalize_identifier(name);
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_identifier_matches(table, row, "relname", &name)
+                && static_row_column_oid(table, row, "relnamespace")
+                    .is_some_and(|row_namespace| row_namespace == namespace)
+        },
+        |row| {
+            let row_name = catalog_row_identifier_matches(table, row, "relname", &name);
+            let row_namespace = catalog_row_value(table, row, "relnamespace")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_namespace| row_namespace == namespace);
+            row_name && row_namespace
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
+        if !catalog_row_identifier_matches(table, &row, "relname", &name) {
+            return None;
+        }
+        let row_namespace =
+            catalog_row_value(table, &row, "relnamespace").and_then(catalog_value_oid)?;
+        if row_namespace != namespace {
+            return None;
+        }
+        relation_summary_from_pg_class_row(&row)
+    })
+}
+
 pub fn relation_oid_by_name_in_namespace(name: &str, namespace: Oid) -> Option<Oid> {
     let name = normalize_identifier(name);
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
@@ -2580,6 +2615,13 @@ mod tests {
         assert_eq!(relation_summary.column_count, 2);
         assert!(!relation_summary.has_indexes);
         assert!(!relation_summary.has_primary_key);
+        let relation_summary =
+            relation_summary_by_name_in_namespace("PgBench_Accounts", PUBLIC_NAMESPACE_OID)
+                .unwrap();
+        assert_eq!(relation_summary.name, "pgbench_accounts");
+        assert_eq!(relation_summary.column_count, 2);
+        assert!(!relation_summary.has_indexes);
+        assert!(!relation_summary.has_primary_key);
         assert_eq!(
             relation_column_by_attnum(relation.oid, 1).unwrap().name,
             "aid"
@@ -2686,6 +2728,12 @@ mod tests {
             index_oid
         );
         let relation_summary = relation_summary_by_oid(relation.oid).unwrap();
+        assert_eq!(relation_summary.column_count, 2);
+        assert!(relation_summary.has_indexes);
+        assert!(relation_summary.has_primary_key);
+        let relation_summary =
+            relation_summary_by_name_in_namespace("pgbench_accounts", PUBLIC_NAMESPACE_OID)
+                .unwrap();
         assert_eq!(relation_summary.column_count, 2);
         assert!(relation_summary.has_indexes);
         assert!(relation_summary.has_primary_key);

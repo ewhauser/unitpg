@@ -214,6 +214,9 @@ extern bool fastpg_rust_catalog_relation_oid_by_name(const char *name,
 													 uint32_t namespace_oid,
 													 uint32_t *oid_out);
 extern bool fastpg_rust_catalog_relation_exists_by_oid(uint32_t oid);
+extern bool fastpg_rust_catalog_relation_by_name(const char *name,
+												 uint32_t namespace_oid,
+												 FastPgRustCatalogRelation *out);
 extern bool fastpg_rust_catalog_relation_by_oid(uint32_t oid,
 												FastPgRustCatalogRelation *out);
 extern bool fastpg_rust_catalog_relation_column_by_index(uint32_t relation_oid,
