@@ -20,10 +20,10 @@ use fastpg_catalog::{
     index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_count,
-    relation_oid_by_name_in_namespace, relation_oid_for_index_oid, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid,
+    relation_oid_by_name_in_namespace, relation_oid_for_index_oid, relation_summary_by_oid,
+    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -1788,6 +1788,21 @@ fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatal
     }
 }
 
+fn relation_summary_to_ffi(
+    relation: &fastpg_catalog::RelationSummaryRecord,
+) -> FastPgRustCatalogRelation {
+    FastPgRustCatalogRelation {
+        oid: relation.oid.0,
+        namespace_oid: relation.namespace.0,
+        owner_oid: relation.owner.0,
+        name: fixed_c_name(&relation.name),
+        column_count: relation.column_count,
+        relkind: relation.relkind,
+        has_primary_key: u8::from(relation.has_primary_key),
+        has_indexes: u8::from(relation.has_indexes),
+    }
+}
+
 fn primary_key_index_to_ffi(
     relation: &fastpg_catalog::RelationRecord,
     index_oid: Oid,
@@ -2745,6 +2760,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_oid(
     }
 
     unsafe {
+        if let Some(relation) = relation_summary_by_oid(Oid(oid)) {
+            *out = relation_summary_to_ffi(&relation);
+            return true;
+        }
         if let Some(relation) = relation_by_oid(Oid(oid)) {
             *out = relation_to_ffi(&relation);
             return true;

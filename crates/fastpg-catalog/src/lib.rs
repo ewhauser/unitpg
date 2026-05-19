@@ -297,6 +297,18 @@ pub struct RelationRecord {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RelationSummaryRecord {
+    pub oid: Oid,
+    pub namespace: Oid,
+    pub owner: Oid,
+    pub name: String,
+    pub relkind: u8,
+    pub column_count: u16,
+    pub has_primary_key: bool,
+    pub has_indexes: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRecord {
     pub index_oid: Oid,
     pub relation_oid: Oid,
@@ -1635,6 +1647,42 @@ fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord>
     })
 }
 
+fn relation_summary_from_pg_class_row(row: &CatalogRow) -> Option<RelationSummaryRecord> {
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let namespace = catalog_row_value(table, row, "relnamespace")
+        .and_then(catalog_value_oid)
+        .unwrap_or(PUBLIC_NAMESPACE_OID);
+    let owner = catalog_row_value(table, row, "relowner")
+        .and_then(catalog_value_oid)
+        .unwrap_or(POSTGRES_ROLE_OID);
+    let name = catalog_row_value(table, row, "relname").and_then(catalog_value_string)?;
+    let relkind = catalog_row_value(table, row, "relkind")
+        .and_then(catalog_value_u8)
+        .unwrap_or(b'r');
+    let column_count = catalog_row_value(table, row, "relnatts")
+        .and_then(catalog_value_i16)
+        .map(|value| value.max(0) as usize)
+        .unwrap_or_else(|| relation_columns_from_pg_attribute(oid).len())
+        .min(u16::MAX as usize) as u16;
+    let has_primary_key = primary_key_index_oid_for_relation_oid(oid).is_some();
+    let has_indexes = catalog_row_value(table, row, "relhasindex")
+        .and_then(catalog_value_bool)
+        .unwrap_or_else(|| !index_records_for_relation_oid(oid).is_empty())
+        || has_primary_key;
+
+    Some(RelationSummaryRecord {
+        oid,
+        namespace,
+        owner,
+        name: normalize_identifier(&name),
+        relkind,
+        column_count,
+        has_primary_key,
+        has_indexes,
+    })
+}
+
 pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
@@ -1740,6 +1788,10 @@ pub fn relations() -> Vec<RelationRecord> {
 
 pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
     relation_pg_class_row_by_oid(oid).and_then(|row| relation_record_from_pg_class_row(&row))
+}
+
+pub fn relation_summary_by_oid(oid: Oid) -> Option<RelationSummaryRecord> {
+    relation_pg_class_row_by_oid(oid).and_then(|row| relation_summary_from_pg_class_row(&row))
 }
 
 pub fn relation_column_count(name: &str) -> Result<usize, CatalogError> {
@@ -2306,6 +2358,11 @@ mod tests {
             relation_by_oid(relation.oid).unwrap().name,
             "pgbench_accounts"
         );
+        let relation_summary = relation_summary_by_oid(relation.oid).unwrap();
+        assert_eq!(relation_summary.name, "pgbench_accounts");
+        assert_eq!(relation_summary.column_count, 2);
+        assert!(!relation_summary.has_indexes);
+        assert!(!relation_summary.has_primary_key);
         upsert_named_catalog_row(
             "pg_class",
             relation_oid.0 as u64,
@@ -2397,6 +2454,10 @@ mod tests {
             unique_index_oids_for_relation_oid(relation.oid),
             vec![index_oid]
         );
+        let relation_summary = relation_summary_by_oid(relation.oid).unwrap();
+        assert_eq!(relation_summary.column_count, 2);
+        assert!(relation_summary.has_indexes);
+        assert!(relation_summary.has_primary_key);
         assert!(catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
             value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")
         }));
