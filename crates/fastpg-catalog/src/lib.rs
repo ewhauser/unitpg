@@ -1463,6 +1463,44 @@ pub fn unique_index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexReco
         .collect()
 }
 
+pub fn unique_index_oids_for_relation_oid(relation_oid: Oid) -> Vec<Oid> {
+    let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
+        return Vec::new();
+    };
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "indrelid")
+                .is_some_and(|indrelid| indrelid == relation_oid)
+                && static_row_column_bool(table, row, "indisunique").unwrap_or(false)
+                && static_row_column_bool(table, row, "indisvalid").unwrap_or(true)
+                && static_row_column_bool(table, row, "indisready").unwrap_or(true)
+                && static_row_column_bool(table, row, "indislive").unwrap_or(true)
+        },
+        |row| {
+            let relation_matches = catalog_row_value(table, row, "indrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|indrelid| indrelid == relation_oid);
+            let is_unique = catalog_row_value(table, row, "indisunique")
+                .and_then(catalog_value_bool)
+                .unwrap_or(false);
+            let is_valid = catalog_row_value(table, row, "indisvalid")
+                .and_then(catalog_value_bool)
+                .unwrap_or(true);
+            let is_ready = catalog_row_value(table, row, "indisready")
+                .and_then(catalog_value_bool)
+                .unwrap_or(true);
+            let is_live = catalog_row_value(table, row, "indislive")
+                .and_then(catalog_value_bool)
+                .unwrap_or(true);
+            relation_matches && is_unique && is_valid && is_ready && is_live
+        },
+    )
+    .into_iter()
+    .filter_map(|row| catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid))
+    .collect()
+}
+
 pub fn relation_oid_for_index_oid(index_oid: Oid) -> Option<Oid> {
     index_record_by_index_oid(index_oid).map(|record| record.relation_oid)
 }
@@ -2354,6 +2392,10 @@ mod tests {
         assert_eq!(
             relation_by_name("pgbench_accounts").unwrap().primary_key,
             vec!["aid"]
+        );
+        assert_eq!(
+            unique_index_oids_for_relation_oid(relation.oid),
+            vec![index_oid]
         );
         assert!(catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
             value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")

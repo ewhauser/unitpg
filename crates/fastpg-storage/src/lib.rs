@@ -21,8 +21,9 @@ use fastpg_catalog::{
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_count,
     relation_oid_by_name_in_namespace, relation_oid_for_index_oid, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, unique_index_records_for_relation_oid,
-    upsert_catalog_row, virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
+    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -2863,15 +2864,12 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_unique_index_oid(
     if oid_out.is_null() {
         return false;
     }
-    let indexes = unique_index_records_for_relation_oid(Oid(relation_oid))
-        .into_iter()
-        .filter(|record| unique_index_spec_for_record(record).is_some())
-        .collect::<Vec<_>>();
-    let Some(index) = indexes.get(index_position) else {
+    let indexes = unique_index_oids_for_relation_oid(Oid(relation_oid));
+    let Some(index_oid) = indexes.get(index_position) else {
         return false;
     };
     unsafe {
-        *oid_out = index.index_oid.0;
+        *oid_out = index_oid.0;
     }
     true
 }
