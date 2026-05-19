@@ -3207,7 +3207,7 @@ pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64)
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_begin() {
-    with_storage(|state, session| state.begin_explicit_transaction(session));
+    begin_explicit_transaction();
 }
 
 #[unsafe(no_mangle)]
@@ -3217,12 +3217,12 @@ pub extern "C" fn fastpg_rust_xact_begin_implicit() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_commit() {
-    with_storage(|state, session| state.commit_explicit_transaction(session));
+    commit_explicit_transaction();
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_abort() {
-    with_storage(|state, session| state.abort_explicit_transaction(session));
+    abort_explicit_transaction();
 }
 
 #[unsafe(no_mangle)]
@@ -3243,9 +3243,25 @@ pub fn abort_implicit_transaction() {
     with_storage(|state, session| state.abort_implicit_transaction(session));
 }
 
+pub fn begin_explicit_transaction() {
+    with_storage(|state, session| state.begin_explicit_transaction(session));
+}
+
+pub fn commit_explicit_transaction() {
+    with_storage(|state, session| state.commit_explicit_transaction(session));
+}
+
+pub fn abort_explicit_transaction() {
+    with_storage(|state, session| state.abort_explicit_transaction(session));
+}
+
+pub fn is_explicit_transaction() -> bool {
+    with_storage(|state, session| state.is_explicit_transaction(session))
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_xact_is_explicit() -> bool {
-    with_storage(|state, session| state.is_explicit_transaction(session))
+    is_explicit_transaction()
 }
 
 #[unsafe(no_mangle)]
