@@ -5332,15 +5332,7 @@ RelationGetIndexList(Relation relation)
 	/* Quick exit if we already computed the list. */
 	if (relation->rd_indexvalid)
 	{
-#ifdef USE_FASTPG
-		FastPgRustCatalogRelation fastpg_relation;
-
-		if (!fastpg_rust_catalog_relation_by_oid((uint32_t) RelationGetRelid(relation),
-												 &fastpg_relation))
-			return list_copy(relation->rd_indexlist);
-#else
 		return list_copy(relation->rd_indexlist);
-#endif
 	}
 
 #ifdef USE_FASTPG

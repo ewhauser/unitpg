@@ -9,10 +9,13 @@ import json
 import os
 import platform
 import re
+import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -24,8 +27,25 @@ from typing import Any
 TPS_RE = re.compile(r"^tps =\s+([0-9.]+)\s+\(without initial connection time\)", re.MULTILINE)
 LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
 SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
-HOTSPOT_RE = re.compile(r"^(.*) \((\d+) samples?, ([0-9.]+)%\)$")
+SVG_TOTAL_SAMPLES_RE = re.compile(r'<svg id="frames"[^>]*\btotal_samples="([\d,]+)"')
+HOTSPOT_RE = re.compile(r"^(.*) \(([\d,]+) samples?, ([0-9.]+)%\)$")
 DEFAULT_PGBENCH_INIT_STEPS = "dtgvp"
+PROFILE_COMPONENT_ORDER = [
+    "Socket / protocol",
+    "Query dispatch",
+    "Parsing / analysis",
+    "Planning / rewrite",
+    "Execution",
+    "Storage / index AM",
+    "Catalog / metadata",
+    "Transactions / WAL",
+    "Runtime / memory",
+    "Other",
+]
+PROFILE_HOTSPOT_LIMIT = 40
+PROFILE_COMPONENT_CAPTURE_LIMIT = 25
+PROFILE_COMPONENT_MARKDOWN_LIMIT = 3
+PROFILE_COMPONENT_HTML_LIMIT = 8
 
 
 @dataclass(frozen=True)
@@ -50,6 +70,90 @@ class CommandResult:
             "cwd": self.cwd,
             "returncode": self.returncode,
             "seconds": self.seconds,
+        }
+
+
+class ProcessMemorySampler:
+    def __init__(self, pid: int, interval_seconds: float = 0.1):
+        self.pid = pid
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._samples: list[int] = []
+
+    def __enter__(self) -> "ProcessMemorySampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            rss_kb = process_rss_kb(self.pid)
+            if rss_kb is not None:
+                self._samples.append(rss_kb * 1024)
+            self._stop.wait(self.interval_seconds)
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if not self._samples:
+            return {
+                "pid": self.pid,
+                "sample_count": 0,
+                "interval_seconds": self.interval_seconds,
+            }
+        return {
+            "pid": self.pid,
+            "sample_count": len(self._samples),
+            "interval_seconds": self.interval_seconds,
+            "first_rss_bytes": self._samples[0],
+            "last_rss_bytes": self._samples[-1],
+            "max_rss_bytes": max(self._samples),
+        }
+
+
+class PostgresBackendMemorySampler:
+    def __init__(self, postmaster_pid: int, interval_seconds: float = 0.1):
+        self.postmaster_pid = postmaster_pid
+        self.interval_seconds = interval_seconds
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._samples: list[int] = []
+
+    def __enter__(self) -> "PostgresBackendMemorySampler":
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, traceback: object) -> None:
+        self.stop()
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            backend_pid = postgres_backend_child_pid(self.postmaster_pid)
+            if backend_pid is not None:
+                rss_kb = process_rss_kb(backend_pid)
+                if rss_kb is not None:
+                    self._samples.append(rss_kb * 1024)
+            self._stop.wait(self.interval_seconds)
+
+    def stop(self) -> dict[str, Any]:
+        self._stop.set()
+        self._thread.join(timeout=1.0)
+        if not self._samples:
+            return {
+                "postmaster_pid": self.postmaster_pid,
+                "sample_count": 0,
+                "interval_seconds": self.interval_seconds,
+            }
+        return {
+            "postmaster_pid": self.postmaster_pid,
+            "sample_count": len(self._samples),
+            "interval_seconds": self.interval_seconds,
+            "first_rss_bytes": self._samples[0],
+            "last_rss_bytes": self._samples[-1],
+            "max_rss_bytes": max(self._samples),
         }
 
 
@@ -100,6 +204,10 @@ class PgBenchCompare:
                 "profile_phase": args.profile_phase,
                 "profile_open": args.profile_open,
                 "profile_warmup_seconds": args.profile_warmup_seconds,
+                "profile_hyperfine": args.profile_hyperfine,
+                "profile_hyperfine_runs": args.profile_hyperfine_runs,
+                "profile_hyperfine_warmup": args.profile_hyperfine_warmup,
+                "profile_server_memory": args.profile_server_memory,
             },
             "workload": workload_metadata(args.builtin, args.init_steps),
             "warnings": workload_warnings(args.init_steps),
@@ -402,7 +510,7 @@ class PgBenchCompare:
 
             if self.should_profile_normal_postgres(variant) and self.args.profile_phase == "run":
                 postmaster_pid = read_postmaster_pid(data_dir)
-                bench, profiler = self.run_profiled_postgres_pgbench(
+                bench, profiler, server_memory = self.run_profiled_postgres_pgbench(
                     variant.name,
                     self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
                     postmaster_pid,
@@ -410,6 +518,8 @@ class PgBenchCompare:
                     env,
                 )
                 run_record["commands"]["profile_start"] = profiler["result"].as_json()
+                if server_memory is not None:
+                    run_record.setdefault("memory", {})["pgbench_run"] = server_memory
             else:
                 bench = self.checked_command(
                     variant.name,
@@ -421,6 +531,24 @@ class PgBenchCompare:
                 )
             run_record["commands"]["pgbench_run"] = bench.as_json()
             run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
+            if profiler is not None:
+                profile_result = self.finish_profiler(profiler, run_dir)
+                run_record["commands"]["profile_stop"] = profile_result.as_json()
+                run_record["profile"] = profiler["profile_record"]
+                profiler = None
+                if profile_result.returncode != 0:
+                    raise BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
+            if self.args.profile_hyperfine:
+                hyperfine = self.run_hyperfine_pgbench(
+                    variant.name,
+                    self.pgbench_run_command(paths["bindir"], str(socket_dir), port),
+                    run_dir,
+                    env,
+                    memory_pid=None,
+                    memory_postmaster_pid=read_postmaster_pid(data_dir),
+                )
+                run_record["commands"]["hyperfine"] = hyperfine["result"].as_json()
+                run_record["hyperfine"] = hyperfine["record"]
             return run_record
         finally:
             active_failure = sys.exc_info()[0] is not None
@@ -513,16 +641,45 @@ class PgBenchCompare:
                 profiler = self.start_rust_profiler(variant.name, server, run_dir)
                 run_record["commands"]["profile_start"] = profiler["result"].as_json()
 
-            bench = self.checked_command(
-                variant.name,
-                "pgbench-run",
-                self.pgbench_run_command(paths["client_bindir"], host, port),
-                run_dir,
-                "pgbench-run",
-                env=env,
+            memory_sampler = (
+                ProcessMemorySampler(server["process"].pid)
+                if self.args.profile_server_memory
+                else None
             )
+            if memory_sampler is not None:
+                memory_sampler.__enter__()
+            try:
+                bench = self.checked_command(
+                    variant.name,
+                    "pgbench-run",
+                    self.pgbench_run_command(paths["client_bindir"], host, port),
+                    run_dir,
+                    "pgbench-run",
+                    env=env,
+                )
+            finally:
+                if memory_sampler is not None:
+                    run_record.setdefault("memory", {})["pgbench_run"] = memory_sampler.stop()
             run_record["commands"]["pgbench_run"] = bench.as_json()
             run_record["metrics"] = parse_pgbench_metrics(bench.stdout)
+            if profiler is not None:
+                profile_result = self.finish_rust_profiler(profiler, run_dir)
+                run_record["commands"]["profile_stop"] = profile_result.as_json()
+                run_record["profile"] = profiler["profile_record"]
+                profiler = None
+                if profile_result.returncode != 0:
+                    raise BenchmarkFailure(variant.name, "profile", profile_result, run_dir)
+            if self.args.profile_hyperfine:
+                hyperfine = self.run_hyperfine_pgbench(
+                    variant.name,
+                    self.pgbench_run_command(paths["client_bindir"], host, port),
+                    run_dir,
+                    env,
+                    memory_pid=server["process"].pid,
+                    memory_postmaster_pid=None,
+                )
+                run_record["commands"]["hyperfine"] = hyperfine["result"].as_json()
+                run_record["hyperfine"] = hyperfine["record"]
             return run_record
         finally:
             active_failure = sys.exc_info()[0] is not None
@@ -663,7 +820,7 @@ class PgBenchCompare:
         postmaster_pid: int,
         output_dir: Path,
         env: dict[str, str],
-    ) -> tuple[CommandResult, dict[str, Any]]:
+    ) -> tuple[CommandResult, dict[str, Any], dict[str, Any] | None]:
         output_dir.mkdir(parents=True, exist_ok=True)
         stdout_path = output_dir / "pgbench-run.stdout"
         stderr_path = output_dir / "pgbench-run.stderr"
@@ -679,6 +836,8 @@ class PgBenchCompare:
             stderr=stderr_file,
         )
         profiler: dict[str, Any] | None = None
+        memory_sampler: ProcessMemorySampler | None = None
+        server_memory: dict[str, Any] | None = None
         try:
             backend_pid = wait_for_postgres_backend(postmaster_pid, pgbench_process)
             if backend_pid is None:
@@ -710,8 +869,17 @@ class PgBenchCompare:
                 "normal-postgres-flamegraph.svg",
                 "normal Postgres pgbench backend",
             )
+            memory_sampler = (
+                ProcessMemorySampler(backend_pid)
+                if self.args.profile_server_memory
+                else None
+            )
+            if memory_sampler is not None:
+                memory_sampler.__enter__()
             pgbench_process.wait()
         finally:
+            if memory_sampler is not None:
+                server_memory = memory_sampler.stop()
             stdout_file.close()
             stderr_file.close()
 
@@ -727,7 +895,85 @@ class PgBenchCompare:
         if result.returncode != 0:
             raise BenchmarkFailure(variant, "pgbench-run", result, output_dir)
         assert profiler is not None
-        return result, profiler
+        return result, profiler, server_memory
+
+    def run_hyperfine_pgbench(
+        self,
+        variant: str,
+        pgbench_command: list[str],
+        output_dir: Path,
+        env: dict[str, str],
+        *,
+        memory_pid: int | None,
+        memory_postmaster_pid: int | None,
+    ) -> dict[str, Any]:
+        hyperfine = shutil.which("hyperfine")
+        if hyperfine is None:
+            raise BenchmarkFailure(
+                variant,
+                "hyperfine",
+                CommandResult(["hyperfine"], str(self.source_root), 1, "", "missing hyperfine", 0.0),
+                output_dir,
+            )
+
+        json_path = output_dir / "hyperfine.json"
+        command = [
+            hyperfine,
+            "--style",
+            "none",
+            "--runs",
+            str(self.args.profile_hyperfine_runs),
+            "--warmup",
+            str(self.args.profile_hyperfine_warmup),
+            "--export-json",
+            str(json_path),
+            "--command-name",
+            f"{variant} pgbench run",
+            shlex.join(pgbench_command),
+        ]
+        started = time.monotonic()
+        memory_sampler: ProcessMemorySampler | PostgresBackendMemorySampler | None = None
+        if self.args.profile_server_memory:
+            if memory_pid is not None:
+                memory_sampler = ProcessMemorySampler(memory_pid)
+            elif memory_postmaster_pid is not None:
+                memory_sampler = PostgresBackendMemorySampler(memory_postmaster_pid)
+        if memory_sampler is not None:
+            memory_sampler.__enter__()
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.source_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+            )
+        finally:
+            server_memory = memory_sampler.stop() if memory_sampler is not None else None
+
+        result = CommandResult(
+            command,
+            str(self.source_root),
+            completed.returncode,
+            completed.stdout,
+            completed.stderr,
+            time.monotonic() - started,
+        )
+        (output_dir / "hyperfine.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
+        (output_dir / "hyperfine.stdout").write_text(completed.stdout)
+        (output_dir / "hyperfine.stderr").write_text(completed.stderr)
+        if result.returncode != 0:
+            raise BenchmarkFailure(variant, "hyperfine", result, output_dir)
+
+        record: dict[str, Any] = {
+            "path": str(json_path),
+            "summary": parse_hyperfine_summary(json_path),
+        }
+        if server_memory is not None:
+            record["server_memory"] = server_memory
+        return {"result": result, "record": record}
 
     def start_rust_profiler(
         self,
@@ -776,6 +1022,7 @@ class PgBenchCompare:
             text=True,
             stdout=stdout_file,
             stderr=stderr_file,
+            start_new_session=(os.name != "nt"),
         )
         if self.args.profile_warmup_seconds > 0:
             time.sleep(self.args.profile_warmup_seconds)
@@ -850,12 +1097,20 @@ class PgBenchCompare:
         return command, output
 
     def finish_rust_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
-        return self.finish_profiler(profiler, output_dir)
+        return self.finish_profiler(profiler, output_dir, stop_running=True)
 
-    def finish_profiler(self, profiler: dict[str, Any], output_dir: Path) -> CommandResult:
+    def finish_profiler(
+        self,
+        profiler: dict[str, Any],
+        output_dir: Path,
+        *,
+        stop_running: bool = False,
+    ) -> CommandResult:
         started = time.monotonic()
         process = profiler["process"]
         command = ["wait-profile", f"pid={process.pid}"]
+        if stop_running and process.poll() is None:
+            interrupt_process_group(process)
         try:
             process.wait(timeout=30)
         except subprocess.TimeoutExpired:
@@ -883,6 +1138,8 @@ class PgBenchCompare:
         )
         if profile_path.exists():
             profiler["profile_record"]["hotspots"] = profile_hotspots(profile_path)
+            profiler["profile_record"]["component_hotspots"] = profile_component_hotspots(profile_path)
+            profiler["profile_record"]["total_samples"] = profile_total_samples(profile_path)
         (profiler["profile_dir"] / "profile-stop.command.json").write_text(
             json.dumps(result.as_json(), indent=2) + "\n"
         )
@@ -1065,6 +1322,28 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=1.0,
         help="seconds to wait after starting the profiler before running pgbench",
     )
+    parser.add_argument(
+        "--profile-hyperfine",
+        action="store_true",
+        help="run a hyperfine timing pass against the already-started server",
+    )
+    parser.add_argument(
+        "--profile-hyperfine-runs",
+        type=int,
+        default=1,
+        help="number of hyperfine timing runs when --profile-hyperfine is set",
+    )
+    parser.add_argument(
+        "--profile-hyperfine-warmup",
+        type=int,
+        default=0,
+        help="number of hyperfine warmup runs when --profile-hyperfine is set",
+    )
+    parser.add_argument(
+        "--profile-server-memory",
+        action="store_true",
+        help="sample server RSS during profiled pgbench and hyperfine runs",
+    )
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
@@ -1074,6 +1353,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:
         parser.error("--profile-warmup-seconds must be non-negative")
+    if args.profile_hyperfine_runs < 1:
+        parser.error("--profile-hyperfine-runs must be at least 1")
+    if args.profile_hyperfine_warmup < 0:
+        parser.error("--profile-hyperfine-warmup must be non-negative")
     return args
 
 
@@ -1148,6 +1431,35 @@ def read_text(path: Path) -> str:
         return ""
 
 
+def process_rss_kb(pid: int) -> int | None:
+    ps = subprocess.run(
+        ["ps", "-o", "rss=", "-p", str(pid)],
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        check=False,
+    )
+    if ps.returncode != 0:
+        return None
+    output = ps.stdout.strip()
+    if not output:
+        return None
+    try:
+        return int(output.splitlines()[-1].strip())
+    except ValueError:
+        return None
+
+
+def interrupt_process_group(process: subprocess.Popen[str]) -> None:
+    try:
+        if os.name != "nt":
+            os.killpg(process.pid, signal.SIGINT)
+        else:
+            process.send_signal(signal.SIGINT)
+    except ProcessLookupError:
+        return
+
+
 def read_postmaster_pid(data_dir: Path) -> int:
     pid_file = data_dir / "postmaster.pid"
     first_line = pid_file.read_text().splitlines()[0]
@@ -1215,7 +1527,18 @@ def is_postgres_client_backend(command: str) -> bool:
     return not any(name in lowered for name in auxiliary_processes)
 
 
-def profile_hotspots(profile_path: Path, limit: int = 40) -> list[dict[str, Any]]:
+def profile_hotspots(profile_path: Path, limit: int = PROFILE_HOTSPOT_LIMIT) -> list[dict[str, Any]]:
+    return profile_frame_hotspots(profile_path)[:limit]
+
+
+def profile_total_samples(profile_path: Path) -> int | None:
+    match = SVG_TOTAL_SAMPLES_RE.search(read_text(profile_path))
+    if match is None:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
+def profile_frame_hotspots(profile_path: Path) -> list[dict[str, Any]]:
     text = read_text(profile_path)
     by_name: dict[str, dict[str, Any]] = {}
     for raw_title in SVG_TITLE_RE.findall(text):
@@ -1228,13 +1551,265 @@ def profile_hotspots(profile_path: Path, limit: int = 40) -> list[dict[str, Any]
             continue
         hotspot = {
             "name": name,
-            "samples": int(match.group(2)),
+            "samples": int(match.group(2).replace(",", "")),
             "percent": float(match.group(3)),
         }
         previous = by_name.get(name)
         if previous is None or hotspot["percent"] > previous["percent"]:
             by_name[name] = hotspot
-    return sorted(by_name.values(), key=lambda value: value["percent"], reverse=True)[:limit]
+    return sorted(by_name.values(), key=lambda value: value["percent"], reverse=True)
+
+
+def profile_component_hotspots(
+    profile_path: Path,
+    limit_per_component: int = PROFILE_COMPONENT_CAPTURE_LIMIT,
+) -> dict[str, list[dict[str, Any]]]:
+    return profile_hotspots_by_component(profile_frame_hotspots(profile_path), limit_per_component)
+
+
+def profile_component(name: str) -> str:
+    lowered = name.lower()
+    if any(
+        token in lowered
+        for token in (
+            "exec_simple_query",
+            "portalrun",
+            "portalstart",
+            "portaldrop",
+            "createportal",
+            "processquery",
+            "endcommand",
+            "fastpg_exec::queryexecutor",
+            "fastpg_pgcore::preparedstatement",
+            "preparedstatement::execute_with_params",
+            "fastpg_pgcore::pgcoresession::prepare",
+            "fastpg_pgcore_prepare",
+            "fastpg_pgcore_execute_params",
+            "fastpg_pgcore_execute_utility",
+            "pgwire::api::query::simplequeryhandler",
+            "pgwire::tokio::server::process_message",
+            "fastpg_wire::fastpgwirehandler",
+        )
+    ):
+        return "Query dispatch"
+    if any(
+        token in lowered
+        for token in (
+            "socket",
+            "pgwire",
+            "protocol",
+            "readcommand",
+            "secure_read",
+            "secure_write",
+            "pq_get",
+            "pq_put",
+            "pq_recv",
+            "pq_send",
+            "internal_flush",
+            "printtup",
+            "destremote",
+            "tokio::net",
+            "mio::net",
+        )
+    ):
+        return "Socket / protocol"
+    if any(
+        token in lowered
+        for token in (
+            "raw_parser",
+            "base_yy",
+            "core_yylex",
+            "scanner_yy",
+            "pg_parse_query",
+            "parse_analyze",
+            "parse_analyze_",
+            "parse_fixed",
+            "parser",
+            "transform",
+            "analyze",
+            "settargettable",
+            "addrangetableentry",
+            "make_op",
+        )
+    ):
+        return "Parsing / analysis"
+    if any(
+        token in lowered
+        for token in (
+            "planner",
+            "pg_plan_queries",
+            "subquery_planner",
+            "grouping_planner",
+            "query_planner",
+            "preprocess_",
+            "make_one_rel",
+            "set_plan_refs",
+            "create_plan",
+            "create_index_paths",
+            "build_index_paths",
+            "create_index_path",
+            "finalize_plan",
+            "standard_qp_callback",
+            "set_rel_pathlist",
+            "set_plan_references",
+            "add_base_rels",
+            "build_simple_rel",
+            "get_relation_info",
+            "get_index_paths",
+            "deconstruct_jointree",
+            "distribute_quals_to_rels",
+            "set_baserel_size_estimates",
+            "build_base_rel_tlists",
+            "eval_const_expressions",
+            "expression_tree_mutator",
+            "firerirrules",
+            "get_row_security_policies",
+            "check_enable_rls",
+            "list_copy_deep",
+            "cost_",
+            "selectivity",
+            "eqsel",
+            "pg_rewrite_query",
+            "queryrewrite",
+            "rewritequery",
+            "_copyquery",
+            "_copyrangetblentry",
+            "_copyalias",
+        )
+    ):
+        return "Planning / rewrite"
+    if any(
+        token in lowered
+        for token in (
+            "fastpg_catalog",
+            "catalog",
+            "catcache",
+            "relcache",
+            "syscache",
+            "pg_class",
+            "pg_attribute",
+            "pg_index",
+            "relation_by_oid",
+            "relation_record",
+            "relationidgetrelation",
+            "relation_open",
+            "relation_close",
+            "relationclose",
+            "relationincrementreferencecount",
+            "relationbuild",
+            "rangevargetrelid",
+            "index_open",
+            "get_relname_relid",
+            "searchsyscache",
+            "builddesc",
+            "namespace",
+            "table_open",
+        )
+    ):
+        return "Catalog / metadata"
+    if any(
+        token in lowered
+        for token in (
+            "fastpg_mem",
+            "fastpg_storage",
+            "primary_key_index",
+            "index_getnext",
+            "index_beginscan",
+            "index_rescan",
+            "index_endscan",
+            "heap_",
+            "heapam",
+            "heapget",
+            "heaptuplesatisfies",
+            "mvcc",
+            "table_",
+            "tableam",
+            "bt",
+            "bufmgr",
+            "buffer",
+            "smgr",
+            "visibilitymap",
+            "toast",
+            "relation_insert",
+            "relation_update",
+            "relation_delete",
+            "relation_fetch",
+            "scan_begin",
+            "scan_next",
+            "scan_end",
+            "tuple_update",
+        )
+    ):
+        return "Storage / index AM"
+    if any(
+        token in lowered
+        for token in (
+            "xact",
+            "transaction",
+            "commit",
+            "rollback",
+            "abort",
+            "wal",
+            "xlog",
+            "clog",
+            "subtrans",
+            "lock",
+        )
+    ):
+        return "Transactions / WAL"
+    if any(
+        token in lowered
+        for token in (
+            "portalrun",
+            "processquery",
+            "executor",
+            "exec",
+            "modifytable",
+            "indexnext",
+            "seqnext",
+            "seqscan",
+            "tuplestore",
+            "projectset",
+            "slot",
+            "node",
+        )
+    ):
+        return "Execution"
+    if any(
+        token in lowered
+        for token in (
+            "alloc::",
+            "core::",
+            "std::",
+            "tokio::",
+            "hashbrown::",
+            "malloc",
+            "calloc",
+            "realloc",
+            "free",
+            "palloc",
+            "pfree",
+            "memcpy",
+            "memmove",
+            "memset",
+            "bzero",
+            "_xzm",
+        )
+    ):
+        return "Runtime / memory"
+    return "Other"
+
+
+def profile_hotspots_by_component(
+    hotspots: list[dict[str, Any]],
+    limit_per_component: int | None = None,
+) -> dict[str, list[dict[str, Any]]]:
+    grouped = {component: [] for component in PROFILE_COMPONENT_ORDER}
+    for hotspot in hotspots:
+        component = profile_component(str(hotspot["name"]))
+        if limit_per_component is None or len(grouped[component]) < limit_per_component:
+            grouped[component].append(hotspot)
+    return grouped
 
 
 def is_profile_noise(name: str) -> bool:
@@ -1243,8 +1818,12 @@ def is_profile_noise(name: str) -> bool:
     noisy_prefixes = (
         "std::rt::",
         "std::sys::backtrace",
+        "std::thread::local::LocalKey<",
         "tokio::runtime::context::",
+        "tokio::runtime::scheduler::current_thread::Context::",
         "tokio::runtime::scheduler::current_thread::CoreGuard",
+        "tokio::runtime::task::harness::Harness<",
+        "fastpg_server::serve_unix_listener_with_handlers::",
     )
     noisy_exact = {
         "BackendRun",
@@ -1264,6 +1843,26 @@ def parse_pgbench_metrics(stdout: str) -> dict[str, float | None]:
     return {
         "tps_without_initial_connection": float(tps_match.group(1)) if tps_match else None,
         "latency_average_ms": float(latency_match.group(1)) if latency_match else None,
+    }
+
+
+def parse_hyperfine_summary(path: Path) -> dict[str, Any]:
+    data = json.loads(path.read_text())
+    results = data.get("results", [])
+    if not results:
+        return {}
+    result = results[0]
+    memory_values = [int(value) for value in result.get("memory_usage_byte", []) if value is not None]
+    return {
+        "mean_seconds": result.get("mean"),
+        "stddev_seconds": result.get("stddev"),
+        "median_seconds": result.get("median"),
+        "min_seconds": result.get("min"),
+        "max_seconds": result.get("max"),
+        "user_seconds": result.get("user"),
+        "system_seconds": result.get("system"),
+        "runs": len(result.get("times", [])),
+        "command_max_rss_bytes": max(memory_values) if memory_values else None,
     }
 
 
@@ -1291,6 +1890,32 @@ def speedup_ratio(fastpg_tps: float | None, normal_tps: float | None) -> float |
     return fastpg_tps / normal_tps
 
 
+def first_run_for_variant(results: dict[str, Any], variant_name: str) -> dict[str, Any] | None:
+    runs = results.get("variants", {}).get(variant_name, {}).get("runs", [])
+    return runs[0] if runs else None
+
+
+def run_metric_value(run: dict[str, Any] | None, path: tuple[str, ...]) -> Any:
+    value: Any = run
+    for key in path:
+        if not isinstance(value, dict):
+            return None
+        value = value.get(key)
+    return value
+
+
+def metric_delta(fastpg: float | int | None, normal: float | int | None) -> float | None:
+    if fastpg is None or normal is None:
+        return None
+    return float(fastpg) - float(normal)
+
+
+def metric_ratio(fastpg: float | int | None, normal: float | int | None) -> float | None:
+    if fastpg is None or normal in (None, 0):
+        return None
+    return float(fastpg) / float(normal)
+
+
 def profile_records_by_variant(results: dict[str, Any]) -> dict[str, dict[str, Any]]:
     records: dict[str, dict[str, Any]] = {}
     for variant_name, variant in results.get("variants", {}).items():
@@ -1300,6 +1925,54 @@ def profile_records_by_variant(results: dict[str, Any]) -> dict[str, dict[str, A
                 records[variant_name] = profile
                 break
     return records
+
+
+def profile_components_from_record(profile: dict[str, Any] | None) -> dict[str, list[dict[str, Any]]]:
+    if profile is None:
+        return {component: [] for component in PROFILE_COMPONENT_ORDER}
+
+    path = profile.get("path")
+    if path:
+        profile_path = Path(str(path))
+        if profile_path.exists():
+            return profile_component_hotspots(profile_path)
+
+    stored_components = profile.get("component_hotspots")
+    if isinstance(stored_components, dict):
+        grouped = {component: [] for component in PROFILE_COMPONENT_ORDER}
+        for component in PROFILE_COMPONENT_ORDER:
+            hotspots = stored_components.get(component, [])
+            if isinstance(hotspots, list):
+                grouped[component] = hotspots[:PROFILE_COMPONENT_CAPTURE_LIMIT]
+        return grouped
+
+    return profile_hotspots_by_component(
+        profile.get("hotspots", []),
+        PROFILE_COMPONENT_CAPTURE_LIMIT,
+    )
+
+
+def profile_hotspots_from_record(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if profile is None:
+        return []
+    path = profile.get("path")
+    if path:
+        profile_path = Path(str(path))
+        if profile_path.exists():
+            return profile_hotspots(profile_path)
+    return profile.get("hotspots", [])
+
+
+def profile_total_samples_from_record(profile: dict[str, Any] | None) -> int | None:
+    if profile is None:
+        return None
+    path = profile.get("path")
+    if path:
+        profile_path = Path(str(path))
+        if profile_path.exists():
+            return profile_total_samples(profile_path)
+    total_samples = profile.get("total_samples")
+    return int(str(total_samples).replace(",", "")) if total_samples is not None else None
 
 
 def effective_init_steps(init_steps: str | None) -> str:
@@ -1394,6 +2067,30 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
         )
         lines.extend(["## Comparison", "", f"- fastpg/normal median TPS ratio: `{ratio}`", ""])
 
+    metric_rows = [
+        row
+        for row in profile_run_metric_rows(results)
+        if row["normal"] is not None or row["fastpg"] is not None
+    ]
+    if metric_rows:
+        lines.extend(["## Run Metrics", ""])
+        lines.append(
+            "Wall-time rows come from pgbench and, when enabled, hyperfine. Memory rows are "
+            "RSS measurements for the measured command/server process, not stack-level "
+            "allocation traces."
+        )
+        lines.append("")
+        lines.append("| metric | normal Postgres | fastpg Rust server | fastpg - normal | fastpg / normal |")
+        lines.append("| --- | --- | --- | --- | --- |")
+        for row in metric_rows:
+            unit = str(row["unit"])
+            lines.append(
+                f"| {row['label']} | {format_metric_value(row['normal'], unit)} | "
+                f"{format_metric_value(row['fastpg'], unit)} | "
+                f"{format_metric_delta(row['delta'], unit)} | {format_metric_ratio(row['ratio'])} |"
+            )
+        lines.append("")
+
     profiles = profile_records_by_variant(results)
     if profiles:
         lines.extend(["## Profiles", ""])
@@ -1403,13 +2100,43 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
             if profile is None:
                 continue
             lines.append(f"- {variant_name} flamegraph: `{profile.get('path')}`")
+            total_samples = profile_total_samples_from_record(profile)
+            if total_samples is not None:
+                lines.append(f"- {variant_name} profile samples: `{total_samples}`")
         lines.append("")
         if all(name in profiles for name in ("normal", "fastpg")):
+            normal_hotspots = profile_hotspots_from_record(profiles["normal"])
+            fastpg_hotspots = profile_hotspots_from_record(profiles["fastpg"])
+            normal_components = profile_components_from_record(profiles["normal"])
+            fastpg_components = profile_components_from_record(profiles["fastpg"])
+
+            lines.extend(["### Component Hotspots", ""])
+            lines.append(
+                "Inclusive flamegraph percentages are not additive. The component table scans "
+                "all captured flamegraph frames and each cell shows the top frames in that "
+                "component. Percentages use each side's own total sample count. Sample deltas "
+                "compare the component peak frame only because displayed frames are inclusive "
+                "and can contain the same samples."
+            )
+            lines.append("")
+            lines.append("| component | normal Postgres | fastpg Rust server | fastpg +/- peak samples |")
+            lines.append("| --- | --- | --- | --- |")
+            for component in PROFILE_COMPONENT_ORDER:
+                normal_component_hotspots = normal_components[component]
+                fastpg_component_hotspots = fastpg_components[component]
+                normal_cell = format_component_hotspot_cell(normal_component_hotspots)
+                fastpg_cell = format_component_hotspot_cell(fastpg_component_hotspots)
+                if component == "Other" and not normal_cell and not fastpg_cell:
+                    continue
+                delta_cell = format_sample_delta_cell(
+                    component_sample_delta(normal_component_hotspots, fastpg_component_hotspots)
+                )
+                lines.append(f"| {component} | {normal_cell} | {fastpg_cell} | {delta_cell} |")
+            lines.append("")
+
             lines.extend(["### Hotspot Comparison", ""])
             lines.append("| rank | normal Postgres | fastpg Rust server |")
             lines.append("| --- | --- | --- |")
-            normal_hotspots = profiles["normal"].get("hotspots", [])
-            fastpg_hotspots = profiles["fastpg"].get("hotspots", [])
             for index in range(min(12, max(len(normal_hotspots), len(fastpg_hotspots)))):
                 normal = format_hotspot_cell(normal_hotspots, index)
                 fastpg = format_hotspot_cell(fastpg_hotspots, index)
@@ -1455,6 +2182,157 @@ def format_hotspot_cell(hotspots: list[dict[str, Any]], index: int) -> str:
     return f"`{hotspot['name']}` {hotspot['percent']:.2f}%"
 
 
+def format_component_hotspot_cell(
+    hotspots: list[dict[str, Any]],
+    limit: int = PROFILE_COMPONENT_MARKDOWN_LIMIT,
+) -> str:
+    if not hotspots:
+        return ""
+    return "<br>".join(format_hotspot_cell(hotspots, index) for index in range(min(limit, len(hotspots))))
+
+
+def component_sample_delta(
+    normal_hotspots: list[dict[str, Any]],
+    fastpg_hotspots: list[dict[str, Any]],
+) -> int:
+    normal_samples = int(normal_hotspots[0]["samples"]) if normal_hotspots else 0
+    fastpg_samples = int(fastpg_hotspots[0]["samples"]) if fastpg_hotspots else 0
+    return fastpg_samples - normal_samples
+
+
+def format_sample_delta_cell(delta: int) -> str:
+    sign = "+" if delta > 0 else ""
+    return f"`{sign}{delta:,}` samples"
+
+
+def profile_run_metric_rows(results: dict[str, Any]) -> list[dict[str, Any]]:
+    normal_run = first_run_for_variant(results, "normal")
+    fastpg_run = first_run_for_variant(results, "fastpg")
+    profiles = profile_records_by_variant(results)
+
+    def add_row(label: str, unit: str, normal: Any, fastpg: Any) -> dict[str, Any]:
+        return {
+            "label": label,
+            "unit": unit,
+            "normal": normal,
+            "fastpg": fastpg,
+            "delta": metric_delta(fastpg, normal),
+            "ratio": metric_ratio(fastpg, normal),
+        }
+
+    return [
+        add_row(
+            "pgbench average latency",
+            "milliseconds",
+            run_metric_value(normal_run, ("metrics", "latency_average_ms")),
+            run_metric_value(fastpg_run, ("metrics", "latency_average_ms")),
+        ),
+        add_row(
+            "pgbench TPS",
+            "float",
+            run_metric_value(normal_run, ("metrics", "tps_without_initial_connection")),
+            run_metric_value(fastpg_run, ("metrics", "tps_without_initial_connection")),
+        ),
+        add_row(
+            "pgbench command wall time",
+            "seconds",
+            run_metric_value(normal_run, ("commands", "pgbench_run", "seconds")),
+            run_metric_value(fastpg_run, ("commands", "pgbench_run", "seconds")),
+        ),
+        add_row(
+            "hyperfine mean wall time",
+            "seconds",
+            run_metric_value(normal_run, ("hyperfine", "summary", "mean_seconds")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "mean_seconds")),
+        ),
+        add_row(
+            "hyperfine median wall time",
+            "seconds",
+            run_metric_value(normal_run, ("hyperfine", "summary", "median_seconds")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "median_seconds")),
+        ),
+        add_row(
+            "hyperfine stddev",
+            "seconds",
+            run_metric_value(normal_run, ("hyperfine", "summary", "stddev_seconds")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "stddev_seconds")),
+        ),
+        add_row(
+            "hyperfine command max RSS",
+            "bytes",
+            run_metric_value(normal_run, ("hyperfine", "summary", "command_max_rss_bytes")),
+            run_metric_value(fastpg_run, ("hyperfine", "summary", "command_max_rss_bytes")),
+        ),
+        add_row(
+            "server max RSS during pgbench",
+            "bytes",
+            run_metric_value(normal_run, ("memory", "pgbench_run", "max_rss_bytes")),
+            run_metric_value(fastpg_run, ("memory", "pgbench_run", "max_rss_bytes")),
+        ),
+        add_row(
+            "server max RSS during hyperfine",
+            "bytes",
+            run_metric_value(normal_run, ("hyperfine", "server_memory", "max_rss_bytes")),
+            run_metric_value(fastpg_run, ("hyperfine", "server_memory", "max_rss_bytes")),
+        ),
+        add_row(
+            "profile samples",
+            "samples",
+            profile_total_samples_from_record(profiles.get("normal")),
+            profile_total_samples_from_record(profiles.get("fastpg")),
+        ),
+    ]
+
+
+def format_metric_value(value: Any, unit: str) -> str:
+    if value is None:
+        return ""
+    if unit == "bytes":
+        return format_bytes(float(value))
+    if unit == "seconds":
+        return f"{float(value):.3f} s"
+    if unit == "milliseconds":
+        return f"{float(value):.3f} ms"
+    if unit == "samples":
+        return f"{int(value):,}"
+    return f"{float(value):.3f}"
+
+
+def format_metric_delta(value: Any, unit: str) -> str:
+    if value is None:
+        return ""
+    sign = "+" if float(value) > 0 else ""
+    if unit == "bytes":
+        return f"{sign}{format_bytes(float(value))}"
+    if unit == "seconds":
+        return f"{sign}{float(value):.3f} s"
+    if unit == "milliseconds":
+        return f"{sign}{float(value):.3f} ms"
+    if unit == "samples":
+        return f"{sign}{int(value):,}"
+    return f"{sign}{float(value):.3f}"
+
+
+def format_metric_ratio(value: Any) -> str:
+    if value is None:
+        return ""
+    return f"{float(value):.3f}x"
+
+
+def format_bytes(value: float) -> str:
+    sign = "-" if value < 0 else ""
+    value = abs(value)
+    units = ("B", "KiB", "MiB", "GiB")
+    unit = units[0]
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            break
+        value /= 1024
+    if unit == "B":
+        return f"{sign}{value:.0f} {unit}"
+    return f"{sign}{value:.2f} {unit}"
+
+
 def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -> str:
     profiles = profile_records_by_variant(results)
     normal = profiles.get("normal")
@@ -1474,21 +2352,36 @@ def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -
     table {{ border-collapse: collapse; width: 100%; margin-top: 24px; }}
     th, td {{ border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }}
     th {{ text-align: left; background: #f6f6f6; }}
-    code {{ white-space: normal; }}
+    code {{ white-space: normal; overflow-wrap: anywhere; }}
+    .note {{ color: #555; line-height: 1.4; max-width: 960px; }}
+    .component-name {{ width: 180px; font-weight: 600; }}
+    .component-peak {{ color: #555; font-size: 12px; margin-bottom: 4px; }}
+    .sample-delta {{ font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }}
+    .sample-delta-positive {{ color: #b42318; }}
+    .sample-delta-negative {{ color: #027a48; }}
+    .sample-delta-zero {{ color: #777; }}
+    .frame-list {{ margin: 0 0 0 18px; padding: 0; }}
+    .frame-list li {{ margin: 4px 0; }}
+    .frame-meta {{ color: #555; white-space: nowrap; }}
+    .muted {{ color: #777; }}
   </style>
 </head>
 <body>
   <h1>pgbench profile comparison</h1>
+  {render_run_metrics_html(results)}
   <div class=\"profiles\">
     <section class=\"profile\">
       <h2>normal Postgres</h2>
       {profile_object(normal_path)}
+      {profile_sample_summary(normal)}
     </section>
     <section class=\"profile\">
       <h2>fastpg Rust server</h2>
       {profile_object(fastpg_path)}
+      {profile_sample_summary(fastpg)}
     </section>
   </div>
+  {render_component_table_html(normal, fastpg)}
   {render_hotspot_table_html(normal, fastpg)}
 </body>
 </html>
@@ -1508,12 +2401,138 @@ def profile_object(path: str | None) -> str:
     return f'<object data="{escaped}" type="image/svg+xml"><a href="{escaped}">{escaped}</a></object>'
 
 
+def profile_sample_summary(profile: dict[str, Any] | None) -> str:
+    total_samples = profile_total_samples_from_record(profile)
+    if total_samples is None:
+        return ""
+    return f'<p class="note">total profile samples: {total_samples:,}</p>'
+
+
+def render_run_metrics_html(results: dict[str, Any]) -> str:
+    rows = []
+    for row in profile_run_metric_rows(results):
+        unit = str(row["unit"])
+        normal = format_metric_value(row["normal"], unit)
+        fastpg = format_metric_value(row["fastpg"], unit)
+        if not normal and not fastpg:
+            continue
+        rows.append(
+            "<tr>"
+            f"<th scope=\"row\">{html.escape(str(row['label']))}</th>"
+            f"<td>{html_metric_value(normal)}</td>"
+            f"<td>{html_metric_value(fastpg)}</td>"
+            f"<td>{html_metric_value(format_metric_delta(row['delta'], unit))}</td>"
+            f"<td>{html_metric_value(format_metric_ratio(row['ratio']))}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<h2>Run metrics</h2>"
+        "<p class=\"note\">Wall-time rows come from pgbench and, when enabled, hyperfine. "
+        "Memory rows are RSS measurements for the measured command/server process; they are "
+        "allocation-pressure indicators, not stack-level allocation traces.</p>"
+        "<table><thead><tr><th>metric</th><th>normal Postgres</th>"
+        "<th>fastpg Rust server</th><th>fastpg - normal</th><th>fastpg / normal</th>"
+        "</tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def html_metric_value(value: str) -> str:
+    if not value:
+        return "<span class=\"muted\">not captured</span>"
+    return html.escape(value)
+
+
+def render_component_table_html(
+    normal: dict[str, Any] | None,
+    fastpg: dict[str, Any] | None,
+) -> str:
+    normal_components = profile_components_from_record(normal)
+    fastpg_components = profile_components_from_record(fastpg)
+    rows = []
+    for component in PROFILE_COMPONENT_ORDER:
+        normal_component_hotspots = normal_components[component]
+        fastpg_component_hotspots = fastpg_components[component]
+        if component == "Other" and not normal_component_hotspots and not fastpg_component_hotspots:
+            continue
+        normal_cell = html_component_hotspots(normal_component_hotspots)
+        fastpg_cell = html_component_hotspots(fastpg_component_hotspots)
+        sample_delta = html_sample_delta_cell(
+            component_sample_delta(normal_component_hotspots, fastpg_component_hotspots)
+        )
+        rows.append(
+            "<tr>"
+            f"<th class=\"component-name\" scope=\"row\">{html.escape(component)}</th>"
+            f"<td>{normal_cell}</td>"
+            f"<td>{fastpg_cell}</td>"
+            f"<td>{sample_delta}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<h2>Component view</h2>"
+        "<p class=\"note\">Inclusive flamegraph percentages are not additive. This table scans "
+        "all captured flamegraph frames and each cell shows the top frames in that component, "
+        "with the largest frame listed as the component peak. Percentages use each side's own "
+        "total sample count. Sample delta compares the component peak frame only because "
+        "displayed frames are inclusive and can contain the same samples.</p>"
+        "<table class=\"component-table\"><thead><tr><th>component</th>"
+        "<th>normal Postgres</th><th>fastpg Rust server</th><th>fastpg +/- peak samples</th>"
+        "</tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def html_sample_delta_cell(delta: int) -> str:
+    if delta > 0:
+        class_name = "sample-delta sample-delta-positive"
+        sign = "+"
+    elif delta < 0:
+        class_name = "sample-delta sample-delta-negative"
+        sign = ""
+    else:
+        class_name = "sample-delta sample-delta-zero"
+        sign = ""
+    return f"<span class=\"{class_name}\">{sign}{delta:,} samples</span>"
+
+
+def html_component_hotspots(
+    hotspots: list[dict[str, Any]],
+    limit: int = PROFILE_COMPONENT_HTML_LIMIT,
+) -> str:
+    if not hotspots:
+        return "<span class=\"muted\">No frame captured in this component.</span>"
+    peak = hotspots[0]
+    items = []
+    for hotspot in hotspots[:limit]:
+        name = html.escape(str(hotspot["name"]))
+        items.append(
+            "<li>"
+            f"<code>{name}</code> "
+            f"<span class=\"frame-meta\">{hotspot['percent']:.2f}% "
+            f"({int(hotspot['samples']):,} samples)</span>"
+            "</li>"
+        )
+    return (
+        f"<div class=\"component-peak\">component peak: {peak['percent']:.2f}% "
+        f"({int(peak['samples']):,} samples)</div>"
+        "<ol class=\"frame-list\">"
+        + "\n".join(items)
+        + "</ol>"
+    )
+
+
 def render_hotspot_table_html(
     normal: dict[str, Any] | None,
     fastpg: dict[str, Any] | None,
 ) -> str:
-    normal_hotspots = normal.get("hotspots", []) if normal else []
-    fastpg_hotspots = fastpg.get("hotspots", []) if fastpg else []
+    normal_hotspots = profile_hotspots_from_record(normal)
+    fastpg_hotspots = profile_hotspots_from_record(fastpg)
     rows = []
     for index in range(min(25, max(len(normal_hotspots), len(fastpg_hotspots)))):
         rows.append(
@@ -1524,7 +2543,7 @@ def render_hotspot_table_html(
             "</tr>"
         )
     return (
-        "<h2>Hot frames</h2>"
+        "<h2>Flat hot frames</h2>"
         "<table><thead><tr><th>rank</th><th>normal Postgres</th>"
         "<th>fastpg Rust server</th></tr></thead><tbody>"
         + "\n".join(rows)

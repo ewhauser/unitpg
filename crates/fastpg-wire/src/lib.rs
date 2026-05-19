@@ -526,7 +526,7 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
     match execution {
         QueryExecution::Empty => Ok(Response::EmptyQuery),
         QueryExecution::Rows(result) => query_result_response(result, format),
-        QueryExecution::Command { tag, rows } => Ok(command_response(&tag, rows)),
+        QueryExecution::Command { tag, rows } => Ok(command_response(tag.as_ref(), rows)),
         QueryExecution::CopyIn(target) => Ok(Response::CopyIn(CopyResponse::new(
             0,
             target.columns,
@@ -546,11 +546,12 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
 
 fn query_result_response(result: QueryResult, format: FieldFormat) -> PgWireResult<Response> {
     let schema = Arc::new(field_infos(&result.fields, format));
+    let fields = result.fields;
+    let row_schema = schema.clone();
     let rows = result
         .rows
-        .iter()
-        .map(|row| encode_row(schema.clone(), &result.fields, row))
-        .collect::<Vec<_>>();
+        .into_iter()
+        .map(move |row| encode_row(row_schema.clone(), &fields, &row));
 
     Ok(Response::Query(QueryResponse::new(
         schema,

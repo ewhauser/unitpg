@@ -1260,12 +1260,10 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 		{
 			const char *relation_name = DatumGetCString(arguments[0]);
 			Oid			namespace_oid = DatumGetObjectId(arguments[1]);
-			uint32_t	relation_oid;
 
-			if (fastpg_rust_catalog_relation_oid_by_name(relation_name,
-														 (uint32_t) namespace_oid,
-														 &relation_oid) &&
-				fastpg_rust_catalog_relation_by_oid(relation_oid, &relation))
+			if (fastpg_rust_catalog_relation_by_name(relation_name,
+													 (uint32_t) namespace_oid,
+													 &relation))
 				return FastPgBuildClassTuple(cache->cc_tupdesc, &relation);
 		}
 	}

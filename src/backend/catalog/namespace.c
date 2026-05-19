@@ -569,10 +569,7 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 #ifdef USE_FASTPG
 		if (OidIsValid(relId))
 		{
-			FastPgRustCatalogRelation fastpg_relation;
-
-			if (fastpg_rust_catalog_relation_by_oid((uint32_t) relId,
-													&fastpg_relation))
+			if (fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relId))
 				break;
 		}
 #endif

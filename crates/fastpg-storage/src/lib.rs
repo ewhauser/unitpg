@@ -16,13 +16,16 @@ use fastpg_catalog::{
     VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
     builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row,
-    index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
-    primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
-    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_count,
-    relation_oid_for_index_oid, static_catalog_by_name, static_catalog_by_relation_oid,
-    type_by_name, unique_index_records_for_relation_oid, upsert_catalog_row,
-    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    builtin_operators_by_name, catalog_row_value, catalog_rows, current_generation,
+    delete_catalog_row, has_uncommitted_catalog_changes, index_record_by_index_oid,
+    index_records_for_relation_oid, lookup_type, primary_key_index_oid_for_relation_oid,
+    primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
+    relation_by_oid, relation_column_by_attnum, relation_column_count,
+    relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
+    relation_summary_by_name_in_namespace, relation_summary_by_oid, static_catalog_by_name,
+    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
+    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -721,6 +724,12 @@ struct UniqueIndexSpec {
     columns: Vec<IndexColumnSpec>,
 }
 
+#[derive(Clone, Debug)]
+struct CachedUniqueIndex {
+    info: FastPgRustPrimaryKeyIndexInfo,
+    spec: UniqueIndexSpec,
+}
+
 #[derive(Debug)]
 struct RowSegment {
     rows: Vec<Row>,
@@ -847,6 +856,7 @@ struct TransactionOverlay {
     region_kind: StorageRegionKind,
     relations: HashMap<u32, RowSegment>,
     deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+    pending_primary_key_rebuilds: BTreeSet<u32>,
 }
 
 impl TransactionOverlay {
@@ -855,6 +865,7 @@ impl TransactionOverlay {
             region_kind,
             relations: HashMap::new(),
             deleted_row_ids: HashMap::new(),
+            pending_primary_key_rebuilds: BTreeSet::new(),
         }
     }
 
@@ -871,6 +882,10 @@ impl TransactionOverlay {
         self.relations
             .entry(relid)
             .or_insert_with(|| RowSegment::new(region_kind))
+    }
+
+    fn mark_primary_key_rebuild(&mut self, relid: u32) {
+        self.pending_primary_key_rebuilds.insert(relid);
     }
 
     fn bytes(&self) -> usize {
@@ -892,10 +907,10 @@ struct ScanState {
 }
 
 impl ScanState {
-    fn materialize(rows: Vec<Row>) -> Result<Self, CatalogError> {
+    fn materialize<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Result<Self, CatalogError> {
         let mut region = StorageRegion::new(StorageRegionKind::Scan);
         let rows = rows
-            .iter()
+            .into_iter()
             .map(|row| {
                 region
                     .copy_row(row)
@@ -1040,6 +1055,14 @@ impl SessionStorage {
         fastpg_catalog::begin_implicit_transaction();
     }
 
+    fn mark_primary_key_rebuild(&mut self, relid: u32) {
+        self.ensure_transaction();
+        self.transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured")
+            .mark_primary_key_rebuild(relid);
+    }
+
     fn transaction_bytes(&self) -> usize {
         self.transaction_stack
             .iter()
@@ -1136,11 +1159,13 @@ impl StorageState {
     }
 
     fn commit_explicit_transaction(&mut self, session: &mut SessionStorage) {
+        let mut pending_primary_key_rebuilds = BTreeSet::new();
         while !session.transaction_stack.is_empty() {
-            self.commit_top_overlay(session);
+            pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
         fastpg_catalog::commit_explicit_transaction();
         session.explicit_transaction = false;
+        self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
     }
 
     fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
@@ -1153,10 +1178,12 @@ impl StorageState {
         if session.explicit_transaction {
             return;
         }
+        let mut pending_primary_key_rebuilds = BTreeSet::new();
         while !session.transaction_stack.is_empty() {
-            self.commit_top_overlay(session);
+            pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
         fastpg_catalog::commit_implicit_transaction();
+        self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
     }
 
     fn abort_implicit_transaction(&mut self, session: &mut SessionStorage) {
@@ -1234,6 +1261,34 @@ impl StorageState {
         rows.into_values().collect()
     }
 
+    fn visible_scan_state(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+    ) -> Result<ScanState, CatalogError> {
+        let mut rows = BTreeMap::new();
+        if let Some(relation) = self.relations.get(&relid) {
+            for row_id in &relation.committed_row_ids {
+                if let Some(row) = relation.committed_row_index.get(row_id) {
+                    rows.insert(*row_id, row);
+                }
+            }
+        }
+        for overlay in self.visible_overlay_stack(session) {
+            if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
+                for row_id in deleted_row_ids {
+                    rows.remove(row_id);
+                }
+            }
+            if let Some(segment) = overlay.relations.get(&relid) {
+                for row in &segment.rows {
+                    rows.insert(row.row_id, row);
+                }
+            }
+        }
+        ScanState::materialize(rows.into_values())
+    }
+
     fn find_visible_row(&self, session: &SessionStorage, relid: u32, row_id: u64) -> Option<Row> {
         if row_id == 0 {
             return None;
@@ -1255,6 +1310,33 @@ impl StorageState {
         }
 
         self.find_committed_row(relid, row_id)
+    }
+
+    fn visible_row_exists(&self, session: &SessionStorage, relid: u32, row_id: u64) -> bool {
+        if row_id == 0 {
+            return false;
+        }
+
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
+            if overlay
+                .relations
+                .get(&relid)
+                .is_some_and(|segment| segment.rows.iter().any(|row| row.row_id == row_id))
+            {
+                return true;
+            }
+            if overlay
+                .deleted_row_ids
+                .get(&relid)
+                .is_some_and(|deleted| deleted.contains(&row_id))
+            {
+                return false;
+            }
+        }
+
+        self.relations
+            .get(&relid)
+            .is_some_and(|relation| relation.committed_row_index.contains_key(&row_id))
     }
 
     fn find_committed_row(&self, relid: u32, row_id: u64) -> Option<Row> {
@@ -1363,15 +1445,16 @@ impl StorageState {
         }
     }
 
-    fn commit_top_overlay(&mut self, session: &mut SessionStorage) {
+    fn commit_top_overlay(&mut self, session: &mut SessionStorage) -> BTreeSet<u32> {
         let Some(overlay) = session.transaction_stack.pop() else {
-            return;
+            return BTreeSet::new();
         };
 
         if let Some(parent) = session.transaction_stack.last_mut() {
             merge_overlay_into_overlay(parent, overlay);
+            BTreeSet::new()
         } else {
-            self.commit_overlay_to_relations(overlay);
+            self.commit_overlay_to_relations(overlay)
         }
     }
 
@@ -1379,11 +1462,12 @@ impl StorageState {
         &session.transaction_stack
     }
 
-    fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
+    fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) -> BTreeSet<u32> {
         let TransactionOverlay {
             region_kind: _,
             relations,
             deleted_row_ids,
+            pending_primary_key_rebuilds,
         } = overlay;
         let mut unchanged_primary_key_updates: HashMap<u32, BTreeSet<u64>> = HashMap::new();
 
@@ -1391,15 +1475,7 @@ impl StorageState {
             if deleted_row_ids.is_empty() {
                 continue;
             }
-            let primary_key_spec = relation_by_oid(Oid(*relid)).and_then(|relation| {
-                primary_key_spec_for_relation(&relation).map(|columns| UniqueIndexSpec {
-                    index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
-                    relation_oid: relation.oid,
-                    is_primary: true,
-                    nulls_not_distinct: true,
-                    columns,
-                })
-            });
+            let primary_key_spec = primary_index_spec_for_relation_oid(Oid(*relid));
             let unchanged_row_ids = self.remove_committed_entries(
                 *relid,
                 primary_key_spec.as_ref(),
@@ -1415,36 +1491,66 @@ impl StorageState {
             if segment.rows.is_empty() {
                 continue;
             }
-            let primary_key_spec = relation_by_oid(Oid(relid)).and_then(|relation| {
-                primary_key_spec_for_relation(&relation).map(|columns| UniqueIndexSpec {
-                    index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
-                    relation_oid: relation.oid,
-                    is_primary: true,
-                    nulls_not_distinct: true,
-                    columns,
-                })
-            });
+            let primary_key_spec = primary_index_spec_for_relation_oid(Oid(relid));
             let unchanged_row_ids = unchanged_primary_key_updates.get(&relid);
             let relation = self.relations.entry(relid).or_default();
             for row in &segment.rows {
+                let primary_key_unchanged =
+                    unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&row.row_id));
                 let committed_row = relation
                     .committed_region
                     .copy_row(row)
                     .expect("stored by-reference cells must point to owned storage");
-                relation.committed_row_ids.insert(committed_row.row_id);
-                relation
-                    .committed_row_index
-                    .insert(committed_row.row_id, committed_row.clone());
-                if unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&committed_row.row_id))
-                {
-                    continue;
+                let row_id = committed_row.row_id;
+                let primary_key = if primary_key_unchanged {
+                    None
+                } else {
+                    primary_key_spec.as_ref().and_then(|primary_key_spec| {
+                        index_key_for_row(primary_key_spec, &committed_row)
+                    })
+                };
+                if !primary_key_unchanged {
+                    relation.committed_row_ids.insert(row_id);
                 }
-                if let Some(primary_key_spec) = &primary_key_spec
-                    && let Some(key) = index_key_for_row(primary_key_spec, &committed_row)
-                {
-                    relation.insert_primary_key(key, committed_row.row_id);
+                relation.committed_row_index.insert(row_id, committed_row);
+                if let Some(key) = primary_key {
+                    relation.insert_primary_key(key, row_id);
                 }
             }
+        }
+
+        pending_primary_key_rebuilds
+    }
+
+    fn rebuild_primary_key_indexes(&mut self, relation_oids: &BTreeSet<u32>) {
+        for relid in relation_oids {
+            self.rebuild_primary_key_index(*relid);
+        }
+    }
+
+    fn rebuild_primary_key_index(&mut self, relid: u32) {
+        let Some(relation) = self.relations.get_mut(&relid) else {
+            return;
+        };
+
+        let old_keys = std::mem::take(&mut relation.primary_key_index);
+        for key in old_keys.into_keys() {
+            relation.committed_region.unaccount_index_key(&key);
+        }
+
+        let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid)) else {
+            return;
+        };
+        let index_entries = relation
+            .committed_row_ids
+            .iter()
+            .filter_map(|row_id| {
+                let row = relation.committed_row_index.get(row_id)?;
+                index_key_for_row(&index_spec, row).map(|key| (key, *row_id))
+            })
+            .collect::<Vec<_>>();
+        for (key, row_id) in index_entries {
+            relation.insert_primary_key(key, row_id);
         }
     }
 
@@ -1462,12 +1568,12 @@ impl StorageState {
 
         if let Some(relation) = self.relations.get_mut(&relid) {
             for row_id in deleted_row_ids {
-                relation.committed_row_ids.remove(row_id);
                 let Some(row) = relation.committed_row_index.remove(row_id) else {
                     continue;
                 };
                 relation.committed_region.unaccount_row(&row);
                 let Some(primary_key_spec) = primary_key_spec else {
+                    relation.committed_row_ids.remove(row_id);
                     continue;
                 };
                 if let Some(replacement) =
@@ -1480,6 +1586,7 @@ impl StorageState {
                 if let Some(key) = index_key_for_row(primary_key_spec, &row) {
                     relation.remove_primary_key(&key);
                 }
+                relation.committed_row_ids.remove(row_id);
             }
         }
         unchanged_primary_key_row_ids
@@ -1495,7 +1602,14 @@ fn committed_contains_row_id(relation: &RelationRows, row_id: u64) -> bool {
 }
 
 fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: TransactionOverlay) {
-    for (relid, deleted_row_ids) in overlay.deleted_row_ids {
+    let TransactionOverlay {
+        region_kind: _,
+        relations,
+        deleted_row_ids,
+        pending_primary_key_rebuilds,
+    } = overlay;
+
+    for (relid, deleted_row_ids) in deleted_row_ids {
         if deleted_row_ids.is_empty() {
             continue;
         }
@@ -1509,13 +1623,17 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
             .extend(deleted_row_ids);
     }
 
-    for (relid, mut segment) in overlay.relations {
+    for (relid, mut segment) in relations {
         if segment.rows.is_empty() {
             continue;
         }
         let parent_segment = parent.row_segment_mut(relid);
         parent_segment.append_from(&mut segment);
     }
+
+    parent
+        .pending_primary_key_rebuilds
+        .extend(pending_primary_key_rebuilds);
 }
 
 fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet<u64>) {
@@ -1539,17 +1657,142 @@ fn primary_key_unchanged(primary_key_spec: &UniqueIndexSpec, old_row: &Row, new_
 }
 
 static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
-static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<
-    Mutex<HashMap<u32, Option<FastPgRustPrimaryKeyIndexInfo>>>,
-> = OnceLock::new();
+static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<Mutex<HashMap<u32, Option<CachedUniqueIndex>>>> =
+    OnceLock::new();
+static RELATION_OID_BY_NAME_CACHE: OnceLock<Mutex<RelationOidByNameCache>> = OnceLock::new();
+static RELATION_EXISTS_CACHE: OnceLock<Mutex<RelationExistsCache>> = OnceLock::new();
+
+#[derive(Debug)]
+struct RelationOidByNameCache {
+    generation: u64,
+    entries: HashMap<u32, HashMap<String, Option<u32>>>,
+}
+
+impl Default for RelationOidByNameCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RelationExistsCache {
+    generation: u64,
+    entries: HashMap<u32, bool>,
+}
+
+impl Default for RelationExistsCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: HashMap::new(),
+        }
+    }
+}
 
 fn storage() -> &'static Mutex<StorageState> {
     STORAGE.get_or_init(|| Mutex::new(StorageState::default()))
 }
 
-fn primary_key_index_info_cache()
--> &'static Mutex<HashMap<u32, Option<FastPgRustPrimaryKeyIndexInfo>>> {
+fn primary_key_index_info_cache() -> &'static Mutex<HashMap<u32, Option<CachedUniqueIndex>>> {
     PRIMARY_KEY_INDEX_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn relation_oid_by_name_cache() -> &'static Mutex<RelationOidByNameCache> {
+    RELATION_OID_BY_NAME_CACHE.get_or_init(|| Mutex::new(RelationOidByNameCache::default()))
+}
+
+fn relation_exists_cache() -> &'static Mutex<RelationExistsCache> {
+    RELATION_EXISTS_CACHE.get_or_init(|| Mutex::new(RelationExistsCache::default()))
+}
+
+fn relation_oid_by_name_cache_lookup(name: &str, namespace_oid: u32) -> Option<Option<u32>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    let generation = current_generation();
+    let mut cache = relation_oid_by_name_cache()
+        .lock()
+        .expect("relation oid by name cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache
+        .entries
+        .get(&namespace_oid)
+        .and_then(|entries| entries.get(name).copied())
+}
+
+fn relation_oid_by_name_cache_store(name: &str, namespace_oid: u32, oid: Option<u32>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    let generation = current_generation();
+    let mut cache = relation_oid_by_name_cache()
+        .lock()
+        .expect("relation oid by name cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache
+        .entries
+        .entry(namespace_oid)
+        .or_default()
+        .insert(name.to_owned(), oid);
+}
+
+#[cfg(test)]
+fn clear_relation_oid_by_name_cache() {
+    if let Some(cache) = RELATION_OID_BY_NAME_CACHE.get() {
+        let mut cache = cache
+            .lock()
+            .expect("relation oid by name cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+    }
+}
+
+fn relation_exists_cache_lookup(oid: u32) -> Option<bool> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    let generation = current_generation();
+    let mut cache = relation_exists_cache()
+        .lock()
+        .expect("relation exists cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache.entries.get(&oid).copied()
+}
+
+fn relation_exists_cache_store(oid: u32, exists: bool) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    let generation = current_generation();
+    let mut cache = relation_exists_cache()
+        .lock()
+        .expect("relation exists cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache.entries.insert(oid, exists);
+}
+
+#[cfg(test)]
+fn clear_relation_exists_cache() {
+    if let Some(cache) = RELATION_EXISTS_CACHE.get() {
+        let mut cache = cache.lock().expect("relation exists cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+    }
 }
 
 fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStorage) -> R) -> R {
@@ -1578,26 +1821,57 @@ fn catalog_mutation_invalidates_primary_key_cache(relation_oid: u32) -> bool {
     matches!(relation_oid, 1249 | 1259 | 2606 | 2610)
 }
 
-fn cached_primary_key_index_info(index_oid: Oid) -> Option<FastPgRustPrimaryKeyIndexInfo> {
+fn pg_index_heap_relation_from_upsert(relation_oid: u32, values: &[Option<String>]) -> Option<u32> {
+    let table = static_catalog_by_name("pg_index")?;
+    if table.oid.0 != relation_oid {
+        return None;
+    }
+    let indrelid_index = table
+        .columns
+        .iter()
+        .position(|column| column.name == "indrelid")?;
+    values.get(indrelid_index)?.as_deref()?.parse::<u32>().ok()
+}
+
+fn pg_index_heap_relation_from_delete(relation_oid: u32, row_id: u64) -> Option<u32> {
+    let table = static_catalog_by_name("pg_index")?;
+    if table.oid.0 != relation_oid {
+        return None;
+    }
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        if row.row_id != row_id {
+            return None;
+        }
+        catalog_row_value(table, &row, "indrelid")
+            .and_then(catalog_value_oid)
+            .map(|oid| oid.0)
+    })
+}
+
+fn mark_primary_key_rebuild(relid: u32) {
+    with_storage(|_state, session| session.mark_primary_key_rebuild(relid));
+}
+
+fn cached_primary_key_index(index_oid: Oid) -> Option<CachedUniqueIndex> {
     let cached = match primary_key_index_info_cache().lock() {
-        Ok(cache) => cache.get(&index_oid.0).copied(),
-        Err(poisoned) => poisoned.into_inner().get(&index_oid.0).copied(),
+        Ok(cache) => cache.get(&index_oid.0).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(&index_oid.0).cloned(),
     };
-    if let Some(index_info) = cached {
-        return index_info;
+    if let Some(index) = cached {
+        return index;
     }
 
-    let index_info = index_heap_relation(index_oid)
-        .and_then(|relation| primary_key_index_info(&relation, index_oid));
+    let index = index_heap_relation(index_oid)
+        .and_then(|relation| primary_key_index_cache_entry(&relation, index_oid));
     match primary_key_index_info_cache().lock() {
         Ok(mut cache) => {
-            cache.insert(index_oid.0, index_info);
+            cache.insert(index_oid.0, index.clone());
         }
         Err(poisoned) => {
-            poisoned.into_inner().insert(index_oid.0, index_info);
+            poisoned.into_inner().insert(index_oid.0, index.clone());
         }
     }
-    index_info
+    index
 }
 
 unsafe fn c_str_to_string(value: *const c_char) -> Result<String, String> {
@@ -1688,6 +1962,21 @@ fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatal
         relkind: relation.relkind,
         has_primary_key: u8::from(!relation.primary_key.is_empty()),
         has_indexes: u8::from(!index_records_for_relation_oid(relation.oid).is_empty()),
+    }
+}
+
+fn relation_summary_to_ffi(
+    relation: &fastpg_catalog::RelationSummaryRecord,
+) -> FastPgRustCatalogRelation {
+    FastPgRustCatalogRelation {
+        oid: relation.oid.0,
+        namespace_oid: relation.namespace.0,
+        owner_oid: relation.owner.0,
+        name: fixed_c_name(&relation.name),
+        column_count: relation.column_count,
+        relkind: relation.relkind,
+        has_primary_key: u8::from(relation.has_primary_key),
+        has_indexes: u8::from(relation.has_indexes),
     }
 }
 
@@ -2103,33 +2392,7 @@ fn invalid_ffi_argument(message: String) -> CatalogError {
     CatalogError::new("22023", message)
 }
 
-fn primary_key_spec_for_relation(
-    relation: &fastpg_catalog::RelationRecord,
-) -> Option<Vec<IndexColumnSpec>> {
-    if relation.primary_key.is_empty() {
-        return None;
-    }
-
-    let mut columns = Vec::with_capacity(relation.primary_key.len());
-    for primary_key_column in &relation.primary_key {
-        let column_index = relation
-            .columns
-            .iter()
-            .position(|column| &column.name == primary_key_column)?;
-        let column = relation.columns.get(column_index)?;
-        let pg_type = lookup_type(column.type_oid)?;
-        columns.push(IndexColumnSpec {
-            column_index,
-            typbyval: pg_type.typbyval,
-            typlen: pg_type.typlen,
-        });
-    }
-
-    Some(columns)
-}
-
 fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
-    let relation = relation_by_oid(record.relation_oid)?;
     if !record.is_unique || !record.is_valid || !record.is_ready || !record.is_live {
         return None;
     }
@@ -2139,7 +2402,7 @@ fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<
             return None;
         }
         let column_index = usize::try_from(*attnum - 1).ok()?;
-        let column = relation.columns.get(column_index)?;
+        let column = relation_column_by_attnum(record.relation_oid, *attnum)?;
         let pg_type = lookup_type(column.type_oid)?;
         columns.push(IndexColumnSpec {
             column_index,
@@ -2161,11 +2424,6 @@ fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<
     })
 }
 
-fn unique_index_spec_for_index_oid(index_oid: Oid) -> Option<UniqueIndexSpec> {
-    let record = index_record_by_index_oid(index_oid)?;
-    unique_index_spec_for_record(&record)
-}
-
 fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec> {
     unique_index_records_for_relation_oid(relation_oid)
         .iter()
@@ -2174,15 +2432,9 @@ fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec
 }
 
 fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
-    let relation = relation_by_oid(relation_oid)?;
-    let columns = primary_key_spec_for_relation(&relation)?;
-    Some(UniqueIndexSpec {
-        index_oid: primary_key_index_oid(&relation).unwrap_or(Oid(0)),
-        relation_oid: relation.oid,
-        is_primary: true,
-        nulls_not_distinct: true,
-        columns,
-    })
+    let index_oid = primary_key_index_oid_for_relation_oid(relation_oid)?;
+    let index_spec = cached_primary_key_index(index_oid)?.spec;
+    index_spec.is_primary.then_some(index_spec)
 }
 
 fn primary_key_index_oid(relation: &fastpg_catalog::RelationRecord) -> Option<Oid> {
@@ -2228,10 +2480,10 @@ fn primary_key_column(
         .find(|column| &column.name == column_name)
 }
 
-fn primary_key_index_info(
+fn primary_key_index_cache_entry(
     relation: &fastpg_catalog::RelationRecord,
     index_oid: Oid,
-) -> Option<FastPgRustPrimaryKeyIndexInfo> {
+) -> Option<CachedUniqueIndex> {
     let record = index_record_by_index_oid(index_oid)?;
     let index_spec = unique_index_spec_for_record(&record)?;
     let key_count = index_spec.columns.len();
@@ -2250,7 +2502,7 @@ fn primary_key_index_info(
         collation_oids[key_index] = type_record.typcollation.0;
     }
 
-    Some(FastPgRustPrimaryKeyIndexInfo {
+    let info = FastPgRustPrimaryKeyIndexInfo {
         index_oid: index_oid.0,
         heap_oid: relation.oid.0,
         key_count: key_count as u16,
@@ -2261,6 +2513,11 @@ fn primary_key_index_info(
         attnums,
         type_oids,
         collation_oids,
+    };
+
+    Some(CachedUniqueIndex {
+        info,
+        spec: index_spec,
     })
 }
 
@@ -2594,6 +2851,17 @@ pub extern "C" fn fastpg_rust_catalog_policy_by_relation_oid(relation_oid: u32) 
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_catalog_relation_exists_by_oid(oid: u32) -> bool {
+    if let Some(exists) = relation_exists_cache_lookup(oid) {
+        return exists;
+    }
+    let exists =
+        relation_oid_exists(Oid(oid)) || virtual_catalog_by_relation_oid(Oid(oid)).is_some();
+    relation_exists_cache_store(oid, exists);
+    exists
+}
+
+#[unsafe(no_mangle)]
 /// # Safety
 ///
 /// C callers must pass valid output pointers where required; any C strings or
@@ -2606,33 +2874,77 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
     if oid_out.is_null() {
         return false;
     }
+    if name.is_null() {
+        return false;
+    }
+    let Ok(name) = unsafe { CStr::from_ptr(name) }.to_str() else {
+        return false;
+    };
+    if let Some(cached_oid) = relation_oid_by_name_cache_lookup(name, namespace_oid) {
+        if let Some(cached_oid) = cached_oid {
+            unsafe {
+                *oid_out = cached_oid;
+            }
+            return true;
+        }
+        return false;
+    }
+    let oid = if let Some(relation) = virtual_catalog_by_name(name, Oid(namespace_oid)) {
+        Some(relation.relation_oid.0)
+    } else {
+        let namespace = Oid(namespace_oid);
+        relation_oid_by_name_in_namespace(name, namespace)
+            .map(|relation_oid| relation_oid.0)
+            .or_else(|| {
+                let relation = primary_key_index_relation_by_name(name, namespace)?;
+                let index_oid = primary_key_index_oid(&relation)?;
+                Some(index_oid.0)
+            })
+    };
+    relation_oid_by_name_cache_store(name, namespace_oid, oid);
+    if let Some(oid) = oid {
+        unsafe {
+            *oid_out = oid;
+        }
+        return true;
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_name(
+    name: *const c_char,
+    namespace_oid: u32,
+    out: *mut FastPgRustCatalogRelation,
+) -> bool {
+    if out.is_null() {
+        return false;
+    }
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return false;
     };
-    if let Some(relation) = virtual_catalog_by_name(&name, Oid(namespace_oid)) {
-        unsafe {
-            *oid_out = relation.relation_oid.0;
-        }
-        return true;
-    }
     let namespace = Oid(namespace_oid);
-    if let Some(relation) = primary_key_index_relation_by_name(&name, namespace) {
-        let Some(index_oid) = primary_key_index_oid(&relation) else {
-            return false;
-        };
-        unsafe {
-            *oid_out = index_oid.0;
-        }
-        return true;
-    }
-    let Some(relation) = relation_by_name_in_namespace(&name, namespace) else {
-        return false;
-    };
-
     unsafe {
-        *oid_out = relation.oid.0;
+        if let Some(relation) = virtual_catalog_by_name(&name, namespace) {
+            *out = virtual_catalog_relation_to_ffi(relation);
+            return true;
+        }
+        if let Some(relation) = relation_summary_by_name_in_namespace(&name, namespace) {
+            *out = relation_summary_to_ffi(&relation);
+            return true;
+        }
+        if let Some(relation) = primary_key_index_relation_by_name(&name, namespace)
+            && let Some(index_oid) = primary_key_index_oid(&relation)
+        {
+            *out = primary_key_index_to_ffi(&relation, index_oid);
+            return true;
+        }
     }
-    true
+    false
 }
 
 #[unsafe(no_mangle)]
@@ -2649,6 +2961,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_oid(
     }
 
     unsafe {
+        if let Some(relation) = relation_summary_by_oid(Oid(oid)) {
+            *out = relation_summary_to_ffi(&relation);
+            return true;
+        }
         if let Some(relation) = relation_by_oid(Oid(oid)) {
             *out = relation_to_ffi(&relation);
             return true;
@@ -2723,7 +3039,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_info(
     if out.is_null() {
         return false;
     }
-    let Some(index_info) = cached_primary_key_index_info(Oid(index_oid)) else {
+    let Some(index_info) = cached_primary_key_index(Oid(index_oid)).map(|index| index.info) else {
         return false;
     };
     unsafe {
@@ -2768,15 +3084,12 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_unique_index_oid(
     if oid_out.is_null() {
         return false;
     }
-    let indexes = unique_index_records_for_relation_oid(Oid(relation_oid))
-        .into_iter()
-        .filter(|record| unique_index_spec_for_record(record).is_some())
-        .collect::<Vec<_>>();
-    let Some(index) = indexes.get(index_position) else {
+    let indexes = unique_index_oids_for_relation_oid(Oid(relation_oid));
+    let Some(index_oid) = indexes.get(index_position) else {
         return false;
     };
     unsafe {
-        *oid_out = index.index_oid.0;
+        *oid_out = index_oid.0;
     }
     true
 }
@@ -3181,9 +3494,13 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
     let result = (|| {
         let values = unsafe { nullable_c_str_array_to_strings(values, is_null, natts) }
             .map_err(invalid_ffi_argument)?;
+        let pending_primary_key_rebuild = pg_index_heap_relation_from_upsert(relation_oid, &values);
         let row_id = upsert_catalog_row(Oid(relation_oid), row_id, values)?;
         if catalog_mutation_invalidates_primary_key_cache(relation_oid) {
             clear_primary_key_index_info_cache();
+        }
+        if let Some(relid) = pending_primary_key_rebuild {
+            mark_primary_key_rebuild(relid);
         }
         if !row_id_out.is_null() {
             unsafe {
@@ -3198,9 +3515,13 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64) -> bool {
+    let pending_primary_key_rebuild = pg_index_heap_relation_from_delete(relation_oid, row_id);
     let ok = delete_catalog_row(Oid(relation_oid), row_id).is_ok();
     if ok && catalog_mutation_invalidates_primary_key_cache(relation_oid) {
         clear_primary_key_index_info_cache();
+    }
+    if ok && let Some(relid) = pending_primary_key_rebuild {
+        mark_primary_key_rebuild(relid);
     }
     ok
 }
@@ -3428,7 +3749,8 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
-    let Some(index_spec) = unique_index_spec_for_index_oid(Oid(index_relid)) else {
+    let Some(index_spec) = cached_primary_key_index(Oid(index_relid)).map(|index| index.spec)
+    else {
         return false;
     };
 
@@ -3479,7 +3801,8 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
-    let Some(index_spec) = unique_index_spec_for_index_oid(Oid(index_relid)) else {
+    let Some(index_spec) = cached_primary_key_index(Oid(index_relid)).map(|index| index.spec)
+    else {
         return false;
     };
     let values = if nkeys == 0 {
@@ -3777,10 +4100,7 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
     };
 
     let result = with_storage(|state, session| -> Result<bool, CatalogError> {
-        if state
-            .find_visible_row(session, input.relid, row_id)
-            .is_none()
-        {
+        if !state.visible_row_exists(session, input.relid, row_id) {
             return Ok(false);
         }
 
@@ -3866,7 +4186,7 @@ pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
     }
 
     with_storage(|state, session| {
-        if state.find_visible_row(session, relid, row_id).is_none() {
+        if !state.visible_row_exists(session, relid, row_id) {
             return false;
         }
 
@@ -4319,7 +4639,7 @@ pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
             Some(scan) => scan,
             None => {
                 state.relations.entry(relid).or_default();
-                ScanState::materialize(state.visible_rows(session, relid))?
+                state.visible_scan_state(session, relid)?
             }
         };
         state.check_scan_limit(scan.bytes())?;
@@ -4366,16 +4686,16 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
-    let row = with_storage(|_state, session| {
+    with_storage(|_state, session| {
         let scan = match session.scans.get_mut(&scan_handle) {
             Some(scan) => scan,
-            None => return None,
+            None => return false,
         };
 
         let row_count = scan.rows.len();
         let row_index = if forward != 0 {
             if scan.next_index >= row_count {
-                return None;
+                return false;
             }
             let row_index = scan.next_index;
             scan.next_index += 1;
@@ -4385,21 +4705,17 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
                 scan.next_index = row_count;
             }
             if scan.next_index == 0 {
-                return None;
+                return false;
             }
             scan.next_index -= 1;
             scan.next_index
         };
 
-        scan.rows.get(row_index).cloned()
-    });
-
-    match row {
-        Some(row) => unsafe {
-            copy_row_to_outputs(&row, values_out, is_null_out, natts, row_id_out)
-        },
-        None => false,
-    }
+        let Some(row) = scan.rows.get(row_index) else {
+            return false;
+        };
+        unsafe { copy_row_to_outputs(row, values_out, is_null_out, natts, row_id_out) }
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -4464,8 +4780,11 @@ unsafe fn copy_row_to_outputs(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fastpg_catalog::{builtin_namespaces, static_catalog_by_name, upsert_catalog_row};
+    use fastpg_catalog::{
+        PUBLIC_NAMESPACE_OID, builtin_namespaces, static_catalog_by_name, upsert_catalog_row,
+    };
     use std::collections::BTreeMap;
+    use std::ffi::CString;
     use std::ptr;
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::{Mutex as StdMutex, MutexGuard};
@@ -4489,6 +4808,8 @@ mod tests {
         fastpg_rust_storage_reset_limits();
         fastpg_rust_xact_abort();
         clear_primary_key_index_info_cache();
+        clear_relation_oid_by_name_cache();
+        clear_relation_exists_cache();
         TestGuard { _guard: guard }
     }
 
@@ -4508,6 +4829,56 @@ mod tests {
             .map(|column| values.get(column.name).cloned())
             .collect::<Vec<_>>();
         upsert_catalog_row(table.oid, row_id, row).expect("upsert catalog row")
+    }
+
+    fn upsert_named_catalog_row_via_ffi(
+        table_name: &str,
+        row_id: u64,
+        values: &[(&str, &str)],
+    ) -> u64 {
+        let table = static_catalog_by_name(table_name).expect("catalog table");
+        let values = values
+            .iter()
+            .map(|(column, value)| (*column, (*value).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let c_values = table
+            .columns
+            .iter()
+            .map(|column| {
+                values
+                    .get(column.name)
+                    .map(|value| CString::new(value.as_str()).expect("catalog value has no NUL"))
+            })
+            .collect::<Vec<_>>();
+        let value_ptrs = c_values
+            .iter()
+            .map(|value| value.as_ref().map_or(ptr::null(), |value| value.as_ptr()))
+            .collect::<Vec<_>>();
+        let nulls = c_values
+            .iter()
+            .map(|value| u8::from(value.is_none()))
+            .collect::<Vec<_>>();
+        let mut row_id_out = 0;
+        unsafe {
+            assert!(fastpg_rust_catalog_upsert_row(
+                table.oid.0,
+                row_id,
+                value_ptrs.as_ptr(),
+                nulls.as_ptr(),
+                value_ptrs.len(),
+                &mut row_id_out,
+            ));
+        }
+        row_id_out
+    }
+
+    fn relation_oid_by_name_via_ffi(name: &str, namespace_oid: u32) -> Option<u32> {
+        let name = CString::new(name).expect("relation name has no NUL");
+        let mut oid = 0;
+        unsafe {
+            fastpg_rust_catalog_relation_oid_by_name(name.as_ptr(), namespace_oid, &mut oid)
+                .then_some(oid)
+        }
     }
 
     fn install_primary_key_test_catalog() -> (u32, Oid) {
@@ -4981,6 +5352,83 @@ mod tests {
     }
 
     #[test]
+    fn relation_name_cache_skips_uncommitted_catalog_overlays() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let relation_name = format!("cache_visible_{relid}");
+        let relid_text = relid.to_string();
+        let namespace_text = PUBLIC_NAMESPACE_OID.0.to_string();
+
+        assert_eq!(
+            relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
+            None
+        );
+
+        fastpg_rust_xact_begin();
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid_text),
+                ("relname", &relation_name),
+                ("relnamespace", &namespace_text),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid_text),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "0"),
+            ],
+        );
+        assert_eq!(
+            relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
+            Some(relid)
+        );
+
+        fastpg_rust_xact_abort();
+        assert_eq!(
+            relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
+            None
+        );
+    }
+
+    #[test]
+    fn relation_exists_cache_skips_uncommitted_catalog_overlays() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let relation_name = format!("exists_cache_visible_{relid}");
+        let relid_text = relid.to_string();
+        let namespace_text = PUBLIC_NAMESPACE_OID.0.to_string();
+
+        assert!(!fastpg_rust_catalog_relation_exists_by_oid(relid));
+
+        fastpg_rust_xact_begin();
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid_text),
+                ("relname", &relation_name),
+                ("relnamespace", &namespace_text),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid_text),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "0"),
+            ],
+        );
+        assert!(fastpg_rust_catalog_relation_exists_by_oid(relid));
+
+        fastpg_rust_xact_abort();
+        assert!(!fastpg_rust_catalog_relation_exists_by_oid(relid));
+    }
+
+    #[test]
     fn aborted_rows_are_dropped() {
         let _guard = test_guard();
         let relid = next_relid();
@@ -5392,6 +5840,178 @@ mod tests {
         fastpg_rust_xact_commit();
 
         assert!(fastpg_rust_storage_index_bytes() > before_index_bytes);
+    }
+
+    #[test]
+    fn primary_key_index_backfills_rows_inserted_before_index_catalog() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let type_oid = relid + 100_000;
+        let index_oid = Oid(relid + 200_000);
+        let constraint_oid = relid + 300_000;
+        let mut first_row_id = 0;
+        let mut second_row_id = 0;
+
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid.to_string()),
+                ("relname", "late_pk_storage"),
+                ("relnamespace", "2200"),
+                ("reltype", &type_oid.to_string()),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid.to_string()),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_type",
+            type_oid as u64,
+            &[
+                ("oid", &type_oid.to_string()),
+                ("typname", "late_pk_storage"),
+                ("typnamespace", "2200"),
+                ("typowner", "10"),
+                ("typlen", "-1"),
+                ("typbyval", "f"),
+                ("typtype", "c"),
+                ("typcategory", "C"),
+                ("typisdefined", "t"),
+                ("typdelim", ","),
+                ("typrelid", &relid.to_string()),
+                ("typalign", "d"),
+                ("typstorage", "x"),
+            ],
+        );
+        for (attnum, name) in [(1, "id"), (2, "value")] {
+            upsert_named_catalog_row(
+                "pg_attribute",
+                0,
+                &[
+                    ("attrelid", &relid.to_string()),
+                    ("attname", name),
+                    ("atttypid", "23"),
+                    ("attlen", "4"),
+                    ("attnum", &attnum.to_string()),
+                    ("atttypmod", "-1"),
+                    ("attbyval", "t"),
+                    ("attalign", "i"),
+                    ("attstorage", "p"),
+                    ("attnotnull", if attnum == 1 { "t" } else { "f" }),
+                    ("attisdropped", "f"),
+                ],
+            );
+        }
+        fastpg_rust_xact_commit_if_implicit();
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1, 10], &[0, 0], &mut first_row_id));
+            assert!(insert_byval(relid, &[2, 20], &[0, 0], &mut second_row_id));
+        }
+        fastpg_rust_xact_commit();
+        let before_index_bytes = fastpg_rust_storage_index_bytes();
+
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid.to_string()),
+                ("relname", "late_pk_storage"),
+                ("relnamespace", "2200"),
+                ("reltype", &type_oid.to_string()),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid.to_string()),
+                ("relhasindex", "t"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", &index_oid.0.to_string()),
+                ("relname", "late_pk_storage_pkey"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "403"),
+                ("relfilenode", &index_oid.0.to_string()),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", &index_oid.0.to_string()),
+                ("attname", "id"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "t"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row_via_ffi(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", &index_oid.0.to_string()),
+                ("indrelid", &relid.to_string()),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "t"),
+                ("indisprimary", "t"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_constraint",
+            constraint_oid as u64,
+            &[
+                ("oid", &constraint_oid.to_string()),
+                ("conname", "late_pk_storage_pkey"),
+                ("connamespace", "2200"),
+                ("contype", "p"),
+                ("conrelid", &relid.to_string()),
+                ("conindid", &index_oid.0.to_string()),
+                ("conkey", "1"),
+            ],
+        );
+        fastpg_rust_xact_commit_if_implicit();
+        assert!(fastpg_rust_storage_index_bytes() > before_index_bytes);
+
+        let mut found_row_id = 0;
+        unsafe {
+            assert!(fastpg_rust_primary_key_index_lookup(
+                index_oid.0,
+                [2usize].as_ptr(),
+                [0u8].as_ptr(),
+                1,
+                &mut found_row_id,
+            ));
+        }
+        assert_eq!(found_row_id, second_row_id);
+        assert_ne!(first_row_id, second_row_id);
     }
 
     #[test]

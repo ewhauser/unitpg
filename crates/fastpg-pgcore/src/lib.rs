@@ -1,5 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
+use std::borrow::Cow;
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawParseSummary {
     pub statement_count: usize,
@@ -99,7 +101,7 @@ pub struct PgCoreCopyIn {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionStatement {
-    pub command_tag: String,
+    pub command_tag: Cow<'static, str>,
     pub fields: Vec<PgCoreField>,
     pub rows: Vec<Vec<PgCoreValue>>,
     pub copy_in: Option<PgCoreCopyIn>,
@@ -134,6 +136,15 @@ impl PgCoreSession {
             inner,
             storage_session: self.storage_session.clone(),
         })
+    }
+
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[PgCoreParam],
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        self.inner.execute_with_params(sql, params)
     }
 }
 
@@ -198,6 +209,7 @@ impl Portal {
 
 #[cfg(feature = "postgres-linked")]
 mod inner {
+    use std::borrow::Cow;
     use std::ffi::{CStr, CString, c_char};
     use std::ptr;
     use std::ptr::NonNull;
@@ -217,6 +229,7 @@ mod inner {
     static PGCORE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+    const STACK_SQL_BUFFER_LEN: usize = 1024;
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
         PgCoreLaneMetrics {
@@ -434,12 +447,33 @@ mod inner {
         ) -> *const c_char;
     }
 
+    fn check_sql(sql: &str) -> Result<(), PgCoreError> {
+        if sql.as_bytes().contains(&0) {
+            return Err(PgCoreError::new(
+                "22023",
+                "query contains an embedded NUL byte",
+                0,
+            ));
+        }
+        Ok(())
+    }
+
+    fn with_c_sql<R>(sql: &str, f: impl FnOnce(*const c_char) -> R) -> R {
+        let bytes = sql.as_bytes();
+        if bytes.len() < STACK_SQL_BUFFER_LEN {
+            let mut buffer = [0u8; STACK_SQL_BUFFER_LEN];
+            buffer[..bytes.len()].copy_from_slice(bytes);
+            return f(buffer.as_ptr().cast());
+        }
+        let c_sql = CString::new(sql).expect("checked SQL string does not contain embedded NULs");
+        f(c_sql.as_ptr())
+    }
+
     pub fn raw_parse(sql: &str) -> Result<RawParseSummary, PgCoreError> {
-        let c_sql = CString::new(sql)
-            .map_err(|_| PgCoreError::new("22023", "query contains an embedded NUL byte", 0))?;
+        check_sql(sql)?;
         let _guard = enter_pgcore_lane("raw_parse");
 
-        let result = unsafe { fastpg_pgcore_raw_parse(c_sql.as_ptr()) };
+        let result = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_raw_parse(c_sql) });
         let Some(result) = NonNull::new(result) else {
             return Err(PgCoreError::new(
                 "XX000",
@@ -501,6 +535,32 @@ mod inner {
         if value.is_empty() { None } else { Some(value) }
     }
 
+    unsafe fn command_tag(value: *const c_char) -> Cow<'static, str> {
+        if value.is_null() {
+            return Cow::Borrowed("");
+        }
+
+        let value = unsafe { CStr::from_ptr(value) };
+        match value.to_bytes() {
+            b"" => Cow::Borrowed(""),
+            b"BEGIN" => Cow::Borrowed("BEGIN"),
+            b"COMMIT" => Cow::Borrowed("COMMIT"),
+            b"COPY" => Cow::Borrowed("COPY"),
+            b"CREATE TABLE" => Cow::Borrowed("CREATE TABLE"),
+            b"DELETE" => Cow::Borrowed("DELETE"),
+            b"DROP TABLE" => Cow::Borrowed("DROP TABLE"),
+            b"INSERT" => Cow::Borrowed("INSERT"),
+            b"MERGE" => Cow::Borrowed("MERGE"),
+            b"RELEASE" => Cow::Borrowed("RELEASE"),
+            b"ROLLBACK" => Cow::Borrowed("ROLLBACK"),
+            b"SAVEPOINT" => Cow::Borrowed("SAVEPOINT"),
+            b"SELECT" => Cow::Borrowed("SELECT"),
+            b"TRUNCATE TABLE" => Cow::Borrowed("TRUNCATE TABLE"),
+            b"UPDATE" => Cow::Borrowed("UPDATE"),
+            _ => Cow::Owned(value.to_string_lossy().into_owned()),
+        }
+    }
+
     #[derive(Clone, Debug)]
     pub struct PgCoreSession;
 
@@ -511,10 +571,9 @@ mod inner {
         }
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
-            let c_sql = CString::new(sql)
-                .map_err(|_| PgCoreError::new("22023", "query contains an embedded NUL byte", 0))?;
+            check_sql(sql)?;
             let _guard = enter_pgcore_lane("prepare");
-            let prepared = unsafe { fastpg_pgcore_prepare(c_sql.as_ptr()) };
+            let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
             let Some(prepared) = NonNull::new(prepared) else {
                 return Err(PgCoreError::new(
                     "XX000",
@@ -537,6 +596,34 @@ mod inner {
                 drop(_guard);
                 Err(error)
             }
+        }
+
+        pub fn execute_with_params(
+            &self,
+            sql: &str,
+            params: &[PgCoreParam],
+        ) -> Result<ExecutionResult, PgCoreError> {
+            check_sql(sql)?;
+            let encoded_params = EncodedParams::new(params)?;
+            let _guard = enter_pgcore_lane("prepare_execute");
+            let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
+            let Some(prepared) = NonNull::new(prepared) else {
+                return Err(PgCoreError::new(
+                    "XX000",
+                    "PostgreSQL prepare returned a null result",
+                    0,
+                ));
+            };
+
+            let result = if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
+                execute_prepared_ptr_with_params(prepared.as_ptr(), &encoded_params)
+            } else {
+                Err(prepared_error_from_ptr(prepared.as_ptr()))
+            };
+            unsafe {
+                fastpg_pgcore_prepared_free(prepared.as_ptr());
+            }
+            result
         }
     }
 
@@ -580,6 +667,29 @@ mod inner {
             &self,
             params: &[PgCoreParam],
         ) -> Result<ExecutionResult, PgCoreError> {
+            if params.is_empty() {
+                let _guard = enter_pgcore_lane("execute");
+                let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
+                return execution_result_from_ptr(result);
+            }
+
+            let encoded_params = EncodedParams::new(params)?;
+            let _guard = enter_pgcore_lane("execute");
+            execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params)
+        }
+    }
+
+    struct EncodedParams {
+        encoded_text_params: Vec<CString>,
+        parameter_values: Vec<*const c_char>,
+        parameter_is_null: Vec<bool>,
+        parameter_datums: Vec<usize>,
+        parameter_is_datum: Vec<bool>,
+        param_count: i32,
+    }
+
+    impl EncodedParams {
+        fn new(params: &[PgCoreParam]) -> Result<Self, PgCoreError> {
             let param_count = i32::try_from(params.len()).map_err(|_| {
                 PgCoreError::new("54000", "too many parameters for PostgreSQL execution", 0)
             })?;
@@ -618,45 +728,70 @@ mod inner {
                     }
                 }
             }
+            Ok(Self {
+                encoded_text_params,
+                parameter_values,
+                parameter_is_null,
+                parameter_datums,
+                parameter_is_datum,
+                param_count,
+            })
+        }
+    }
 
-            let _guard = enter_pgcore_lane("execute");
-            let result = if params.is_empty() {
-                unsafe { fastpg_pgcore_execute(self.as_ptr()) }
-            } else {
-                unsafe {
-                    fastpg_pgcore_execute_params(
-                        self.as_ptr(),
-                        parameter_values.as_ptr(),
-                        parameter_is_null.as_ptr(),
-                        parameter_datums.as_ptr(),
-                        parameter_is_datum.as_ptr(),
-                        param_count,
-                    )
-                }
-            };
-            let Some(result) = NonNull::new(result) else {
-                return Err(PgCoreError::new(
-                    "XX000",
-                    "PostgreSQL execute returned a null result",
-                    0,
-                ));
-            };
-            let result = ExecuteResult(result);
-            if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
-                Ok(result.to_execution_result())
-            } else {
-                Err(PgCoreError::with_fields(
-                    unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
-                    unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr()))
-                    },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr()))
-                    },
-                    unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
-                ))
+    fn execute_prepared_ptr_with_params(
+        prepared: *const FastPgPgCorePrepared,
+        params: &EncodedParams,
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let _keep_text_params_alive = &params.encoded_text_params;
+        let result = if params.param_count == 0 {
+            unsafe { fastpg_pgcore_execute(prepared) }
+        } else {
+            unsafe {
+                fastpg_pgcore_execute_params(
+                    prepared,
+                    params.parameter_values.as_ptr(),
+                    params.parameter_is_null.as_ptr(),
+                    params.parameter_datums.as_ptr(),
+                    params.parameter_is_datum.as_ptr(),
+                    params.param_count,
+                )
             }
+        };
+        execution_result_from_ptr(result)
+    }
+
+    fn prepared_error_from_ptr(prepared: *const FastPgPgCorePrepared) -> PgCoreError {
+        PgCoreError::with_fields(
+            unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared)) },
+            unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
+            unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
+            unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
+            unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
+        )
+    }
+
+    fn execution_result_from_ptr(
+        result: *mut FastPgPgCoreExecuteResult,
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let Some(result) = NonNull::new(result) else {
+            return Err(PgCoreError::new(
+                "XX000",
+                "PostgreSQL execute returned a null result",
+                0,
+            ));
+        };
+        let result = ExecuteResult(result);
+        if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
+            Ok(result.to_execution_result())
+        } else {
+            Err(PgCoreError::with_fields(
+                unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
+                unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr())) },
+                unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
+            ))
         }
     }
 
@@ -679,92 +814,91 @@ mod inner {
         fn to_execution_result(&self) -> ExecutionResult {
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
-            let statements = (0..statement_count)
-                .map(|statement_index| {
-                    let field_count = unsafe {
-                        fastpg_pgcore_execute_statement_column_count(self.as_ptr(), statement_index)
+            let mut statements = Vec::with_capacity(statement_count as usize);
+            for statement_index in 0..statement_count {
+                let field_count = unsafe {
+                    fastpg_pgcore_execute_statement_column_count(self.as_ptr(), statement_index)
+                }
+                .max(0);
+                let row_count = unsafe {
+                    fastpg_pgcore_execute_statement_row_count(self.as_ptr(), statement_index)
+                }
+                .max(0);
+                let copy_in = unsafe {
+                    fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
+                }
+                .then(|| PgCoreCopyIn {
+                    table: unsafe {
+                        c_string(fastpg_pgcore_execute_statement_copy_table(
+                            self.as_ptr(),
+                            statement_index,
+                        ))
+                    },
+                    columns: unsafe {
+                        fastpg_pgcore_execute_statement_copy_column_count(
+                            self.as_ptr(),
+                            statement_index,
+                        )
                     }
-                    .max(0);
-                    let row_count = unsafe {
-                        fastpg_pgcore_execute_statement_row_count(self.as_ptr(), statement_index)
-                    }
-                    .max(0);
-                    let copy_in = unsafe {
-                        fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
-                    }
-                    .then(|| PgCoreCopyIn {
-                        table: unsafe {
-                            c_string(fastpg_pgcore_execute_statement_copy_table(
+                    .max(0) as usize,
+                });
+                let mut fields = Vec::with_capacity(field_count as usize);
+                for column_index in 0..field_count {
+                    fields.push(PgCoreField {
+                        name: unsafe {
+                            c_string(fastpg_pgcore_execute_column_name(
                                 self.as_ptr(),
                                 statement_index,
+                                column_index,
                             ))
                         },
-                        columns: unsafe {
-                            fastpg_pgcore_execute_statement_copy_column_count(
+                        type_oid: unsafe {
+                            fastpg_pgcore_execute_column_type_oid(
                                 self.as_ptr(),
                                 statement_index,
+                                column_index,
                             )
-                        }
-                        .max(0) as usize,
+                        },
                     });
-                    let fields = (0..field_count)
-                        .map(|column_index| PgCoreField {
-                            name: unsafe {
-                                c_string(fastpg_pgcore_execute_column_name(
+                }
+                let mut rows = Vec::with_capacity(row_count as usize);
+                for row_index in 0..row_count {
+                    let mut row = Vec::with_capacity(field_count as usize);
+                    for column_index in 0..field_count {
+                        if unsafe {
+                            fastpg_pgcore_execute_value_is_null(
+                                self.as_ptr(),
+                                statement_index,
+                                row_index,
+                                column_index,
+                            )
+                        } {
+                            row.push(PgCoreValue::Null);
+                        } else {
+                            row.push(PgCoreValue::Text(unsafe {
+                                c_string(fastpg_pgcore_execute_value_text(
                                     self.as_ptr(),
                                     statement_index,
+                                    row_index,
                                     column_index,
                                 ))
-                            },
-                            type_oid: unsafe {
-                                fastpg_pgcore_execute_column_type_oid(
-                                    self.as_ptr(),
-                                    statement_index,
-                                    column_index,
-                                )
-                            },
-                        })
-                        .collect::<Vec<_>>();
-                    let rows = (0..row_count)
-                        .map(|row_index| {
-                            (0..field_count)
-                                .map(|column_index| {
-                                    if unsafe {
-                                        fastpg_pgcore_execute_value_is_null(
-                                            self.as_ptr(),
-                                            statement_index,
-                                            row_index,
-                                            column_index,
-                                        )
-                                    } {
-                                        PgCoreValue::Null
-                                    } else {
-                                        PgCoreValue::Text(unsafe {
-                                            c_string(fastpg_pgcore_execute_value_text(
-                                                self.as_ptr(),
-                                                statement_index,
-                                                row_index,
-                                                column_index,
-                                            ))
-                                        })
-                                    }
-                                })
-                                .collect::<Vec<_>>()
-                        })
-                        .collect::<Vec<_>>();
-                    ExecutionStatement {
-                        command_tag: unsafe {
-                            c_string(fastpg_pgcore_execute_statement_command_tag(
-                                self.as_ptr(),
-                                statement_index,
-                            ))
-                        },
-                        fields,
-                        rows,
-                        copy_in,
+                            }));
+                        }
                     }
-                })
-                .collect();
+                    rows.push(row);
+                }
+                statements.push(ExecutionStatement {
+                    command_tag: unsafe {
+                        command_tag(fastpg_pgcore_execute_statement_command_tag(
+                            self.as_ptr(),
+                            statement_index,
+                        ))
+                    },
+                    fields,
+                    rows,
+                    copy_in,
+                });
+            }
             ExecutionResult { statements }
         }
     }
@@ -801,6 +935,18 @@ mod inner {
         }
 
         pub fn prepare(&self, _sql: &str) -> Result<PreparedStatement, PgCoreError> {
+            Err(PgCoreError::new(
+                "0A000",
+                "fastpg-pgcore was built without postgres-linked support",
+                0,
+            ))
+        }
+
+        pub fn execute_with_params(
+            &self,
+            _sql: &str,
+            _params: &[super::PgCoreParam],
+        ) -> Result<ExecutionResult, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
                 "fastpg-pgcore was built without postgres-linked support",
