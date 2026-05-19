@@ -388,11 +388,12 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
 
 fn query_result_response(result: QueryResult, format: FieldFormat) -> PgWireResult<Response> {
     let schema = Arc::new(field_infos(&result.fields, format));
+    let fields = result.fields;
+    let row_schema = schema.clone();
     let rows = result
         .rows
-        .iter()
-        .map(|row| encode_row(schema.clone(), &result.fields, row))
-        .collect::<Vec<_>>();
+        .into_iter()
+        .map(move |row| encode_row(row_schema.clone(), &fields, &row));
 
     Ok(Response::Query(QueryResponse::new(
         schema,
