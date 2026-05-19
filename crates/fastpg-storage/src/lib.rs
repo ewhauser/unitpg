@@ -567,16 +567,11 @@ fn estimated_row_bytes(row: &Row) -> usize {
 }
 
 fn estimated_index_key_bytes(key: &IndexKey) -> usize {
-    std::mem::size_of::<IndexKey>()
-        .saturating_add(
-            key.0
-                .capacity()
-                .saturating_mul(std::mem::size_of::<IndexKeyPart>()),
-        )
-        .saturating_add(key.0.iter().fold(0usize, |total, part| match part {
-            IndexKeyPart::Bytes(bytes) => total.saturating_add(bytes.capacity()),
-            IndexKeyPart::Null | IndexKeyPart::ByValue(_) => total,
-        }))
+    std::mem::size_of::<IndexKey>().saturating_add(
+        key.parts()
+            .len()
+            .saturating_mul(std::mem::size_of::<IndexKeyPart>()),
+    )
 }
 
 fn estimated_input_row_bytes(is_null: &[u8], byval: &[u8], value_lens: &[usize]) -> usize {
@@ -623,15 +618,92 @@ fn limit_from_ffi(value: usize) -> Option<usize> {
     (value != 0).then_some(value)
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Default)]
 enum IndexKeyPart {
+    #[default]
     Null,
     ByValue(usize),
-    Bytes(Vec<u8>),
+    Bytes(ValueRef),
 }
 
-#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-struct IndexKey(Vec<IndexKeyPart>);
+impl PartialEq for IndexKeyPart {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Eq for IndexKeyPart {}
+
+impl PartialOrd for IndexKeyPart {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IndexKeyPart {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (Self::Null, Self::Null) => std::cmp::Ordering::Equal,
+            (Self::Null, _) => std::cmp::Ordering::Less,
+            (_, Self::Null) => std::cmp::Ordering::Greater,
+            (Self::ByValue(left), Self::ByValue(right)) => left.cmp(right),
+            (Self::ByValue(_), Self::Bytes(_)) => std::cmp::Ordering::Less,
+            (Self::Bytes(_), Self::ByValue(_)) => std::cmp::Ordering::Greater,
+            (Self::Bytes(left), Self::Bytes(right)) => {
+                value_ref_bytes(left).cmp(value_ref_bytes(right))
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct IndexKey {
+    len: u8,
+    parts: [IndexKeyPart; FASTPG_MAX_INDEX_KEYS],
+}
+
+impl IndexKey {
+    fn new() -> Self {
+        Self {
+            len: 0,
+            parts: [IndexKeyPart::Null; FASTPG_MAX_INDEX_KEYS],
+        }
+    }
+
+    fn push(&mut self, part: IndexKeyPart) -> Option<()> {
+        let index = usize::from(self.len);
+        if index >= FASTPG_MAX_INDEX_KEYS {
+            return None;
+        }
+        self.parts[index] = part;
+        self.len = self.len.checked_add(1)?;
+        Some(())
+    }
+
+    fn parts(&self) -> &[IndexKeyPart] {
+        &self.parts[..usize::from(self.len)]
+    }
+}
+
+impl PartialEq for IndexKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.parts() == other.parts()
+    }
+}
+
+impl Eq for IndexKey {}
+
+impl PartialOrd for IndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for IndexKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.parts().cmp(other.parts())
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IndexColumnSpec {
@@ -1462,14 +1534,7 @@ fn primary_key_unchanged(primary_key_spec: &UniqueIndexSpec, old_row: &Row, new_
         let Some(new_cell) = new_row.cells.get(column.column_index) else {
             return false;
         };
-        if old_cell.is_null || new_cell.is_null {
-            return old_cell.is_null == new_cell.is_null;
-        }
-        if column.typbyval {
-            return old_cell.output_value() == new_cell.output_value();
-        }
-        byref_key_bytes_from_cell(old_cell, column.typlen)
-            == byref_key_bytes_from_cell(new_cell, column.typlen)
+        index_key_part(column, old_cell) == index_key_part(column, new_cell)
     })
 }
 
@@ -2200,17 +2265,17 @@ fn primary_key_index_info(
 }
 
 fn index_key_for_row(index_spec: &UniqueIndexSpec, row: &Row) -> Option<IndexKey> {
-    let mut parts = Vec::with_capacity(index_spec.columns.len());
+    let mut key = IndexKey::new();
 
     for column in &index_spec.columns {
         let cell = row.cells.get(column.column_index)?;
         if cell.is_null && !index_spec.nulls_not_distinct {
             return None;
         }
-        parts.push(index_key_part(column, cell)?);
+        key.push(index_key_part(column, cell)?)?;
     }
 
-    Some(IndexKey(parts))
+    Some(key)
 }
 
 fn index_key_for_datums(
@@ -2222,7 +2287,7 @@ fn index_key_for_datums(
         return None;
     }
 
-    let mut parts = Vec::with_capacity(index_spec.columns.len());
+    let mut key = IndexKey::new();
     for (key_index, column) in index_spec.columns.iter().enumerate() {
         let cell = if is_null[key_index] != 0 {
             Cell::null()
@@ -2232,10 +2297,10 @@ fn index_key_for_datums(
         if cell.is_null && !index_spec.nulls_not_distinct {
             return None;
         }
-        parts.push(index_key_part(column, &cell)?);
+        key.push(index_key_part(column, &cell)?)?;
     }
 
-    Some(IndexKey(parts))
+    Some(key)
 }
 
 fn index_key_part(column: &IndexColumnSpec, cell: &Cell) -> Option<IndexKeyPart> {
@@ -2247,12 +2312,25 @@ fn index_key_part(column: &IndexColumnSpec, cell: &Cell) -> Option<IndexKeyPart>
         return Some(IndexKeyPart::ByValue(cell.output_value()));
     }
 
-    let bytes = byref_key_bytes_from_cell(cell, column.typlen)?;
-    Some(IndexKeyPart::Bytes(bytes))
+    let value_ref = byref_key_ref_from_cell(cell, column.typlen)?;
+    Some(IndexKeyPart::Bytes(value_ref))
 }
 
-fn byref_key_bytes_from_cell(cell: &Cell, typlen: i16) -> Option<Vec<u8>> {
-    let bytes = cell.byref_bytes()?;
+fn value_ref_bytes(value_ref: &ValueRef) -> &[u8] {
+    if value_ref.len == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(value_ref.ptr as *const u8, value_ref.len) }
+    }
+}
+
+fn byref_key_ref_from_cell(cell: &Cell, typlen: i16) -> Option<ValueRef> {
+    let StoredDatum::ByRef(mut value_ref) = cell.datum else {
+        return None;
+    };
+    if value_ref.ptr == 0 && value_ref.len > 0 {
+        return None;
+    }
     let len = if typlen > 0 {
         typlen as usize
     } else if typlen == -1 {
@@ -2262,7 +2340,11 @@ fn byref_key_bytes_from_cell(cell: &Cell, typlen: i16) -> Option<Vec<u8>> {
     } else {
         return None;
     };
-    (bytes.len() >= len).then(|| bytes[..len].to_vec())
+    if value_ref.len < len {
+        return None;
+    }
+    value_ref.len = len;
+    Some(value_ref)
 }
 
 fn varlena_payload_len(value: usize) -> Option<usize> {
