@@ -1600,6 +1600,7 @@ static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
 static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<Mutex<HashMap<u32, Option<CachedUniqueIndex>>>> =
     OnceLock::new();
 static RELATION_OID_BY_NAME_CACHE: OnceLock<Mutex<RelationOidByNameCache>> = OnceLock::new();
+static RELATION_EXISTS_CACHE: OnceLock<Mutex<RelationExistsCache>> = OnceLock::new();
 
 #[derive(Debug)]
 struct RelationOidByNameCache {
@@ -1608,6 +1609,21 @@ struct RelationOidByNameCache {
 }
 
 impl Default for RelationOidByNameCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: HashMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct RelationExistsCache {
+    generation: u64,
+    entries: HashMap<u32, bool>,
+}
+
+impl Default for RelationExistsCache {
     fn default() -> Self {
         Self {
             generation: current_generation(),
@@ -1626,6 +1642,10 @@ fn primary_key_index_info_cache() -> &'static Mutex<HashMap<u32, Option<CachedUn
 
 fn relation_oid_by_name_cache() -> &'static Mutex<RelationOidByNameCache> {
     RELATION_OID_BY_NAME_CACHE.get_or_init(|| Mutex::new(RelationOidByNameCache::default()))
+}
+
+fn relation_exists_cache() -> &'static Mutex<RelationExistsCache> {
+    RELATION_EXISTS_CACHE.get_or_init(|| Mutex::new(RelationExistsCache::default()))
 }
 
 fn relation_oid_by_name_cache_lookup(name: &str, namespace_oid: u32) -> Option<Option<u32>> {
@@ -1671,6 +1691,45 @@ fn clear_relation_oid_by_name_cache() {
         let mut cache = cache
             .lock()
             .expect("relation oid by name cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+    }
+}
+
+fn relation_exists_cache_lookup(oid: u32) -> Option<bool> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    let generation = current_generation();
+    let mut cache = relation_exists_cache()
+        .lock()
+        .expect("relation exists cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache.entries.get(&oid).copied()
+}
+
+fn relation_exists_cache_store(oid: u32, exists: bool) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    let generation = current_generation();
+    let mut cache = relation_exists_cache()
+        .lock()
+        .expect("relation exists cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    cache.entries.insert(oid, exists);
+}
+
+#[cfg(test)]
+fn clear_relation_exists_cache() {
+    if let Some(cache) = RELATION_EXISTS_CACHE.get() {
+        let mut cache = cache.lock().expect("relation exists cache mutex poisoned");
         cache.generation = current_generation();
         cache.entries.clear();
     }
@@ -2733,7 +2792,13 @@ pub extern "C" fn fastpg_rust_catalog_policy_by_relation_oid(relation_oid: u32) 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_catalog_relation_exists_by_oid(oid: u32) -> bool {
-    relation_oid_exists(Oid(oid)) || virtual_catalog_by_relation_oid(Oid(oid)).is_some()
+    if let Some(exists) = relation_exists_cache_lookup(oid) {
+        return exists;
+    }
+    let exists =
+        relation_oid_exists(Oid(oid)) || virtual_catalog_by_relation_oid(Oid(oid)).is_some();
+    relation_exists_cache_store(oid, exists);
+    exists
 }
 
 #[unsafe(no_mangle)]
@@ -4684,6 +4749,7 @@ mod tests {
         fastpg_rust_xact_abort();
         clear_primary_key_index_info_cache();
         clear_relation_oid_by_name_cache();
+        clear_relation_exists_cache();
         TestGuard { _guard: guard }
     }
 
@@ -5266,6 +5332,40 @@ mod tests {
             relation_oid_by_name_via_ffi(&relation_name, PUBLIC_NAMESPACE_OID.0),
             None
         );
+    }
+
+    #[test]
+    fn relation_exists_cache_skips_uncommitted_catalog_overlays() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let relation_name = format!("exists_cache_visible_{relid}");
+        let relid_text = relid.to_string();
+        let namespace_text = PUBLIC_NAMESPACE_OID.0.to_string();
+
+        assert!(!fastpg_rust_catalog_relation_exists_by_oid(relid));
+
+        fastpg_rust_xact_begin();
+        upsert_named_catalog_row(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid_text),
+                ("relname", &relation_name),
+                ("relnamespace", &namespace_text),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid_text),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "0"),
+            ],
+        );
+        assert!(fastpg_rust_catalog_relation_exists_by_oid(relid));
+
+        fastpg_rust_xact_abort();
+        assert!(!fastpg_rust_catalog_relation_exists_by_oid(relid));
     }
 
     #[test]
