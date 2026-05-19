@@ -437,7 +437,7 @@ static void
 fastpg_pgcore_execute_noop_utility(const char *command_tag,
 								   FastPgPgCoreExecuteStatement *summary)
 {
-	summary->command_tag = pstrdup(command_tag);
+	summary->command_tag = (char *) command_tag;
 }
 
 static void
@@ -463,7 +463,7 @@ fastpg_pgcore_execute_copy_stmt(const CopyStmt *stmt,
 	else
 		summary->copy_column_count =
 			(int) fastpg_pgcore_call_relation_column_count(relation_name);
-	summary->command_tag = pstrdup("COPY");
+	summary->command_tag = "COPY";
 }
 
 static void
@@ -478,40 +478,40 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			fastpg_xid_begin();
 			fastpg_rust_xact_begin();
 #endif
-			summary->command_tag = pstrdup("BEGIN");
+			summary->command_tag = "BEGIN";
 			break;
 		case TRANS_STMT_COMMIT:
 #ifdef USE_FASTPG
 			fastpg_xid_commit();
 			fastpg_rust_xact_commit();
 #endif
-			summary->command_tag = pstrdup("COMMIT");
+			summary->command_tag = "COMMIT";
 			break;
 		case TRANS_STMT_ROLLBACK:
 #ifdef USE_FASTPG
 			fastpg_xid_rollback();
 			fastpg_rust_xact_abort();
 #endif
-			summary->command_tag = pstrdup("ROLLBACK");
+			summary->command_tag = "ROLLBACK";
 			break;
 		case TRANS_STMT_SAVEPOINT:
 #ifdef USE_FASTPG
 			fastpg_rust_subxact_begin();
 #endif
-			summary->command_tag = pstrdup("SAVEPOINT");
+			summary->command_tag = "SAVEPOINT";
 			break;
 		case TRANS_STMT_RELEASE:
 #ifdef USE_FASTPG
 			fastpg_rust_subxact_commit();
 #endif
-			summary->command_tag = pstrdup("RELEASE");
+			summary->command_tag = "RELEASE";
 			break;
 		case TRANS_STMT_ROLLBACK_TO:
 #ifdef USE_FASTPG
 			fastpg_rust_subxact_abort();
 			fastpg_rust_subxact_begin();
 #endif
-			summary->command_tag = pstrdup("ROLLBACK");
+			summary->command_tag = "ROLLBACK";
 			break;
 		default:
 			ereport(ERROR,
@@ -621,9 +621,9 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 	PG_END_TRY();
 
 	if (qc.commandTag != CMDTAG_UNKNOWN)
-		summary->command_tag = pstrdup(GetCommandTagName(qc.commandTag));
+		summary->command_tag = (char *) GetCommandTagName(qc.commandTag);
 	else
-		summary->command_tag = pstrdup(CreateCommandName(utility_stmt));
+		summary->command_tag = (char *) CreateCommandName(utility_stmt);
 
 	dest->rDestroy(dest);
 }
@@ -1274,7 +1274,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 			if (fastpg_pgcore_should_noop_system_catalog_write(statement))
 			{
 				summary->command_tag =
-					pstrdup(fastpg_pgcore_command_tag_name(statement->commandType));
+					(char *) fastpg_pgcore_command_tag_name(statement->commandType);
 				continue;
 			}
 #endif
