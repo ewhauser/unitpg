@@ -2841,10 +2841,13 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
     if oid_out.is_null() {
         return false;
     }
-    let Ok(name) = (unsafe { c_str_to_string(name) }) else {
+    if name.is_null() {
+        return false;
+    }
+    let Ok(name) = unsafe { CStr::from_ptr(name) }.to_str() else {
         return false;
     };
-    if let Some(cached_oid) = relation_oid_by_name_cache_lookup(&name, namespace_oid) {
+    if let Some(cached_oid) = relation_oid_by_name_cache_lookup(name, namespace_oid) {
         if let Some(cached_oid) = cached_oid {
             unsafe {
                 *oid_out = cached_oid;
@@ -2853,19 +2856,19 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_oid_by_name(
         }
         return false;
     }
-    let oid = if let Some(relation) = virtual_catalog_by_name(&name, Oid(namespace_oid)) {
+    let oid = if let Some(relation) = virtual_catalog_by_name(name, Oid(namespace_oid)) {
         Some(relation.relation_oid.0)
     } else {
         let namespace = Oid(namespace_oid);
-        relation_oid_by_name_in_namespace(&name, namespace)
+        relation_oid_by_name_in_namespace(name, namespace)
             .map(|relation_oid| relation_oid.0)
             .or_else(|| {
-                let relation = primary_key_index_relation_by_name(&name, namespace)?;
+                let relation = primary_key_index_relation_by_name(name, namespace)?;
                 let index_oid = primary_key_index_oid(&relation)?;
                 Some(index_oid.0)
             })
     };
-    relation_oid_by_name_cache_store(&name, namespace_oid, oid);
+    relation_oid_by_name_cache_store(name, namespace_oid, oid);
     if let Some(oid) = oid {
         unsafe {
             *oid_out = oid;
