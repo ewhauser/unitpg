@@ -144,8 +144,7 @@ impl PgCoreSession {
         params: &[PgCoreParam],
     ) -> Result<ExecutionResult, PgCoreError> {
         let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
-        let statement = self.inner.prepare(sql)?;
-        statement.execute_with_params(params)
+        self.inner.execute_with_params(sql, params)
     }
 }
 
@@ -598,6 +597,34 @@ mod inner {
                 Err(error)
             }
         }
+
+        pub fn execute_with_params(
+            &self,
+            sql: &str,
+            params: &[PgCoreParam],
+        ) -> Result<ExecutionResult, PgCoreError> {
+            check_sql(sql)?;
+            let encoded_params = EncodedParams::new(params)?;
+            let _guard = enter_pgcore_lane("prepare_execute");
+            let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
+            let Some(prepared) = NonNull::new(prepared) else {
+                return Err(PgCoreError::new(
+                    "XX000",
+                    "PostgreSQL prepare returned a null result",
+                    0,
+                ));
+            };
+
+            let result = if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
+                execute_prepared_ptr_with_params(prepared.as_ptr(), &encoded_params)
+            } else {
+                Err(prepared_error_from_ptr(prepared.as_ptr()))
+            };
+            unsafe {
+                fastpg_pgcore_prepared_free(prepared.as_ptr());
+            }
+            result
+        }
     }
 
     #[derive(Debug)]
@@ -646,6 +673,23 @@ mod inner {
                 return execution_result_from_ptr(result);
             }
 
+            let encoded_params = EncodedParams::new(params)?;
+            let _guard = enter_pgcore_lane("execute");
+            execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params)
+        }
+    }
+
+    struct EncodedParams {
+        encoded_text_params: Vec<CString>,
+        parameter_values: Vec<*const c_char>,
+        parameter_is_null: Vec<bool>,
+        parameter_datums: Vec<usize>,
+        parameter_is_datum: Vec<bool>,
+        param_count: i32,
+    }
+
+    impl EncodedParams {
+        fn new(params: &[PgCoreParam]) -> Result<Self, PgCoreError> {
             let param_count = i32::try_from(params.len()).map_err(|_| {
                 PgCoreError::new("54000", "too many parameters for PostgreSQL execution", 0)
             })?;
@@ -684,20 +728,47 @@ mod inner {
                     }
                 }
             }
-
-            let _guard = enter_pgcore_lane("execute");
-            let result = unsafe {
-                fastpg_pgcore_execute_params(
-                    self.as_ptr(),
-                    parameter_values.as_ptr(),
-                    parameter_is_null.as_ptr(),
-                    parameter_datums.as_ptr(),
-                    parameter_is_datum.as_ptr(),
-                    param_count,
-                )
-            };
-            execution_result_from_ptr(result)
+            Ok(Self {
+                encoded_text_params,
+                parameter_values,
+                parameter_is_null,
+                parameter_datums,
+                parameter_is_datum,
+                param_count,
+            })
         }
+    }
+
+    fn execute_prepared_ptr_with_params(
+        prepared: *const FastPgPgCorePrepared,
+        params: &EncodedParams,
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let _keep_text_params_alive = &params.encoded_text_params;
+        let result = if params.param_count == 0 {
+            unsafe { fastpg_pgcore_execute(prepared) }
+        } else {
+            unsafe {
+                fastpg_pgcore_execute_params(
+                    prepared,
+                    params.parameter_values.as_ptr(),
+                    params.parameter_is_null.as_ptr(),
+                    params.parameter_datums.as_ptr(),
+                    params.parameter_is_datum.as_ptr(),
+                    params.param_count,
+                )
+            }
+        };
+        execution_result_from_ptr(result)
+    }
+
+    fn prepared_error_from_ptr(prepared: *const FastPgPgCorePrepared) -> PgCoreError {
+        PgCoreError::with_fields(
+            unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared)) },
+            unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
+            unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
+            unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
+            unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
+        )
     }
 
     fn execution_result_from_ptr(
@@ -865,6 +936,18 @@ mod inner {
         }
 
         pub fn prepare(&self, _sql: &str) -> Result<PreparedStatement, PgCoreError> {
+            Err(PgCoreError::new(
+                "0A000",
+                "fastpg-pgcore was built without postgres-linked support",
+                0,
+            ))
+        }
+
+        pub fn execute_with_params(
+            &self,
+            _sql: &str,
+            _params: &[super::PgCoreParam],
+        ) -> Result<ExecutionResult, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
                 "fastpg-pgcore was built without postgres-linked support",
