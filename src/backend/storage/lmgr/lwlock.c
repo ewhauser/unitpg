@@ -1160,6 +1160,11 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return true;
+#endif
+
 	PRINT_LWDEBUG("LWLockAcquire", lock, mode);
 
 #ifdef LWLOCK_STATS
@@ -1324,6 +1329,11 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return true;
+#endif
+
 	PRINT_LWDEBUG("LWLockConditionalAcquire", lock, mode);
 
 	/* Ensure we will have room to remember the lock */
@@ -1387,6 +1397,11 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 #endif
 
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return true;
+#endif
 
 	PRINT_LWDEBUG("LWLockAcquireOrWait", lock, mode);
 
@@ -1576,6 +1591,15 @@ LWLockWaitForVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 oldval,
 #endif
 
 	PRINT_LWDEBUG("LWLockWaitForVar", lock, LW_WAIT_UNTIL_FREE);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (newval != NULL)
+			*newval = pg_atomic_read_u64(valptr);
+		return false;
+	}
+#endif
 
 	/*
 	 * Lock out cancel/die interrupts while we sleep on the lock.  There is no
@@ -1770,6 +1794,11 @@ LWLockRelease(LWLock *lock)
 	uint32		oldstate;
 	bool		check_waiters;
 	int			i;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 
 	/*
 	 * Remove lock from list of locks held.  Usually, but not always, it will

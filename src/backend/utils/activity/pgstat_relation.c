@@ -20,6 +20,7 @@
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "miscadmin.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
@@ -93,6 +94,15 @@ pgstat_init_relation(Relation rel)
 {
 	char		relkind = rel->rd_rel->relkind;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		rel->pgstat_enabled = false;
+		rel->pgstat_info = NULL;
+		return;
+	}
+#endif
+
 	/*
 	 * We only count stats for relations with storage and partitioned tables
 	 */
@@ -131,6 +141,11 @@ pgstat_init_relation(Relation rel)
 void
 pgstat_assoc_relation(Relation rel)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	Assert(rel->pgstat_enabled);
 	Assert(rel->pgstat_info == NULL);
 
@@ -168,6 +183,11 @@ pgstat_unlink_relation(Relation rel)
 void
 pgstat_create_relation(Relation rel)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	pgstat_create_transactional(PGSTAT_KIND_RELATION,
 								rel->rd_rel->relisshared ? InvalidOid : MyDatabaseId,
 								RelationGetRelid(rel));
@@ -181,6 +201,11 @@ pgstat_drop_relation(Relation rel)
 {
 	int			nest_level = GetCurrentTransactionNestLevel();
 	PgStat_TableStatus *pgstat_info;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 
 	pgstat_drop_transactional(PGSTAT_KIND_RELATION,
 							  rel->rd_rel->relisshared ? InvalidOid : MyDatabaseId,

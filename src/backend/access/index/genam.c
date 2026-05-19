@@ -563,6 +563,11 @@ systable_getnext(SysScanDesc sysscan)
 
 			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
 			Assert(!shouldFree);
+#ifdef USE_FASTPG
+			if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
+															RelationGetRelid(sysscan->heap_rel)) != 0)
+				ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
+#endif
 
 			/*
 			 * We currently don't need to support lossy index operators for
@@ -584,6 +589,11 @@ systable_getnext(SysScanDesc sysscan)
 
 			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
 			Assert(!shouldFree);
+#ifdef USE_FASTPG
+			if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
+															RelationGetRelid(sysscan->heap_rel)) != 0)
+				ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
+#endif
 		}
 	}
 

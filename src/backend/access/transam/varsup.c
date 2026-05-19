@@ -554,6 +554,13 @@ Oid
 GetNewObjectId(void)
 {
 	Oid			result;
+#ifdef USE_FASTPG
+	static pg_atomic_uint32 fastpg_oid_offset;
+
+	if (!IsUnderPostmaster)
+		return (Oid) FirstNormalObjectId +
+			(Oid) pg_atomic_fetch_add_u32(&fastpg_oid_offset, 1);
+#endif
 
 	/* safety check, we should never get this far in a HS standby */
 	if (RecoveryInProgress())

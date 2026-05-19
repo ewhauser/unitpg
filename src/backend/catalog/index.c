@@ -1240,6 +1240,10 @@ index_create(Relation heapRelation,
 	 */
 	if (IsBootstrapProcessingMode())
 		RelationInitIndexAccessInfo(indexRelation);
+#ifdef USE_FASTPG
+	else if (!IsUnderPostmaster && indexRelation->rd_index == NULL)
+		RelationInitIndexAccessInfo(indexRelation);
+#endif
 	else
 		Assert(indexRelation->rd_indexcxt != NULL);
 
@@ -2880,6 +2884,11 @@ index_update_stats(Relation rel,
 			update_stats = false;
 	}
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		update_stats = false;
+#endif
+
 	/*
 	 * Finish I/O and visibility map buffer locks before
 	 * systable_inplace_update_begin() locks the pg_class buffer.  The rd_rel
@@ -2894,6 +2903,60 @@ index_update_stats(Relation rel,
 		if (rel->rd_rel->relkind != RELKIND_INDEX)
 			visibilitymap_count(rel, &relallvisible, &relallfrozen);
 	}
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		pg_class = table_open(RelationRelationId, RowExclusiveLock);
+		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));
+
+		if (!HeapTupleIsValid(tuple))
+			elog(ERROR, "could not find tuple for relation %u", relid);
+		rd_rel = (Form_pg_class) GETSTRUCT(tuple);
+
+		Assert(rd_rel->relkind != RELKIND_PARTITIONED_INDEX);
+
+		dirty = false;
+		if (rd_rel->relhasindex != hasindex)
+		{
+			rd_rel->relhasindex = hasindex;
+			dirty = true;
+		}
+
+		if (update_stats)
+		{
+			if (rd_rel->relpages != (int32) relpages)
+			{
+				rd_rel->relpages = (int32) relpages;
+				dirty = true;
+			}
+			if (rd_rel->reltuples != (float4) reltuples)
+			{
+				rd_rel->reltuples = (float4) reltuples;
+				dirty = true;
+			}
+			if (rd_rel->relallvisible != (int32) relallvisible)
+			{
+				rd_rel->relallvisible = (int32) relallvisible;
+				dirty = true;
+			}
+			if (rd_rel->relallfrozen != (int32) relallfrozen)
+			{
+				rd_rel->relallfrozen = (int32) relallfrozen;
+				dirty = true;
+			}
+		}
+
+		if (dirty)
+			CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+		else
+			CacheInvalidateRelcacheByTuple(tuple);
+
+		heap_freetuple(tuple);
+		table_close(pg_class, RowExclusiveLock);
+		return;
+	}
+#endif
 
 	/*
 	 * We always update the pg_class row using a non-transactional,

@@ -1187,6 +1187,11 @@ EventTriggerBeginCompleteQuery(void)
 	EventTriggerQueryState *state;
 	MemoryContext cxt;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster || !event_triggers)
+		return false;
+#endif
+
 	/*
 	 * Currently, sql_drop, table_rewrite, ddl_command_end events are the only
 	 * reason to have event trigger state at all; so if there are none, don't
@@ -1246,6 +1251,11 @@ EventTriggerEndCompleteQuery(void)
 bool
 trackDroppedObjectsNeeded(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster || !event_triggers)
+		return false;
+#endif
+
 	/*
 	 * true if any sql_drop, table_rewrite, ddl_command_end event trigger
 	 * exists

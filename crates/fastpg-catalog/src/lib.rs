@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use fastpg_types::Oid;
 
@@ -37,32 +38,20 @@ pub const REGCLASS_OID: Oid = Oid(2205);
 pub const ANY_OID: Oid = Oid(2276);
 pub const ANYARRAY_OID: Oid = Oid(2277);
 pub const INTERNAL_OID: Oid = Oid(2281);
+pub const LSN_OID: Oid = Oid(3220);
 
 pub const DEFAULT_COLLATION_OID: Oid = Oid(100);
 pub const C_COLLATION_OID: Oid = Oid(950);
 
 const INVALID_OID: Oid = Oid(0);
-const BOOTSTRAP_SUPERUSER_OID: Oid = Oid(10);
-
 pub const PG_CATALOG_NAMESPACE_OID: Oid = Oid(11);
 pub const PUBLIC_NAMESPACE_OID: Oid = Oid(2200);
-const FIRST_DYNAMIC_RELATION_OID: u32 = 16_384;
 const PG_CLASS_RELATION_OID: Oid = Oid(1259);
 const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
 const PG_TYPE_RELATION_OID: Oid = Oid(1247);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
-const PG_PROC_RELATION_OID: Oid = Oid(1255);
-const HEAP_TABLE_AM_OID: Oid = Oid(2);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
-const FIRST_NORMAL_TRANSACTION_ID: i32 = 3;
-const FIRST_MULTI_XACT_ID: i32 = 1;
-const PRIMARY_KEY_INDEX_OID_OFFSET: u32 = 1_000_000_000;
-const ARRAY_IN_PROC_OID: Oid = Oid(750);
-const ARRAY_OUT_PROC_OID: Oid = Oid(751);
-const ARRAY_RECV_PROC_OID: Oid = Oid(2400);
-const ARRAY_SEND_PROC_OID: Oid = Oid(2401);
-const ARRAY_SUBSCRIPT_HANDLER_PROC_OID: Oid = Oid(6179);
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
 pub const VIRTUAL_CATALOG_DYNAMIC: u8 = 2;
@@ -294,6 +283,7 @@ pub struct RelationRecord {
     pub type_oid: Oid,
     pub namespace: Oid,
     pub name: String,
+    pub relkind: u8,
     pub columns: Vec<ColumnRecord>,
     pub primary_key: Vec<String>,
     pub primary_key_constraint_oid: Option<Oid>,
@@ -314,13 +304,18 @@ impl CatalogError {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 struct CatalogOverlay {
     rows: BTreeMap<u32, BTreeMap<u64, Arc<CatalogRow>>>,
     tombstones: BTreeMap<u32, BTreeSet<u64>>,
 }
 
 impl CatalogOverlay {
+    fn is_empty(&self) -> bool {
+        self.rows.values().all(BTreeMap::is_empty)
+            && self.tombstones.values().all(BTreeSet::is_empty)
+    }
+
     fn insert(&mut self, row: CatalogRow) {
         self.tombstones
             .entry(row.relation_oid.0)
@@ -339,26 +334,45 @@ impl CatalogOverlay {
             .or_default()
             .insert(row_id);
     }
+
+    fn merge(&mut self, other: CatalogOverlay) {
+        for (relation_oid, tombstones) in other.tombstones {
+            for row_id in tombstones {
+                self.delete(Oid(relation_oid), row_id);
+            }
+        }
+        for rows in other.rows.into_values() {
+            for row in rows.into_values() {
+                self.insert(row.as_ref().clone());
+            }
+        }
+    }
+
+    fn apply_to_rows(&self, relation_oid: Oid, rows: &mut BTreeMap<u64, CatalogRow>) {
+        if let Some(tombstones) = self.tombstones.get(&relation_oid.0) {
+            for row_id in tombstones {
+                rows.remove(row_id);
+            }
+        }
+        if let Some(overlay_rows) = self.rows.get(&relation_oid.0) {
+            for (row_id, row) in overlay_rows {
+                rows.insert(*row_id, row.as_ref().clone());
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
 struct CatalogState {
-    next_relation_oid: u32,
-    next_object_oid: u32,
-    relations_by_name: BTreeMap<String, RelationRecord>,
-    relation_names_by_oid: BTreeMap<u32, String>,
+    next_overlay_row_ids: BTreeMap<u32, u64>,
     overlay: CatalogOverlay,
     generation: u64,
 }
 
 impl Default for CatalogState {
     fn default() -> Self {
-        let first_dynamic_oid = FIRST_DYNAMIC_RELATION_OID.max(max_static_oid().saturating_add(1));
         Self {
-            next_relation_oid: first_dynamic_oid,
-            next_object_oid: first_dynamic_oid,
-            relations_by_name: BTreeMap::new(),
-            relation_names_by_oid: BTreeMap::new(),
+            next_overlay_row_ids: BTreeMap::new(),
             overlay: CatalogOverlay::default(),
             generation: 1,
         }
@@ -366,6 +380,54 @@ impl Default for CatalogState {
 }
 
 static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
+
+#[derive(Debug, Default)]
+pub struct CatalogSession {
+    transaction_stack: Vec<CatalogOverlay>,
+    explicit_transaction: bool,
+}
+
+pub type CatalogSessionHandle = Arc<Mutex<CatalogSession>>;
+
+pub fn new_catalog_session() -> CatalogSessionHandle {
+    Arc::new(Mutex::new(CatalogSession::default()))
+}
+
+static DEFAULT_CATALOG_SESSION: OnceLock<CatalogSessionHandle> = OnceLock::new();
+
+thread_local! {
+    static CURRENT_CATALOG_SESSION: RefCell<Option<CatalogSessionHandle>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug)]
+pub struct CatalogSessionGuard {
+    previous: Option<CatalogSessionHandle>,
+}
+
+pub fn enter_catalog_session(handle: CatalogSessionHandle) -> CatalogSessionGuard {
+    let previous = CURRENT_CATALOG_SESSION.with(|slot| slot.replace(Some(handle)));
+    CatalogSessionGuard { previous }
+}
+
+impl Drop for CatalogSessionGuard {
+    fn drop(&mut self) {
+        CURRENT_CATALOG_SESSION.with(|slot| {
+            slot.replace(self.previous.take());
+        });
+    }
+}
+
+fn default_catalog_session() -> CatalogSessionHandle {
+    DEFAULT_CATALOG_SESSION
+        .get_or_init(new_catalog_session)
+        .clone()
+}
+
+fn current_catalog_session() -> CatalogSessionHandle {
+    CURRENT_CATALOG_SESSION
+        .with(|slot| slot.borrow().clone())
+        .unwrap_or_else(default_catalog_session)
+}
 
 fn catalog() -> &'static RwLock<CatalogState> {
     CATALOG.get_or_init(|| RwLock::new(CatalogState::default()))
@@ -391,6 +453,126 @@ fn with_catalog_read<R>(f: impl FnOnce(&CatalogState) -> R) -> R {
     }
 }
 
+fn with_catalog_session<R>(f: impl FnOnce(&mut CatalogSession) -> R) -> R {
+    let session = current_catalog_session();
+    match session.lock() {
+        Ok(mut session) => f(&mut session),
+        Err(poisoned) => {
+            let mut session = poisoned.into_inner();
+            f(&mut session)
+        }
+    }
+}
+
+fn visible_session_overlays() -> Vec<CatalogOverlay> {
+    let session = current_catalog_session();
+    match session.lock() {
+        Ok(session) => session.transaction_stack.clone(),
+        Err(poisoned) => poisoned.into_inner().transaction_stack.clone(),
+    }
+}
+
+fn ensure_catalog_transaction(session: &mut CatalogSession) {
+    if session.transaction_stack.is_empty() {
+        session.transaction_stack.push(CatalogOverlay::default());
+    }
+}
+
+fn commit_catalog_overlay(overlay: CatalogOverlay) {
+    if overlay.is_empty() {
+        return;
+    }
+    with_catalog(|state| {
+        state.overlay.merge(overlay);
+        bump_generation(state);
+    });
+}
+
+fn commit_top_catalog_overlay(session: &mut CatalogSession) {
+    let Some(overlay) = session.transaction_stack.pop() else {
+        return;
+    };
+    if let Some(parent) = session.transaction_stack.last_mut() {
+        parent.merge(overlay);
+    } else {
+        commit_catalog_overlay(overlay);
+    }
+}
+
+pub fn begin_explicit_transaction() {
+    with_catalog_session(|session| {
+        if !session.explicit_transaction {
+            while !session.transaction_stack.is_empty() {
+                commit_top_catalog_overlay(session);
+            }
+        }
+        ensure_catalog_transaction(session);
+        session.explicit_transaction = true;
+    });
+}
+
+pub fn begin_implicit_transaction() {
+    with_catalog_session(ensure_catalog_transaction);
+}
+
+pub fn commit_explicit_transaction() {
+    with_catalog_session(|session| {
+        while !session.transaction_stack.is_empty() {
+            commit_top_catalog_overlay(session);
+        }
+        session.explicit_transaction = false;
+    });
+}
+
+pub fn abort_explicit_transaction() {
+    with_catalog_session(|session| {
+        session.transaction_stack.clear();
+        session.explicit_transaction = false;
+    });
+}
+
+pub fn commit_implicit_transaction() {
+    with_catalog_session(|session| {
+        if session.explicit_transaction {
+            return;
+        }
+        while !session.transaction_stack.is_empty() {
+            commit_top_catalog_overlay(session);
+        }
+    });
+}
+
+pub fn abort_implicit_transaction() {
+    with_catalog_session(|session| {
+        if !session.explicit_transaction {
+            session.transaction_stack.clear();
+        }
+    });
+}
+
+pub fn begin_subtransaction() {
+    with_catalog_session(|session| {
+        ensure_catalog_transaction(session);
+        session.transaction_stack.push(CatalogOverlay::default());
+    });
+}
+
+pub fn commit_subtransaction() {
+    with_catalog_session(|session| {
+        if session.transaction_stack.len() > 1 {
+            commit_top_catalog_overlay(session);
+        }
+    });
+}
+
+pub fn abort_subtransaction() {
+    with_catalog_session(|session| {
+        if session.transaction_stack.len() > 1 {
+            session.transaction_stack.pop();
+        }
+    });
+}
+
 fn normalize_identifier(value: &str) -> String {
     value.trim().to_ascii_lowercase()
 }
@@ -410,30 +592,6 @@ pub fn static_catalog_by_name(name: &str) -> Option<&'static StaticCatalogTable>
     generated_catalog::STATIC_CATALOG_TABLES
         .iter()
         .find(|table| table.name == name.as_str())
-}
-
-fn catalog_relation_oid(name: &str) -> Option<Oid> {
-    static_catalog_by_name(name).map(|table| table.oid)
-}
-
-fn max_static_oid() -> u32 {
-    generated_catalog::STATIC_CATALOG_TABLES
-        .iter()
-        .flat_map(|table| {
-            let oid_column = table.columns.iter().position(|column| column.name == "oid");
-            table
-                .rows
-                .iter()
-                .filter_map(move |row| {
-                    oid_column
-                        .and_then(|index| row.values.get(index))
-                        .and_then(|value| static_value_as_u32(*value))
-                })
-                .chain(std::iter::once(table.oid.0))
-                .chain(std::iter::once(table.rowtype_oid.0))
-        })
-        .max()
-        .unwrap_or(FIRST_DYNAMIC_RELATION_OID)
 }
 
 fn static_value_as_u32(value: StaticCatalogValue) -> Option<u32> {
@@ -541,19 +699,15 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
     let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
         return Vec::new();
     };
+    let session_overlays = visible_session_overlays();
     with_catalog_read(|state| {
-        let tombstones = state.overlay.tombstones.get(&relation_oid.0);
         let mut rows = BTreeMap::<u64, CatalogRow>::new();
         for row in table.rows {
-            if tombstones.is_some_and(|tombstones| tombstones.contains(&row.row_id)) {
-                continue;
-            }
             rows.insert(row.row_id, static_row_to_catalog_row(table, row));
         }
-        if let Some(overlay_rows) = state.overlay.rows.get(&relation_oid.0) {
-            for (row_id, row) in overlay_rows {
-                rows.insert(*row_id, row.as_ref().clone());
-            }
+        state.overlay.apply_to_rows(relation_oid, &mut rows);
+        for overlay in &session_overlays {
+            overlay.apply_to_rows(relation_oid, &mut rows);
         }
         rows.into_values().collect()
     })
@@ -571,377 +725,149 @@ pub fn catalog_row_value<'a>(
         .and_then(|index| row.values.get(index))
 }
 
-fn default_catalog_value(column: &StaticCatalogColumn) -> CatalogValue {
-    if !column.attnotnull {
+fn catalog_value_from_text(column: &StaticCatalogColumn, value: Option<&str>) -> CatalogValue {
+    let Some(raw) = value else {
         return CatalogValue::Null;
-    }
+    };
     match column.type_oid {
-        BOOL_OID => CatalogValue::Bool(false),
-        CHAR_OID => CatalogValue::Char(0),
-        INT2_OID => CatalogValue::Int16(0),
-        INT4_OID => CatalogValue::Int32(0),
-        FLOAT4_OID => CatalogValue::Float32(0.0),
-        NAME_OID => CatalogValue::Name(String::new()),
-        TEXT_OID | PG_NODE_TREE_OID => CatalogValue::Text(String::new()),
-        OIDVECTOR_OID => CatalogValue::OidVector(Vec::new()),
-        INT2VECTOR_OID => CatalogValue::Int2Vector(Vec::new()),
-        OID_OID | REGCLASS_OID => CatalogValue::Oid(INVALID_OID),
-        _ if column.type_name.starts_with("reg") => CatalogValue::Oid(INVALID_OID),
-        _ if column.type_name.starts_with('_') => CatalogValue::Null,
-        _ => CatalogValue::Raw(String::new()),
+        BOOL_OID => match raw {
+            "t" | "true" => CatalogValue::Bool(true),
+            "f" | "false" => CatalogValue::Bool(false),
+            _ => CatalogValue::Raw(raw.to_owned()),
+        },
+        CHAR_OID => CatalogValue::Char(match raw {
+            "\\0" => 0,
+            _ => raw.as_bytes().first().copied().unwrap_or(0),
+        }),
+        INT2_OID => raw
+            .parse::<i16>()
+            .map(CatalogValue::Int16)
+            .unwrap_or_else(|_| CatalogValue::Raw(raw.to_owned())),
+        INT4_OID => raw
+            .parse::<i32>()
+            .map(CatalogValue::Int32)
+            .unwrap_or_else(|_| CatalogValue::Raw(raw.to_owned())),
+        FLOAT4_OID => raw
+            .parse::<f32>()
+            .map(CatalogValue::Float32)
+            .unwrap_or_else(|_| CatalogValue::Raw(raw.to_owned())),
+        NAME_OID => CatalogValue::Name(raw.to_owned()),
+        TEXT_OID | PG_NODE_TREE_OID => CatalogValue::Text(raw.to_owned()),
+        OIDVECTOR_OID => CatalogValue::OidVector(parse_oid_vector(raw)),
+        INT2VECTOR_OID => CatalogValue::Int2Vector(parse_int2_vector(raw)),
+        OID_OID | REGCLASS_OID => raw
+            .parse::<u32>()
+            .map(|oid| CatalogValue::Oid(Oid(oid)))
+            .unwrap_or_else(|_| CatalogValue::Raw(raw.to_owned())),
+        _ if column.type_name.starts_with("reg") || column.type_name == "oid" => raw
+            .parse::<u32>()
+            .map(|oid| CatalogValue::Oid(Oid(oid)))
+            .unwrap_or_else(|_| CatalogValue::Raw(raw.to_owned())),
+        _ => CatalogValue::Raw(raw.to_owned()),
     }
 }
 
-fn catalog_row_from_named_values(
+fn row_id_from_catalog_values(table: &StaticCatalogTable, values: &[CatalogValue]) -> Option<u64> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.name == "oid")
+        .and_then(|index| values.get(index))
+        .and_then(catalog_value_oid)
+        .map(|oid| oid.0 as u64)
+}
+
+fn next_overlay_row_id(state: &mut CatalogState, table: &StaticCatalogTable) -> u64 {
+    let first_dynamic_row_id = table
+        .rows
+        .iter()
+        .map(|row| row.row_id)
+        .max()
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+    let next = state
+        .next_overlay_row_ids
+        .entry(table.oid.0)
+        .or_insert(first_dynamic_row_id);
+    let row_id = *next;
+    *next = next.saturating_add(1).max(1);
+    row_id
+}
+
+pub fn upsert_catalog_row(
     relation_oid: Oid,
     row_id: u64,
-    named_values: Vec<(&'static str, CatalogValue)>,
-) -> CatalogRow {
-    let table = static_catalog_by_relation_oid(relation_oid)
-        .unwrap_or_else(|| panic!("missing generated catalog table {}", relation_oid.0));
-    let named_values = named_values.into_iter().collect::<BTreeMap<_, _>>();
-    CatalogRow {
+    values: Vec<Option<String>>,
+) -> Result<u64, CatalogError> {
+    let table = static_catalog_by_relation_oid(relation_oid).ok_or_else(|| {
+        CatalogError::new(
+            "42P01",
+            format!(
+                "generated catalog relation {} does not exist",
+                relation_oid.0
+            ),
+        )
+    })?;
+    if values.len() != table.columns.len() {
+        return Err(CatalogError::new(
+            "42804",
+            format!(
+                "catalog row for {} has {} values but {} columns",
+                table.name,
+                values.len(),
+                table.columns.len()
+            ),
+        ));
+    }
+    let values = table
+        .columns
+        .iter()
+        .zip(values.iter())
+        .map(|(column, value)| catalog_value_from_text(column, value.as_deref()))
+        .collect::<Vec<_>>();
+    let row_id = if row_id != 0 {
+        row_id
+    } else if let Some(row_id) = row_id_from_catalog_values(table, &values) {
+        row_id
+    } else {
+        with_catalog(|state| next_overlay_row_id(state, table))
+    };
+    let row = CatalogRow {
         relation_oid,
         row_id,
-        values: table
-            .columns
-            .iter()
-            .map(|column| {
-                named_values
-                    .get(column.name)
-                    .cloned()
-                    .unwrap_or_else(|| default_catalog_value(column))
-            })
-            .collect(),
-    }
+        values,
+    };
+    with_catalog_session(|session| {
+        ensure_catalog_transaction(session);
+        session
+            .transaction_stack
+            .last_mut()
+            .expect("catalog transaction was just ensured")
+            .insert(row);
+    });
+    Ok(row_id)
 }
 
-fn relation_primary_key_index_oid(relation: &RelationRecord) -> Option<Oid> {
-    if relation.primary_key.is_empty() {
-        return None;
-    }
-    relation
-        .oid
-        .0
-        .checked_add(PRIMARY_KEY_INDEX_OID_OFFSET)
-        .map(Oid)
-}
-
-fn primary_key_index_name(relation: &RelationRecord) -> String {
-    format!("{}_pkey", relation.name)
-}
-
-fn relation_column_attnums(
-    relation: &RelationRecord,
-    columns: &[String],
-) -> Result<Vec<i16>, CatalogError> {
-    columns
-        .iter()
-        .map(|column_name| {
-            relation
-                .columns
-                .iter()
-                .position(|column| &column.name == column_name)
-                .and_then(|index| i16::try_from(index + 1).ok())
-                .ok_or_else(|| {
-                    CatalogError::new("42703", format!("column \"{column_name}\" does not exist"))
-                })
-        })
-        .collect()
-}
-
-struct PgClassOverlayInput<'a> {
-    oid: Oid,
-    namespace: Oid,
-    name: &'a str,
-    reltype: Oid,
-    relkind: u8,
-    relam: Oid,
-    column_count: usize,
-    has_index: bool,
-}
-
-fn pg_class_overlay_row(input: PgClassOverlayInput<'_>) -> CatalogRow {
-    catalog_row_from_named_values(
-        PG_CLASS_RELATION_OID,
-        input.oid.0 as u64,
-        vec![
-            ("oid", CatalogValue::Oid(input.oid)),
-            ("relname", CatalogValue::Name(input.name.to_owned())),
-            ("relnamespace", CatalogValue::Oid(input.namespace)),
-            ("reltype", CatalogValue::Oid(input.reltype)),
-            ("reloftype", CatalogValue::Oid(INVALID_OID)),
-            ("relowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
-            ("relam", CatalogValue::Oid(input.relam)),
-            ("relfilenode", CatalogValue::Oid(input.oid)),
-            ("reltablespace", CatalogValue::Oid(INVALID_OID)),
-            ("relpages", CatalogValue::Int32(0)),
-            ("reltuples", CatalogValue::Float32(-1.0)),
-            ("relallvisible", CatalogValue::Int32(0)),
-            ("relallfrozen", CatalogValue::Int32(0)),
-            ("reltoastrelid", CatalogValue::Oid(INVALID_OID)),
-            ("relhasindex", CatalogValue::Bool(input.has_index)),
-            ("relisshared", CatalogValue::Bool(false)),
-            ("relpersistence", CatalogValue::Char(b'p')),
-            ("relkind", CatalogValue::Char(input.relkind)),
-            (
-                "relnatts",
-                CatalogValue::Int16(input.column_count.min(i16::MAX as usize) as i16),
+pub fn delete_catalog_row(relation_oid: Oid, row_id: u64) -> Result<(), CatalogError> {
+    if static_catalog_by_relation_oid(relation_oid).is_none() {
+        return Err(CatalogError::new(
+            "42P01",
+            format!(
+                "generated catalog relation {} does not exist",
+                relation_oid.0
             ),
-            ("relchecks", CatalogValue::Int16(0)),
-            ("relhasrules", CatalogValue::Bool(false)),
-            ("relhastriggers", CatalogValue::Bool(false)),
-            ("relhassubclass", CatalogValue::Bool(false)),
-            ("relrowsecurity", CatalogValue::Bool(false)),
-            ("relforcerowsecurity", CatalogValue::Bool(false)),
-            ("relispopulated", CatalogValue::Bool(true)),
-            ("relreplident", CatalogValue::Char(b'n')),
-            ("relispartition", CatalogValue::Bool(false)),
-            ("relrewrite", CatalogValue::Oid(INVALID_OID)),
-            (
-                "relfrozenxid",
-                CatalogValue::Int32(FIRST_NORMAL_TRANSACTION_ID),
-            ),
-            ("relminmxid", CatalogValue::Int32(FIRST_MULTI_XACT_ID)),
-        ],
-    )
-}
-
-fn pg_type_overlay_row(relation: &RelationRecord) -> CatalogRow {
-    let record_type = lookup_type(Oid(2249));
-    catalog_row_from_named_values(
-        PG_TYPE_RELATION_OID,
-        relation.type_oid.0 as u64,
-        vec![
-            ("oid", CatalogValue::Oid(relation.type_oid)),
-            ("typname", CatalogValue::Name(relation.name.clone())),
-            ("typnamespace", CatalogValue::Oid(relation.namespace)),
-            ("typowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
-            ("typlen", CatalogValue::Int16(-1)),
-            ("typbyval", CatalogValue::Bool(false)),
-            ("typtype", CatalogValue::Char(b'c')),
-            ("typcategory", CatalogValue::Char(b'C')),
-            ("typispreferred", CatalogValue::Bool(false)),
-            ("typisdefined", CatalogValue::Bool(true)),
-            ("typdelim", CatalogValue::Char(b',')),
-            ("typrelid", CatalogValue::Oid(relation.oid)),
-            ("typsubscript", CatalogValue::Oid(INVALID_OID)),
-            ("typelem", CatalogValue::Oid(INVALID_OID)),
-            ("typarray", CatalogValue::Oid(INVALID_OID)),
-            (
-                "typinput",
-                CatalogValue::Oid(
-                    record_type
-                        .as_ref()
-                        .map(|record| record.typinput)
-                        .unwrap_or(INVALID_OID),
-                ),
-            ),
-            (
-                "typoutput",
-                CatalogValue::Oid(
-                    record_type
-                        .as_ref()
-                        .map(|record| record.typoutput)
-                        .unwrap_or(INVALID_OID),
-                ),
-            ),
-            (
-                "typreceive",
-                CatalogValue::Oid(
-                    record_type
-                        .as_ref()
-                        .map(|record| record.typreceive)
-                        .unwrap_or(INVALID_OID),
-                ),
-            ),
-            (
-                "typsend",
-                CatalogValue::Oid(
-                    record_type
-                        .as_ref()
-                        .map(|record| record.typsend)
-                        .unwrap_or(INVALID_OID),
-                ),
-            ),
-            ("typmodin", CatalogValue::Oid(INVALID_OID)),
-            ("typmodout", CatalogValue::Oid(INVALID_OID)),
-            ("typanalyze", CatalogValue::Oid(INVALID_OID)),
-            ("typalign", CatalogValue::Char(b'd')),
-            ("typstorage", CatalogValue::Char(b'x')),
-            ("typnotnull", CatalogValue::Bool(false)),
-            ("typbasetype", CatalogValue::Oid(INVALID_OID)),
-            ("typtypmod", CatalogValue::Int32(-1)),
-            ("typndims", CatalogValue::Int32(0)),
-            ("typcollation", CatalogValue::Oid(INVALID_OID)),
-        ],
-    )
-}
-
-const SYSTEM_ATTRIBUTE_COLUMNS: &[(&str, i16, Oid)] = &[
-    ("ctid", -1, TID_OID),
-    ("xmin", -2, XID_OID),
-    ("cmin", -3, CID_OID),
-    ("xmax", -4, XID_OID),
-    ("cmax", -5, CID_OID),
-    ("tableoid", -6, OID_OID),
-];
-
-fn pg_attribute_overlay_row_for_column(
-    relation_oid: Oid,
-    attnum: i16,
-    name: &str,
-    type_oid: Oid,
-    type_mod: i32,
-    is_not_null: bool,
-) -> Option<CatalogRow> {
-    let type_record = lookup_type(type_oid)?;
-    Some(catalog_row_from_named_values(
-        PG_ATTRIBUTE_RELATION_OID,
-        ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
-        vec![
-            ("attrelid", CatalogValue::Oid(relation_oid)),
-            ("attname", CatalogValue::Name(name.to_owned())),
-            ("atttypid", CatalogValue::Oid(type_oid)),
-            ("attlen", CatalogValue::Int16(type_record.typlen)),
-            ("attnum", CatalogValue::Int16(attnum)),
-            ("atttypmod", CatalogValue::Int32(type_mod)),
-            ("attndims", CatalogValue::Int16(0)),
-            ("attbyval", CatalogValue::Bool(type_record.typbyval)),
-            ("attalign", CatalogValue::Char(type_record.typalign)),
-            ("attstorage", CatalogValue::Char(type_record.typstorage)),
-            ("attcompression", CatalogValue::Char(0)),
-            ("attnotnull", CatalogValue::Bool(is_not_null)),
-            ("atthasdef", CatalogValue::Bool(false)),
-            ("atthasmissing", CatalogValue::Bool(false)),
-            ("attidentity", CatalogValue::Char(0)),
-            ("attgenerated", CatalogValue::Char(0)),
-            ("attisdropped", CatalogValue::Bool(false)),
-            ("attislocal", CatalogValue::Bool(true)),
-            ("attinhcount", CatalogValue::Int16(0)),
-            ("attcollation", CatalogValue::Oid(type_record.typcollation)),
-            ("attstattarget", CatalogValue::Int16(-1)),
-        ],
-    ))
-}
-
-fn pg_attribute_overlay_row(
-    relation_oid: Oid,
-    attnum: i16,
-    column: &ColumnRecord,
-) -> Option<CatalogRow> {
-    pg_attribute_overlay_row_for_column(
-        relation_oid,
-        attnum,
-        &column.name,
-        column.type_oid,
-        column.type_mod,
-        column.is_not_null,
-    )
-}
-
-fn insert_system_attribute_overlay_rows(state: &mut CatalogState, relation_oid: Oid) {
-    for (name, attnum, type_oid) in SYSTEM_ATTRIBUTE_COLUMNS {
-        if let Some(row) =
-            pg_attribute_overlay_row_for_column(relation_oid, *attnum, name, *type_oid, -1, true)
-        {
-            state.overlay.insert(row);
-        }
+        ));
     }
-}
-
-fn insert_relation_attribute_overlay_rows(state: &mut CatalogState, relation: &RelationRecord) {
-    insert_system_attribute_overlay_rows(state, relation.oid);
-    for (index, column) in relation.columns.iter().enumerate() {
-        let Some(attnum) = i16::try_from(index + 1).ok() else {
-            continue;
-        };
-        if let Some(row) = pg_attribute_overlay_row(relation.oid, attnum, column) {
-            state.overlay.insert(row);
-        }
-    }
-}
-
-fn insert_index_attribute_overlay_rows(
-    state: &mut CatalogState,
-    relation: &RelationRecord,
-    index_oid: Oid,
-) {
-    insert_system_attribute_overlay_rows(state, index_oid);
-    for (index, primary_key_column) in relation.primary_key.iter().enumerate() {
-        let Some(attnum) = i16::try_from(index + 1).ok() else {
-            continue;
-        };
-        let Some(column) = relation
-            .columns
-            .iter()
-            .find(|column| &column.name == primary_key_column)
-        else {
-            continue;
-        };
-        if let Some(row) = pg_attribute_overlay_row(index_oid, attnum, column) {
-            state.overlay.insert(row);
-        }
-    }
-}
-
-fn delete_attribute_overlay_rows(state: &mut CatalogState, relation_oid: Oid, column_count: usize) {
-    for (_name, attnum, _type_oid) in SYSTEM_ATTRIBUTE_COLUMNS {
-        state.overlay.delete(
-            PG_ATTRIBUTE_RELATION_OID,
-            ((relation_oid.0 as u64) << 16) | u64::from(*attnum as u16),
-        );
-    }
-    for index in 0..column_count {
-        let Some(attnum) = i16::try_from(index + 1).ok() else {
-            continue;
-        };
-        state.overlay.delete(
-            PG_ATTRIBUTE_RELATION_OID,
-            ((relation_oid.0 as u64) << 16) | u64::from(attnum as u16),
-        );
-    }
-}
-
-fn insert_relation_overlay_rows(state: &mut CatalogState, relation: &RelationRecord) {
-    state
-        .overlay
-        .insert(pg_class_overlay_row(PgClassOverlayInput {
-            oid: relation.oid,
-            namespace: relation.namespace,
-            name: &relation.name,
-            reltype: relation.type_oid,
-            relkind: b'r',
-            relam: HEAP_TABLE_AM_OID,
-            column_count: relation.columns.len(),
-            has_index: !relation.primary_key.is_empty(),
-        }));
-    state.overlay.insert(pg_type_overlay_row(relation));
-    insert_relation_attribute_overlay_rows(state, relation);
-}
-
-fn delete_relation_overlay_rows(state: &mut CatalogState, relation: &RelationRecord) {
-    state
-        .overlay
-        .delete(PG_CLASS_RELATION_OID, relation.oid.0 as u64);
-    state
-        .overlay
-        .delete(PG_TYPE_RELATION_OID, relation.type_oid.0 as u64);
-    delete_attribute_overlay_rows(state, relation.oid, relation.columns.len());
-    if let Some(index_oid) = relation_primary_key_index_oid(relation) {
-        state
-            .overlay
-            .delete(PG_CLASS_RELATION_OID, index_oid.0 as u64);
-        state
-            .overlay
-            .delete(PG_INDEX_RELATION_OID, index_oid.0 as u64);
-        delete_attribute_overlay_rows(state, index_oid, relation.primary_key.len());
-        if let Some(constraint_oid) = relation.primary_key_constraint_oid {
-            state
-                .overlay
-                .delete(PG_CONSTRAINT_RELATION_OID, constraint_oid.0 as u64);
-        }
-    }
+    with_catalog_session(|session| {
+        ensure_catalog_transaction(session);
+        session
+            .transaction_stack
+            .last_mut()
+            .expect("catalog transaction was just ensured")
+            .delete(relation_oid, row_id);
+    });
+    Ok(())
 }
 
 fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
@@ -949,9 +875,30 @@ fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
         CatalogValue::Oid(oid) => Some(*oid),
         CatalogValue::Int32(value) => u32::try_from(*value).ok().map(Oid),
         CatalogValue::Int16(value) => u32::try_from(*value).ok().map(Oid),
-        CatalogValue::Raw(value) => value.parse::<u32>().ok().map(Oid),
+        CatalogValue::Raw(value) => resolve_generated_catalog_oid_name(value),
         _ => None,
     }
+}
+
+pub fn resolve_generated_catalog_oid_name(value: &str) -> Option<Oid> {
+    if value == "-" {
+        return Some(INVALID_OID);
+    }
+    if let Ok(oid) = value.parse::<u32>() {
+        return Some(Oid(oid));
+    }
+    let name = normalize_identifier(value);
+    generated_catalog::STATIC_PROCS
+        .iter()
+        .find(|record| record.name == name)
+        .map(|record| record.oid)
+        .or_else(|| {
+            generated_catalog::STATIC_TYPES
+                .iter()
+                .find(|record| record.name == name)
+                .map(|record| record.oid)
+        })
+        .or_else(|| static_catalog_by_name(&name).map(|table| table.oid))
 }
 
 fn catalog_value_bool(value: &CatalogValue) -> Option<bool> {
@@ -1018,185 +965,6 @@ fn static_btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
     })
 }
 
-fn pg_index_overlay_row(
-    relation: &RelationRecord,
-    index_oid: Oid,
-    key_attnums: Vec<i16>,
-) -> Result<CatalogRow, CatalogError> {
-    let mut collations = Vec::with_capacity(key_attnums.len());
-    let mut opclasses = Vec::with_capacity(key_attnums.len());
-    for attnum in &key_attnums {
-        let column = relation
-            .columns
-            .get((*attnum as usize).saturating_sub(1))
-            .ok_or_else(|| CatalogError::new("42703", "primary key column does not exist"))?;
-        let type_record = lookup_type(column.type_oid).ok_or_else(|| {
-            CatalogError::new(
-                "42704",
-                format!("type OID {} does not exist", column.type_oid.0),
-            )
-        })?;
-        let opclass = static_btree_opclass_for_type(column.type_oid).ok_or_else(|| {
-            CatalogError::new(
-                "0A000",
-                format!(
-                    "fastpg does not have a btree opclass for type OID {}",
-                    column.type_oid.0
-                ),
-            )
-        })?;
-        collations.push(type_record.typcollation);
-        opclasses.push(opclass);
-    }
-    let key_count = key_attnums.len().min(i16::MAX as usize) as i16;
-    Ok(catalog_row_from_named_values(
-        PG_INDEX_RELATION_OID,
-        index_oid.0 as u64,
-        vec![
-            ("indexrelid", CatalogValue::Oid(index_oid)),
-            ("indrelid", CatalogValue::Oid(relation.oid)),
-            ("indnatts", CatalogValue::Int16(key_count)),
-            ("indnkeyatts", CatalogValue::Int16(key_count)),
-            ("indisunique", CatalogValue::Bool(true)),
-            ("indnullsnotdistinct", CatalogValue::Bool(false)),
-            ("indisprimary", CatalogValue::Bool(true)),
-            ("indisexclusion", CatalogValue::Bool(false)),
-            ("indimmediate", CatalogValue::Bool(true)),
-            ("indisclustered", CatalogValue::Bool(false)),
-            ("indisvalid", CatalogValue::Bool(true)),
-            ("indcheckxmin", CatalogValue::Bool(false)),
-            ("indisready", CatalogValue::Bool(true)),
-            ("indislive", CatalogValue::Bool(true)),
-            ("indisreplident", CatalogValue::Bool(false)),
-            ("indkey", CatalogValue::Int2Vector(key_attnums)),
-            ("indcollation", CatalogValue::OidVector(collations)),
-            ("indclass", CatalogValue::OidVector(opclasses)),
-            (
-                "indoption",
-                CatalogValue::Int2Vector(vec![0; key_count as usize]),
-            ),
-        ],
-    ))
-}
-
-fn pg_constraint_overlay_row(
-    relation: &RelationRecord,
-    constraint_oid: Oid,
-    index_oid: Oid,
-    key_attnums: Vec<i16>,
-) -> CatalogRow {
-    catalog_row_from_named_values(
-        PG_CONSTRAINT_RELATION_OID,
-        constraint_oid.0 as u64,
-        vec![
-            ("oid", CatalogValue::Oid(constraint_oid)),
-            (
-                "conname",
-                CatalogValue::Name(primary_key_index_name(relation)),
-            ),
-            ("connamespace", CatalogValue::Oid(relation.namespace)),
-            ("contype", CatalogValue::Char(b'p')),
-            ("condeferrable", CatalogValue::Bool(false)),
-            ("condeferred", CatalogValue::Bool(false)),
-            ("conenforced", CatalogValue::Bool(true)),
-            ("convalidated", CatalogValue::Bool(true)),
-            ("conrelid", CatalogValue::Oid(relation.oid)),
-            ("contypid", CatalogValue::Oid(INVALID_OID)),
-            ("conindid", CatalogValue::Oid(index_oid)),
-            ("conparentid", CatalogValue::Oid(INVALID_OID)),
-            ("confrelid", CatalogValue::Oid(INVALID_OID)),
-            ("confupdtype", CatalogValue::Char(b' ')),
-            ("confdeltype", CatalogValue::Char(b' ')),
-            ("confmatchtype", CatalogValue::Char(b' ')),
-            ("conislocal", CatalogValue::Bool(true)),
-            ("coninhcount", CatalogValue::Int16(0)),
-            ("connoinherit", CatalogValue::Bool(true)),
-            ("conperiod", CatalogValue::Bool(false)),
-            ("conkey", CatalogValue::Int2Vector(key_attnums)),
-        ],
-    )
-}
-
-fn insert_primary_key_overlay_rows(
-    state: &mut CatalogState,
-    relation: &RelationRecord,
-    key_attnums: Vec<i16>,
-) -> Result<(), CatalogError> {
-    let Some(index_oid) = relation_primary_key_index_oid(relation) else {
-        return Ok(());
-    };
-    state
-        .overlay
-        .insert(pg_class_overlay_row(PgClassOverlayInput {
-            oid: relation.oid,
-            namespace: relation.namespace,
-            name: &relation.name,
-            reltype: relation.type_oid,
-            relkind: b'r',
-            relam: HEAP_TABLE_AM_OID,
-            column_count: relation.columns.len(),
-            has_index: true,
-        }));
-    state
-        .overlay
-        .insert(pg_class_overlay_row(PgClassOverlayInput {
-            oid: index_oid,
-            namespace: relation.namespace,
-            name: &primary_key_index_name(relation),
-            reltype: INVALID_OID,
-            relkind: b'i',
-            relam: BTREE_INDEX_AM_OID,
-            column_count: key_attnums.len(),
-            has_index: false,
-        }));
-    state.overlay.insert(pg_index_overlay_row(
-        relation,
-        index_oid,
-        key_attnums.clone(),
-    )?);
-    insert_index_attribute_overlay_rows(state, relation, index_oid);
-    if let Some(constraint_oid) = relation.primary_key_constraint_oid {
-        state.overlay.insert(pg_constraint_overlay_row(
-            relation,
-            constraint_oid,
-            index_oid,
-            key_attnums,
-        ));
-    }
-    Ok(())
-}
-
-fn next_relation_oid(state: &mut CatalogState) -> Result<Oid, CatalogError> {
-    let oid = state.next_relation_oid;
-    if oid == 0 {
-        return Err(CatalogError::new(
-            "54000",
-            "fastpg relation OID space is exhausted",
-        ));
-    }
-    state.next_relation_oid = state
-        .next_relation_oid
-        .checked_add(1)
-        .ok_or_else(|| CatalogError::new("54000", "fastpg relation OID space is exhausted"))?;
-    state.next_object_oid = state.next_object_oid.max(state.next_relation_oid);
-    Ok(Oid(oid))
-}
-
-fn next_object_oid(state: &mut CatalogState) -> Result<Oid, CatalogError> {
-    let oid = state.next_object_oid;
-    if oid == 0 {
-        return Err(CatalogError::new(
-            "54000",
-            "fastpg object OID space is exhausted",
-        ));
-    }
-    state.next_object_oid = state
-        .next_object_oid
-        .checked_add(1)
-        .ok_or_else(|| CatalogError::new("54000", "fastpg object OID space is exhausted"))?;
-    Ok(Oid(oid))
-}
-
 fn bump_generation(state: &mut CatalogState) {
     state.generation = state.generation.saturating_add(1).max(1);
 }
@@ -1205,96 +973,224 @@ pub fn current_generation() -> u64 {
     with_catalog_read(|state| state.generation)
 }
 
-pub fn create_relation(
-    name: &str,
-    columns: Vec<ColumnRecord>,
-    if_not_exists: bool,
-) -> Result<Option<RelationRecord>, CatalogError> {
-    let name = normalize_identifier(name);
-    if name.is_empty() {
-        return Err(CatalogError::new("42602", "relation name cannot be empty"));
-    }
-    if columns.iter().any(|column| column.name.is_empty()) {
-        return Err(CatalogError::new("42602", "column name cannot be empty"));
-    }
+fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    catalog_rows(table.oid).into_iter().find(|row| {
+        catalog_row_value(table, row, "oid")
+            .and_then(catalog_value_oid)
+            .is_some_and(|row_oid| row_oid == oid)
+    })
+}
 
-    with_catalog(|state| {
-        if state.relations_by_name.contains_key(&name) {
-            if if_not_exists {
-                return Ok(None);
+fn catalog_value_int2_vector(value: &CatalogValue) -> Option<Vec<i16>> {
+    match value {
+        CatalogValue::Int2Vector(values) => Some(values.clone()),
+        CatalogValue::Raw(value) | CatalogValue::Text(value) | CatalogValue::Name(value) => {
+            Some(parse_int2_vector(value))
+        }
+        _ => None,
+    }
+}
+
+fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
+    let Some(table) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID) else {
+        return Vec::new();
+    };
+    let mut columns = catalog_rows(table.oid)
+        .into_iter()
+        .filter_map(|row| {
+            let attrelid =
+                catalog_row_value(table, &row, "attrelid").and_then(catalog_value_oid)?;
+            if attrelid != relation_oid {
+                return None;
             }
-            return Err(CatalogError::new(
-                "42P07",
-                format!("relation \"{name}\" already exists"),
-            ));
-        }
+            let attnum = catalog_row_value(table, &row, "attnum").and_then(catalog_value_i16)?;
+            if attnum <= 0 {
+                return None;
+            }
+            let attisdropped = catalog_row_value(table, &row, "attisdropped")
+                .and_then(catalog_value_bool)
+                .unwrap_or(false);
+            if attisdropped {
+                return None;
+            }
+            let name = catalog_row_value(table, &row, "attname").and_then(catalog_value_string)?;
+            let type_oid =
+                catalog_row_value(table, &row, "atttypid").and_then(catalog_value_oid)?;
+            let type_mod = catalog_row_value(table, &row, "atttypmod")
+                .and_then(catalog_value_i32)
+                .unwrap_or(-1);
+            let is_not_null = catalog_row_value(table, &row, "attnotnull")
+                .and_then(catalog_value_bool)
+                .unwrap_or(false);
+            Some((
+                attnum,
+                ColumnRecord {
+                    name: normalize_identifier(&name),
+                    type_oid,
+                    type_mod,
+                    is_not_null,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    columns.sort_by_key(|(attnum, _)| *attnum);
+    columns.into_iter().map(|(_, column)| column).collect()
+}
 
-        let relation_oid = next_relation_oid(state)?;
-        let type_oid = next_object_oid(state)?;
-        let relation = RelationRecord {
-            oid: relation_oid,
-            type_oid,
-            namespace: PUBLIC_NAMESPACE_OID,
-            name: name.clone(),
-            columns,
-            primary_key: Vec::new(),
-            primary_key_constraint_oid: None,
-        };
-        insert_relation_overlay_rows(state, &relation);
-        state
-            .relation_names_by_oid
-            .insert(relation.oid.0, name.clone());
-        state.relations_by_name.insert(name, relation.clone());
-        bump_generation(state);
-        Ok(Some(relation))
+fn primary_key_pg_index_row(relation_oid: Oid) -> Option<CatalogRow> {
+    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
+    catalog_rows(table.oid).into_iter().find(|row| {
+        let indrelid = catalog_row_value(table, row, "indrelid").and_then(catalog_value_oid);
+        let is_primary = catalog_row_value(table, row, "indisprimary")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+        indrelid == Some(relation_oid) && is_primary
     })
 }
 
-pub fn drop_relation(name: &str, missing_ok: bool) -> Result<Option<RelationRecord>, CatalogError> {
-    let name = normalize_identifier(name);
-    with_catalog(|state| match state.relations_by_name.remove(&name) {
-        Some(relation) => {
-            delete_relation_overlay_rows(state, &relation);
-            state.relation_names_by_oid.remove(&relation.oid.0);
-            bump_generation(state);
-            Ok(Some(relation))
+pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> {
+    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
+    let row = primary_key_pg_index_row(relation_oid)?;
+    catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid)
+}
+
+pub fn primary_key_relation_oid_for_index_oid(index_oid: Oid) -> Option<Oid> {
+    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        let row_index_oid =
+            catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid)?;
+        if row_index_oid != index_oid {
+            return None;
         }
-        None if missing_ok => Ok(None),
-        None => Err(CatalogError::new(
-            "42P01",
-            format!("relation \"{name}\" does not exist"),
-        )),
+        let is_primary = catalog_row_value(table, &row, "indisprimary")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+        if !is_primary {
+            return None;
+        }
+        catalog_row_value(table, &row, "indrelid").and_then(catalog_value_oid)
     })
 }
 
-pub fn truncate_relation(name: &str) -> Result<RelationRecord, CatalogError> {
-    let name = normalize_identifier(name);
-    with_catalog(|state| {
-        let relation = state.relations_by_name.get(&name).cloned().ok_or_else(|| {
-            CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
-        })?;
-        bump_generation(state);
-        Ok(relation)
+fn primary_key_constraint_oid_for_relation(
+    relation_oid: Oid,
+    index_oid: Option<Oid>,
+) -> Option<Oid> {
+    let table = static_catalog_by_relation_oid(PG_CONSTRAINT_RELATION_OID)?;
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        let conrelid = catalog_row_value(table, &row, "conrelid").and_then(catalog_value_oid)?;
+        if conrelid != relation_oid {
+            return None;
+        }
+        let contype = catalog_row_value(table, &row, "contype").and_then(catalog_value_u8)?;
+        if contype != b'p' {
+            return None;
+        }
+        if let Some(index_oid) = index_oid {
+            let conindid = catalog_row_value(table, &row, "conindid").and_then(catalog_value_oid);
+            if conindid.is_some_and(|conindid| conindid != index_oid) {
+                return None;
+            }
+        }
+        catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)
+    })
+}
+
+fn relation_primary_key_from_pg_index(
+    relation_oid: Oid,
+    columns: &[ColumnRecord],
+) -> (Vec<String>, Option<Oid>) {
+    let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
+        return (Vec::new(), None);
+    };
+    let Some(row) = primary_key_pg_index_row(relation_oid) else {
+        return (
+            Vec::new(),
+            primary_key_constraint_oid_for_relation(relation_oid, None),
+        );
+    };
+    let index_oid = catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid);
+    let indkey = catalog_row_value(table, &row, "indkey")
+        .and_then(catalog_value_int2_vector)
+        .unwrap_or_default();
+    let primary_key = indkey
+        .into_iter()
+        .filter_map(|attnum| {
+            if attnum <= 0 {
+                return None;
+            }
+            columns
+                .get(usize::try_from(attnum - 1).ok()?)
+                .map(|column| column.name.clone())
+        })
+        .collect::<Vec<_>>();
+    let constraint_oid = primary_key_constraint_oid_for_relation(relation_oid, index_oid);
+    (primary_key, constraint_oid)
+}
+
+fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord> {
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let type_oid = catalog_row_value(table, row, "reltype")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
+    let namespace = catalog_row_value(table, row, "relnamespace")
+        .and_then(catalog_value_oid)
+        .unwrap_or(PUBLIC_NAMESPACE_OID);
+    let name = catalog_row_value(table, row, "relname").and_then(catalog_value_string)?;
+    let relkind = catalog_row_value(table, row, "relkind")
+        .and_then(catalog_value_u8)
+        .unwrap_or(b'r');
+    let columns = relation_columns_from_pg_attribute(oid);
+    let (primary_key, primary_key_constraint_oid) =
+        relation_primary_key_from_pg_index(oid, &columns);
+    Some(RelationRecord {
+        oid,
+        type_oid,
+        namespace,
+        name: normalize_identifier(&name),
+        relkind,
+        columns,
+        primary_key,
+        primary_key_constraint_oid,
     })
 }
 
 pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
     let name = normalize_identifier(name);
-    with_catalog_read(|state| state.relations_by_name.get(&name).cloned())
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    let mut matches = catalog_rows(table.oid)
+        .into_iter()
+        .filter_map(|row| {
+            let row_name =
+                catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
+            if normalize_identifier(&row_name) != name {
+                return None;
+            }
+            relation_record_from_pg_class_row(&row)
+        })
+        .collect::<Vec<_>>();
+    matches.sort_by_key(|relation| match relation.namespace {
+        PUBLIC_NAMESPACE_OID => 0,
+        PG_CATALOG_NAMESPACE_OID => 1,
+        _ => 2,
+    });
+    matches.into_iter().next()
 }
 
 pub fn relations() -> Vec<RelationRecord> {
-    with_catalog_read(|state| state.relations_by_name.values().cloned().collect())
+    let Some(table) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID) else {
+        return Vec::new();
+    };
+    catalog_rows(table.oid)
+        .into_iter()
+        .filter_map(|row| relation_record_from_pg_class_row(&row))
+        .collect()
 }
 
 pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
-    with_catalog_read(|state| {
-        state
-            .relation_names_by_oid
-            .get(&oid.0)
-            .and_then(|name| state.relations_by_name.get(name))
-            .cloned()
-    })
+    relation_pg_class_row_by_oid(oid).and_then(|row| relation_record_from_pg_class_row(&row))
 }
 
 pub fn relation_column_count(name: &str) -> Result<usize, CatalogError> {
@@ -1306,584 +1202,6 @@ pub fn relation_column_count(name: &str) -> Result<usize, CatalogError> {
                 format!("relation \"{}\" does not exist", normalize_identifier(name)),
             )
         })
-}
-
-pub fn add_primary_key(name: &str, columns: Vec<String>) -> Result<(), CatalogError> {
-    let name = normalize_identifier(name);
-    let columns = columns
-        .into_iter()
-        .map(|column| normalize_identifier(&column))
-        .collect::<Vec<_>>();
-    if columns.is_empty() {
-        return Err(CatalogError::new(
-            "42602",
-            "primary key must include at least one column",
-        ));
-    }
-
-    with_catalog(|state| {
-        let key_attnums = {
-            let relation = state.relations_by_name.get(&name).ok_or_else(|| {
-                CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
-            })?;
-            relation_column_attnums(relation, &columns)?
-        };
-        let constraint_oid = state
-            .relations_by_name
-            .get(&name)
-            .and_then(|relation| relation.primary_key_constraint_oid)
-            .map(Ok)
-            .unwrap_or_else(|| next_object_oid(state))?;
-        let relation_snapshot = {
-            let relation = state.relations_by_name.get_mut(&name).ok_or_else(|| {
-                CatalogError::new("42P01", format!("relation \"{name}\" does not exist"))
-            })?;
-            for column in &mut relation.columns {
-                if columns
-                    .iter()
-                    .any(|primary_key_column| primary_key_column == &column.name)
-                {
-                    column.is_not_null = true;
-                }
-            }
-            relation.primary_key = columns;
-            relation.primary_key_constraint_oid = Some(constraint_oid);
-            relation.clone()
-        };
-        insert_relation_attribute_overlay_rows(state, &relation_snapshot);
-        insert_primary_key_overlay_rows(state, &relation_snapshot, key_attnums)?;
-        bump_generation(state);
-        Ok(())
-    })
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateTypeColumn {
-    pub name: String,
-    pub type_oid: Oid,
-    pub type_mod: i32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum CreateTypeKind {
-    Shell,
-    Base,
-    Composite { columns: Vec<CreateTypeColumn> },
-    Enum { labels: Vec<String> },
-    Range { subtype: Oid, collation: Oid },
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct CreateFunctionSpec {
-    pub name: String,
-    pub return_type: Oid,
-    pub arg_types: Vec<Oid>,
-    pub language: Oid,
-    pub strict: bool,
-    pub leakproof: bool,
-    pub returns_set: bool,
-    pub volatility: u8,
-    pub parallel: u8,
-    pub source: String,
-}
-
-fn pg_type_row_for_created_type(input: CreatedTypeInput<'_>) -> CatalogRow {
-    catalog_row_from_named_values(
-        PG_TYPE_RELATION_OID,
-        input.oid.0 as u64,
-        vec![
-            ("oid", CatalogValue::Oid(input.oid)),
-            ("typname", CatalogValue::Name(input.name.to_owned())),
-            ("typnamespace", CatalogValue::Oid(input.namespace)),
-            ("typowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
-            ("typlen", CatalogValue::Int16(input.typlen)),
-            ("typbyval", CatalogValue::Bool(input.typbyval)),
-            ("typtype", CatalogValue::Char(input.typtype)),
-            ("typcategory", CatalogValue::Char(input.typcategory)),
-            ("typispreferred", CatalogValue::Bool(false)),
-            ("typisdefined", CatalogValue::Bool(input.typisdefined)),
-            ("typdelim", CatalogValue::Char(b',')),
-            ("typrelid", CatalogValue::Oid(input.typrelid)),
-            ("typsubscript", CatalogValue::Oid(input.typsubscript)),
-            ("typelem", CatalogValue::Oid(input.typelem)),
-            ("typarray", CatalogValue::Oid(input.typarray)),
-            ("typinput", CatalogValue::Oid(input.typinput)),
-            ("typoutput", CatalogValue::Oid(input.typoutput)),
-            ("typreceive", CatalogValue::Oid(input.typreceive)),
-            ("typsend", CatalogValue::Oid(input.typsend)),
-            ("typmodin", CatalogValue::Oid(INVALID_OID)),
-            ("typmodout", CatalogValue::Oid(INVALID_OID)),
-            ("typanalyze", CatalogValue::Oid(INVALID_OID)),
-            ("typalign", CatalogValue::Char(input.typalign)),
-            ("typstorage", CatalogValue::Char(input.typstorage)),
-            ("typnotnull", CatalogValue::Bool(false)),
-            ("typbasetype", CatalogValue::Oid(input.typbasetype)),
-            ("typtypmod", CatalogValue::Int32(-1)),
-            ("typndims", CatalogValue::Int32(0)),
-            ("typcollation", CatalogValue::Oid(input.typcollation)),
-        ],
-    )
-}
-
-struct CreatedTypeInput<'a> {
-    oid: Oid,
-    namespace: Oid,
-    name: &'a str,
-    typlen: i16,
-    typbyval: bool,
-    typtype: u8,
-    typcategory: u8,
-    typisdefined: bool,
-    typrelid: Oid,
-    typelem: Oid,
-    typarray: Oid,
-    typbasetype: Oid,
-    typcollation: Oid,
-    typsubscript: Oid,
-    typinput: Oid,
-    typoutput: Oid,
-    typreceive: Oid,
-    typsend: Oid,
-    typalign: u8,
-    typstorage: u8,
-}
-
-fn pg_array_type_row(type_oid: Oid, array_oid: Oid, namespace: Oid, name: &str) -> CatalogRow {
-    pg_type_row_for_created_type(CreatedTypeInput {
-        oid: array_oid,
-        namespace,
-        name,
-        typlen: -1,
-        typbyval: false,
-        typtype: b'b',
-        typcategory: b'A',
-        typisdefined: true,
-        typrelid: INVALID_OID,
-        typelem: type_oid,
-        typarray: INVALID_OID,
-        typbasetype: INVALID_OID,
-        typcollation: INVALID_OID,
-        typsubscript: ARRAY_SUBSCRIPT_HANDLER_PROC_OID,
-        typinput: ARRAY_IN_PROC_OID,
-        typoutput: ARRAY_OUT_PROC_OID,
-        typreceive: ARRAY_RECV_PROC_OID,
-        typsend: ARRAY_SEND_PROC_OID,
-        typalign: b'd',
-        typstorage: b'x',
-    })
-}
-
-fn pg_enum_row(enum_oid: Oid, type_oid: Oid, label: &str, sort_order: f32) -> CatalogRow {
-    let relation_oid = catalog_relation_oid("pg_enum").expect("generated pg_enum catalog");
-    catalog_row_from_named_values(
-        relation_oid,
-        enum_oid.0 as u64,
-        vec![
-            ("oid", CatalogValue::Oid(enum_oid)),
-            ("enumtypid", CatalogValue::Oid(type_oid)),
-            ("enumsortorder", CatalogValue::Float32(sort_order)),
-            ("enumlabel", CatalogValue::Name(label.to_owned())),
-        ],
-    )
-}
-
-fn pg_range_row(range_oid: Oid, subtype: Oid, collation: Oid) -> CatalogRow {
-    let relation_oid = catalog_relation_oid("pg_range").expect("generated pg_range catalog");
-    let subtype_opclass = static_btree_opclass_for_type(subtype).unwrap_or(INVALID_OID);
-    catalog_row_from_named_values(
-        relation_oid,
-        range_oid.0 as u64,
-        vec![
-            ("rngtypid", CatalogValue::Oid(range_oid)),
-            ("rngsubtype", CatalogValue::Oid(subtype)),
-            ("rngmultitypid", CatalogValue::Oid(INVALID_OID)),
-            ("rngcollation", CatalogValue::Oid(collation)),
-            ("rngsubopc", CatalogValue::Oid(subtype_opclass)),
-            ("rngcanonical", CatalogValue::Oid(INVALID_OID)),
-            ("rngsubdiff", CatalogValue::Oid(INVALID_OID)),
-        ],
-    )
-}
-
-fn insert_array_type_row(
-    state: &mut CatalogState,
-    type_oid: Oid,
-    namespace: Oid,
-    name: &str,
-) -> Result<Oid, CatalogError> {
-    let array_name = format!("_{name}");
-    if overlay_type_by_name(state, &array_name, namespace).is_some() {
-        return Ok(INVALID_OID);
-    }
-    let array_oid = next_object_oid(state)?;
-    state.overlay.insert(pg_array_type_row(
-        type_oid,
-        array_oid,
-        namespace,
-        &array_name,
-    ));
-    Ok(array_oid)
-}
-
-pub fn create_type(name: &str, kind: CreateTypeKind) -> Result<Oid, CatalogError> {
-    let name = normalize_identifier(name);
-    if name.is_empty() {
-        return Err(CatalogError::new("42602", "type name cannot be empty"));
-    }
-
-    with_catalog(|state| {
-        let namespace = PUBLIC_NAMESPACE_OID;
-        let existing = overlay_type_by_name(state, &name, namespace);
-        if let Some(existing) = existing.as_ref().filter(|record| record.typisdefined) {
-            return Ok(existing.oid);
-        }
-
-        let type_oid = existing
-            .as_ref()
-            .map(|record| record.oid)
-            .map(Ok)
-            .unwrap_or_else(|| next_object_oid(state))?;
-        let array_oid = match kind {
-            CreateTypeKind::Shell => INVALID_OID,
-            _ => insert_array_type_row(state, type_oid, namespace, &name)?,
-        };
-
-        match kind {
-            CreateTypeKind::Shell => {
-                state
-                    .overlay
-                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
-                        oid: type_oid,
-                        namespace,
-                        name: &name,
-                        typlen: -1,
-                        typbyval: false,
-                        typtype: b'p',
-                        typcategory: b'P',
-                        typisdefined: false,
-                        typrelid: INVALID_OID,
-                        typelem: INVALID_OID,
-                        typarray: INVALID_OID,
-                        typbasetype: INVALID_OID,
-                        typcollation: INVALID_OID,
-                        typsubscript: INVALID_OID,
-                        typinput: INVALID_OID,
-                        typoutput: INVALID_OID,
-                        typreceive: INVALID_OID,
-                        typsend: INVALID_OID,
-                        typalign: b'i',
-                        typstorage: b'x',
-                    }));
-            }
-            CreateTypeKind::Base => {
-                state
-                    .overlay
-                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
-                        oid: type_oid,
-                        namespace,
-                        name: &name,
-                        typlen: -1,
-                        typbyval: false,
-                        typtype: b'b',
-                        typcategory: b'U',
-                        typisdefined: true,
-                        typrelid: INVALID_OID,
-                        typelem: INVALID_OID,
-                        typarray: array_oid,
-                        typbasetype: INVALID_OID,
-                        typcollation: INVALID_OID,
-                        typsubscript: INVALID_OID,
-                        typinput: INVALID_OID,
-                        typoutput: INVALID_OID,
-                        typreceive: INVALID_OID,
-                        typsend: INVALID_OID,
-                        typalign: b'i',
-                        typstorage: b'x',
-                    }));
-            }
-            CreateTypeKind::Enum { labels } => {
-                state
-                    .overlay
-                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
-                        oid: type_oid,
-                        namespace,
-                        name: &name,
-                        typlen: 4,
-                        typbyval: true,
-                        typtype: b'e',
-                        typcategory: b'E',
-                        typisdefined: true,
-                        typrelid: INVALID_OID,
-                        typelem: INVALID_OID,
-                        typarray: array_oid,
-                        typbasetype: INVALID_OID,
-                        typcollation: INVALID_OID,
-                        typsubscript: INVALID_OID,
-                        typinput: INVALID_OID,
-                        typoutput: INVALID_OID,
-                        typreceive: INVALID_OID,
-                        typsend: INVALID_OID,
-                        typalign: b'i',
-                        typstorage: b'p',
-                    }));
-                for (index, label) in labels.iter().enumerate() {
-                    let enum_oid = next_object_oid(state)?;
-                    state.overlay.insert(pg_enum_row(
-                        enum_oid,
-                        type_oid,
-                        label,
-                        (index + 1) as f32,
-                    ));
-                }
-            }
-            CreateTypeKind::Range { subtype, collation } => {
-                if !type_oid_exists_in_state(state, subtype) {
-                    return Err(CatalogError::new(
-                        "42704",
-                        format!("range subtype OID {} does not exist", subtype.0),
-                    ));
-                }
-                state
-                    .overlay
-                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
-                        oid: type_oid,
-                        namespace,
-                        name: &name,
-                        typlen: -1,
-                        typbyval: false,
-                        typtype: b'r',
-                        typcategory: b'R',
-                        typisdefined: true,
-                        typrelid: INVALID_OID,
-                        typelem: INVALID_OID,
-                        typarray: array_oid,
-                        typbasetype: INVALID_OID,
-                        typcollation: collation,
-                        typsubscript: INVALID_OID,
-                        typinput: INVALID_OID,
-                        typoutput: INVALID_OID,
-                        typreceive: INVALID_OID,
-                        typsend: INVALID_OID,
-                        typalign: b'd',
-                        typstorage: b'x',
-                    }));
-                state
-                    .overlay
-                    .insert(pg_range_row(type_oid, subtype, collation));
-            }
-            CreateTypeKind::Composite { columns } => {
-                for column in &columns {
-                    if !type_oid_exists_in_state(state, column.type_oid) {
-                        return Err(CatalogError::new(
-                            "42704",
-                            format!("type OID {} does not exist", column.type_oid.0),
-                        ));
-                    }
-                }
-                let relation_oid = next_relation_oid(state)?;
-                let relation = RelationRecord {
-                    oid: relation_oid,
-                    type_oid,
-                    namespace,
-                    name: name.clone(),
-                    columns: columns
-                        .into_iter()
-                        .map(|column| ColumnRecord {
-                            name: normalize_identifier(&column.name),
-                            type_oid: column.type_oid,
-                            type_mod: column.type_mod,
-                            is_not_null: false,
-                        })
-                        .collect(),
-                    primary_key: Vec::new(),
-                    primary_key_constraint_oid: None,
-                };
-                state
-                    .overlay
-                    .insert(pg_class_overlay_row(PgClassOverlayInput {
-                        oid: relation.oid,
-                        namespace: relation.namespace,
-                        name: &relation.name,
-                        reltype: relation.type_oid,
-                        relkind: b'c',
-                        relam: HEAP_TABLE_AM_OID,
-                        column_count: relation.columns.len(),
-                        has_index: false,
-                    }));
-                state
-                    .overlay
-                    .insert(pg_type_row_for_created_type(CreatedTypeInput {
-                        oid: type_oid,
-                        namespace,
-                        name: &name,
-                        typlen: -1,
-                        typbyval: false,
-                        typtype: b'c',
-                        typcategory: b'C',
-                        typisdefined: true,
-                        typrelid: relation_oid,
-                        typelem: INVALID_OID,
-                        typarray: array_oid,
-                        typbasetype: INVALID_OID,
-                        typcollation: INVALID_OID,
-                        typsubscript: INVALID_OID,
-                        typinput: INVALID_OID,
-                        typoutput: INVALID_OID,
-                        typreceive: INVALID_OID,
-                        typsend: INVALID_OID,
-                        typalign: b'd',
-                        typstorage: b'x',
-                    }));
-                insert_relation_attribute_overlay_rows(state, &relation);
-                state
-                    .relation_names_by_oid
-                    .insert(relation.oid.0, name.clone());
-                state.relations_by_name.insert(name.clone(), relation);
-            }
-        }
-        bump_generation(state);
-        Ok(type_oid)
-    })
-}
-
-fn pg_proc_row(oid: Oid, spec: &CreateFunctionSpec) -> CatalogRow {
-    catalog_row_from_named_values(
-        PG_PROC_RELATION_OID,
-        oid.0 as u64,
-        vec![
-            ("oid", CatalogValue::Oid(oid)),
-            (
-                "proname",
-                CatalogValue::Name(normalize_identifier(&spec.name)),
-            ),
-            ("pronamespace", CatalogValue::Oid(PUBLIC_NAMESPACE_OID)),
-            ("proowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
-            ("prolang", CatalogValue::Oid(spec.language)),
-            ("procost", CatalogValue::Float32(1.0)),
-            ("prorows", CatalogValue::Float32(0.0)),
-            ("provariadic", CatalogValue::Oid(INVALID_OID)),
-            ("prosupport", CatalogValue::Oid(INVALID_OID)),
-            ("prokind", CatalogValue::Char(b'f')),
-            ("prosecdef", CatalogValue::Bool(false)),
-            ("proleakproof", CatalogValue::Bool(spec.leakproof)),
-            ("proisstrict", CatalogValue::Bool(spec.strict)),
-            ("proretset", CatalogValue::Bool(spec.returns_set)),
-            ("provolatile", CatalogValue::Char(spec.volatility)),
-            ("proparallel", CatalogValue::Char(spec.parallel)),
-            (
-                "pronargs",
-                CatalogValue::Int16(spec.arg_types.len().min(i16::MAX as usize) as i16),
-            ),
-            ("pronargdefaults", CatalogValue::Int16(0)),
-            ("prorettype", CatalogValue::Oid(spec.return_type)),
-            (
-                "proargtypes",
-                CatalogValue::OidVector(spec.arg_types.clone()),
-            ),
-            ("prosrc", CatalogValue::Text(spec.source.clone())),
-        ],
-    )
-}
-
-pub fn create_function(spec: CreateFunctionSpec) -> Result<Oid, CatalogError> {
-    let name = normalize_identifier(&spec.name);
-    if name.is_empty() {
-        return Err(CatalogError::new("42602", "function name cannot be empty"));
-    }
-    if lookup_type(spec.return_type).is_none() {
-        return Err(CatalogError::new(
-            "42704",
-            format!("return type OID {} does not exist", spec.return_type.0),
-        ));
-    }
-    for arg_type in &spec.arg_types {
-        if lookup_type(*arg_type).is_none() {
-            return Err(CatalogError::new(
-                "42704",
-                format!("argument type OID {} does not exist", arg_type.0),
-            ));
-        }
-    }
-
-    with_catalog(|state| {
-        let oid = next_object_oid(state)?;
-        state.overlay.insert(pg_proc_row(oid, &spec));
-        bump_generation(state);
-        Ok(oid)
-    })
-}
-
-fn access_method_oid_by_name(name: &str) -> Option<Oid> {
-    let table = static_catalog_by_name("pg_am")?;
-    let name = normalize_identifier(name);
-    catalog_rows(table.oid).into_iter().find_map(|row| {
-        let amname = catalog_row_value(table, &row, "amname").and_then(catalog_value_string)?;
-        let oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
-        (amname == name).then_some(oid)
-    })
-}
-
-pub fn create_opclass(
-    name: &str,
-    method_name: &str,
-    input_type: Oid,
-    is_default: bool,
-) -> Result<Oid, CatalogError> {
-    let name = normalize_identifier(name);
-    if lookup_type(input_type).is_none() {
-        return Err(CatalogError::new(
-            "42704",
-            format!(
-                "operator class input type OID {} does not exist",
-                input_type.0
-            ),
-        ));
-    }
-    let method_oid = access_method_oid_by_name(method_name).ok_or_else(|| {
-        CatalogError::new(
-            "42704",
-            format!(
-                "access method \"{}\" does not exist",
-                normalize_identifier(method_name)
-            ),
-        )
-    })?;
-    with_catalog(|state| {
-        let opfamily_oid = next_object_oid(state)?;
-        let opclass_oid = next_object_oid(state)?;
-        let opfamily_relation_oid =
-            catalog_relation_oid("pg_opfamily").expect("generated pg_opfamily catalog");
-        let opclass_relation_oid =
-            catalog_relation_oid("pg_opclass").expect("generated pg_opclass catalog");
-        state.overlay.insert(catalog_row_from_named_values(
-            opfamily_relation_oid,
-            opfamily_oid.0 as u64,
-            vec![
-                ("oid", CatalogValue::Oid(opfamily_oid)),
-                ("opfmethod", CatalogValue::Oid(method_oid)),
-                ("opfname", CatalogValue::Name(name.clone())),
-                ("opfnamespace", CatalogValue::Oid(PUBLIC_NAMESPACE_OID)),
-                ("opfowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
-            ],
-        ));
-        state.overlay.insert(catalog_row_from_named_values(
-            opclass_relation_oid,
-            opclass_oid.0 as u64,
-            vec![
-                ("oid", CatalogValue::Oid(opclass_oid)),
-                ("opcmethod", CatalogValue::Oid(method_oid)),
-                ("opcname", CatalogValue::Name(name)),
-                ("opcnamespace", CatalogValue::Oid(PUBLIC_NAMESPACE_OID)),
-                ("opcowner", CatalogValue::Oid(BOOTSTRAP_SUPERUSER_OID)),
-                ("opcfamily", CatalogValue::Oid(opfamily_oid)),
-                ("opcintype", CatalogValue::Oid(input_type)),
-                ("opcdefault", CatalogValue::Bool(is_default)),
-                ("opckeytype", CatalogValue::Oid(INVALID_OID)),
-            ],
-        ));
-        bump_generation(state);
-        Ok(opclass_oid)
-    })
 }
 
 #[cfg(test)]
@@ -2046,64 +1364,29 @@ fn canonical_catalog_type_name(name: &str) -> String {
     }
 }
 
-fn overlay_type_by_oid(state: &CatalogState, oid: Oid) -> Option<CatalogTypeRecord> {
-    let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
-    state
-        .overlay
-        .rows
-        .get(&PG_TYPE_RELATION_OID.0)?
-        .get(&(oid.0 as u64))
-        .and_then(|row| catalog_type_from_row(table, row))
-}
-
-fn type_oid_exists_in_state(state: &CatalogState, oid: Oid) -> bool {
-    lookup_builtin_type(oid).is_some() || overlay_type_by_oid(state, oid).is_some()
-}
-
-fn overlay_type_by_name(
-    state: &CatalogState,
-    name: &str,
-    namespace: Oid,
-) -> Option<CatalogTypeRecord> {
-    let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
-    state
-        .overlay
-        .rows
-        .get(&PG_TYPE_RELATION_OID.0)?
-        .values()
-        .find_map(|row| {
-            let record = catalog_type_from_row(table, row)?;
-            (record.namespace == namespace && record.name == name).then_some(record)
-        })
-}
-
 pub fn lookup_type(oid: Oid) -> Option<CatalogTypeRecord> {
-    lookup_builtin_type(oid)
-        .map(CatalogTypeRecord::from)
-        .or_else(|| {
-            with_catalog_read(|state| {
-                state
-                    .overlay
-                    .tombstones
-                    .get(&PG_TYPE_RELATION_OID.0)
-                    .is_none_or(|tombstones| !tombstones.contains(&(oid.0 as u64)))
-                    .then(|| overlay_type_by_oid(state, oid))
-                    .flatten()
-            })
+    if let Some(record) = lookup_builtin_type(oid) {
+        return Some(record.into());
+    }
+
+    let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
+    catalog_rows(PG_TYPE_RELATION_OID)
+        .into_iter()
+        .find_map(|row| {
+            let record = catalog_type_from_row(table, &row)?;
+            (record.oid == oid).then_some(record)
         })
 }
 
 pub fn type_by_name(name: &str, namespace: Oid) -> Option<CatalogTypeRecord> {
     let canonical_name = canonical_catalog_type_name(name);
-    if namespace == PG_CATALOG_NAMESPACE_OID
-        && let Some(record) = generated_catalog::STATIC_TYPES
-            .iter()
-            .copied()
-            .find(|record| record.name == canonical_name)
-    {
-        return Some(record.into());
-    }
-    with_catalog_read(|state| overlay_type_by_name(state, &canonical_name, namespace))
+    let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
+    catalog_rows(PG_TYPE_RELATION_OID)
+        .into_iter()
+        .find_map(|row| {
+            let record = catalog_type_from_row(table, &row)?;
+            (record.namespace == namespace && record.name == canonical_name).then_some(record)
+        })
 }
 
 pub fn builtin_type_by_name(name: &str, namespace: Oid) -> Option<PgTypeRecord> {
@@ -2195,6 +1478,7 @@ mod generated_catalog {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
 
     #[test]
     fn has_pgbench_scalar_types() {
@@ -2274,6 +1558,20 @@ mod tests {
         }
     }
 
+    fn upsert_named_catalog_row(table_name: &str, row_id: u64, values: &[(&str, &str)]) -> u64 {
+        let table = static_catalog_by_name(table_name).expect("catalog table");
+        let values = values
+            .iter()
+            .map(|(column, value)| (*column, (*value).to_owned()))
+            .collect::<BTreeMap<_, _>>();
+        let row = table
+            .columns
+            .iter()
+            .map(|column| values.get(column.name).cloned())
+            .collect::<Vec<_>>();
+        upsert_catalog_row(table.oid, row_id, row).expect("upsert catalog row")
+    }
+
     #[test]
     fn generated_static_catalog_has_core_rows() {
         assert!(static_catalog_by_name("pg_type").is_some());
@@ -2315,12 +1613,16 @@ mod tests {
             ("pg_attribute", VirtualCatalogPolicy::Dynamic),
             ("pg_index", VirtualCatalogPolicy::Dynamic),
             ("pg_constraint", VirtualCatalogPolicy::Dynamic),
-            ("pg_statistic", VirtualCatalogPolicy::Empty),
-            ("pg_statistic_ext", VirtualCatalogPolicy::Empty),
-            ("pg_statistic_ext_data", VirtualCatalogPolicy::Empty),
-            ("pg_authid", VirtualCatalogPolicy::Empty),
-            ("pg_auth_members", VirtualCatalogPolicy::Empty),
-            ("pg_parameter_acl", VirtualCatalogPolicy::Empty),
+            ("pg_am", VirtualCatalogPolicy::Static),
+            ("pg_opfamily", VirtualCatalogPolicy::Static),
+            ("pg_amop", VirtualCatalogPolicy::Static),
+            ("pg_amproc", VirtualCatalogPolicy::Static),
+            ("pg_statistic", VirtualCatalogPolicy::Static),
+            ("pg_statistic_ext", VirtualCatalogPolicy::Static),
+            ("pg_statistic_ext_data", VirtualCatalogPolicy::Static),
+            ("pg_authid", VirtualCatalogPolicy::Static),
+            ("pg_auth_members", VirtualCatalogPolicy::Static),
+            ("pg_parameter_acl", VirtualCatalogPolicy::Static),
         ];
 
         for (name, policy) in required {
@@ -2333,28 +1635,89 @@ mod tests {
     }
 
     #[test]
-    fn creates_drops_and_truncates_relations() {
+    fn generic_overlay_rows_drive_relation_views() {
         clear_for_tests();
+        abort_implicit_transaction();
+        let relation_oid = Oid(50_000);
+        let type_oid = Oid(50_001);
+        let index_oid = Oid(50_002);
+        let constraint_oid = Oid(50_003);
         let initial_generation = current_generation();
-        let relation = create_relation(
-            "PgBench_Accounts",
-            vec![
-                ColumnRecord::new("aid", INT4_OID, -1, true),
-                ColumnRecord::new("filler", BPCHAR_OID, -1, false),
-            ],
-            false,
-        )
-        .unwrap()
-        .expect("created");
 
+        upsert_named_catalog_row(
+            "pg_class",
+            relation_oid.0 as u64,
+            &[
+                ("oid", "50000"),
+                ("relname", "pgbench_accounts"),
+                ("relnamespace", "2200"),
+                ("reltype", "50001"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", "50000"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_type",
+            type_oid.0 as u64,
+            &[
+                ("oid", "50001"),
+                ("typname", "pgbench_accounts"),
+                ("typnamespace", "2200"),
+                ("typowner", "10"),
+                ("typlen", "-1"),
+                ("typbyval", "f"),
+                ("typtype", "c"),
+                ("typcategory", "C"),
+                ("typisdefined", "t"),
+                ("typdelim", ","),
+                ("typrelid", "50000"),
+                ("typalign", "d"),
+                ("typstorage", "x"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50000"),
+                ("attname", "aid"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "t"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50000"),
+                ("attname", "filler"),
+                ("atttypid", "1042"),
+                ("attlen", "-1"),
+                ("attnum", "2"),
+                ("atttypmod", "-1"),
+                ("attbyval", "f"),
+                ("attalign", "i"),
+                ("attstorage", "x"),
+                ("attnotnull", "f"),
+                ("attisdropped", "f"),
+            ],
+        );
+        commit_implicit_transaction();
         assert!(current_generation() > initial_generation);
         let after_create_generation = current_generation();
-        assert!(
-            create_relation("pgbench_accounts", Vec::new(), true)
-                .unwrap()
-                .is_none()
-        );
-        assert_eq!(current_generation(), after_create_generation);
+        let relation = relation_by_name("PgBench_Accounts").expect("relation");
         assert_eq!(relation.name, "pgbench_accounts");
         assert_eq!(relation.columns[0].name, "aid");
         assert_eq!(
@@ -2365,15 +1728,89 @@ mod tests {
             relation_by_oid(relation.oid).unwrap().name,
             "pgbench_accounts"
         );
-        assert_eq!(
-            truncate_relation("pgbench_accounts").unwrap().oid,
-            relation.oid
+        upsert_named_catalog_row(
+            "pg_class",
+            relation_oid.0 as u64,
+            &[
+                ("oid", "50000"),
+                ("relname", "pgbench_accounts"),
+                ("relnamespace", "2200"),
+                ("reltype", "50001"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", "50000"),
+                ("relhasindex", "t"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "2"),
+            ],
         );
-        let after_truncate_generation = current_generation();
-        assert!(after_truncate_generation > after_create_generation);
-        add_primary_key("pgbench_accounts", vec!["aid".to_owned()]).unwrap();
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", "50002"),
+                ("relname", "pgbench_accounts_pkey"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "403"),
+                ("relfilenode", "50002"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50002"),
+                ("attname", "aid"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "t"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", "50002"),
+                ("indrelid", "50000"),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "t"),
+                ("indisprimary", "t"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_constraint",
+            constraint_oid.0 as u64,
+            &[
+                ("oid", "50003"),
+                ("conname", "pgbench_accounts_pkey"),
+                ("connamespace", "2200"),
+                ("contype", "p"),
+                ("conrelid", "50000"),
+                ("conindid", "50002"),
+                ("conkey", "1"),
+            ],
+        );
+        commit_implicit_transaction();
         let after_primary_key_generation = current_generation();
-        assert!(after_primary_key_generation > after_truncate_generation);
+        assert!(after_primary_key_generation > after_create_generation);
         assert_eq!(
             relation_by_name("pgbench_accounts").unwrap().primary_key,
             vec!["aid"]
@@ -2396,13 +1833,8 @@ mod tests {
                 && value_name(row_value("pg_constraint", row, "conname"))
                     == Some("pgbench_accounts_pkey")
         }));
-        assert_eq!(
-            drop_relation("pgbench_accounts", false)
-                .unwrap()
-                .unwrap()
-                .oid,
-            relation.oid
-        );
+        delete_catalog_row(PG_CLASS_RELATION_OID, relation.oid.0 as u64).unwrap();
+        commit_implicit_transaction();
         assert!(current_generation() > after_primary_key_generation);
         assert!(relation_by_name("pgbench_accounts").is_none());
         assert!(!catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {

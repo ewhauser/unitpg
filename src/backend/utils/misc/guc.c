@@ -2152,6 +2152,11 @@ NewGUCNestLevel(void)
 void
 RestrictSearchPath(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && guc_hashtab == NULL)
+		return;
+#endif
+
 	if (!IsBootstrapProcessingMode())
 		set_config_option("search_path", GUC_SAFE_SEARCH_PATH, PGC_USERSET,
 						  PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);

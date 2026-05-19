@@ -238,6 +238,7 @@ fn tokenize_bki_values(values: &str) -> Vec<String> {
     let mut token = String::new();
     let mut chars = values.chars().peekable();
     let mut in_quote = false;
+    let mut token_started = false;
 
     while let Some(ch) = chars.next() {
         if in_quote {
@@ -256,16 +257,23 @@ fn tokenize_bki_values(values: &str) -> Vec<String> {
         }
 
         match ch {
-            '\'' => in_quote = true,
+            '\'' => {
+                token_started = true;
+                in_quote = true;
+            }
             ch if ch.is_whitespace() => {
-                if !token.is_empty() {
+                if token_started {
                     tokens.push(std::mem::take(&mut token));
+                    token_started = false;
                 }
             }
-            _ => token.push(ch),
+            _ => {
+                token_started = true;
+                token.push(ch);
+            }
         }
     }
-    if !token.is_empty() {
+    if token_started {
         tokens.push(token);
     }
     tokens
@@ -528,7 +536,7 @@ fn emit_raw_tables(
                 .and_then(|value| value.as_ref())
                 .and_then(|value| parse_catalog_oid(value))
                 .map(u64::from)
-                .unwrap_or_else(|| ((table.oid as u64) << 32) | (index as u64 + 1));
+                .unwrap_or(index as u64 + 1);
             out.push_str("            StaticCatalogRow {\n");
             out.push_str(&format!("                row_id: {row_id},\n"));
             out.push_str("                values: &[\n");
@@ -556,13 +564,8 @@ fn emit_raw_tables(
             "pg_class" | "pg_attribute" | "pg_index" | "pg_constraint" | "pg_type"
         ) {
             "VirtualCatalogPolicy::Dynamic"
-        } else if matches!(
-            table.name.as_str(),
-            "pg_proc" | "pg_aggregate" | "pg_namespace" | "pg_operator" | "pg_cast" | "pg_opclass"
-        ) {
-            "VirtualCatalogPolicy::Static"
         } else {
-            "VirtualCatalogPolicy::Empty"
+            "VirtualCatalogPolicy::Static"
         };
         out.push_str(&format!(
             "    VirtualCatalogRecord {{ relation_oid: Oid({}), name: \"{}\", policy: {policy} }},\n",

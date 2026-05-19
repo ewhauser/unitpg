@@ -43,6 +43,9 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_database_d.h"
 #include "commands/vacuum.h"
+#ifdef USE_FASTPG
+#include "executor/tuptable.h"
+#endif
 #include "executor/instrument_node.h"
 #include "pgstat.h"
 #include "port/pg_bitutils.h"
@@ -1434,7 +1437,7 @@ heap_endscan(TableScanDesc sscan)
 HeapTuple
 heap_getnext(TableScanDesc sscan, ScanDirection direction)
 {
-	HeapScanDesc scan = (HeapScanDesc) sscan;
+	HeapScanDesc scan;
 
 	/*
 	 * This is still widely used directly, without going through table AM, so
@@ -1444,9 +1447,35 @@ heap_getnext(TableScanDesc sscan, ScanDirection direction)
 	 * that create another AM reusing the heap handler.
 	 */
 	if (unlikely(sscan->rs_rd->rd_tableam != GetHeapamTableAmRoutine()))
+	{
+#ifdef USE_FASTPG
+		TupleTableSlot *slot;
+		HeapTuple	slot_tuple;
+		HeapTuple	result;
+		bool		should_free = false;
+
+		slot = table_slot_create(sscan->rs_rd, NULL);
+		if (!table_scan_getnextslot(sscan, direction, slot))
+		{
+			ExecDropSingleTupleTableSlot(slot);
+			return NULL;
+		}
+
+		slot_tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
+		result = heap_copytuple(slot_tuple);
+		ItemPointerCopy(&slot->tts_tid, &result->t_self);
+		if (should_free)
+			heap_freetuple(slot_tuple);
+		ExecDropSingleTupleTableSlot(slot);
+		return result;
+#else
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg_internal("only heap AM is supported")));
+#endif
+	}
+
+	scan = (HeapScanDesc) sscan;
 
 	/* Note: no locking manipulations needed */
 
