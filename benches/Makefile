@@ -57,7 +57,7 @@ PGBENCH_PROFILE_ARGS = \
 	--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" \
 	$(PROFILE_OPEN_FLAG)
 
-.PHONY: pgbench pgbench-tpcb profile profile-open profile-side-by-side profile-open-latest
+.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb profile profile-open profile-side-by-side profile-open-latest
 .PHONY: regression
 .PHONY: bench bench-smoke lint validate
 
@@ -65,6 +65,14 @@ pgbench:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "$(BUILTIN)" \
 		--init-steps "$(INIT_STEPS)" \
+		$(PGBENCH_COMMON_ARGS)
+
+pgbench-simple-indexed: RUST_BUILD_PROFILE = release
+pgbench-simple-indexed: RUST_PGCORE = full
+pgbench-simple-indexed:
+	$(PYTHON) pgbench_compare.py \
+		--builtin "simple-update" \
+		--init-steps "dtgp" \
 		$(PGBENCH_COMMON_ARGS)
 
 pgbench-tpcb: RUST_BUILD_PROFILE = release

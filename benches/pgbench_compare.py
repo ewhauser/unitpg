@@ -25,6 +25,7 @@ TPS_RE = re.compile(r"^tps =\s+([0-9.]+)\s+\(without initial connection time\)",
 LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
 SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
 HOTSPOT_RE = re.compile(r"^(.*) \((\d+) samples?, ([0-9.]+)%\)$")
+DEFAULT_PGBENCH_INIT_STEPS = "dtgvp"
 
 
 @dataclass(frozen=True)
@@ -100,6 +101,8 @@ class PgBenchCompare:
                 "profile_open": args.profile_open,
                 "profile_warmup_seconds": args.profile_warmup_seconds,
             },
+            "workload": workload_metadata(args.builtin, args.init_steps),
+            "warnings": workload_warnings(args.init_steps),
             "variants": {},
         }
 
@@ -1299,15 +1302,66 @@ def profile_records_by_variant(results: dict[str, Any]) -> dict[str, dict[str, A
     return records
 
 
+def effective_init_steps(init_steps: str | None) -> str:
+    if init_steps is None:
+        return DEFAULT_PGBENCH_INIT_STEPS
+    cleaned = init_steps.strip()
+    if cleaned == "" or cleaned == "default":
+        return DEFAULT_PGBENCH_INIT_STEPS
+    return cleaned
+
+
+def has_primary_key_init_step(init_steps: str | None) -> bool:
+    return "p" in effective_init_steps(init_steps)
+
+
+def workload_metadata(builtin: str, init_steps: str | None) -> dict[str, Any]:
+    indexed = has_primary_key_init_step(init_steps)
+    workload_name = "TPC-B-like" if builtin == "tpcb-like" else builtin
+    if indexed:
+        if builtin == "simple-update":
+            label = "pgbench indexed simple-update comparison"
+        elif builtin == "tpcb-like":
+            label = "pgbench indexed TPC-B-like comparison"
+        else:
+            label = f"pgbench indexed {workload_name} comparison"
+    else:
+        label = f"pgbench unindexed {workload_name} smoke"
+
+    return {
+        "label": label,
+        "effective_init_steps": effective_init_steps(init_steps),
+        "has_primary_key_indexes": indexed,
+    }
+
+
+def workload_warnings(init_steps: str | None) -> list[str]:
+    if has_primary_key_init_step(init_steps):
+        return []
+    effective = effective_init_steps(init_steps)
+    return [
+        f"init_steps={effective} does not create pgbench primary-key indexes (`p` step missing). "
+        "Treat this as an unindexed smoke path, not UPDATE performance evidence.",
+    ]
+
+
 def render_markdown(results: dict[str, Any], result_root: Path) -> str:
+    workload = results.get("workload", {})
+    title = workload.get("label", "pgbench comparison")
     lines = [
-        "# pgbench comparison",
+        f"# {title}",
         "",
         f"Status: `{results['status']}`",
         "",
-        "## Config",
-        "",
     ]
+    warnings = results.get("warnings", [])
+    if warnings:
+        lines.extend(["## Warnings", ""])
+        for warning in warnings:
+            lines.append(f"- {warning}")
+        lines.append("")
+
+    lines.extend(["## Config", ""])
     for key, value in results["config"].items():
         lines.append(f"- `{key}`: `{value}`")
     lines.extend(["", "## Variants", ""])

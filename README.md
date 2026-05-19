@@ -140,6 +140,12 @@ Run the TPC-B-like pgbench comparison against the Rust server:
 make -C benches pgbench-tpcb
 ```
 
+Run simple-update with pgbench primary-key indexes:
+
+```sh
+make -C benches pgbench-simple-indexed
+```
+
 Run the curated SQL regression comparison:
 
 ```sh
@@ -193,6 +199,11 @@ JSON plus Markdown summaries under `benches/results/`.
 ```sh
 make -C benches pgbench
 ```
+
+The default `pgbench` target is an unindexed simple-update smoke path
+(`INIT_STEPS=dtg`). Use `pgbench-simple-indexed` or `pgbench-tpcb` for indexed
+UPDATE performance comparisons. Generated summaries warn when the `p` init step
+is missing.
 
 To run the storage engine Criterion benchmarks:
 

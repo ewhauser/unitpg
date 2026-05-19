@@ -4,7 +4,7 @@
 
 The pgbench comparison harness lives under `benches/`.
 
-Run the default Rust-server comparison with:
+Run the default Rust-server smoke comparison with:
 
 ```sh
 make -C benches pgbench
@@ -39,7 +39,15 @@ RUST_PGCORE=full
 
 `INIT_STEPS=dtg` is intentional. pgbench built-in transaction scripts derive
 `:scale` from generated rows, so `dt` alone makes normal Postgres see scale `0`
-and abort before the workload starts.
+and abort before the workload starts. This default does not create pgbench
+primary-key indexes because the `p` init step is missing. Treat `make -C
+benches pgbench` as an unindexed smoke path, not as UPDATE performance evidence.
+
+To run the same simple-update workload with primary-key indexes:
+
+```sh
+make -C benches pgbench-simple-indexed
+```
 
 To run pgbench's fuller default initialization and TPC-B-like script against
 the full PostgreSQL parser/analyzer/rewriter/planner/executor facade:
@@ -48,10 +56,10 @@ the full PostgreSQL parser/analyzer/rewriter/planner/executor facade:
 make -C benches pgbench-tpcb
 ```
 
-The `pgbench` and `pgbench-tpcb` targets use `RUST_PGCORE=full`, build the Rust
-server in release mode, and link it against a `-Dfastpg=true` Postgres backend
-build so the guarded virtual catalog hooks are available. The default fastpg
-build includes the internal IPC guard.
+The `pgbench`, `pgbench-simple-indexed`, and `pgbench-tpcb` targets use
+`RUST_PGCORE=full`, build the Rust server in release mode, and link it against
+a `-Dfastpg=true` Postgres backend build so the guarded virtual catalog hooks
+are available. The default fastpg build includes the internal IPC guard.
 
 To temporarily run a quicker debug build:
 
@@ -116,7 +124,8 @@ fastpg failures as useful implementation targets and reports the failing phase:
 
 Current expected state: normal Postgres should pass the quick smoke run. The
 Rust-server target should also pass the simple-update smoke run with
-`INIT_STEPS=dtg`, while stricter pgbench paths remain implementation targets.
+`INIT_STEPS=dtg`. Use `pgbench-simple-indexed` or `pgbench-tpcb` for indexed
+UPDATE performance comparisons.
 
 Useful validation commands after harness edits:
 
@@ -124,6 +133,7 @@ Useful validation commands after harness edits:
 python3 -m py_compile benches/pgbench_compare.py
 python3 -m py_compile benches/open_latest_profile.py
 cargo test -p fastpg-storage
+make -C benches pgbench-simple-indexed
 make -C benches pgbench-tpcb
 make -C benches regression
 ```
