@@ -9,7 +9,7 @@ fn main() {
     println!("cargo:rerun-if-changed=c/pgcore_raw_parser.c");
     println!("cargo:rerun-if-env-changed=FASTPG_POSTGRES_BUILD_DIR");
 
-    if env::var_os("CARGO_FEATURE_POSTGRES_LINKED").is_none() {
+    if env::var_os("CARGO_FEATURE_POSTGRES_EXECUTION").is_none() {
         return;
     }
 

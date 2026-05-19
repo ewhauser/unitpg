@@ -1,11 +1,9 @@
 [workspace]
 members = [
-    "crates/fastpg-bind",
     "crates/fastpg-catalog",
     "crates/fastpg-compat",
     "crates/fastpg-exec",
     "crates/fastpg-index",
-    "crates/fastpg-parser",
     "crates/fastpg-pgcore",
     "crates/fastpg-plan",
     "crates/fastpg-server",
@@ -26,12 +24,10 @@ rust-version = "1.94"
 
 [workspace.dependencies]
 async-trait = "0.1"
-fastpg-bind = { path = "crates/fastpg-bind" }
 fastpg-catalog = { path = "crates/fastpg-catalog" }
 fastpg-compat = { path = "crates/fastpg-compat" }
 fastpg-exec = { path = "crates/fastpg-exec" }
 fastpg-index = { path = "crates/fastpg-index" }
-fastpg-parser = { path = "crates/fastpg-parser" }
 fastpg-pgcore = { path = "crates/fastpg-pgcore" }
 fastpg-plan = { path = "crates/fastpg-plan" }
 fastpg-server = { path = "crates/fastpg-server" }

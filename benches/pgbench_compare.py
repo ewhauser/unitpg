@@ -194,10 +194,8 @@ class PgBenchCompare:
                 "jobs": args.jobs,
                 "runs": args.runs,
                 "protocol": args.protocol,
-                "fastpg_engine": args.fastpg_engine,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
-                "rust_pgcore": args.rust_pgcore,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
                 "profile_normal_postgres": args.profile_normal_postgres,
                 "profile_tool": args.profile_tool,
@@ -218,7 +216,7 @@ class PgBenchCompare:
         print(f"results: {self.result_root}")
         for variant in (
             Variant("normal", False, "postgres"),
-            Variant("fastpg", True, self.args.fastpg_engine),
+            Variant("fastpg", True, "rust-server"),
         ):
             self.run_variant(variant)
 
@@ -323,15 +321,17 @@ class PgBenchCompare:
                 output_dir,
             )
 
-        build_command = ["cargo", "build", "-p", "fastpg-server"]
+        pgcore_build_dir = self.ensure_fastpg_pgcore_build(variant.name, output_dir)
+        build_command = [
+            "cargo",
+            "build",
+            "-p",
+            "fastpg-server",
+            "--features",
+            "postgres-execution",
+        ]
         build_env = os.environ.copy()
-        if self.args.rust_pgcore == "raw-parser":
-            build_command.extend(["--features", "postgres-linked"])
-            build_env["FASTPG_POSTGRES_BUILD_DIR"] = str(self.pgbench_client_paths["build_dir"])
-        elif self.args.rust_pgcore == "full":
-            pgcore_build_dir = self.ensure_fastpg_pgcore_build(variant.name, output_dir)
-            build_command.extend(["--features", "postgres-execution"])
-            build_env["FASTPG_POSTGRES_BUILD_DIR"] = str(pgcore_build_dir)
+        build_env["FASTPG_POSTGRES_BUILD_DIR"] = str(pgcore_build_dir)
         if self.args.rust_build_profile == "release":
             build_command.append("--release")
 
@@ -365,9 +365,8 @@ class PgBenchCompare:
             "client_prefix": self.pgbench_client_paths["prefix"],
             "client_bindir": self.pgbench_client_paths["bindir"],
             "client_libdir": self.pgbench_client_paths["libdir"],
+            "pgcore_build_dir": pgcore_build_dir,
         }
-        if self.args.rust_pgcore == "full":
-            paths["pgcore_build_dir"] = Path(build_env["FASTPG_POSTGRES_BUILD_DIR"])
         return paths
 
     def ensure_fastpg_pgcore_build(self, variant_name: str, output_dir: Path) -> Path:
@@ -1269,25 +1268,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--meson-buildtype",
         choices=["plain", "debug", "debugoptimized", "release", "minsize"],
         default="release",
-        help="Meson buildtype for normal/Postgres-wrapper variants and pgbench client binaries",
+        help="Meson buildtype for normal Postgres, pgbench client binaries, and linked pgcore",
     )
     parser.add_argument(
         "--rust-build-profile",
         choices=["debug", "release"],
         default="release",
-        help="Cargo build profile for the Rust server when --fastpg-engine=rust-server",
-    )
-    parser.add_argument(
-        "--rust-pgcore",
-        choices=["off", "raw-parser", "full"],
-        default="full",
-        help="Postgres C components to link into the Rust server",
-    )
-    parser.add_argument(
-        "--fastpg-engine",
-        choices=["rust-server", "postgres-wrapper"],
-        default="rust-server",
-        help="run fastpg as the Rust single-process server or as the Postgres tableam wrapper",
+        help="Cargo build profile for the Rust server",
     )
     parser.add_argument(
         "--profile-fastpg-rust-server",
@@ -1347,8 +1334,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
-    if args.profile_fastpg_rust_server and args.fastpg_engine != "rust-server":
-        parser.error("--profile-fastpg-rust-server requires --fastpg-engine=rust-server")
     if args.profile_normal_postgres and args.clients != 1:
         parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:

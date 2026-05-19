@@ -12,7 +12,6 @@ RUNS ?= 3
 PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
-RUST_PGCORE ?= full
 REGRESSION_SUITE ?= core
 REGRESSION_CASES_DIR ?=
 REGRESSION_ALLOW_FAILURES ?= 0
@@ -42,9 +41,7 @@ PGBENCH_COMMON_ARGS = \
 	--runs "$(RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
-	--fastpg-engine "rust-server" \
-	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
-	--rust-pgcore "$(RUST_PGCORE)"
+	--rust-build-profile "$(RUST_BUILD_PROFILE)"
 
 PGBENCH_PROFILE_ARGS = \
 	--scale "$(SCALE)" \
@@ -54,9 +51,7 @@ PGBENCH_PROFILE_ARGS = \
 	--runs "$(PROFILE_RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
-	--fastpg-engine "rust-server" \
 	--rust-build-profile "release" \
-	--rust-pgcore "$(RUST_PGCORE)" \
 	--profile-fastpg-rust-server \
 	--profile-tool "$(PROFILE_TOOL)" \
 	--profile-phase "$(PROFILE_PHASE)" \
@@ -78,7 +73,6 @@ pgbench:
 		$(PGBENCH_COMMON_ARGS)
 
 pgbench-simple-indexed: RUST_BUILD_PROFILE = release
-pgbench-simple-indexed: RUST_PGCORE = full
 pgbench-simple-indexed:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "simple-update" \
@@ -86,7 +80,6 @@ pgbench-simple-indexed:
 		$(PGBENCH_COMMON_ARGS)
 
 pgbench-tpcb: RUST_BUILD_PROFILE = release
-pgbench-tpcb: RUST_PGCORE = full
 pgbench-tpcb:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "tpcb-like" \
@@ -113,9 +106,7 @@ profile-side-by-side:
 		--runs "1" \
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--fastpg-engine "rust-server" \
 		--rust-build-profile "release" \
-		--rust-pgcore "full" \
 		--profile-normal-postgres \
 		--profile-fastpg-rust-server \
 		--profile-tool "$(PROFILE_TOOL)" \
@@ -136,7 +127,6 @@ regression:
 		$(REGRESSION_CASES_ARG) \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
 		--rust-build-profile "release" \
-		--rust-pgcore "full" \
 		$(REGRESSION_ALLOW_FAILURES_ARG)
 
 bench:

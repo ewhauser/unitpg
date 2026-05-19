@@ -1,10 +1,8 @@
-#![cfg(any(feature = "mini-sql-testkit", feature = "postgres-execution"))]
+#![cfg(feature = "postgres-execution")]
 
 use std::error::Error;
 
 use fastpg_testkit::TestServer;
-#[cfg(feature = "mini-sql-testkit")]
-use tokio_postgres::error::SqlState;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
 #[tokio::test]
@@ -27,27 +25,10 @@ async fn tokio_postgres_simple_query_smoke() -> Result<(), Box<dyn Error>> {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].get("count"), Some("0"));
 
-    #[cfg(feature = "mini-sql-testkit")]
-    {
-        let messages = client.simple_query("SHOW server_version").await?;
-        let rows = rows_only(&messages);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get("server_version"), Some("17.0-fastpg"));
-
-        let error = client
-            .simple_query("SELECT 2")
-            .await
-            .expect_err("unsupported SQL should return a Postgres-shaped error");
-        assert_eq!(error.code(), Some(&SqlState::FEATURE_NOT_SUPPORTED));
-    }
-
-    #[cfg(feature = "postgres-execution")]
-    {
-        let messages = client.simple_query("SELECT 2").await?;
-        let rows = rows_only(&messages);
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].get(0), Some("2"));
-    }
+    let messages = client.simple_query("SELECT 2").await?;
+    let rows = rows_only(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get(0), Some("2"));
 
     drop(client);
     connection_task.abort();
@@ -65,33 +46,13 @@ async fn tokio_postgres_extended_query_smoke() -> Result<(), Box<dyn Error>> {
     let value: i32 = row.get(0);
     assert_eq!(value, 1);
 
-    #[cfg(feature = "mini-sql-testkit")]
-    {
-        let row = client.query_one("SHOW server_version", &[]).await?;
-        let server_version: String = row.get("server_version");
-        assert_eq!(server_version, "17.0-fastpg");
+    let row = client.query_one("SELECT 2", &[]).await?;
+    let value: i32 = row.get(0);
+    assert_eq!(value, 2);
 
-        let row = client.query_one("SELECT $1::int4", &[&41i32]).await?;
-        let value: i32 = row.get(0);
-        assert_eq!(value, 41);
-
-        let error = client
-            .query_one("SELECT 2", &[])
-            .await
-            .expect_err("unsupported extended SQL should return a Postgres-shaped error");
-        assert_eq!(error.code(), Some(&SqlState::FEATURE_NOT_SUPPORTED));
-    }
-
-    #[cfg(feature = "postgres-execution")]
-    {
-        let row = client.query_one("SELECT 2", &[]).await?;
-        let value: i32 = row.get(0);
-        assert_eq!(value, 2);
-
-        let row = client.query_one("SELECT $1::int4", &[&41i32]).await?;
-        let value: i32 = row.get(0);
-        assert_eq!(value, 41);
-    }
+    let row = client.query_one("SELECT $1::int4", &[&41i32]).await?;
+    let value: i32 = row.get(0);
+    assert_eq!(value, 41);
 
     drop(client);
     connection_task.abort();
