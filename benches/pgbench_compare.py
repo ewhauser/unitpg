@@ -26,6 +26,17 @@ LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
 SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
 HOTSPOT_RE = re.compile(r"^(.*) \((\d+) samples?, ([0-9.]+)%\)$")
 DEFAULT_PGBENCH_INIT_STEPS = "dtgvp"
+PROFILE_COMPONENT_ORDER = [
+    "Socket / protocol",
+    "Parsing / analysis",
+    "Planning / rewrite",
+    "Execution",
+    "Storage / index AM",
+    "Catalog / metadata",
+    "Transactions / WAL",
+    "Runtime / memory",
+    "Other",
+]
 
 
 @dataclass(frozen=True)
@@ -1237,6 +1248,184 @@ def profile_hotspots(profile_path: Path, limit: int = 40) -> list[dict[str, Any]
     return sorted(by_name.values(), key=lambda value: value["percent"], reverse=True)[:limit]
 
 
+def profile_component(name: str) -> str:
+    lowered = name.lower()
+    if any(
+        token in lowered
+        for token in (
+            "socket",
+            "pgwire",
+            "protocol",
+            "readcommand",
+            "secure_read",
+            "secure_write",
+            "pq_get",
+            "pq_put",
+            "pq_recv",
+            "pq_send",
+            "internal_flush",
+            "printtup",
+            "destremote",
+            "tokio::net",
+            "mio::net",
+        )
+    ):
+        return "Socket / protocol"
+    if any(
+        token in lowered
+        for token in (
+            "raw_parser",
+            "base_yy",
+            "scanner_yy",
+            "pg_parse_query",
+            "parse_analyze",
+            "parse_analyze_",
+            "parse_fixed",
+            "parser",
+            "transform",
+            "analyze",
+            "settargettable",
+        )
+    ):
+        return "Parsing / analysis"
+    if any(
+        token in lowered
+        for token in (
+            "planner",
+            "pg_plan_queries",
+            "subquery_planner",
+            "grouping_planner",
+            "query_planner",
+            "preprocess_",
+            "make_one_rel",
+            "set_plan_refs",
+            "create_plan",
+            "create_index_paths",
+            "standard_qp_callback",
+            "set_rel_pathlist",
+            "add_base_rels",
+            "build_simple_rel",
+            "get_relation_info",
+            "get_index_paths",
+        )
+    ):
+        return "Planning / rewrite"
+    if any(
+        token in lowered
+        for token in (
+            "fastpg_catalog",
+            "catalog",
+            "catcache",
+            "relcache",
+            "syscache",
+            "pg_class",
+            "pg_attribute",
+            "pg_index",
+            "relation_by_oid",
+            "relation_record",
+            "relationidgetrelation",
+            "searchsyscache",
+            "builddesc",
+            "namespace",
+        )
+    ):
+        return "Catalog / metadata"
+    if any(
+        token in lowered
+        for token in (
+            "fastpg_mem",
+            "fastpg_storage",
+            "primary_key_index",
+            "index_getnext",
+            "index_beginscan",
+            "index_rescan",
+            "index_endscan",
+            "heap_",
+            "heapam",
+            "heapget",
+            "table_",
+            "tableam",
+            "bt",
+            "bufmgr",
+            "buffer",
+            "smgr",
+            "visibilitymap",
+            "toast",
+            "relation_insert",
+            "relation_update",
+            "relation_delete",
+            "relation_fetch",
+            "scan_begin",
+            "scan_next",
+            "scan_end",
+            "tuple_update",
+        )
+    ):
+        return "Storage / index AM"
+    if any(
+        token in lowered
+        for token in (
+            "xact",
+            "transaction",
+            "commit",
+            "rollback",
+            "abort",
+            "wal",
+            "xlog",
+            "clog",
+            "subtrans",
+            "lock",
+        )
+    ):
+        return "Transactions / WAL"
+    if any(
+        token in lowered
+        for token in (
+            "portalrun",
+            "processquery",
+            "executor",
+            "exec",
+            "modifytable",
+            "indexnext",
+            "seqnext",
+            "seqscan",
+            "tuplestore",
+            "projectset",
+            "slot",
+            "node",
+        )
+    ):
+        return "Execution"
+    if any(
+        token in lowered
+        for token in (
+            "alloc::",
+            "core::",
+            "std::",
+            "tokio::",
+            "hashbrown::",
+            "malloc",
+            "calloc",
+            "realloc",
+            "free",
+            "palloc",
+            "pfree",
+            "memcpy",
+            "memmove",
+            "bzero",
+        )
+    ):
+        return "Runtime / memory"
+    return "Other"
+
+
+def profile_hotspots_by_component(hotspots: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    grouped = {component: [] for component in PROFILE_COMPONENT_ORDER}
+    for hotspot in hotspots:
+        grouped[profile_component(str(hotspot["name"]))].append(hotspot)
+    return grouped
+
+
 def is_profile_noise(name: str) -> bool:
     if name in {"all", "main", "start", "<deduplicated_symbol>"}:
         return True
@@ -1405,11 +1594,30 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
             lines.append(f"- {variant_name} flamegraph: `{profile.get('path')}`")
         lines.append("")
         if all(name in profiles for name in ("normal", "fastpg")):
+            normal_hotspots = profiles["normal"].get("hotspots", [])
+            fastpg_hotspots = profiles["fastpg"].get("hotspots", [])
+            normal_components = profile_hotspots_by_component(normal_hotspots)
+            fastpg_components = profile_hotspots_by_component(fastpg_hotspots)
+
+            lines.extend(["### Component Hotspots", ""])
+            lines.append(
+                "Inclusive flamegraph percentages are not additive; each cell shows the top "
+                "captured frames in that component."
+            )
+            lines.append("")
+            lines.append("| component | normal Postgres | fastpg Rust server |")
+            lines.append("| --- | --- | --- |")
+            for component in PROFILE_COMPONENT_ORDER:
+                normal_cell = format_component_hotspot_cell(normal_components[component])
+                fastpg_cell = format_component_hotspot_cell(fastpg_components[component])
+                if component == "Other" and not normal_cell and not fastpg_cell:
+                    continue
+                lines.append(f"| {component} | {normal_cell} | {fastpg_cell} |")
+            lines.append("")
+
             lines.extend(["### Hotspot Comparison", ""])
             lines.append("| rank | normal Postgres | fastpg Rust server |")
             lines.append("| --- | --- | --- |")
-            normal_hotspots = profiles["normal"].get("hotspots", [])
-            fastpg_hotspots = profiles["fastpg"].get("hotspots", [])
             for index in range(min(12, max(len(normal_hotspots), len(fastpg_hotspots)))):
                 normal = format_hotspot_cell(normal_hotspots, index)
                 fastpg = format_hotspot_cell(fastpg_hotspots, index)
@@ -1455,6 +1663,12 @@ def format_hotspot_cell(hotspots: list[dict[str, Any]], index: int) -> str:
     return f"`{hotspot['name']}` {hotspot['percent']:.2f}%"
 
 
+def format_component_hotspot_cell(hotspots: list[dict[str, Any]], limit: int = 3) -> str:
+    if not hotspots:
+        return ""
+    return "<br>".join(format_hotspot_cell(hotspots, index) for index in range(min(limit, len(hotspots))))
+
+
 def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -> str:
     profiles = profile_records_by_variant(results)
     normal = profiles.get("normal")
@@ -1474,7 +1688,14 @@ def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -
     table {{ border-collapse: collapse; width: 100%; margin-top: 24px; }}
     th, td {{ border: 1px solid #ddd; padding: 6px 8px; vertical-align: top; }}
     th {{ text-align: left; background: #f6f6f6; }}
-    code {{ white-space: normal; }}
+    code {{ white-space: normal; overflow-wrap: anywhere; }}
+    .note {{ color: #555; line-height: 1.4; max-width: 960px; }}
+    .component-name {{ width: 180px; font-weight: 600; }}
+    .component-peak {{ color: #555; font-size: 12px; margin-bottom: 4px; }}
+    .frame-list {{ margin: 0 0 0 18px; padding: 0; }}
+    .frame-list li {{ margin: 4px 0; }}
+    .frame-meta {{ color: #555; white-space: nowrap; }}
+    .muted {{ color: #777; }}
   </style>
 </head>
 <body>
@@ -1489,6 +1710,7 @@ def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -
       {profile_object(fastpg_path)}
     </section>
   </div>
+  {render_component_table_html(normal, fastpg)}
   {render_hotspot_table_html(normal, fastpg)}
 </body>
 </html>
@@ -1508,6 +1730,66 @@ def profile_object(path: str | None) -> str:
     return f'<object data="{escaped}" type="image/svg+xml"><a href="{escaped}">{escaped}</a></object>'
 
 
+def render_component_table_html(
+    normal: dict[str, Any] | None,
+    fastpg: dict[str, Any] | None,
+) -> str:
+    normal_hotspots = normal.get("hotspots", []) if normal else []
+    fastpg_hotspots = fastpg.get("hotspots", []) if fastpg else []
+    normal_components = profile_hotspots_by_component(normal_hotspots)
+    fastpg_components = profile_hotspots_by_component(fastpg_hotspots)
+    rows = []
+    for component in PROFILE_COMPONENT_ORDER:
+        normal_component_hotspots = normal_components[component]
+        fastpg_component_hotspots = fastpg_components[component]
+        if component == "Other" and not normal_component_hotspots and not fastpg_component_hotspots:
+            continue
+        normal_cell = html_component_hotspots(normal_component_hotspots)
+        fastpg_cell = html_component_hotspots(fastpg_component_hotspots)
+        rows.append(
+            "<tr>"
+            f"<th class=\"component-name\" scope=\"row\">{html.escape(component)}</th>"
+            f"<td>{normal_cell}</td>"
+            f"<td>{fastpg_cell}</td>"
+            "</tr>"
+        )
+    if not rows:
+        return ""
+    return (
+        "<h2>Component view</h2>"
+        "<p class=\"note\">Inclusive flamegraph percentages are not additive; each cell shows "
+        "the top captured frames in that component, with the largest frame listed as the "
+        "component peak.</p>"
+        "<table class=\"component-table\"><thead><tr><th>component</th>"
+        "<th>normal Postgres</th><th>fastpg Rust server</th></tr></thead><tbody>"
+        + "\n".join(rows)
+        + "</tbody></table>"
+    )
+
+
+def html_component_hotspots(hotspots: list[dict[str, Any]], limit: int = 8) -> str:
+    if not hotspots:
+        return "<span class=\"muted\">No top frame captured.</span>"
+    peak = hotspots[0]
+    items = []
+    for hotspot in hotspots[:limit]:
+        name = html.escape(str(hotspot["name"]))
+        items.append(
+            "<li>"
+            f"<code>{name}</code> "
+            f"<span class=\"frame-meta\">{hotspot['percent']:.2f}% "
+            f"({hotspot['samples']} samples)</span>"
+            "</li>"
+        )
+    return (
+        f"<div class=\"component-peak\">component peak: {peak['percent']:.2f}% "
+        f"({peak['samples']} samples)</div>"
+        "<ol class=\"frame-list\">"
+        + "\n".join(items)
+        + "</ol>"
+    )
+
+
 def render_hotspot_table_html(
     normal: dict[str, Any] | None,
     fastpg: dict[str, Any] | None,
@@ -1524,7 +1806,7 @@ def render_hotspot_table_html(
             "</tr>"
         )
     return (
-        "<h2>Hot frames</h2>"
+        "<h2>Flat hot frames</h2>"
         "<table><thead><tr><th>rank</th><th>normal Postgres</th>"
         "<th>fastpg Rust server</th></tr></thead><tbody>"
         + "\n".join(rows)
