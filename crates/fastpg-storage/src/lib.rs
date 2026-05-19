@@ -4450,16 +4450,16 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
-    let row = with_storage(|_state, session| {
+    with_storage(|_state, session| {
         let scan = match session.scans.get_mut(&scan_handle) {
             Some(scan) => scan,
-            None => return None,
+            None => return false,
         };
 
         let row_count = scan.rows.len();
         let row_index = if forward != 0 {
             if scan.next_index >= row_count {
-                return None;
+                return false;
             }
             let row_index = scan.next_index;
             scan.next_index += 1;
@@ -4469,21 +4469,17 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
                 scan.next_index = row_count;
             }
             if scan.next_index == 0 {
-                return None;
+                return false;
             }
             scan.next_index -= 1;
             scan.next_index
         };
 
-        scan.rows.get(row_index).cloned()
-    });
-
-    match row {
-        Some(row) => unsafe {
-            copy_row_to_outputs(&row, values_out, is_null_out, natts, row_id_out)
-        },
-        None => false,
-    }
+        let Some(row) = scan.rows.get(row_index) else {
+            return false;
+        };
+        unsafe { copy_row_to_outputs(row, values_out, is_null_out, natts, row_id_out) }
+    })
 }
 
 #[unsafe(no_mangle)]
