@@ -1845,6 +1845,10 @@ pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
     relation_pg_class_row_by_oid(oid).and_then(|row| relation_record_from_pg_class_row(&row))
 }
 
+pub fn relation_oid_exists(oid: Oid) -> bool {
+    relation_pg_class_row_by_oid(oid).is_some()
+}
+
 pub fn relation_summary_by_oid(oid: Oid) -> Option<RelationSummaryRecord> {
     relation_pg_class_row_by_oid(oid).and_then(|row| relation_summary_from_pg_class_row(&row))
 }

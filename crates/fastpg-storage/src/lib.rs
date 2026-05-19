@@ -20,10 +20,11 @@ use fastpg_catalog::{
     index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
     primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
-    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_for_index_oid,
-    relation_summary_by_oid, static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
-    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
-    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_exists,
+    relation_oid_for_index_oid, relation_summary_by_oid, static_catalog_by_name,
+    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
+    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -2659,6 +2660,11 @@ pub extern "C" fn fastpg_rust_catalog_policy_by_relation_oid(relation_oid: u32) 
     virtual_catalog_by_relation_oid(Oid(relation_oid))
         .map(|record| record.policy.code())
         .unwrap_or(0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_catalog_relation_exists_by_oid(oid: u32) -> bool {
+    relation_oid_exists(Oid(oid)) || virtual_catalog_by_relation_oid(Oid(oid)).is_some()
 }
 
 #[unsafe(no_mangle)]

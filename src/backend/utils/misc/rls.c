@@ -66,13 +66,8 @@ check_enable_rls(Oid relid, Oid checkAsUser, bool noError)
 		return RLS_NONE;
 
 #ifdef USE_FASTPG
-	{
-		FastPgRustCatalogRelation fastpg_relation;
-
-		if (fastpg_rust_catalog_relation_by_oid((uint32_t) relid,
-												&fastpg_relation))
-			return RLS_NONE;
-	}
+	if (fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relid))
+		return RLS_NONE;
 #endif
 
 	/* Fetch relation's relrowsecurity and relforcerowsecurity flags */
