@@ -44,11 +44,13 @@ pub const DEFAULT_COLLATION_OID: Oid = Oid(100);
 pub const C_COLLATION_OID: Oid = Oid(950);
 
 const INVALID_OID: Oid = Oid(0);
+const POSTGRES_ROLE_OID: Oid = Oid(10);
 pub const PG_CATALOG_NAMESPACE_OID: Oid = Oid(11);
 pub const PUBLIC_NAMESPACE_OID: Oid = Oid(2200);
 const PG_CLASS_RELATION_OID: Oid = Oid(1259);
 const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
 const PG_TYPE_RELATION_OID: Oid = Oid(1247);
+const PG_PROC_RELATION_OID: Oid = Oid(1255);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
@@ -264,6 +266,8 @@ pub struct ColumnRecord {
     pub type_oid: Oid,
     pub type_mod: i32,
     pub is_not_null: bool,
+    pub has_default: bool,
+    pub generated: u8,
 }
 
 impl ColumnRecord {
@@ -273,6 +277,8 @@ impl ColumnRecord {
             type_oid,
             type_mod,
             is_not_null,
+            has_default: false,
+            generated: 0,
         }
     }
 }
@@ -282,11 +288,26 @@ pub struct RelationRecord {
     pub oid: Oid,
     pub type_oid: Oid,
     pub namespace: Oid,
+    pub owner: Oid,
     pub name: String,
     pub relkind: u8,
     pub columns: Vec<ColumnRecord>,
     pub primary_key: Vec<String>,
     pub primary_key_constraint_oid: Option<Oid>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct IndexRecord {
+    pub index_oid: Oid,
+    pub relation_oid: Oid,
+    pub key_attnums: Vec<i16>,
+    pub is_unique: bool,
+    pub nulls_not_distinct: bool,
+    pub is_primary: bool,
+    pub is_immediate: bool,
+    pub is_valid: bool,
+    pub is_ready: bool,
+    pub is_live: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -653,6 +674,46 @@ fn parse_int2_vector(value: &str) -> Vec<i16> {
         .collect()
 }
 
+fn parse_pg_array_elements(value: &str) -> Option<Vec<Option<String>>> {
+    let inner = value.strip_prefix('{')?.strip_suffix('}')?;
+    let mut elements = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut saw_quote = false;
+    for ch in inner.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if quoted => escaped = true,
+            '"' => {
+                quoted = !quoted;
+                saw_quote = true;
+            }
+            ',' if !quoted => {
+                if !saw_quote && current == "NULL" {
+                    elements.push(None);
+                } else {
+                    elements.push(Some(std::mem::take(&mut current)));
+                }
+                saw_quote = false;
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !saw_quote && current == "NULL" {
+        elements.push(None);
+    } else if inner.is_empty() {
+        return Some(Vec::new());
+    } else {
+        elements.push(Some(current));
+    }
+    Some(elements)
+}
+
 fn static_value_to_catalog_value(
     column: &StaticCatalogColumn,
     value: StaticCatalogValue,
@@ -681,17 +742,167 @@ fn static_value_to_catalog_value(
     }
 }
 
+fn oid_vector_value(value: &CatalogValue) -> Option<Vec<Oid>> {
+    match value {
+        CatalogValue::OidVector(values) => Some(values.clone()),
+        CatalogValue::Raw(value) | CatalogValue::Text(value) | CatalogValue::Name(value) => {
+            Some(parse_oid_vector(value))
+        }
+        _ => None,
+    }
+}
+
+fn constvalue_bytes_for_default(type_oid: Oid, default: &str) -> Option<Vec<u8>> {
+    match type_oid {
+        BOOL_OID => Some(vec![u8::from(matches!(default, "t" | "true" | "1"))]),
+        INT2_OID => default
+            .parse::<i16>()
+            .ok()
+            .map(|value| value.to_ne_bytes().to_vec()),
+        INT4_OID => default
+            .parse::<i32>()
+            .ok()
+            .map(|value| value.to_ne_bytes().to_vec()),
+        INT8_OID => default
+            .parse::<i64>()
+            .ok()
+            .map(|value| value.to_ne_bytes().to_vec()),
+        OID_OID | REGCLASS_OID => default
+            .parse::<u32>()
+            .ok()
+            .map(|value| value.to_ne_bytes().to_vec()),
+        FLOAT4_OID => default
+            .parse::<f32>()
+            .ok()
+            .map(|value| value.to_ne_bytes().to_vec()),
+        FLOAT8_OID => default
+            .parse::<f64>()
+            .ok()
+            .map(|value| value.to_ne_bytes().to_vec()),
+        TEXT_OID | VARCHAR_OID | BPCHAR_OID | NAME_OID => {
+            let mut bytes = Vec::with_capacity(4 + default.len());
+            let total_len = 4 + default.len();
+            bytes.extend_from_slice(&((total_len as u32) << 2).to_ne_bytes());
+            bytes.extend_from_slice(default.as_bytes());
+            Some(bytes)
+        }
+        _ => None,
+    }
+}
+
+fn const_node_for_default(type_oid: Oid, default: Option<&str>) -> Option<String> {
+    let type_record = lookup_builtin_type(type_oid)?;
+    let is_null = default.is_none();
+    let constvalue = if let Some(default) = default {
+        let mut bytes = constvalue_bytes_for_default(type_oid, default)?;
+        if type_record.typbyval {
+            bytes.resize(8, 0);
+        }
+        let bytes = bytes
+            .iter()
+            .map(|byte| (*byte as i8).to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{} [ {bytes} ]", type_record.typlen)
+    } else {
+        "<>".to_owned()
+    };
+    Some(format!(
+        "{{CONST :consttype {} :consttypmod -1 :constcollid {} :constlen {} :constbyval {} :constisnull {} :location -1 :constvalue {}}}",
+        type_oid.0,
+        type_record.typcollation.0,
+        type_record.typlen,
+        if type_record.typbyval {
+            "true"
+        } else {
+            "false"
+        },
+        if is_null { "true" } else { "false" },
+        constvalue
+    ))
+}
+
+fn normalize_pg_proc_bootstrap_defaults(table: &StaticCatalogTable, values: &mut [CatalogValue]) {
+    if table.oid != PG_PROC_RELATION_OID {
+        return;
+    }
+    let Some(pronargs_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "pronargs")
+    else {
+        return;
+    };
+    let Some(pronargdefaults_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "pronargdefaults")
+    else {
+        return;
+    };
+    let Some(proargtypes_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "proargtypes")
+    else {
+        return;
+    };
+    let Some(proargdefaults_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "proargdefaults")
+    else {
+        return;
+    };
+    let Some(defaults_text) = values
+        .get(proargdefaults_index)
+        .and_then(catalog_value_string)
+    else {
+        return;
+    };
+    if !defaults_text.starts_with('{') {
+        return;
+    }
+    let Some(defaults) = parse_pg_array_elements(&defaults_text) else {
+        return;
+    };
+    let Some(pronargs) = values.get(pronargs_index).and_then(catalog_value_i16) else {
+        return;
+    };
+    let Some(arg_types) = values.get(proargtypes_index).and_then(oid_vector_value) else {
+        return;
+    };
+    let pronargs = usize::from(u16::try_from(pronargs).unwrap_or(0));
+    if defaults.len() > pronargs || arg_types.len() < pronargs {
+        return;
+    }
+    let default_arg_types = &arg_types[pronargs - defaults.len()..pronargs];
+    let Some(nodes) = default_arg_types
+        .iter()
+        .zip(defaults.iter())
+        .map(|(type_oid, default)| const_node_for_default(*type_oid, default.as_deref()))
+        .collect::<Option<Vec<_>>>()
+    else {
+        return;
+    };
+    values[pronargdefaults_index] =
+        CatalogValue::Int16(defaults.len().min(i16::MAX as usize) as i16);
+    values[proargdefaults_index] = CatalogValue::Text(format!("({})", nodes.join(" ")));
+}
+
 fn static_row_to_catalog_row(table: &StaticCatalogTable, row: &StaticCatalogRow) -> CatalogRow {
+    let mut values = row
+        .values
+        .iter()
+        .copied()
+        .zip(table.columns.iter())
+        .map(|(value, column)| static_value_to_catalog_value(column, value))
+        .collect::<Vec<_>>();
+    normalize_pg_proc_bootstrap_defaults(table, &mut values);
     CatalogRow {
         relation_oid: table.oid,
         row_id: row.row_id,
-        values: row
-            .values
-            .iter()
-            .copied()
-            .zip(table.columns.iter())
-            .map(|(value, column)| static_value_to_catalog_value(column, value))
-            .collect(),
+        values,
     }
 }
 
@@ -1023,6 +1234,12 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
             let is_not_null = catalog_row_value(table, &row, "attnotnull")
                 .and_then(catalog_value_bool)
                 .unwrap_or(false);
+            let has_default = catalog_row_value(table, &row, "atthasdef")
+                .and_then(catalog_value_bool)
+                .unwrap_or(false);
+            let generated = catalog_row_value(table, &row, "attgenerated")
+                .and_then(catalog_value_u8)
+                .unwrap_or(0);
             Some((
                 attnum,
                 ColumnRecord {
@@ -1030,6 +1247,8 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
                     type_oid,
                     type_mod,
                     is_not_null,
+                    has_default,
+                    generated,
                 },
             ))
         })
@@ -1038,14 +1257,86 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
     columns.into_iter().map(|(_, column)| column).collect()
 }
 
+fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
+    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
+    let index_oid = catalog_row_value(table, row, "indexrelid").and_then(catalog_value_oid)?;
+    let relation_oid = catalog_row_value(table, row, "indrelid").and_then(catalog_value_oid)?;
+    let indnkeyatts = catalog_row_value(table, row, "indnkeyatts")
+        .and_then(catalog_value_i16)
+        .unwrap_or(0)
+        .max(0) as usize;
+    let mut key_attnums = catalog_row_value(table, row, "indkey")
+        .and_then(catalog_value_int2_vector)
+        .unwrap_or_default();
+    if indnkeyatts > 0 && key_attnums.len() > indnkeyatts {
+        key_attnums.truncate(indnkeyatts);
+    }
+
+    Some(IndexRecord {
+        index_oid,
+        relation_oid,
+        key_attnums,
+        is_unique: catalog_row_value(table, row, "indisunique")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false),
+        nulls_not_distinct: catalog_row_value(table, row, "indnullsnotdistinct")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false),
+        is_primary: catalog_row_value(table, row, "indisprimary")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false),
+        is_immediate: catalog_row_value(table, row, "indimmediate")
+            .and_then(catalog_value_bool)
+            .unwrap_or(true),
+        is_valid: catalog_row_value(table, row, "indisvalid")
+            .and_then(catalog_value_bool)
+            .unwrap_or(true),
+        is_ready: catalog_row_value(table, row, "indisready")
+            .and_then(catalog_value_bool)
+            .unwrap_or(true),
+        is_live: catalog_row_value(table, row, "indislive")
+            .and_then(catalog_value_bool)
+            .unwrap_or(true),
+    })
+}
+
+pub fn index_record_by_index_oid(index_oid: Oid) -> Option<IndexRecord> {
+    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        let record = pg_index_record_from_row(&row)?;
+        (record.index_oid == index_oid).then_some(record)
+    })
+}
+
+pub fn index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
+    let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
+        return Vec::new();
+    };
+    catalog_rows(table.oid)
+        .into_iter()
+        .filter_map(|row| {
+            let record = pg_index_record_from_row(&row)?;
+            (record.relation_oid == relation_oid).then_some(record)
+        })
+        .collect()
+}
+
+pub fn unique_index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
+    index_records_for_relation_oid(relation_oid)
+        .into_iter()
+        .filter(|record| record.is_unique && record.is_valid && record.is_ready && record.is_live)
+        .collect()
+}
+
+pub fn relation_oid_for_index_oid(index_oid: Oid) -> Option<Oid> {
+    index_record_by_index_oid(index_oid).map(|record| record.relation_oid)
+}
+
 fn primary_key_pg_index_row(relation_oid: Oid) -> Option<CatalogRow> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
     catalog_rows(table.oid).into_iter().find(|row| {
-        let indrelid = catalog_row_value(table, row, "indrelid").and_then(catalog_value_oid);
-        let is_primary = catalog_row_value(table, row, "indisprimary")
-            .and_then(catalog_value_bool)
-            .unwrap_or(false);
-        indrelid == Some(relation_oid) && is_primary
+        pg_index_record_from_row(row)
+            .is_some_and(|record| record.relation_oid == relation_oid && record.is_primary)
     })
 }
 
@@ -1056,21 +1347,8 @@ pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> 
 }
 
 pub fn primary_key_relation_oid_for_index_oid(index_oid: Oid) -> Option<Oid> {
-    let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
-    catalog_rows(table.oid).into_iter().find_map(|row| {
-        let row_index_oid =
-            catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid)?;
-        if row_index_oid != index_oid {
-            return None;
-        }
-        let is_primary = catalog_row_value(table, &row, "indisprimary")
-            .and_then(catalog_value_bool)
-            .unwrap_or(false);
-        if !is_primary {
-            return None;
-        }
-        catalog_row_value(table, &row, "indrelid").and_then(catalog_value_oid)
-    })
+    let record = index_record_by_index_oid(index_oid)?;
+    record.is_primary.then_some(record.relation_oid)
 }
 
 fn primary_key_constraint_oid_for_relation(
@@ -1138,6 +1416,9 @@ fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord>
     let namespace = catalog_row_value(table, row, "relnamespace")
         .and_then(catalog_value_oid)
         .unwrap_or(PUBLIC_NAMESPACE_OID);
+    let owner = catalog_row_value(table, row, "relowner")
+        .and_then(catalog_value_oid)
+        .unwrap_or(POSTGRES_ROLE_OID);
     let name = catalog_row_value(table, row, "relname").and_then(catalog_value_string)?;
     let relkind = catalog_row_value(table, row, "relkind")
         .and_then(catalog_value_u8)
@@ -1149,6 +1430,7 @@ fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord>
         oid,
         type_oid,
         namespace,
+        owner,
         name: normalize_identifier(&name),
         relkind,
         columns,
@@ -1177,6 +1459,23 @@ pub fn relation_by_name(name: &str) -> Option<RelationRecord> {
         _ => 2,
     });
     matches.into_iter().next()
+}
+
+pub fn relation_by_name_in_namespace(name: &str, namespace: Oid) -> Option<RelationRecord> {
+    let name = normalize_identifier(name);
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    catalog_rows(table.oid).into_iter().find_map(|row| {
+        let row_name = catalog_row_value(table, &row, "relname").and_then(catalog_value_string)?;
+        if normalize_identifier(&row_name) != name {
+            return None;
+        }
+        let row_namespace =
+            catalog_row_value(table, &row, "relnamespace").and_then(catalog_value_oid)?;
+        if row_namespace != namespace {
+            return None;
+        }
+        relation_record_from_pg_class_row(&row)
+    })
 }
 
 pub fn relations() -> Vec<RelationRecord> {
@@ -1558,6 +1857,13 @@ mod tests {
         }
     }
 
+    fn value_i16(value: &CatalogValue) -> Option<i16> {
+        match value {
+            CatalogValue::Int16(value) => Some(*value),
+            _ => None,
+        }
+    }
+
     fn upsert_named_catalog_row(table_name: &str, row_id: u64, values: &[(&str, &str)]) -> u64 {
         let table = static_catalog_by_name(table_name).expect("catalog table");
         let values = values
@@ -1598,6 +1904,24 @@ mod tests {
         );
         assert!(btree_opclass_for_type(INT4_OID).is_some());
         assert!(builtin_cast_by_source_target(INT4_OID, OID_OID).is_some());
+    }
+
+    #[test]
+    fn pg_proc_bootstrap_defaults_are_normalized() {
+        let table = static_catalog_by_name("pg_proc").expect("pg_proc");
+        let row = catalog_rows(PG_PROC_RELATION_OID)
+            .into_iter()
+            .find(|row| value_name(row_value("pg_proc", row, "proname")) == Some("parse_ident"))
+            .expect("parse_ident proc row");
+        assert_eq!(
+            value_i16(row_value("pg_proc", &row, "pronargdefaults")),
+            Some(1)
+        );
+        let defaults = catalog_row_value(table, &row, "proargdefaults")
+            .and_then(catalog_value_string)
+            .expect("proargdefaults");
+        assert!(defaults.starts_with("({CONST :consttype 16"));
+        assert!(defaults.contains(":constvalue 1 [ 1 0 0 0 0 0 0 0 ]"));
     }
 
     #[test]

@@ -20,6 +20,7 @@ impl Column {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum PgType {
+    Int2,
     Int4,
     Int8,
     Varchar,
@@ -27,6 +28,7 @@ pub enum PgType {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Value {
+    Int2(i16),
     Int4(i32),
     Int8(i64),
     Text(String),

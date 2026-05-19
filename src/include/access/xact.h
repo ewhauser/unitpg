@@ -457,6 +457,9 @@ extern TimestampTz GetCurrentTransactionStartTimestamp(void);
 extern TimestampTz GetCurrentStatementStartTimestamp(void);
 extern TimestampTz GetCurrentTransactionStopTimestamp(void);
 extern void SetCurrentStatementStartTimestamp(void);
+#ifdef USE_FASTPG
+extern void FastPgSetCurrentTransactionStartTimestampToStatement(void);
+#endif
 extern int	GetCurrentTransactionNestLevel(void);
 extern bool TransactionIdIsCurrentTransactionId(TransactionId xid);
 extern int	GetTopReadOnlyTransactionNestLevel(void);

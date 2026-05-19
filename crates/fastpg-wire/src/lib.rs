@@ -301,6 +301,7 @@ fn field_info(field: &Column, format: FieldFormat) -> FieldInfo {
 
 fn to_pgwire_type(data_type: PgType) -> Type {
     match data_type {
+        PgType::Int2 => Type::INT2,
         PgType::Int4 => Type::INT4,
         PgType::Int8 => Type::INT8,
         PgType::Varchar => Type::VARCHAR,
@@ -316,6 +317,9 @@ fn decode_parameters(
         .iter()
         .enumerate()
         .map(|(idx, data_type)| match data_type {
+            PgType::Int2 => portal
+                .parameter::<i16>(idx, &Type::INT2)
+                .map(|value| value.map(Value::Int2).unwrap_or(Value::Null)),
             PgType::Int4 => portal
                 .parameter::<i32>(idx, &Type::INT4)
                 .map(|value| value.map(Value::Int4).unwrap_or(Value::Null)),
@@ -341,7 +345,13 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
         ))),
         QueryExecution::Unsupported { query } => Ok(unsupported_response(&query)),
         QueryExecution::InvalidParameters { message } => Ok(invalid_parameter_response(&message)),
-        QueryExecution::Error { sqlstate, message } => Ok(error_response(&sqlstate, &message)),
+        QueryExecution::Error {
+            sqlstate,
+            message,
+            detail,
+            hint,
+            cursorpos,
+        } => Ok(error_response(&sqlstate, &message, detail, hint, cursorpos)),
     }
 }
 
@@ -377,9 +387,11 @@ fn encode_value(
     value: &Value,
 ) -> PgWireResult<()> {
     match (data_type, value) {
+        (PgType::Int2, Value::Int2(value)) => encoder.encode_field(&Some(*value)),
         (PgType::Int4, Value::Int4(value)) => encoder.encode_field(&Some(*value)),
         (PgType::Int8, Value::Int8(value)) => encoder.encode_field(&Some(*value)),
         (PgType::Varchar, Value::Text(value)) => encoder.encode_field(&Some(value.as_str())),
+        (PgType::Int2, Value::Null) => encoder.encode_field(&Option::<i16>::None),
         (PgType::Int4, Value::Null) => encoder.encode_field(&Option::<i32>::None),
         (PgType::Int8, Value::Null) => encoder.encode_field(&Option::<i64>::None),
         (PgType::Varchar, Value::Null) => encoder.encode_field(&Option::<&str>::None),
@@ -406,12 +418,20 @@ fn invalid_parameter_response(message: &str) -> Response {
     )))
 }
 
-fn error_response(sqlstate: &str, message: &str) -> Response {
-    Response::Error(Box::new(ErrorInfo::new(
-        "ERROR".to_owned(),
-        sqlstate.to_owned(),
-        message.to_owned(),
-    )))
+fn error_response(
+    sqlstate: &str,
+    message: &str,
+    detail: Option<String>,
+    hint: Option<String>,
+    cursorpos: i32,
+) -> Response {
+    let mut error = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
+    error.detail = detail;
+    error.hint = hint;
+    if cursorpos > 0 {
+        error.position = Some(cursorpos.to_string());
+    }
+    Response::Error(Box::new(error))
 }
 
 pub fn command_complete(tag: &str, rows: usize) -> Response {

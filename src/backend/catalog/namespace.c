@@ -238,16 +238,6 @@ static void InvalidationCallback(Datum arg, SysCacheIdentifier cacheid,
 static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 						   bool include_out_arguments, int pronargs,
 						   int **argnumbers, int *fgc_flags);
-#ifdef USE_FASTPG
-static bool FastPgFuncnameGetCandidates(List *names, int nargs,
-										List *argnames,
-										bool expand_variadic,
-										bool expand_defaults,
-										bool include_out_arguments,
-										bool missing_ok,
-										int *fgc_flags,
-										FuncCandidateList *result);
-#endif
 
 /*
  * Recomputing the namespace path can be costly when done frequently, such as
@@ -912,15 +902,6 @@ RelnameGetRelid(const char *relname)
 	Oid			relid;
 	ListCell   *l;
 
-#ifdef USE_FASTPG
-	uint32_t	fastpg_oid;
-
-	if (fastpg_rust_catalog_relation_oid_by_name(relname,
-												 (uint32_t) PG_PUBLIC_NAMESPACE,
-												 &fastpg_oid))
-		return (Oid) fastpg_oid;
-#endif
-
 	recomputeNamespacePath();
 
 	foreach(l, activeSearchPath)
@@ -1250,14 +1231,6 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 	/* deconstruct the name list */
 	DeconstructQualifiedName(names, &schemaname, &funcname);
-
-#ifdef USE_FASTPG
-	if (FastPgFuncnameGetCandidates(names, nargs, argnames,
-									expand_variadic, expand_defaults,
-									include_out_arguments, missing_ok,
-									fgc_flags, &resultList))
-		return resultList;
-#endif
 
 	if (schemaname)
 	{
@@ -1631,94 +1604,6 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 	return resultList;
 }
-
-#ifdef USE_FASTPG
-static bool
-FastPgFuncnameGetCandidates(List *names, int nargs, List *argnames,
-							bool expand_variadic, bool expand_defaults,
-							bool include_out_arguments, bool missing_ok,
-							int *fgc_flags, FuncCandidateList *result)
-{
-	FuncCandidateList resultList = NULL;
-	FuncCandidateList *tail = &resultList;
-	char	   *schemaname;
-	char	   *funcname;
-	Oid			namespaceId = InvalidOid;
-	size_t		proc_count;
-
-	*result = NULL;
-
-	/*
-	 * This virtual path covers deterministic pg_catalog built-ins that the
-	 * standalone fastpg pgcore path needs before a physical pg_proc exists.
-	 * It intentionally does not try to satisfy arbitrary functions yet.
-	 */
-	if (include_out_arguments || argnames != NIL)
-		return false;
-
-	DeconstructQualifiedName(names, &schemaname, &funcname);
-	proc_count = fastpg_rust_catalog_proc_count_by_name(funcname);
-	if (proc_count == 0)
-		return false;
-
-	if (schemaname)
-	{
-		*fgc_flags |= FGC_SCHEMA_GIVEN;
-		if (strcmp(schemaname, "pg_catalog") != 0)
-		{
-			if (!missing_ok)
-				*fgc_flags |= FGC_SCHEMA_EXISTS;
-			*result = NULL;
-			return true;
-		}
-		namespaceId = PG_CATALOG_NAMESPACE;
-		*fgc_flags |= FGC_SCHEMA_EXISTS;
-	}
-	else
-		namespaceId = PG_CATALOG_NAMESPACE;
-
-	for (size_t i = 0; i < proc_count; i++)
-	{
-		FastPgRustCatalogProc proc;
-		FuncCandidateList newResult;
-		int			pronargs;
-		int			effective_nargs;
-
-		if (!fastpg_rust_catalog_proc_by_name_index(funcname, i, &proc))
-			continue;
-		*fgc_flags |= FGC_NAME_EXISTS;
-
-		if (proc.namespace_oid != namespaceId)
-			continue;
-		*fgc_flags |= FGC_NAME_VISIBLE;
-
-		pronargs = (int) proc.arg_count;
-		if (nargs >= 0 && pronargs != nargs)
-			continue;
-		*fgc_flags |= FGC_ARGCOUNT_MATCH;
-
-		effective_nargs = Max(pronargs, nargs);
-		newResult = (FuncCandidateList)
-			palloc0(offsetof(struct _FuncCandidateList, args) +
-					effective_nargs * sizeof(Oid));
-		newResult->pathpos = 0;
-		newResult->oid = (Oid) proc.oid;
-		newResult->nominalnargs = pronargs;
-		newResult->nargs = effective_nargs;
-		newResult->nvargs = 0;
-		newResult->ndargs = 0;
-		newResult->argnumbers = NULL;
-		for (int arg = 0; arg < pronargs; arg++)
-			newResult->args[arg] = (Oid) proc.arg_type_oids[arg];
-
-		*tail = newResult;
-		tail = &newResult->next;
-	}
-
-	*result = resultList;
-	return true;
-}
-#endif
 
 /*
  * MatchNamedCall
@@ -4797,7 +4682,10 @@ InitTempTableNamespace(void)
 	 * this flag makes the namespace as being in use, so no objects created on
 	 * it would be removed concurrently.
 	 */
-	MyProc->tempNamespaceId = namespaceId;
+#ifdef USE_FASTPG
+	if (MyProc != NULL)
+#endif
+		MyProc->tempNamespaceId = namespaceId;
 
 	/* It should not be done already. */
 	Assert(myTempNamespaceSubID == InvalidSubTransactionId);
@@ -4841,7 +4729,10 @@ AtEOXact_Namespace(bool isCommit, bool parallel)
 			 * it's not a problem if objects contained in this namespace are
 			 * removed concurrently.
 			 */
-			MyProc->tempNamespaceId = InvalidOid;
+#ifdef USE_FASTPG
+			if (MyProc != NULL)
+#endif
+				MyProc->tempNamespaceId = InvalidOid;
 		}
 		myTempNamespaceSubID = InvalidSubTransactionId;
 	}
@@ -4883,7 +4774,10 @@ AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 			 * it's not a problem if objects contained in this namespace are
 			 * removed concurrently.
 			 */
-			MyProc->tempNamespaceId = InvalidOid;
+#ifdef USE_FASTPG
+			if (MyProc != NULL)
+#endif
+				MyProc->tempNamespaceId = InvalidOid;
 		}
 	}
 }

@@ -30,6 +30,9 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/multixact.h"
 #include "access/relation.h"
 #include "access/table.h"
@@ -3559,6 +3562,11 @@ static void
 RelationTruncateIndexes(Relation heapRelation)
 {
 	ListCell   *indlist;
+
+#ifdef USE_FASTPG
+	if (heapRelation->rd_tableam == GetFastPgMemTableAmRoutine())
+		return;
+#endif
 
 	/* Ask the relcache to produce a list of the indexes of the rel */
 	foreach(indlist, RelationGetIndexList(heapRelation))
