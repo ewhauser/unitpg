@@ -18,11 +18,10 @@ use fastpg_catalog::{
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
     builtin_operators_by_name, catalog_row_value, catalog_rows, delete_catalog_row,
     index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
-    primary_key_index_oid_for_relation_oid, primary_key_index_record_for_relation_oid,
-    primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
-    relation_by_oid, relation_column_by_attnum, relation_column_count,
-    relation_oid_by_name_in_namespace, relation_oid_for_index_oid, relation_summary_by_oid,
-    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
+    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
+    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_for_index_oid,
+    relation_summary_by_oid, static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
     unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
     virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
@@ -721,6 +720,12 @@ struct UniqueIndexSpec {
     is_primary: bool,
     nulls_not_distinct: bool,
     columns: Vec<IndexColumnSpec>,
+}
+
+#[derive(Clone, Debug)]
+struct CachedUniqueIndex {
+    info: FastPgRustPrimaryKeyIndexInfo,
+    spec: UniqueIndexSpec,
 }
 
 #[derive(Debug)]
@@ -1590,16 +1595,14 @@ fn primary_key_unchanged(primary_key_spec: &UniqueIndexSpec, old_row: &Row, new_
 }
 
 static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
-static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<
-    Mutex<HashMap<u32, Option<FastPgRustPrimaryKeyIndexInfo>>>,
-> = OnceLock::new();
+static PRIMARY_KEY_INDEX_INFO_CACHE: OnceLock<Mutex<HashMap<u32, Option<CachedUniqueIndex>>>> =
+    OnceLock::new();
 
 fn storage() -> &'static Mutex<StorageState> {
     STORAGE.get_or_init(|| Mutex::new(StorageState::default()))
 }
 
-fn primary_key_index_info_cache()
--> &'static Mutex<HashMap<u32, Option<FastPgRustPrimaryKeyIndexInfo>>> {
+fn primary_key_index_info_cache() -> &'static Mutex<HashMap<u32, Option<CachedUniqueIndex>>> {
     PRIMARY_KEY_INDEX_INFO_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
@@ -1660,26 +1663,26 @@ fn mark_primary_key_rebuild(relid: u32) {
     with_storage(|_state, session| session.mark_primary_key_rebuild(relid));
 }
 
-fn cached_primary_key_index_info(index_oid: Oid) -> Option<FastPgRustPrimaryKeyIndexInfo> {
+fn cached_primary_key_index(index_oid: Oid) -> Option<CachedUniqueIndex> {
     let cached = match primary_key_index_info_cache().lock() {
-        Ok(cache) => cache.get(&index_oid.0).copied(),
-        Err(poisoned) => poisoned.into_inner().get(&index_oid.0).copied(),
+        Ok(cache) => cache.get(&index_oid.0).cloned(),
+        Err(poisoned) => poisoned.into_inner().get(&index_oid.0).cloned(),
     };
-    if let Some(index_info) = cached {
-        return index_info;
+    if let Some(index) = cached {
+        return index;
     }
 
-    let index_info = index_heap_relation(index_oid)
-        .and_then(|relation| primary_key_index_info(&relation, index_oid));
+    let index = index_heap_relation(index_oid)
+        .and_then(|relation| primary_key_index_cache_entry(&relation, index_oid));
     match primary_key_index_info_cache().lock() {
         Ok(mut cache) => {
-            cache.insert(index_oid.0, index_info);
+            cache.insert(index_oid.0, index.clone());
         }
         Err(poisoned) => {
-            poisoned.into_inner().insert(index_oid.0, index_info);
+            poisoned.into_inner().insert(index_oid.0, index.clone());
         }
     }
-    index_info
+    index
 }
 
 unsafe fn c_str_to_string(value: *const c_char) -> Result<String, String> {
@@ -2232,11 +2235,6 @@ fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<
     })
 }
 
-fn unique_index_spec_for_index_oid(index_oid: Oid) -> Option<UniqueIndexSpec> {
-    let record = index_record_by_index_oid(index_oid)?;
-    unique_index_spec_for_record(&record)
-}
-
 fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec> {
     unique_index_records_for_relation_oid(relation_oid)
         .iter()
@@ -2245,8 +2243,8 @@ fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec
 }
 
 fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
-    let record = primary_key_index_record_for_relation_oid(relation_oid)?;
-    let index_spec = unique_index_spec_for_record(&record)?;
+    let index_oid = primary_key_index_oid_for_relation_oid(relation_oid)?;
+    let index_spec = cached_primary_key_index(index_oid)?.spec;
     index_spec.is_primary.then_some(index_spec)
 }
 
@@ -2293,10 +2291,10 @@ fn primary_key_column(
         .find(|column| &column.name == column_name)
 }
 
-fn primary_key_index_info(
+fn primary_key_index_cache_entry(
     relation: &fastpg_catalog::RelationRecord,
     index_oid: Oid,
-) -> Option<FastPgRustPrimaryKeyIndexInfo> {
+) -> Option<CachedUniqueIndex> {
     let record = index_record_by_index_oid(index_oid)?;
     let index_spec = unique_index_spec_for_record(&record)?;
     let key_count = index_spec.columns.len();
@@ -2315,7 +2313,7 @@ fn primary_key_index_info(
         collation_oids[key_index] = type_record.typcollation.0;
     }
 
-    Some(FastPgRustPrimaryKeyIndexInfo {
+    let info = FastPgRustPrimaryKeyIndexInfo {
         index_oid: index_oid.0,
         heap_oid: relation.oid.0,
         key_count: key_count as u16,
@@ -2326,6 +2324,11 @@ fn primary_key_index_info(
         attnums,
         type_oids,
         collation_oids,
+    };
+
+    Some(CachedUniqueIndex {
+        info,
+        spec: index_spec,
     })
 }
 
@@ -2791,7 +2794,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_primary_key_index_info(
     if out.is_null() {
         return false;
     }
-    let Some(index_info) = cached_primary_key_index_info(Oid(index_oid)) else {
+    let Some(index_info) = cached_primary_key_index(Oid(index_oid)).map(|index| index.info) else {
         return false;
     };
     unsafe {
@@ -3501,7 +3504,8 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
-    let Some(index_spec) = unique_index_spec_for_index_oid(Oid(index_relid)) else {
+    let Some(index_spec) = cached_primary_key_index(Oid(index_relid)).map(|index| index.spec)
+    else {
         return false;
     };
 
@@ -3552,7 +3556,8 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
-    let Some(index_spec) = unique_index_spec_for_index_oid(Oid(index_relid)) else {
+    let Some(index_spec) = cached_primary_key_index(Oid(index_relid)).map(|index| index.spec)
+    else {
         return false;
     };
     let values = if nkeys == 0 {
