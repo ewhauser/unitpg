@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::io;
+use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
@@ -14,6 +15,7 @@ use tokio::net::TcpListener;
 use tokio::net::UnixListener;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:55432";
+pub const EXECUTION_CONCURRENCY_ENV: &str = "FASTPG_EXECUTION_CONCURRENCY";
 
 pub async fn serve_addr(addr: &str) -> io::Result<()> {
     #[cfg(unix)]
@@ -26,7 +28,7 @@ pub async fn serve_addr(addr: &str) -> io::Result<()> {
 }
 
 pub async fn serve_listener(listener: TcpListener) -> io::Result<()> {
-    serve_listener_with_handlers(listener, Arc::new(FastPgServerHandlers::default())).await
+    serve_listener_with_handlers(listener, default_handlers()).await
 }
 
 pub async fn serve_listener_with_handlers(
@@ -57,7 +59,7 @@ pub async fn serve_unix_path(path: impl AsRef<Path>) -> io::Result<()> {
 
 #[cfg(unix)]
 pub async fn serve_unix_listener(listener: UnixListener) -> io::Result<()> {
-    serve_unix_listener_with_handlers(listener, Arc::new(FastPgServerHandlers::default())).await
+    serve_unix_listener_with_handlers(listener, default_handlers()).await
 }
 
 #[cfg(unix)]
@@ -75,4 +77,18 @@ pub async fn serve_unix_listener_with_handlers(
             }
         });
     }
+}
+
+fn default_handlers() -> Arc<FastPgServerHandlers> {
+    Arc::new(FastPgServerHandlers::with_execution_concurrency(
+        execution_concurrency_from_env(),
+    ))
+}
+
+fn execution_concurrency_from_env() -> NonZeroUsize {
+    std::env::var(EXECUTION_CONCURRENCY_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .and_then(NonZeroUsize::new)
+        .unwrap_or_else(|| std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN))
 }
