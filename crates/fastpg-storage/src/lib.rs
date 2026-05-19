@@ -1284,6 +1284,33 @@ impl StorageState {
         self.find_committed_row(relid, row_id)
     }
 
+    fn visible_row_exists(&self, session: &SessionStorage, relid: u32, row_id: u64) -> bool {
+        if row_id == 0 {
+            return false;
+        }
+
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
+            if overlay
+                .relations
+                .get(&relid)
+                .is_some_and(|segment| segment.rows.iter().any(|row| row.row_id == row_id))
+            {
+                return true;
+            }
+            if overlay
+                .deleted_row_ids
+                .get(&relid)
+                .is_some_and(|deleted| deleted.contains(&row_id))
+            {
+                return false;
+            }
+        }
+
+        self.relations
+            .get(&relid)
+            .is_some_and(|relation| relation.committed_row_index.contains_key(&row_id))
+    }
+
     fn find_committed_row(&self, relid: u32, row_id: u64) -> Option<Row> {
         self.relations
             .get(&relid)
@@ -4037,10 +4064,7 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
     };
 
     let result = with_storage(|state, session| -> Result<bool, CatalogError> {
-        if state
-            .find_visible_row(session, input.relid, row_id)
-            .is_none()
-        {
+        if !state.visible_row_exists(session, input.relid, row_id) {
             return Ok(false);
         }
 
@@ -4126,7 +4150,7 @@ pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
     }
 
     with_storage(|state, session| {
-        if state.find_visible_row(session, relid, row_id).is_none() {
+        if !state.visible_row_exists(session, relid, row_id) {
             return false;
         }
 
