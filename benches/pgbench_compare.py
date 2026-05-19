@@ -24,10 +24,12 @@ from typing import Any
 TPS_RE = re.compile(r"^tps =\s+([0-9.]+)\s+\(without initial connection time\)", re.MULTILINE)
 LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
 SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
-HOTSPOT_RE = re.compile(r"^(.*) \((\d+) samples?, ([0-9.]+)%\)$")
+SVG_TOTAL_SAMPLES_RE = re.compile(r'<svg id="frames"[^>]*\btotal_samples="([\d,]+)"')
+HOTSPOT_RE = re.compile(r"^(.*) \(([\d,]+) samples?, ([0-9.]+)%\)$")
 DEFAULT_PGBENCH_INIT_STEPS = "dtgvp"
 PROFILE_COMPONENT_ORDER = [
     "Socket / protocol",
+    "Query dispatch",
     "Parsing / analysis",
     "Planning / rewrite",
     "Execution",
@@ -899,6 +901,7 @@ class PgBenchCompare:
         if profile_path.exists():
             profiler["profile_record"]["hotspots"] = profile_hotspots(profile_path)
             profiler["profile_record"]["component_hotspots"] = profile_component_hotspots(profile_path)
+            profiler["profile_record"]["total_samples"] = profile_total_samples(profile_path)
         (profiler["profile_dir"] / "profile-stop.command.json").write_text(
             json.dumps(result.as_json(), indent=2) + "\n"
         )
@@ -1235,6 +1238,13 @@ def profile_hotspots(profile_path: Path, limit: int = PROFILE_HOTSPOT_LIMIT) -> 
     return profile_frame_hotspots(profile_path)[:limit]
 
 
+def profile_total_samples(profile_path: Path) -> int | None:
+    match = SVG_TOTAL_SAMPLES_RE.search(read_text(profile_path))
+    if match is None:
+        return None
+    return int(match.group(1).replace(",", ""))
+
+
 def profile_frame_hotspots(profile_path: Path) -> list[dict[str, Any]]:
     text = read_text(profile_path)
     by_name: dict[str, dict[str, Any]] = {}
@@ -1248,7 +1258,7 @@ def profile_frame_hotspots(profile_path: Path) -> list[dict[str, Any]]:
             continue
         hotspot = {
             "name": name,
-            "samples": int(match.group(2)),
+            "samples": int(match.group(2).replace(",", "")),
             "percent": float(match.group(3)),
         }
         previous = by_name.get(name)
@@ -1266,6 +1276,29 @@ def profile_component_hotspots(
 
 def profile_component(name: str) -> str:
     lowered = name.lower()
+    if any(
+        token in lowered
+        for token in (
+            "exec_simple_query",
+            "portalrun",
+            "portalstart",
+            "portaldrop",
+            "createportal",
+            "processquery",
+            "endcommand",
+            "fastpg_exec::queryexecutor",
+            "fastpg_pgcore::preparedstatement",
+            "preparedstatement::execute_with_params",
+            "fastpg_pgcore::pgcoresession::prepare",
+            "fastpg_pgcore_prepare",
+            "fastpg_pgcore_execute_params",
+            "fastpg_pgcore_execute_utility",
+            "pgwire::api::query::simplequeryhandler",
+            "pgwire::tokio::server::process_message",
+            "fastpg_wire::fastpgwirehandler",
+        )
+    ):
+        return "Query dispatch"
     if any(
         token in lowered
         for token in (
@@ -1336,6 +1369,10 @@ def profile_component(name: str) -> str:
             "build_base_rel_tlists",
             "eval_const_expressions",
             "expression_tree_mutator",
+            "firerirrules",
+            "get_row_security_policies",
+            "check_enable_rls",
+            "list_copy_deep",
             "cost_",
             "selectivity",
             "eqsel",
@@ -1369,6 +1406,7 @@ def profile_component(name: str) -> str:
             "relationbuild",
             "rangevargetrelid",
             "index_open",
+            "get_relname_relid",
             "searchsyscache",
             "builddesc",
             "namespace",
@@ -1430,9 +1468,6 @@ def profile_component(name: str) -> str:
         token in lowered
         for token in (
             "portalrun",
-            "portalstart",
-            "portaldrop",
-            "createportal",
             "processquery",
             "executor",
             "exec",
@@ -1490,8 +1525,12 @@ def is_profile_noise(name: str) -> bool:
     noisy_prefixes = (
         "std::rt::",
         "std::sys::backtrace",
+        "std::thread::local::LocalKey<",
         "tokio::runtime::context::",
+        "tokio::runtime::scheduler::current_thread::Context::",
         "tokio::runtime::scheduler::current_thread::CoreGuard",
+        "tokio::runtime::task::harness::Harness<",
+        "fastpg_server::serve_unix_listener_with_handlers::",
     )
     noisy_exact = {
         "BackendRun",
@@ -1572,6 +1611,29 @@ def profile_components_from_record(profile: dict[str, Any] | None) -> dict[str, 
         profile.get("hotspots", []),
         PROFILE_COMPONENT_CAPTURE_LIMIT,
     )
+
+
+def profile_hotspots_from_record(profile: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if profile is None:
+        return []
+    path = profile.get("path")
+    if path:
+        profile_path = Path(str(path))
+        if profile_path.exists():
+            return profile_hotspots(profile_path)
+    return profile.get("hotspots", [])
+
+
+def profile_total_samples_from_record(profile: dict[str, Any] | None) -> int | None:
+    if profile is None:
+        return None
+    path = profile.get("path")
+    if path:
+        profile_path = Path(str(path))
+        if profile_path.exists():
+            return profile_total_samples(profile_path)
+    total_samples = profile.get("total_samples")
+    return int(str(total_samples).replace(",", "")) if total_samples is not None else None
 
 
 def effective_init_steps(init_steps: str | None) -> str:
@@ -1675,10 +1737,13 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
             if profile is None:
                 continue
             lines.append(f"- {variant_name} flamegraph: `{profile.get('path')}`")
+            total_samples = profile_total_samples_from_record(profile)
+            if total_samples is not None:
+                lines.append(f"- {variant_name} profile samples: `{total_samples}`")
         lines.append("")
         if all(name in profiles for name in ("normal", "fastpg")):
-            normal_hotspots = profiles["normal"].get("hotspots", [])
-            fastpg_hotspots = profiles["fastpg"].get("hotspots", [])
+            normal_hotspots = profile_hotspots_from_record(profiles["normal"])
+            fastpg_hotspots = profile_hotspots_from_record(profiles["fastpg"])
             normal_components = profile_components_from_record(profiles["normal"])
             fastpg_components = profile_components_from_record(profiles["fastpg"])
 
@@ -1686,8 +1751,8 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
             lines.append(
                 "Inclusive flamegraph percentages are not additive. The component table scans "
                 "all captured flamegraph frames and each cell shows the top frames in that "
-                "component. Sample deltas compare the displayed fastpg frames against the "
-                "displayed normal Postgres frames."
+                "component. Percentages use each side's own total sample count. Sample deltas "
+                "compare the displayed fastpg frames against the displayed normal Postgres frames."
             )
             lines.append("")
             lines.append("| component | normal Postgres | fastpg Rust server | fastpg +/- displayed samples |")
@@ -1824,10 +1889,12 @@ def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -
     <section class=\"profile\">
       <h2>normal Postgres</h2>
       {profile_object(normal_path)}
+      {profile_sample_summary(normal)}
     </section>
     <section class=\"profile\">
       <h2>fastpg Rust server</h2>
       {profile_object(fastpg_path)}
+      {profile_sample_summary(fastpg)}
     </section>
   </div>
   {render_component_table_html(normal, fastpg)}
@@ -1848,6 +1915,13 @@ def profile_object(path: str | None) -> str:
         return "<p>No profile captured.</p>"
     escaped = html.escape(path)
     return f'<object data="{escaped}" type="image/svg+xml"><a href="{escaped}">{escaped}</a></object>'
+
+
+def profile_sample_summary(profile: dict[str, Any] | None) -> str:
+    total_samples = profile_total_samples_from_record(profile)
+    if total_samples is None:
+        return ""
+    return f'<p class="note">total profile samples: {total_samples:,}</p>'
 
 
 def render_component_table_html(
@@ -1885,8 +1959,9 @@ def render_component_table_html(
         "<h2>Component view</h2>"
         "<p class=\"note\">Inclusive flamegraph percentages are not additive. This table scans "
         "all captured flamegraph frames and each cell shows the top frames in that component, "
-        "with the largest frame listed as the component peak. Sample delta is the displayed "
-        "fastpg frame samples minus the displayed normal Postgres frame samples.</p>"
+        "with the largest frame listed as the component peak. Percentages use each side's own "
+        "total sample count. Sample delta is the displayed fastpg frame samples minus the "
+        "displayed normal Postgres frame samples.</p>"
         "<table class=\"component-table\"><thead><tr><th>component</th>"
         "<th>normal Postgres</th><th>fastpg Rust server</th><th>fastpg +/- displayed samples</th>"
         "</tr></thead><tbody>"
@@ -1938,8 +2013,8 @@ def render_hotspot_table_html(
     normal: dict[str, Any] | None,
     fastpg: dict[str, Any] | None,
 ) -> str:
-    normal_hotspots = normal.get("hotspots", []) if normal else []
-    fastpg_hotspots = fastpg.get("hotspots", []) if fastpg else []
+    normal_hotspots = profile_hotspots_from_record(normal)
+    fastpg_hotspots = profile_hotspots_from_record(fastpg)
     rows = []
     for index in range(min(25, max(len(normal_hotspots), len(fastpg_hotspots)))):
         rows.append(
