@@ -406,6 +406,7 @@ version = "0.1.0"
 dependencies = [
  "fastpg-pgcore",
  "fastpg-storage",
+ "fastpg-storage2",
  "fastpg-types",
 ]
 
@@ -424,6 +425,7 @@ dependencies = [
  "cc",
  "fastpg-catalog",
  "fastpg-storage",
+ "fastpg-storage2",
 ]
 
 [[package]]
@@ -471,6 +473,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "fastpg-storage2"
+version = "0.1.0"
+dependencies = [
+ "fastpg-catalog",
+ "fastpg-types",
+]
+
+[[package]]
 name = "fastpg-testkit"
 version = "0.1.0"
 dependencies = [
@@ -493,11 +503,13 @@ name = "fastpg-wire"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "fastpg-compat",
  "fastpg-session",
  "fastpg-types",
  "futures",
  "pgwire",
+ "postgres-types",
  "tokio",
 ]
 

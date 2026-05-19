@@ -322,6 +322,7 @@ static bool FastPgOpclassForType(Oid type_oid, Oid *opclass_oid,
 static bool FastPgInitIndexAccessInfo(Relation relation);
 static bool FastPgBuildTupleDesc(Relation relation);
 static bool FastPgBuildVirtualCatalogTupleDesc(Relation relation);
+void		FastPgEnsureRelationRules(Relation relation);
 #endif
 static void AttrDefaultFetch(Relation relation, int ndef);
 static int	AttrDefaultCmp(const void *a, const void *b);
@@ -473,7 +474,9 @@ FastPgBuildPgClassTuple(Oid targetRelId)
 	values[Anum_pg_class_relnatts - 1] =
 		Int16GetDatum((int16) fastpg_relation.column_count);
 	values[Anum_pg_class_relchecks - 1] = Int16GetDatum(0);
-	values[Anum_pg_class_relhasrules - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relhasrules - 1] =
+		BoolGetDatum(fastpg_relation.relkind == RELKIND_VIEW ||
+					 fastpg_relation.relkind == RELKIND_MATVIEW);
 	values[Anum_pg_class_relhastriggers - 1] = BoolGetDatum(false);
 	values[Anum_pg_class_relhassubclass - 1] = BoolGetDatum(false);
 	values[Anum_pg_class_relrowsecurity - 1] = BoolGetDatum(false);
@@ -1020,6 +1023,10 @@ RelationBuildTupleDesc(Relation relation)
 }
 
 #ifdef USE_FASTPG
+static void FastPgTupleDescInitDroppedEntry(TupleDesc tupdesc,
+											AttrNumber attrNumber,
+											const FastPgRustCatalogColumn *column);
+
 static bool
 FastPgBuildTupleDesc(Relation relation)
 {
@@ -1056,6 +1063,14 @@ FastPgBuildTupleDesc(Relation relation)
 				 index + 1,
 				 RelationGetRelationName(relation));
 
+		if (fastpg_column.is_dropped != 0)
+		{
+			FastPgTupleDescInitDroppedEntry(relation->rd_att,
+										   (AttrNumber) (index + 1),
+										   &fastpg_column);
+			continue;
+		}
+
 		TupleDescInitEntry(relation->rd_att,
 						   (AttrNumber) (index + 1),
 						   fastpg_column.name,
@@ -1064,6 +1079,7 @@ FastPgBuildTupleDesc(Relation relation)
 						   0);
 
 		attr = TupleDescAttr(relation->rd_att, index);
+		attr->attcollation = (Oid) fastpg_column.attcollation;
 		attr->attnotnull = fastpg_column.is_not_null != 0;
 		attr->atthasdef = fastpg_column.has_default != 0;
 		attr->attgenerated = (char) fastpg_column.generated;
@@ -1098,6 +1114,40 @@ FastPgBuildTupleDesc(Relation relation)
 
 	TupleDescFinalize(relation->rd_att);
 	return true;
+}
+
+static void
+FastPgTupleDescInitDroppedEntry(TupleDesc tupdesc, AttrNumber attrNumber,
+								const FastPgRustCatalogColumn *column)
+{
+	Form_pg_attribute attr;
+	const char *attname;
+
+	attr = TupleDescAttr(tupdesc, attrNumber - 1);
+	attname = column->name[0] != '\0' ? column->name : "........pg.dropped........";
+
+	attr->attrelid = 0;
+	namestrcpy(&(attr->attname), attname);
+	attr->atttypid = InvalidOid;
+	attr->attlen = column->attlen;
+	attr->attnum = attrNumber;
+	attr->atttypmod = column->type_mod;
+	attr->attndims = 0;
+	attr->attbyval = column->attbyval != 0;
+	attr->attalign = column->attalign != '\0' ? (char) column->attalign : TYPALIGN_INT;
+	attr->attstorage = column->attstorage != '\0' ? (char) column->attstorage : TYPSTORAGE_PLAIN;
+	attr->attcompression = '\0';
+	attr->attnotnull = false;
+	attr->atthasdef = false;
+	attr->atthasmissing = false;
+	attr->attidentity = '\0';
+	attr->attgenerated = '\0';
+	attr->attisdropped = true;
+	attr->attislocal = true;
+	attr->attinhcount = 0;
+	attr->attcollation = InvalidOid;
+
+	populate_compact_attribute(tupdesc, attrNumber - 1);
 }
 
 static void
@@ -1343,6 +1393,31 @@ RelationBuildRuleLock(Relation relation)
 
 	relation->rd_rules = rulelock;
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureRelationRules(Relation relation)
+{
+	if (relation == NULL || relation->rd_rel == NULL ||
+		relation->rd_rules != NULL)
+		return;
+
+	if (!relation->rd_rel->relhasrules &&
+		relation->rd_rel->relkind != RELKIND_VIEW &&
+		relation->rd_rel->relkind != RELKIND_MATVIEW)
+		return;
+
+	if (relation->rd_rulescxt != NULL)
+	{
+		MemoryContextDelete(relation->rd_rulescxt);
+		relation->rd_rulescxt = NULL;
+	}
+
+	RelationBuildRuleLock(relation);
+	if (relation->rd_rules != NULL)
+		relation->rd_rel->relhasrules = true;
+}
+#endif
 
 /*
  *		equalRuleLocks
@@ -1675,7 +1750,12 @@ retry:
 	 * Note that RelationBuildRuleLock() relies on this being done after
 	 * extracting the relation's reloptions.
 	 */
-	if (relation->rd_rel->relhasrules)
+	if (relation->rd_rel->relhasrules
+#ifdef USE_FASTPG
+		|| relation->rd_rel->relkind == RELKIND_VIEW ||
+		relation->rd_rel->relkind == RELKIND_MATVIEW
+#endif
+	)
 		RelationBuildRuleLock(relation);
 	else
 	{

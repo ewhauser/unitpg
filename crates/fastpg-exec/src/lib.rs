@@ -4,6 +4,8 @@ use std::borrow::Cow;
 use std::sync::Arc;
 
 #[cfg(feature = "postgres-execution")]
+use fastpg_catalog::relation_by_name;
+#[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
     ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreParam,
     PgCoreSession, PgCoreValue, PreparedStatement, TEXT_OID, VARCHAR_OID,
@@ -16,13 +18,32 @@ const BPCHAR_OID: u32 = 1042;
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct QueryDescription {
     pub parameter_types: Vec<PgType>,
+    pub parameter_type_oids: Vec<u32>,
     pub fields: Vec<Column>,
 }
 
 impl QueryDescription {
     pub fn new(parameter_types: Vec<PgType>, fields: Vec<Column>) -> Self {
+        let parameter_type_oids = parameter_types
+            .iter()
+            .copied()
+            .map(PgType::default_type_oid)
+            .collect();
         Self {
             parameter_types,
+            parameter_type_oids,
+            fields,
+        }
+    }
+
+    pub fn with_type_oids(
+        parameter_types: Vec<PgType>,
+        parameter_type_oids: Vec<u32>,
+        fields: Vec<Column>,
+    ) -> Self {
+        Self {
+            parameter_types,
+            parameter_type_oids,
             fields,
         }
     }
@@ -44,6 +65,7 @@ impl QueryResult {
 pub struct CopyTarget {
     pub table: String,
     pub columns: usize,
+    pub column_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -88,6 +110,8 @@ pub struct QueryExecutor {
     pgcore_session: PgCoreSession,
     #[cfg(feature = "postgres-execution")]
     storage_session: fastpg_storage::SessionStorageHandle,
+    #[cfg(feature = "postgres-execution")]
+    storage2_session: fastpg_storage2::SessionStorageHandle,
 }
 
 impl QueryExecutor {
@@ -99,10 +123,15 @@ impl QueryExecutor {
         #[cfg(feature = "postgres-execution")]
         {
             let storage_session = fastpg_storage::new_session_storage();
+            let storage2_session = fastpg_storage2::new_session_storage();
             Self {
                 shared,
-                pgcore_session: PgCoreSession::with_storage_session(storage_session.clone()),
+                pgcore_session: PgCoreSession::with_storage_sessions(
+                    storage_session.clone(),
+                    storage2_session.clone(),
+                ),
                 storage_session,
+                storage2_session,
             }
         }
         #[cfg(not(feature = "postgres-execution"))]
@@ -139,23 +168,108 @@ impl QueryExecutor {
     }
 
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
+        self.copy_target_text_line(
+            &CopyTarget {
+                table: table.to_owned(),
+                columns: 0,
+                column_names: Vec::new(),
+            },
+            line,
+        )
+    }
+
+    pub fn copy_target_text_line(&self, target: &CopyTarget, line: &str) -> Result<bool, String> {
         #[cfg(feature = "postgres-execution")]
         {
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
-            fastpg_storage::copy_text_line(table, line)
+            let _storage2_guard =
+                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
+            if storage2_enabled() {
+                self.copy_text_line_storage2(target, line)
+            } else {
+                fastpg_storage::copy_text_line(&target.table, line)
+            }
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
-            let _ = (table, line);
+            let _ = (target, line);
             Err("fastpg-exec was built without PostgreSQL execution".to_owned())
         }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn copy_text_line_storage2(&self, target: &CopyTarget, line: &str) -> Result<bool, String> {
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+        if line == "\\." {
+            return Ok(false);
+        }
+
+        let relation = relation_by_name(&target.table)
+            .ok_or_else(|| format!("relation \"{}\" does not exist", target.table.trim()))?;
+        let copy_columns = if target.column_names.is_empty() {
+            relation.columns.iter().enumerate().collect::<Vec<_>>()
+        } else {
+            target
+                .column_names
+                .iter()
+                .map(|name| {
+                    let normalized = name.to_ascii_lowercase();
+                    relation
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, column)| column.name == normalized)
+                        .ok_or_else(|| {
+                            format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, relation.name
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != copy_columns.len() {
+            return Err(format!(
+                "COPY row for relation \"{}\" has {} fields but {} columns",
+                relation.name,
+                fields.len(),
+                copy_columns.len()
+            ));
+        }
+
+        let mut datums = (0..relation.columns.len())
+            .map(|_| None)
+            .collect::<Vec<Option<fastpg_storage2::CopyDatum>>>();
+        for (field, (column_index, column)) in fields.iter().zip(copy_columns) {
+            let datum = if *field == "\\N" {
+                None
+            } else {
+                let decoded = decode_copy_text_field(field);
+                let datum = self
+                    .pgcore_session
+                    .input_text_datum(column.type_oid.0, column.type_mod, &decoded)
+                    .map_err(pgcore_copy_error)?;
+                Some(if datum.typbyval {
+                    fastpg_storage2::CopyDatum::by_value(datum.value)
+                } else {
+                    fastpg_storage2::CopyDatum::by_reference(datum.payload.unwrap_or_default())
+                })
+            };
+            datums[column_index] = datum;
+        }
+
+        fastpg_storage2::insert_copy_datums(&target.table, datums)
     }
 
     pub fn finish_copy(&self) {
         #[cfg(feature = "postgres-execution")]
         {
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            let _storage2_guard =
+                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
             fastpg_storage::commit_implicit_transaction();
+            fastpg_storage2::fastpg_storage2_xact_commit_if_implicit();
         }
     }
 
@@ -163,7 +277,10 @@ impl QueryExecutor {
         #[cfg(feature = "postgres-execution")]
         {
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            let _storage2_guard =
+                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
             fastpg_storage::abort_implicit_transaction();
+            fastpg_storage2::fastpg_storage2_xact_abort_if_implicit();
         }
     }
 
@@ -171,10 +288,14 @@ impl QueryExecutor {
         #[cfg(feature = "postgres-execution")]
         {
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            let _storage2_guard =
+                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
             if fastpg_storage::is_explicit_transaction() {
                 fastpg_storage::abort_explicit_transaction();
+                fastpg_storage2::fastpg_storage2_xact_abort();
             } else {
                 fastpg_storage::abort_implicit_transaction();
+                fastpg_storage2::fastpg_storage2_xact_abort_if_implicit();
             }
         }
     }
@@ -207,6 +328,13 @@ impl QueryExecutor {
     }
 }
 
+#[cfg(feature = "postgres-execution")]
+fn storage2_enabled() -> bool {
+    std::env::var("FASTPG_STORAGE_ENGINE")
+        .map(|value| value.eq_ignore_ascii_case("storage2"))
+        .unwrap_or(false)
+}
+
 fn execution_error(sqlstate: impl Into<String>, message: impl Into<String>) -> QueryExecution {
     QueryExecution::Error {
         sqlstate: sqlstate.into(),
@@ -231,17 +359,25 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
 #[cfg(feature = "postgres-execution")]
 fn query_description_from_pgcore(statement: &PreparedStatement) -> QueryDescription {
     let description = statement.describe();
-    QueryDescription::new(
+    QueryDescription::with_type_oids(
         description
             .parameter_type_oids
             .iter()
             .copied()
             .map(pg_type_for_oid)
             .collect(),
+        description.parameter_type_oids,
         description
             .fields
             .into_iter()
-            .map(|field| Column::new(field.name, pg_type_for_oid(field.type_oid)))
+            .map(|field| {
+                Column::with_type_metadata(
+                    field.name,
+                    pg_type_for_oid(field.type_oid),
+                    field.type_oid,
+                    field.type_modifier,
+                )
+            })
             .collect(),
     )
 }
@@ -256,6 +392,7 @@ fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryEx
         return QueryExecution::CopyIn(CopyTarget {
             table: copy_in.table,
             columns: copy_in.columns,
+            column_names: copy_in.column_names,
         });
     }
 
@@ -269,7 +406,14 @@ fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryEx
     let fields = statement
         .fields
         .into_iter()
-        .map(|field| Column::new(field.name, pg_type_for_oid(field.type_oid)))
+        .map(|field| {
+            Column::with_type_metadata(
+                field.name,
+                pg_type_for_oid(field.type_oid),
+                field.type_oid,
+                field.type_modifier,
+            )
+        })
         .collect::<Vec<_>>();
     let rows = statement
         .rows
@@ -327,6 +471,39 @@ fn pgcore_value_to_value(value: PgCoreValue, data_type: PgType) -> Result<Value,
             .map(Value::Int8)
             .map_err(|error| format!("cannot decode PostgreSQL int8 value {value:?}: {error}")),
         (PgCoreValue::Text(value), PgType::Varchar) => Ok(Value::Text(value)),
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn decode_copy_text_field(field: &str) -> String {
+    let mut decoded = String::with_capacity(field.len());
+    let mut chars = field.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '\\' {
+            decoded.push(ch);
+            continue;
+        }
+
+        match chars.next() {
+            Some('b') => decoded.push('\u{0008}'),
+            Some('f') => decoded.push('\u{000c}'),
+            Some('n') => decoded.push('\n'),
+            Some('r') => decoded.push('\r'),
+            Some('t') => decoded.push('\t'),
+            Some('\\') => decoded.push('\\'),
+            Some(other) => decoded.push(other),
+            None => decoded.push('\\'),
+        }
+    }
+    decoded
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_copy_error(error: fastpg_pgcore::PgCoreError) -> String {
+    if let Some(detail) = error.detail {
+        format!("{}: {}", error.message, detail)
+    } else {
+        error.message
     }
 }
 
@@ -436,15 +613,16 @@ mod tests {
         let sql = "SELECT relkind FROM pg_catalog.pg_class WHERE oid=$1::pg_catalog.regclass";
         assert_eq!(
             executor.describe(sql).unwrap(),
-            QueryDescription::new(
+            QueryDescription::with_type_oids(
                 vec![PgType::Varchar],
-                vec![Column::new("relkind", PgType::Varchar)]
+                vec![2205],
+                vec![Column::with_type_oid("relkind", PgType::Varchar, 18)]
             )
         );
         assert_eq!(
             executor.execute(sql, &[Value::Text(table.clone())]),
             QueryExecution::Rows(QueryResult::new(
-                vec![Column::new("relkind", PgType::Varchar)],
+                vec![Column::with_type_oid("relkind", PgType::Varchar, 18)],
                 vec![vec![Value::Text("r".to_owned())]]
             ))
         );
@@ -467,6 +645,7 @@ mod tests {
             QueryExecution::CopyIn(CopyTarget {
                 table: table.clone(),
                 columns: 2,
+                column_names: Vec::new(),
             })
         );
         assert!(executor.copy_text_line(&table, "1\t").unwrap());
@@ -486,7 +665,7 @@ mod tests {
         };
         assert_eq!(
             result.fields,
-            vec![Column::new("server_version", PgType::Varchar)]
+            vec![Column::with_type_oid("server_version", PgType::Varchar, 25)]
         );
         assert_eq!(result.rows.len(), 1);
         let Value::Text(server_version) = &result.rows[0][0] else {

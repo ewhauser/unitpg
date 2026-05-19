@@ -8279,6 +8279,13 @@ exec_simple_check_plan(PLpgSQL_execstate *estate, PLpgSQL_expr *expr)
 	if (CachedPlanAllowsSimpleValidityCheck(plansource, cplan,
 											estate->simple_eval_resowner))
 	{
+#ifdef USE_FASTPG
+		if (!IsUnderPostmaster)
+		{
+			ReleaseCachedPlan(cplan, CurrentResourceOwner);
+			return;
+		}
+#endif
 		/* Remember that we have the refcount */
 		expr->expr_simple_plansource = plansource;
 		expr->expr_simple_plan = cplan;

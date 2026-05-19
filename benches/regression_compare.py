@@ -77,6 +77,7 @@ class RegressionCompare:
                 "suite": args.suite,
                 "cases_dir": str(cases_dir(self.bench_root, args)),
                 "allow_fastpg_failures": args.allow_fastpg_failures,
+                "storage_engine": args.storage_engine,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
             },
@@ -137,6 +138,7 @@ class RegressionCompare:
         socket_dir = short_temp_dir("fprg-normal-")
         port = free_port()
         env = postgres_env(paths["bindir"], paths["libdir"])
+        env["FASTPG_STORAGE_ENGINE"] = self.args.storage_engine
         logfile = run_dir / "postgres.log"
         started = False
         run_record = {
@@ -247,6 +249,7 @@ class RegressionCompare:
             host = str(socket_dir)
             listen_address = f"unix:{socket_path}"
         env = rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"])
+        env["FASTPG_STORAGE_ENGINE"] = self.args.storage_engine
         server: dict[str, Any] | None = None
         run_record: dict[str, Any] = {
             "host": host,
@@ -270,6 +273,7 @@ class RegressionCompare:
                 host=host,
                 port=port,
                 socket_path=socket_path,
+                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
             )
             run_record["commands"]["start"] = server["result"].as_json()
             fastpg_cases = self.run_cases("fastpg", paths["client_bindir"], host, port, env, run_dir)
@@ -396,6 +400,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         protocol="simple",
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
+        storage_engine=args.storage_engine,
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
@@ -617,6 +622,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--rust-build-profile",
         choices=["debug", "release"],
         default="release",
+    )
+    parser.add_argument(
+        "--storage-engine",
+        choices=["storage1", "storage2"],
+        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
     )
     parser.add_argument(
         "--allow-fastpg-failures",

@@ -3500,6 +3500,9 @@ DeconstructQualifiedName(const List *names,
 			objname = strVal(lsecond(names));
 			break;
 		case 3:
+		{
+			char	   *databasename = get_database_name(MyDatabaseId);
+
 			catalogname = strVal(linitial(names));
 			schemaname = strVal(lsecond(names));
 			objname = strVal(lthird(names));
@@ -3507,12 +3510,14 @@ DeconstructQualifiedName(const List *names,
 			/*
 			 * We check the catalog name and then ignore it.
 			 */
-			if (strcmp(catalogname, get_database_name(MyDatabaseId)) != 0)
+			if (databasename == NULL ||
+				strcmp(catalogname, databasename) != 0)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cross-database references are not implemented: %s",
 								NameListToString(names))));
 			break;
+		}
 		default:
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),

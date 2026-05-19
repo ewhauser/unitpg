@@ -11,9 +11,11 @@ postgres-execution = ["fastpg-session/postgres-execution"]
 
 [dependencies]
 async-trait.workspace = true
+bytes = "1"
 fastpg-compat.workspace = true
 fastpg-session.workspace = true
 fastpg-types.workspace = true
 futures.workspace = true
 pgwire.workspace = true
+postgres-types.workspace = true
 tokio.workspace = true

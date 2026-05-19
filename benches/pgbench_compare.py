@@ -63,14 +63,18 @@ class CommandResult:
     stdout: str
     stderr: str
     seconds: float
+    environment: dict[str, str] | None = None
 
     def as_json(self) -> dict[str, Any]:
-        return {
+        data: dict[str, Any] = {
             "command": self.command,
             "cwd": self.cwd,
             "returncode": self.returncode,
             "seconds": self.seconds,
         }
+        if self.environment is not None:
+            data["environment"] = self.environment
+        return data
 
 
 class ProcessMemorySampler:
@@ -194,6 +198,7 @@ class PgBenchCompare:
                 "jobs": args.jobs,
                 "runs": args.runs,
                 "protocol": args.protocol,
+                "storage_engine": args.storage_engine,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
@@ -367,6 +372,8 @@ class PgBenchCompare:
             "client_libdir": self.pgbench_client_paths["libdir"],
             "pgcore_build_dir": pgcore_build_dir,
         }
+        paths["pgcore_build_dir"] = Path(build_env["FASTPG_POSTGRES_BUILD_DIR"])
+        paths["pgcore_libdir"] = paths["pgcore_build_dir"] / "src/pl/plpgsql/src"
         return paths
 
     def ensure_fastpg_pgcore_build(self, variant_name: str, output_dir: Path) -> Path:
@@ -403,6 +410,13 @@ class PgBenchCompare:
             ["meson", "compile", "-C", str(build_dir), "backend"],
             output_dir,
             "meson-compile-fastpg-backend",
+        )
+        self.checked_command(
+            variant_name,
+            "setup",
+            ["meson", "compile", "-C", str(build_dir), "pl"],
+            output_dir,
+            "meson-compile-fastpg-pl",
         )
         return build_dir
 
@@ -443,6 +457,7 @@ class PgBenchCompare:
         socket_dir.mkdir(parents=True, exist_ok=True)
         port = free_port()
         env = postgres_env(paths["bindir"], paths["libdir"])
+        env["FASTPG_STORAGE_ENGINE"] = self.args.storage_engine
         logfile = run_dir / "postgres.log"
         started = False
         profiler: dict[str, Any] | None = None
@@ -598,6 +613,7 @@ class PgBenchCompare:
             host = str(socket_dir)
             listen_address = f"unix:{socket_path}"
         env = rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"])
+        env["FASTPG_STORAGE_ENGINE"] = self.args.storage_engine
         server: dict[str, Any] | None = None
         profiler: dict[str, Any] | None = None
         stop_failure: BenchmarkFailure | None = None
@@ -620,6 +636,7 @@ class PgBenchCompare:
                 host=host,
                 port=port,
                 socket_path=socket_path,
+                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
             )
             run_record["commands"]["start"] = server["result"].as_json()
             if "profiler" in server:
@@ -709,6 +726,7 @@ class PgBenchCompare:
         host: str,
         port: int,
         socket_path: Path | None = None,
+        server_env: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         output_dir.mkdir(parents=True, exist_ok=True)
         command = [str(server_binary), listen_address]
@@ -716,16 +734,30 @@ class PgBenchCompare:
         stderr_path = output_dir / "fastpg-server.stderr"
         stdout_file = stdout_path.open("w")
         stderr_file = stderr_path.open("w")
+        env = {**os.environ.copy(), "FASTPG_STORAGE_ENGINE": self.args.storage_engine}
+        if server_env:
+            env.update(server_env)
+        recorded_env = {"FASTPG_STORAGE_ENGINE": self.args.storage_engine}
+        if server_env:
+            recorded_env.update(server_env)
         started = time.monotonic()
         process = subprocess.Popen(
             command,
             cwd=self.source_root,
-            env=os.environ.copy(),
+            env=env,
             text=True,
             stdout=stdout_file,
             stderr=stderr_file,
         )
-        result = CommandResult(command, str(self.source_root), 0, "", "", time.monotonic() - started)
+        result = CommandResult(
+            command,
+            str(self.source_root),
+            0,
+            "",
+            "",
+            time.monotonic() - started,
+            recorded_env,
+        )
         server = {
             "command": command,
             "process": process,
@@ -750,6 +782,7 @@ class PgBenchCompare:
                 read_text(stdout_path),
                 read_text(stderr_path),
                 time.monotonic() - started,
+                recorded_env,
             )
             self.stop_rust_server(server, output_dir)
             raise BenchmarkFailure(variant, "start", failure, output_dir)
@@ -1275,6 +1308,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["debug", "release"],
         default="release",
         help="Cargo build profile for the Rust server",
+    )
+    parser.add_argument(
+        "--storage-engine",
+        choices=["storage1", "storage2"],
+        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
+        help="select the fastpg in-memory storage engine for the fastpg variant",
     )
     parser.add_argument(
         "--profile-fastpg-rust-server",

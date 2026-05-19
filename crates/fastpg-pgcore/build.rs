@@ -34,8 +34,7 @@ fn main() {
     let archive = out_dir.join("libfastpg_pgcore_backend.a");
     build_backend_archive(&build_dir, &out_dir, &archive);
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=fastpg_pgcore_backend");
+    link_backend_archive(&archive);
 }
 
 fn compile_shim(source_root: &Path, build_dir: &Path) {
@@ -82,24 +81,31 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
         &object_dir.join("parser"),
         &mut objects,
     );
+    let pgcommon_srv = build_dir.join("src/common/libpgcommon_srv.a");
     extract_archive_objects(
         build_dir,
-        &build_dir.join("src/common/libpgcommon_srv.a"),
+        &pgcommon_srv,
         &object_dir.join("pgcommon_srv"),
         &mut objects,
     );
-    extract_archive_objects(
-        build_dir,
-        &build_dir.join("src/common/libpgcommon_srv_config_info.a"),
-        &object_dir.join("pgcommon_srv_config_info"),
-        &mut objects,
-    );
-    extract_archive_objects(
-        build_dir,
-        &build_dir.join("src/common/libpgcommon_srv_ryu.a"),
-        &object_dir.join("pgcommon_srv_ryu"),
-        &mut objects,
-    );
+    if !archive_has_member(&pgcommon_srv, "config_info.c.o") {
+        extract_archive_objects(
+            build_dir,
+            &build_dir.join("src/common/libpgcommon_srv_config_info.a"),
+            &object_dir.join("pgcommon_srv_config_info"),
+            &mut objects,
+        );
+    }
+    if !archive_has_member(&pgcommon_srv, "d2s.c.o")
+        || !archive_has_member(&pgcommon_srv, "f2s.c.o")
+    {
+        extract_archive_objects(
+            build_dir,
+            &build_dir.join("src/common/libpgcommon_srv_ryu.a"),
+            &object_dir.join("pgcommon_srv_ryu"),
+            &mut objects,
+        );
+    }
     extract_archive_objects(
         build_dir,
         &build_dir.join("src/port/libpgport_srv.a"),
@@ -121,6 +127,14 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
             .args(&objects),
         "build Postgres backend archive",
     );
+}
+
+fn link_backend_archive(archive: &Path) {
+    let out_dir = archive
+        .parent()
+        .expect("backend archive should have an output directory");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static:+whole-archive=fastpg_pgcore_backend");
 }
 
 fn collect_backend_objects(build_dir: &Path, objects: &mut Vec<PathBuf>) {
@@ -242,6 +256,12 @@ fn archive_members(archive: &Path) -> Vec<String> {
         .filter(|line| !line.is_empty())
         .map(ToOwned::to_owned)
         .collect()
+}
+
+fn archive_has_member(archive: &Path, member: &str) -> bool {
+    archive_members(archive)
+        .iter()
+        .any(|candidate| candidate == member)
 }
 
 fn resolve_thin_archive_member(build_dir: &Path, archive: &Path, member: &str) -> PathBuf {

@@ -805,7 +805,9 @@ FastPgBuildClassTuple(TupleDesc tupdesc,
 	values[Anum_pg_class_relkind - 1] = CharGetDatum((char) relation->relkind);
 	values[Anum_pg_class_relnatts - 1] = Int16GetDatum((int16) relation->column_count);
 	values[Anum_pg_class_relchecks - 1] = Int16GetDatum(0);
-	values[Anum_pg_class_relhasrules - 1] = BoolGetDatum(false);
+	values[Anum_pg_class_relhasrules - 1] =
+		BoolGetDatum(relation->relkind == RELKIND_VIEW ||
+					 relation->relkind == RELKIND_MATVIEW);
 	values[Anum_pg_class_relhastriggers - 1] = BoolGetDatum(false);
 	values[Anum_pg_class_relhassubclass - 1] = BoolGetDatum(false);
 	values[Anum_pg_class_relrowsecurity - 1] = BoolGetDatum(false);

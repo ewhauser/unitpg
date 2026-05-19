@@ -1174,6 +1174,10 @@ pgaio_submit_staged(void)
 void
 pgaio_error_cleanup(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster || pgaio_my_backend == NULL)
+		return;
+#endif
 	/*
 	 * It is possible that code errored out after pgaio_enter_batchmode() but
 	 * before pgaio_exit_batchmode() was called. In that case we need to
@@ -1202,6 +1206,10 @@ pgaio_error_cleanup(void)
 void
 AtEOXact_Aio(bool is_commit)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster || pgaio_my_backend == NULL)
+		return;
+#endif
 	/*
 	 * We should never be in batch mode at transactional boundaries. In case
 	 * an error was thrown while in batch mode, pgaio_error_cleanup() should

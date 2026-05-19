@@ -895,6 +895,10 @@ LockErrorCleanup(void)
 void
 ProcReleaseLocks(bool isCommit)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 	if (!MyProc)
 		return;
 	/* If waiting, get off wait queue (should only be needed after error) */

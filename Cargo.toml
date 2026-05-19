@@ -10,6 +10,7 @@ members = [
     "crates/fastpg-session",
     "crates/fastpg-snapshot",
     "crates/fastpg-storage",
+    "crates/fastpg-storage2",
     "crates/fastpg-testkit",
     "crates/fastpg-tx",
     "crates/fastpg-types",
@@ -34,11 +35,13 @@ fastpg-server = { path = "crates/fastpg-server" }
 fastpg-session = { path = "crates/fastpg-session" }
 fastpg-snapshot = { path = "crates/fastpg-snapshot" }
 fastpg-storage = { path = "crates/fastpg-storage" }
+fastpg-storage2 = { path = "crates/fastpg-storage2" }
 fastpg-tx = { path = "crates/fastpg-tx" }
 fastpg-types = { path = "crates/fastpg-types" }
 fastpg-wire = { path = "crates/fastpg-wire" }
 futures = "0.3"
 pgwire = { version = "=0.40.0", default-features = false, features = ["server-api"] }
+postgres-types = "0.2"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "sync", "time", "signal", "macros"] }
 tokio-postgres = "0.7"
 cc = "1"

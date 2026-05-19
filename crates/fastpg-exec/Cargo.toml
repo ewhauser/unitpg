@@ -12,4 +12,5 @@ postgres-execution = ["fastpg-pgcore/postgres-execution"]
 [dependencies]
 fastpg-pgcore.workspace = true
 fastpg-storage.workspace = true
+fastpg-storage2.workspace = true
 fastpg-types.workspace = true

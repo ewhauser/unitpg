@@ -867,6 +867,29 @@ InitializeSessionUserIdStandalone(void)
 	SetCurrentRoleId(InvalidOid, false);
 }
 
+#ifdef USE_FASTPG
+void
+FastPgEnsureStandaloneUserId(void)
+{
+	if (IsUnderPostmaster)
+		return;
+
+	if (!OidIsValid(AuthenticatedUserId))
+		AuthenticatedUserId = BOOTSTRAP_SUPERUSERID;
+
+	if (!OidIsValid(SessionUserId) ||
+		!OidIsValid(OuterUserId) ||
+		!OidIsValid(CurrentUserId))
+	{
+		SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
+		SetCurrentRoleId(InvalidOid, false);
+	}
+
+	if (MyProc != NULL)
+		MyProc->roleId = BOOTSTRAP_SUPERUSERID;
+}
+#endif
+
 /*
  * Initialize the system user.
  *

@@ -80,9 +80,15 @@ typedef struct FastPgRustCatalogColumn
 	char		name[NAMEDATALEN];
 	uint32_t	type_oid;
 	int32_t		type_mod;
+	uint32_t	attcollation;
+	int16_t		attlen;
 	uint8_t		is_not_null;
 	uint8_t		has_default;
 	uint8_t		generated;
+	uint8_t		is_dropped;
+	uint8_t		attbyval;
+	uint8_t		attalign;
+	uint8_t		attstorage;
 	uint8_t		_padding;
 } FastPgRustCatalogColumn;
 
@@ -229,6 +235,13 @@ extern bool fastpg_rust_catalog_primary_key_index_oid(uint32_t relation_oid,
 extern bool fastpg_rust_catalog_relation_unique_index_oid(uint32_t relation_oid,
 														 size_t index_position,
 														 uint32_t *oid_out);
+extern bool fastpg_rust_catalog_enum_endpoint(uint32_t enum_type_oid,
+											  uint8_t forward,
+											  uint32_t *oid_out);
+extern bool fastpg_rust_catalog_enum_oids_by_sort_order(uint32_t enum_type_oid,
+														uint32_t *oids_out,
+														size_t capacity,
+														size_t *count_out);
 extern bool fastpg_rust_catalog_namespace_by_oid(uint32_t oid,
 												 FastPgRustCatalogNamespace *out);
 extern bool fastpg_rust_catalog_namespace_by_name(const char *name,

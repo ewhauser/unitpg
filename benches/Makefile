@@ -12,6 +12,7 @@ RUNS ?= 3
 PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
+STORAGE_ENGINE ?= storage1
 REGRESSION_SUITE ?= core
 REGRESSION_CASES_DIR ?=
 REGRESSION_ALLOW_FAILURES ?= 0
@@ -41,6 +42,7 @@ PGBENCH_COMMON_ARGS = \
 	--runs "$(RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--storage-engine "$(STORAGE_ENGINE)" \
 	--rust-build-profile "$(RUST_BUILD_PROFILE)"
 
 PGBENCH_PROFILE_ARGS = \
@@ -51,6 +53,7 @@ PGBENCH_PROFILE_ARGS = \
 	--runs "$(PROFILE_RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--storage-engine "$(STORAGE_ENGINE)" \
 	--rust-build-profile "release" \
 	--profile-fastpg-rust-server \
 	--profile-tool "$(PROFILE_TOOL)" \
@@ -106,6 +109,7 @@ profile-side-by-side:
 		--runs "1" \
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--storage-engine "$(STORAGE_ENGINE)" \
 		--rust-build-profile "release" \
 		--profile-normal-postgres \
 		--profile-fastpg-rust-server \
@@ -127,6 +131,7 @@ regression:
 		$(REGRESSION_CASES_ARG) \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
 		--rust-build-profile "release" \
+		--storage-engine "$(STORAGE_ENGINE)" \
 		$(REGRESSION_ALLOW_FAILURES_ARG)
 
 bench:

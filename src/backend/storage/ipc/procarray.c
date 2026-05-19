@@ -1403,6 +1403,11 @@ TransactionIdIsInProgress(TransactionId xid)
 	int			numProcs;
 	int			j;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return false;
+#endif
+
 	/*
 	 * Don't bother checking a transaction older than RecentXmin; it could not
 	 * possibly still be running.  (Note: in particular, this guarantees that

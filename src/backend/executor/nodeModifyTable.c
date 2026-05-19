@@ -53,6 +53,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/htup_details.h"
 #include "access/tableam.h"
 #include "access/tupconvert.h"
@@ -1220,6 +1223,21 @@ ExecInsert(ModifyTableContext *context,
 				}
 			}
 
+#ifdef USE_FASTPG
+			if (!IsUnderPostmaster &&
+				resultRelationDesc->rd_tableam == GetFastPgMemTableAmRoutine())
+			{
+				table_tuple_insert(resultRelationDesc, slot,
+								   estate->es_output_cid,
+								   0, NULL);
+
+				recheckIndexes = ExecInsertIndexTuples(resultRelInfo,
+													   estate, 0, slot, NIL,
+													   NULL);
+			}
+			else
+#endif
+			{
 			/*
 			 * Before we start insertion proper, acquire our "speculative
 			 * insertion lock".  Others can use that to wait for us to decide
@@ -1264,6 +1282,7 @@ ExecInsert(ModifyTableContext *context,
 			{
 				list_free(recheckIndexes);
 				goto vlock;
+			}
 			}
 
 			/* Since there was no insertion conflict, we're done */

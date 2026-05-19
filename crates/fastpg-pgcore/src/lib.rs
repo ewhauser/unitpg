@@ -72,6 +72,7 @@ pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
 pub struct PgCoreField {
     pub name: String,
     pub type_oid: u32,
+    pub type_modifier: i32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -94,9 +95,18 @@ pub enum PgCoreParam {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreInputDatum {
+    pub value: usize,
+    pub typbyval: bool,
+    pub typlen: i16,
+    pub payload: Option<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreCopyIn {
     pub table: String,
     pub columns: usize,
+    pub column_names: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -116,6 +126,7 @@ pub struct ExecutionResult {
 pub struct PgCoreSession {
     inner: inner::PgCoreSession,
     storage_session: fastpg_storage::SessionStorageHandle,
+    storage2_session: fastpg_storage2::SessionStorageHandle,
 }
 
 impl PgCoreSession {
@@ -124,17 +135,33 @@ impl PgCoreSession {
     }
 
     pub fn with_storage_session(storage_session: fastpg_storage::SessionStorageHandle) -> Self {
+        Self::with_storage_sessions(storage_session, fastpg_storage2::new_session_storage())
+    }
+
+    pub fn with_storage_sessions(
+        storage_session: fastpg_storage::SessionStorageHandle,
+        storage2_session: fastpg_storage2::SessionStorageHandle,
+    ) -> Self {
         Self {
             inner: inner::PgCoreSession::new(),
             storage_session,
+            storage2_session,
+        }
+    }
+
+    fn enter_storage(&self) -> PgCoreStorageGuards {
+        PgCoreStorageGuards {
+            _storage1: fastpg_storage::enter_session_storage(self.storage_session.clone()),
+            _storage2: fastpg_storage2::enter_session_storage(self.storage2_session.clone()),
         }
     }
 
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
-        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        let _guard = self.enter_storage();
         self.inner.prepare(sql).map(|inner| PreparedStatement {
             inner,
             storage_session: self.storage_session.clone(),
+            storage2_session: self.storage2_session.clone(),
         })
     }
 
@@ -143,8 +170,18 @@ impl PgCoreSession {
         sql: &str,
         params: &[PgCoreParam],
     ) -> Result<ExecutionResult, PgCoreError> {
-        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        let _guard = self.enter_storage();
         self.inner.execute_with_params(sql, params)
+    }
+
+    pub fn input_text_datum(
+        &self,
+        type_oid: u32,
+        typmod: i32,
+        value: &str,
+    ) -> Result<PgCoreInputDatum, PgCoreError> {
+        let _guard = self.enter_storage();
+        self.inner.input_text_datum(type_oid, typmod, value)
     }
 }
 
@@ -158,6 +195,7 @@ impl Default for PgCoreSession {
 pub struct PreparedStatement {
     inner: inner::PreparedStatement,
     storage_session: fastpg_storage::SessionStorageHandle,
+    storage2_session: fastpg_storage2::SessionStorageHandle,
 }
 
 // pgcore is backed by PostgreSQL backend globals, so every public operation is
@@ -171,8 +209,15 @@ impl PreparedStatement {
         self.inner.describe()
     }
 
+    fn enter_storage(&self) -> PgCoreStorageGuards {
+        PgCoreStorageGuards {
+            _storage1: fastpg_storage::enter_session_storage(self.storage_session.clone()),
+            _storage2: fastpg_storage2::enter_session_storage(self.storage2_session.clone()),
+        }
+    }
+
     pub fn execute(&self) -> Result<ExecutionResult, PgCoreError> {
-        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        let _guard = self.enter_storage();
         self.inner.execute()
     }
 
@@ -180,9 +225,14 @@ impl PreparedStatement {
         &self,
         params: &[PgCoreParam],
     ) -> Result<ExecutionResult, PgCoreError> {
-        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        let _guard = self.enter_storage();
         self.inner.execute_with_params(params)
     }
+}
+
+struct PgCoreStorageGuards {
+    _storage1: fastpg_storage::SessionStorageGuard,
+    _storage2: fastpg_storage2::SessionStorageGuard,
 }
 
 #[derive(Debug)]
@@ -219,7 +269,8 @@ mod inner {
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField,
-        PgCoreLaneMetrics, PgCoreParam, PgCoreValue, RawParseSummary, StatementDescription,
+        PgCoreInputDatum, PgCoreLaneMetrics, PgCoreParam, PgCoreValue, RawParseSummary,
+        StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
@@ -330,6 +381,11 @@ mod inner {
         _private: [u8; 0],
     }
 
+    #[repr(C)]
+    struct FastPgPgCoreInputDatumResult {
+        _private: [u8; 0],
+    }
+
     unsafe extern "C" {
         fn fastpg_pgcore_raw_parse(sql: *const c_char) -> *mut FastPgPgCoreParseResult;
         fn fastpg_pgcore_invalidate_system_caches();
@@ -372,6 +428,10 @@ mod inner {
             prepared: *const FastPgPgCorePrepared,
             index: i32,
         ) -> u32;
+        fn fastpg_pgcore_prepared_field_type_modifier(
+            prepared: *const FastPgPgCorePrepared,
+            index: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute(
             prepared: *const FastPgPgCorePrepared,
         ) -> *mut FastPgPgCoreExecuteResult;
@@ -423,6 +483,11 @@ mod inner {
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_column_name(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            column_index: i32,
+        ) -> *const c_char;
         fn fastpg_pgcore_execute_column_name(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
@@ -433,6 +498,11 @@ mod inner {
             statement_index: i32,
             column_index: i32,
         ) -> u32;
+        fn fastpg_pgcore_execute_column_type_modifier(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            column_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute_value_is_null(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
@@ -445,6 +515,44 @@ mod inner {
             row_index: i32,
             column_index: i32,
         ) -> *const c_char;
+        fn fastpg_pgcore_input_text_datum(
+            type_oid: u32,
+            typmod: i32,
+            value_text: *const c_char,
+        ) -> *mut FastPgPgCoreInputDatumResult;
+        fn fastpg_pgcore_input_datum_result_free(result: *mut FastPgPgCoreInputDatumResult);
+        fn fastpg_pgcore_input_datum_result_ok(result: *const FastPgPgCoreInputDatumResult)
+        -> bool;
+        fn fastpg_pgcore_input_datum_result_sqlstate(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_input_datum_result_message(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_input_datum_result_detail(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_input_datum_result_hint(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_input_datum_result_cursorpos(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> i32;
+        fn fastpg_pgcore_input_datum_result_value(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> usize;
+        fn fastpg_pgcore_input_datum_result_typbyval(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> bool;
+        fn fastpg_pgcore_input_datum_result_typlen(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> i16;
+        fn fastpg_pgcore_input_datum_result_value_len(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> usize;
+        fn fastpg_pgcore_input_datum_result_payload(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> *const u8;
     }
 
     fn check_sql(sql: &str) -> Result<(), PgCoreError> {
@@ -625,6 +733,86 @@ mod inner {
             }
             result
         }
+
+        pub fn input_text_datum(
+            &self,
+            type_oid: u32,
+            typmod: i32,
+            value: &str,
+        ) -> Result<PgCoreInputDatum, PgCoreError> {
+            let value = CString::new(value).map_err(|_| {
+                PgCoreError::new("22023", "COPY text value contains an embedded NUL byte", 0)
+            })?;
+            let _guard = enter_pgcore_lane("input_text_datum");
+            let result =
+                unsafe { fastpg_pgcore_input_text_datum(type_oid, typmod, value.as_ptr()) };
+            let Some(result) = NonNull::new(result) else {
+                return Err(PgCoreError::new(
+                    "XX000",
+                    "PostgreSQL type input returned a null result",
+                    0,
+                ));
+            };
+            let result = InputDatumResult(result);
+            if unsafe { fastpg_pgcore_input_datum_result_ok(result.as_ptr()) } {
+                let typbyval =
+                    unsafe { fastpg_pgcore_input_datum_result_typbyval(result.as_ptr()) };
+                let value = unsafe { fastpg_pgcore_input_datum_result_value(result.as_ptr()) };
+                let typlen = unsafe { fastpg_pgcore_input_datum_result_typlen(result.as_ptr()) };
+                let payload = if typbyval {
+                    None
+                } else {
+                    let len =
+                        unsafe { fastpg_pgcore_input_datum_result_value_len(result.as_ptr()) };
+                    let ptr = unsafe { fastpg_pgcore_input_datum_result_payload(result.as_ptr()) };
+                    if len == 0 {
+                        Some(Vec::new())
+                    } else if ptr.is_null() {
+                        return Err(PgCoreError::new(
+                            "XX000",
+                            "PostgreSQL type input returned a null by-reference payload",
+                            0,
+                        ));
+                    } else {
+                        Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+                    }
+                };
+                Ok(PgCoreInputDatum {
+                    value,
+                    typbyval,
+                    typlen,
+                    payload,
+                })
+            } else {
+                Err(PgCoreError::with_fields(
+                    unsafe { c_string(fastpg_pgcore_input_datum_result_sqlstate(result.as_ptr())) },
+                    unsafe { c_string(fastpg_pgcore_input_datum_result_message(result.as_ptr())) },
+                    unsafe {
+                        optional_c_string(fastpg_pgcore_input_datum_result_detail(result.as_ptr()))
+                    },
+                    unsafe {
+                        optional_c_string(fastpg_pgcore_input_datum_result_hint(result.as_ptr()))
+                    },
+                    unsafe { fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr()) },
+                ))
+            }
+        }
+    }
+
+    struct InputDatumResult(NonNull<FastPgPgCoreInputDatumResult>);
+
+    impl InputDatumResult {
+        fn as_ptr(&self) -> *const FastPgPgCoreInputDatumResult {
+            self.0.as_ptr()
+        }
+    }
+
+    impl Drop for InputDatumResult {
+        fn drop(&mut self) {
+            unsafe {
+                fastpg_pgcore_input_datum_result_free(self.0.as_ptr());
+            }
+        }
     }
 
     #[derive(Debug)]
@@ -653,6 +841,9 @@ mod inner {
                         },
                         type_oid: unsafe {
                             fastpg_pgcore_prepared_field_type_oid(self.as_ptr(), index)
+                        },
+                        type_modifier: unsafe {
+                            fastpg_pgcore_prepared_field_type_modifier(self.as_ptr(), index)
                         },
                     })
                     .collect(),
@@ -827,20 +1018,37 @@ mod inner {
                 let copy_in = unsafe {
                     fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
                 }
-                .then(|| PgCoreCopyIn {
-                    table: unsafe {
-                        c_string(fastpg_pgcore_execute_statement_copy_table(
-                            self.as_ptr(),
-                            statement_index,
-                        ))
-                    },
-                    columns: unsafe {
+                .then(|| {
+                    let columns = unsafe {
                         fastpg_pgcore_execute_statement_copy_column_count(
                             self.as_ptr(),
                             statement_index,
                         )
                     }
-                    .max(0) as usize,
+                    .max(0);
+                    let column_names = (0..columns)
+                        .filter_map(|column_index| {
+                            let name = unsafe {
+                                optional_c_string(fastpg_pgcore_execute_statement_copy_column_name(
+                                    self.as_ptr(),
+                                    statement_index,
+                                    column_index,
+                                ))
+                            };
+                            name.filter(|name| !name.is_empty())
+                        })
+                        .collect();
+
+                    PgCoreCopyIn {
+                        table: unsafe {
+                            c_string(fastpg_pgcore_execute_statement_copy_table(
+                                self.as_ptr(),
+                                statement_index,
+                            ))
+                        },
+                        columns: columns as usize,
+                        column_names,
+                    }
                 });
                 let mut fields = Vec::with_capacity(field_count as usize);
                 for column_index in 0..field_count {
@@ -854,6 +1062,13 @@ mod inner {
                         },
                         type_oid: unsafe {
                             fastpg_pgcore_execute_column_type_oid(
+                                self.as_ptr(),
+                                statement_index,
+                                column_index,
+                            )
+                        },
+                        type_modifier: unsafe {
+                            fastpg_pgcore_execute_column_type_modifier(
                                 self.as_ptr(),
                                 statement_index,
                                 column_index,
@@ -915,7 +1130,8 @@ mod inner {
 #[cfg(not(feature = "postgres-execution"))]
 mod inner {
     use super::{
-        ExecutionResult, PgCoreError, PgCoreLaneMetrics, RawParseSummary, StatementDescription,
+        ExecutionResult, PgCoreError, PgCoreInputDatum, PgCoreLaneMetrics, RawParseSummary,
+        StatementDescription,
     };
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
@@ -950,6 +1166,19 @@ mod inner {
             Err(PgCoreError::new(
                 "0A000",
                 "fastpg-pgcore was built without PostgreSQL execution",
+                0,
+            ))
+        }
+
+        pub fn input_text_datum(
+            &self,
+            _type_oid: u32,
+            _typmod: i32,
+            _value: &str,
+        ) -> Result<PgCoreInputDatum, PgCoreError> {
+            Err(PgCoreError::new(
+                "0A000",
+                "fastpg-pgcore was built without postgres-linked support",
                 0,
             ))
         }
@@ -1072,6 +1301,28 @@ mod tests {
         let error = statement.execute().unwrap_err();
         assert_eq!(error.sqlstate, "08P01");
         assert!(error.message.contains("expected 1 parameters but got 0"));
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn input_text_datum_uses_postgres_type_input() {
+        const VARBIT_OID: u32 = 1562;
+
+        let session = PgCoreSession::new();
+        let int4 = session.input_text_datum(INT4_OID, -1, "42").unwrap();
+        assert!(int4.typbyval);
+        assert_eq!(int4.value, 42);
+        assert!(int4.payload.is_none());
+
+        let varbit = session.input_text_datum(VARBIT_OID, -1, "101").unwrap();
+        assert!(!varbit.typbyval);
+        assert_eq!(varbit.typlen, -1);
+        assert!(
+            varbit
+                .payload
+                .as_ref()
+                .is_some_and(|payload| !payload.is_empty())
+        );
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -1594,7 +1845,8 @@ mod tests {
             copy.statements[0].copy_in,
             Some(PgCoreCopyIn {
                 table: table.clone(),
-                columns: 2
+                columns: 2,
+                column_names: Vec::new(),
             })
         );
 

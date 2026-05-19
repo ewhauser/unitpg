@@ -18,6 +18,13 @@
 
 extern const TableAmRoutine *GetFastPgMemTableAmRoutine(void);
 extern const IndexAmRoutine *GetFastPgMemIndexAmRoutine(void);
+extern bool FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
+											  Relation indexRelation,
+											  const Datum *values,
+											  const bool *isnull,
+											  const ItemPointerData *tupleid,
+											  bool *satisfies,
+											  ItemPointer conflictTid);
 
 #endif							/* USE_FASTPG */
 

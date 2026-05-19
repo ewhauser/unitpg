@@ -7,13 +7,30 @@ pub struct Oid(pub u32);
 pub struct Column {
     pub name: String,
     pub data_type: PgType,
+    pub type_oid: u32,
+    pub type_modifier: i32,
 }
 
 impl Column {
     pub fn new(name: impl Into<String>, data_type: PgType) -> Self {
+        Self::with_type_oid(name, data_type, data_type.default_type_oid())
+    }
+
+    pub fn with_type_oid(name: impl Into<String>, data_type: PgType, type_oid: u32) -> Self {
+        Self::with_type_metadata(name, data_type, type_oid, -1)
+    }
+
+    pub fn with_type_metadata(
+        name: impl Into<String>,
+        data_type: PgType,
+        type_oid: u32,
+        type_modifier: i32,
+    ) -> Self {
         Self {
             name: name.into(),
             data_type,
+            type_oid,
+            type_modifier,
         }
     }
 }
@@ -24,6 +41,17 @@ pub enum PgType {
     Int4,
     Int8,
     Varchar,
+}
+
+impl PgType {
+    pub fn default_type_oid(self) -> u32 {
+        match self {
+            PgType::Int2 => 21,
+            PgType::Int4 => 23,
+            PgType::Int8 => 20,
+            PgType::Varchar => 1043,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
