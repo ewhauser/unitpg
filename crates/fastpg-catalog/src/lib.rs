@@ -2,6 +2,7 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 
 use fastpg_types::Oid;
@@ -461,6 +462,7 @@ impl Default for CatalogState {
 }
 
 static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
+static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(1);
 static PRIMARY_KEY_INDEX_OID_CACHE: OnceLock<Mutex<PrimaryKeyIndexOidCache>> = OnceLock::new();
 
 #[derive(Debug)]
@@ -1385,10 +1387,11 @@ fn static_btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
 
 fn bump_generation(state: &mut CatalogState) {
     state.generation = state.generation.saturating_add(1).max(1);
+    CATALOG_GENERATION.store(state.generation, Ordering::Relaxed);
 }
 
 pub fn current_generation() -> u64 {
-    with_catalog_read(|state| state.generation)
+    CATALOG_GENERATION.load(Ordering::Relaxed)
 }
 
 fn primary_key_index_oid_cache() -> &'static Mutex<PrimaryKeyIndexOidCache> {
@@ -2132,7 +2135,10 @@ pub fn relation_column_count(name: &str) -> Result<usize, CatalogError> {
 
 #[cfg(test)]
 pub fn clear_for_tests() {
-    with_catalog(|state| *state = CatalogState::default());
+    with_catalog(|state| {
+        *state = CatalogState::default();
+        CATALOG_GENERATION.store(state.generation, Ordering::Relaxed);
+    });
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
