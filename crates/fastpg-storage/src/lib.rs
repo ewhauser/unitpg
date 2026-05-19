@@ -1499,18 +1499,19 @@ impl StorageState {
                     .committed_region
                     .copy_row(row)
                     .expect("stored by-reference cells must point to owned storage");
-                relation.committed_row_ids.insert(committed_row.row_id);
-                relation
-                    .committed_row_index
-                    .insert(committed_row.row_id, committed_row.clone());
-                if unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&committed_row.row_id))
-                {
-                    continue;
-                }
-                if let Some(primary_key_spec) = &primary_key_spec
-                    && let Some(key) = index_key_for_row(primary_key_spec, &committed_row)
-                {
-                    relation.insert_primary_key(key, committed_row.row_id);
+                let row_id = committed_row.row_id;
+                let primary_key =
+                    if unchanged_row_ids.is_some_and(|row_ids| row_ids.contains(&row_id)) {
+                        None
+                    } else {
+                        primary_key_spec.as_ref().and_then(|primary_key_spec| {
+                            index_key_for_row(primary_key_spec, &committed_row)
+                        })
+                    };
+                relation.committed_row_ids.insert(row_id);
+                relation.committed_row_index.insert(row_id, committed_row);
+                if let Some(key) = primary_key {
+                    relation.insert_primary_key(key, row_id);
                 }
             }
         }
