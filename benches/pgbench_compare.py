@@ -1602,17 +1602,23 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
             lines.extend(["### Component Hotspots", ""])
             lines.append(
                 "Inclusive flamegraph percentages are not additive; each cell shows the top "
-                "captured frames in that component."
+                "captured frames in that component. Sample deltas compare fastpg's component "
+                "peak against normal Postgres' component peak."
             )
             lines.append("")
-            lines.append("| component | normal Postgres | fastpg Rust server |")
-            lines.append("| --- | --- | --- |")
+            lines.append("| component | normal Postgres | fastpg Rust server | fastpg +/- peak samples |")
+            lines.append("| --- | --- | --- | --- |")
             for component in PROFILE_COMPONENT_ORDER:
-                normal_cell = format_component_hotspot_cell(normal_components[component])
-                fastpg_cell = format_component_hotspot_cell(fastpg_components[component])
+                normal_component_hotspots = normal_components[component]
+                fastpg_component_hotspots = fastpg_components[component]
+                normal_cell = format_component_hotspot_cell(normal_component_hotspots)
+                fastpg_cell = format_component_hotspot_cell(fastpg_component_hotspots)
                 if component == "Other" and not normal_cell and not fastpg_cell:
                     continue
-                lines.append(f"| {component} | {normal_cell} | {fastpg_cell} |")
+                delta_cell = format_sample_delta_cell(
+                    component_sample_delta(normal_component_hotspots, fastpg_component_hotspots)
+                )
+                lines.append(f"| {component} | {normal_cell} | {fastpg_cell} | {delta_cell} |")
             lines.append("")
 
             lines.extend(["### Hotspot Comparison", ""])
@@ -1669,6 +1675,20 @@ def format_component_hotspot_cell(hotspots: list[dict[str, Any]], limit: int = 3
     return "<br>".join(format_hotspot_cell(hotspots, index) for index in range(min(limit, len(hotspots))))
 
 
+def component_sample_delta(
+    normal_hotspots: list[dict[str, Any]],
+    fastpg_hotspots: list[dict[str, Any]],
+) -> int:
+    normal_samples = int(normal_hotspots[0]["samples"]) if normal_hotspots else 0
+    fastpg_samples = int(fastpg_hotspots[0]["samples"]) if fastpg_hotspots else 0
+    return fastpg_samples - normal_samples
+
+
+def format_sample_delta_cell(delta: int) -> str:
+    sign = "+" if delta > 0 else ""
+    return f"`{sign}{delta}` samples"
+
+
 def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -> str:
     profiles = profile_records_by_variant(results)
     normal = profiles.get("normal")
@@ -1692,6 +1712,10 @@ def render_profile_comparison_html(results: dict[str, Any], result_root: Path) -
     .note {{ color: #555; line-height: 1.4; max-width: 960px; }}
     .component-name {{ width: 180px; font-weight: 600; }}
     .component-peak {{ color: #555; font-size: 12px; margin-bottom: 4px; }}
+    .sample-delta {{ font-variant-numeric: tabular-nums; font-weight: 700; white-space: nowrap; }}
+    .sample-delta-positive {{ color: #b42318; }}
+    .sample-delta-negative {{ color: #027a48; }}
+    .sample-delta-zero {{ color: #777; }}
     .frame-list {{ margin: 0 0 0 18px; padding: 0; }}
     .frame-list li {{ margin: 4px 0; }}
     .frame-meta {{ color: #555; white-space: nowrap; }}
@@ -1746,11 +1770,15 @@ def render_component_table_html(
             continue
         normal_cell = html_component_hotspots(normal_component_hotspots)
         fastpg_cell = html_component_hotspots(fastpg_component_hotspots)
+        sample_delta = html_sample_delta_cell(
+            component_sample_delta(normal_component_hotspots, fastpg_component_hotspots)
+        )
         rows.append(
             "<tr>"
             f"<th class=\"component-name\" scope=\"row\">{html.escape(component)}</th>"
             f"<td>{normal_cell}</td>"
             f"<td>{fastpg_cell}</td>"
+            f"<td>{sample_delta}</td>"
             "</tr>"
         )
     if not rows:
@@ -1759,12 +1787,27 @@ def render_component_table_html(
         "<h2>Component view</h2>"
         "<p class=\"note\">Inclusive flamegraph percentages are not additive; each cell shows "
         "the top captured frames in that component, with the largest frame listed as the "
-        "component peak.</p>"
+        "component peak. Sample delta is fastpg's component peak samples minus normal "
+        "Postgres' component peak samples.</p>"
         "<table class=\"component-table\"><thead><tr><th>component</th>"
-        "<th>normal Postgres</th><th>fastpg Rust server</th></tr></thead><tbody>"
+        "<th>normal Postgres</th><th>fastpg Rust server</th><th>fastpg +/- peak samples</th>"
+        "</tr></thead><tbody>"
         + "\n".join(rows)
         + "</tbody></table>"
     )
+
+
+def html_sample_delta_cell(delta: int) -> str:
+    if delta > 0:
+        class_name = "sample-delta sample-delta-positive"
+        sign = "+"
+    elif delta < 0:
+        class_name = "sample-delta sample-delta-negative"
+        sign = ""
+    else:
+        class_name = "sample-delta sample-delta-zero"
+        sign = ""
+    return f"<span class=\"{class_name}\">{sign}{delta} samples</span>"
 
 
 def html_component_hotspots(hotspots: list[dict[str, Any]], limit: int = 8) -> str:
