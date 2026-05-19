@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * fastpg_ipc_guard.h
- *	  Validation guard for fastpg's single-process Rust server.
+ *	  Build-time IPC guard for fastpg's single-process Rust server.
  *
  *-------------------------------------------------------------------------
  */

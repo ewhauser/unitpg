@@ -16,7 +16,7 @@ concurrency:
 
 jobs:
   clippy:
-    name: Rust clippy
+    name: Rust lint
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -54,10 +54,10 @@ jobs:
             -Dfastpg=true
           meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
 
-      - name: Run clippy
+      - name: Run lint
         env:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
-        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+        run: make -C benches lint CLIPPY_ARGS="--workspace --all-targets --all-features"
 
   validate:
     name: Validate ${{ matrix.target }}

@@ -80,7 +80,6 @@ class RegressionCompare:
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "rust_pgcore": args.rust_pgcore,
-                "fastpg_no_internal_ipc": args.fastpg_no_internal_ipc,
             },
             "cases": [{"name": case.name, "path": str(case.path)} for case in self.cases],
             "variants": {},
@@ -406,7 +405,6 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         profile_phase="run",
         profile_open=False,
         profile_warmup_seconds=0.0,
-        fastpg_no_internal_ipc=args.fastpg_no_internal_ipc,
     )
 
 
@@ -628,11 +626,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--allow-fastpg-failures",
         action="store_true",
         help="record fastpg failures and stdout mismatches without returning nonzero",
-    )
-    parser.add_argument(
-        "--fastpg-no-internal-ipc",
-        action="store_true",
-        help="set FASTPG_NO_INTERNAL_IPC=1 for the fastpg Rust server process",
     )
     return parser.parse_args(argv)
 

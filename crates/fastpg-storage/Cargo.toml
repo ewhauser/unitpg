@@ -11,3 +11,10 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 fastpg-catalog.workspace = true
 fastpg-types.workspace = true
+
+[dev-dependencies]
+criterion.workspace = true
+
+[[bench]]
+name = "storage_engine"
+harness = false

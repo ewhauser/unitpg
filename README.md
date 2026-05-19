@@ -128,27 +128,28 @@ Run the Rust unit tests:
 cargo test --workspace
 ```
 
-Run the current Rust-server validation bundle:
+Run the current validation bundle:
 
 ```sh
-make -C benches validate-rust-server
+make -C benches validate
 ```
 
-Run the strict pgbench comparison against normal Postgres:
+Run the TPC-B-like pgbench comparison against the Rust server:
 
 ```sh
-make -C benches pgbench-compare-rust-server-strict
+make -C benches pgbench-tpcb
 ```
 
 Run the curated SQL regression comparison:
 
 ```sh
-make -C benches regression-compare-rust-server
+make -C benches regression
 ```
 
 Most full-execution tests build a local fastpg-enabled PostgreSQL core and pass
 that build directory to Cargo through `FASTPG_POSTGRES_BUILD_DIR`. The harnesses
-under `benches/` do that setup for you.
+under `benches/` do that setup for you. The default fastpg build includes the
+internal IPC guard.
 
 ## Run The Server
 
@@ -186,23 +187,29 @@ export PGGSSENCMODE=disable
 
 ## Benchmark And Profile
 
-The pgbench harness compares normal Postgres against fastpg and records JSON
-plus Markdown summaries under `benches/results/`.
+The pgbench harness compares normal Postgres against the Rust server and records
+JSON plus Markdown summaries under `benches/results/`.
 
 ```sh
-make -C benches pgbench-compare-rust-server
+make -C benches pgbench
+```
+
+To run the storage engine Criterion benchmarks:
+
+```sh
+make -C benches bench
 ```
 
 To capture a Rust-server flamegraph:
 
 ```sh
-make -C benches pgbench-profile-rust-server
+make -C benches profile
 ```
 
 To run and open the newest profile:
 
 ```sh
-make -C benches pgbench-profile-rust-server-open
+make -C benches profile-open
 ```
 
 Benchmark numbers are local measurements, not portable guarantees. Treat them

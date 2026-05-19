@@ -12,115 +12,79 @@ RUNS ?= 3
 PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
-RUST_PGCORE ?= raw-parser
+RUST_PGCORE ?= full
 REGRESSION_SUITE ?= core
-REGRESSION_INVENTORY_SUITE ?= inventory
 REGRESSION_CASES_DIR ?=
-UPSTREAM_REGRESSION_LIMIT ?=
-UPSTREAM_REGRESSION_CASE ?=
+REGRESSION_ALLOW_FAILURES ?= 0
 PROFILE_TRANSACTIONS ?= 500
 PROFILE_RUNS ?= 1
 PROFILE_TOOL ?= flamegraph
 PROFILE_PHASE ?= run
 PROFILE_OPEN ?= 0
 PROFILE_WARMUP_SECONDS ?= 1.0
+CRITERION_ARGS ?=
+CLIPPY_ARGS ?= --workspace --all-targets
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 REGRESSION_CASES_ARG := $(if $(REGRESSION_CASES_DIR),--cases-dir "$(REGRESSION_CASES_DIR)",)
-UPSTREAM_REGRESSION_LIMIT_ARG := $(if $(UPSTREAM_REGRESSION_LIMIT),--limit "$(UPSTREAM_REGRESSION_LIMIT)",)
-UPSTREAM_REGRESSION_CASE_ARG := $(if $(UPSTREAM_REGRESSION_CASE),--case "$(UPSTREAM_REGRESSION_CASE)",)
+REGRESSION_ALLOW_FAILURES_ARG := $(if $(filter 1 true yes,$(REGRESSION_ALLOW_FAILURES)),--allow-fastpg-failures,)
 
-.PHONY: pgbench-compare pgbench-compare-strict pgbench-compare-rust-server pgbench-compare-rust-server-strict pgbench-compare-rust-server-strict-no-ipc pgbench-profile-rust-server pgbench-profile-side-by-side pgbench-profile-rust-server-open pgbench-open-latest-flamegraph regression-compare-rust-server regression-compare-rust-server-no-ipc regression-compare-rust-server-inventory upstream-regression-inventory-rust-server validate-rust-server validate-rust-server-no-ipc
+PGBENCH_COMMON_ARGS = \
+	--scale "$(SCALE)" \
+	--transactions "$(TRANSACTIONS)" \
+	--clients "$(CLIENTS)" \
+	--jobs "$(JOBS)" \
+	--runs "$(RUNS)" \
+	--protocol "$(PROTOCOL)" \
+	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--fastpg-engine "rust-server" \
+	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
+	--rust-pgcore "$(RUST_PGCORE)"
 
-pgbench-compare:
+PGBENCH_PROFILE_ARGS = \
+	--scale "$(SCALE)" \
+	--transactions "$(PROFILE_TRANSACTIONS)" \
+	--clients "$(CLIENTS)" \
+	--jobs "$(JOBS)" \
+	--runs "$(PROFILE_RUNS)" \
+	--protocol "$(PROTOCOL)" \
+	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--fastpg-engine "rust-server" \
+	--rust-build-profile "release" \
+	--rust-pgcore "$(RUST_PGCORE)" \
+	--profile-fastpg-rust-server \
+	--profile-tool "$(PROFILE_TOOL)" \
+	--profile-phase "$(PROFILE_PHASE)" \
+	--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" \
+	$(PROFILE_OPEN_FLAG)
+
+.PHONY: pgbench pgbench-tpcb profile profile-open profile-side-by-side profile-open-latest
+.PHONY: regression
+.PHONY: bench bench-smoke lint validate
+
+pgbench:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "$(BUILTIN)" \
 		--init-steps "$(INIT_STEPS)" \
-		--scale "$(SCALE)" \
-		--transactions "$(TRANSACTIONS)" \
-		--clients "$(CLIENTS)" \
-		--jobs "$(JOBS)" \
-		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)" \
-		--meson-buildtype "$(MESON_BUILDTYPE)"
+		$(PGBENCH_COMMON_ARGS)
 
-pgbench-compare-strict:
+pgbench-tpcb: RUST_BUILD_PROFILE = release
+pgbench-tpcb: RUST_PGCORE = full
+pgbench-tpcb:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "tpcb-like" \
 		--init-steps "default" \
-		--scale "$(SCALE)" \
-		--transactions "$(TRANSACTIONS)" \
-		--clients "$(CLIENTS)" \
-		--jobs "$(JOBS)" \
-		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)" \
-		--meson-buildtype "$(MESON_BUILDTYPE)"
+		$(PGBENCH_COMMON_ARGS)
 
-pgbench-compare-rust-server:
+profile:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "$(BUILTIN)" \
 		--init-steps "$(INIT_STEPS)" \
-		--scale "$(SCALE)" \
-		--transactions "$(TRANSACTIONS)" \
-		--clients "$(CLIENTS)" \
-		--jobs "$(JOBS)" \
-		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)" \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--fastpg-engine "rust-server" \
-		--rust-build-profile "$(RUST_BUILD_PROFILE)" \
-		--rust-pgcore "$(RUST_PGCORE)"
+		$(PGBENCH_PROFILE_ARGS)
 
-pgbench-compare-rust-server-strict:
-	$(PYTHON) pgbench_compare.py \
-		--builtin "tpcb-like" \
-		--init-steps "default" \
-		--scale "$(SCALE)" \
-		--transactions "$(TRANSACTIONS)" \
-		--clients "$(CLIENTS)" \
-		--jobs "$(JOBS)" \
-		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)" \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--fastpg-engine "rust-server" \
-		--rust-build-profile "release" \
-		--rust-pgcore "full"
+profile-open:
+	$(MAKE) profile PROFILE_OPEN=1
 
-pgbench-compare-rust-server-strict-no-ipc:
-	$(PYTHON) pgbench_compare.py \
-		--builtin "tpcb-like" \
-		--init-steps "default" \
-		--scale "$(SCALE)" \
-		--transactions "$(TRANSACTIONS)" \
-		--clients "$(CLIENTS)" \
-		--jobs "$(JOBS)" \
-		--runs "$(RUNS)" \
-		--protocol "$(PROTOCOL)" \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--fastpg-engine "rust-server" \
-		--rust-build-profile "release" \
-		--rust-pgcore "full" \
-		--fastpg-no-internal-ipc
-
-pgbench-profile-rust-server:
-	$(PYTHON) pgbench_compare.py \
-		--builtin "$(BUILTIN)" \
-		--init-steps "$(INIT_STEPS)" \
-		--scale "$(SCALE)" \
-		--transactions "$(PROFILE_TRANSACTIONS)" \
-		--clients "$(CLIENTS)" \
-		--jobs "$(JOBS)" \
-		--runs "$(PROFILE_RUNS)" \
-		--protocol "$(PROTOCOL)" \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--fastpg-engine "rust-server" \
-		--rust-build-profile "release" \
-		--rust-pgcore "$(RUST_PGCORE)" \
-		--profile-fastpg-rust-server \
-		--profile-tool "$(PROFILE_TOOL)" \
-		--profile-phase "$(PROFILE_PHASE)" \
-		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" $(PROFILE_OPEN_FLAG)
-
-pgbench-profile-side-by-side:
+profile-side-by-side:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "tpcb-like" \
 		--init-steps "default" \
@@ -140,54 +104,30 @@ pgbench-profile-side-by-side:
 		--profile-phase "run" \
 		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" $(PROFILE_OPEN_FLAG)
 
-pgbench-profile-rust-server-open:
-	$(MAKE) pgbench-profile-rust-server PROFILE_OPEN=1
-
-pgbench-open-latest-flamegraph:
+profile-open-latest:
 	$(PYTHON) open_latest_profile.py
 
-regression-compare-rust-server:
-	$(PYTHON) regression_compare.py \
-		--suite "$(REGRESSION_SUITE)" \
-		$(REGRESSION_CASES_ARG) \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--rust-build-profile "release" \
-		--rust-pgcore "full"
-
-regression-compare-rust-server-no-ipc:
+regression:
 	$(PYTHON) regression_compare.py \
 		--suite "$(REGRESSION_SUITE)" \
 		$(REGRESSION_CASES_ARG) \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
 		--rust-build-profile "release" \
 		--rust-pgcore "full" \
-		--fastpg-no-internal-ipc
+		$(REGRESSION_ALLOW_FAILURES_ARG)
 
-regression-compare-rust-server-inventory:
-	$(PYTHON) regression_compare.py \
-		--suite "$(REGRESSION_INVENTORY_SUITE)" \
-		$(REGRESSION_CASES_ARG) \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--rust-build-profile "release" \
-		--rust-pgcore "full" \
-		--allow-fastpg-failures
+bench:
+	cargo bench -p fastpg-storage --bench storage_engine -- $(CRITERION_ARGS)
 
-upstream-regression-inventory-rust-server:
-	$(PYTHON) upstream_regression_inventory.py \
-		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--rust-build-profile "release" \
-		--rust-pgcore "full" \
-		$(UPSTREAM_REGRESSION_LIMIT_ARG) \
-		$(UPSTREAM_REGRESSION_CASE_ARG)
+bench-smoke:
+	$(MAKE) bench CRITERION_ARGS="--sample-size 10 --warm-up-time 0.1 --measurement-time 0.2"
 
-validate-rust-server:
-	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py upstream_regression_inventory.py
+lint:
+	cargo fmt --all --check
+	cargo clippy $(CLIPPY_ARGS) -- -D warnings
+
+validate:
+	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py
 	cargo test -p fastpg-storage
-	$(MAKE) pgbench-compare-rust-server-strict
-	$(MAKE) regression-compare-rust-server
-
-validate-rust-server-no-ipc:
-	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py upstream_regression_inventory.py
-	cargo test -p fastpg-storage
-	$(MAKE) pgbench-compare-rust-server-strict-no-ipc
-	$(MAKE) regression-compare-rust-server-no-ipc
+	$(MAKE) pgbench-tpcb
+	$(MAKE) regression

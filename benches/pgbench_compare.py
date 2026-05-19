@@ -93,7 +93,6 @@ class PgBenchCompare:
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "rust_pgcore": args.rust_pgcore,
-                "fastpg_no_internal_ipc": args.fastpg_no_internal_ipc,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
                 "profile_normal_postgres": args.profile_normal_postgres,
                 "profile_tool": args.profile_tool,
@@ -562,7 +561,7 @@ class PgBenchCompare:
         process = subprocess.Popen(
             command,
             cwd=self.source_root,
-            env=self.rust_server_process_env(),
+            env=os.environ.copy(),
             text=True,
             stdout=stdout_file,
             stderr=stderr_file,
@@ -640,13 +639,6 @@ class PgBenchCompare:
             json.dumps(result.as_json(), indent=2) + "\n"
         )
         return result
-
-    def rust_server_process_env(self) -> dict[str, str]:
-        env = os.environ.copy()
-        env.pop("FASTPG_NO_INTERNAL_IPC", None)
-        if self.args.fastpg_no_internal_ipc:
-            env["FASTPG_NO_INTERNAL_IPC"] = "1"
-        return env
 
     def should_profile_rust_server(self, variant: Variant) -> bool:
         return self.should_profile_rust_server_name(variant.name) and variant.engine == "rust-server"
@@ -1028,19 +1020,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--rust-pgcore",
         choices=["off", "raw-parser", "full"],
-        default="raw-parser",
+        default="full",
         help="Postgres C components to link into the Rust server",
     )
     parser.add_argument(
         "--fastpg-engine",
         choices=["rust-server", "postgres-wrapper"],
-        default="postgres-wrapper",
+        default="rust-server",
         help="run fastpg as the Rust single-process server or as the Postgres tableam wrapper",
-    )
-    parser.add_argument(
-        "--fastpg-no-internal-ipc",
-        action="store_true",
-        help="set FASTPG_NO_INTERNAL_IPC=1 for the fastpg Rust server process",
     )
     parser.add_argument(
         "--profile-fastpg-rust-server",
@@ -1080,8 +1067,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--runs must be at least 1")
     if args.profile_fastpg_rust_server and args.fastpg_engine != "rust-server":
         parser.error("--profile-fastpg-rust-server requires --fastpg-engine=rust-server")
-    if args.fastpg_no_internal_ipc and args.fastpg_engine != "rust-server":
-        parser.error("--fastpg-no-internal-ipc requires --fastpg-engine=rust-server")
     if args.profile_normal_postgres and args.clients != 1:
         parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:

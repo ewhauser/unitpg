@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * fastpg_ipc_guard.c
- *	  Validation guard for fastpg's single-process Rust server.
+ *	  Build-time IPC guard for fastpg's single-process Rust server.
  *
  *-------------------------------------------------------------------------
  */
@@ -9,18 +9,17 @@
 
 #ifdef USE_FASTPG
 
-#include <string.h>
-
 #include "utils/fastpg_ipc_guard.h"
 
 bool
 fastpg_internal_ipc_forbidden(void)
 {
-	const char *setting = getenv("FASTPG_NO_INTERNAL_IPC");
-
-	return setting != NULL &&
-		setting[0] != '\0' &&
-		strcmp(setting, "0") != 0;
+	/*
+	 * fastpg builds are single-process by default. Reaching PostgreSQL's
+	 * shared-memory, semaphore, background worker, or wait-latch IPC paths is
+	 * a bug in the Rust-server execution path.
+	 */
+	return true;
 }
 
 void
