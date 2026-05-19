@@ -262,7 +262,6 @@ impl QueryExecutor {
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
 
-        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
         let statement = match self.pgcore_session.prepare(sql) {
             Ok(statement) => statement,
             Err(error) => return pgcore_error_execution(error),
@@ -277,7 +276,6 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn prepare_pgcore(&self, sql: &str) -> Result<PreparedStatement, fastpg_pgcore::PgCoreError> {
-        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
         self.pgcore_session.prepare(sql)
     }
 
