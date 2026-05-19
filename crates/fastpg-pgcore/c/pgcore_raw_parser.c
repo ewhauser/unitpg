@@ -975,8 +975,8 @@ fastpg_pgcore_prepare(const char *query)
 														NULL);
 			}
 			fastpg_pgcore_capture_analyze_fields(result);
-			result->querytrees = pg_rewrite_query(copyObject(result->query));
-			result->planned_statements = pg_plan_queries(copyObject(result->querytrees),
+			result->querytrees = pg_rewrite_query(result->query);
+			result->planned_statements = pg_plan_queries(result->querytrees,
 														 result->source_text,
 														 cursor_options,
 														 NULL);
