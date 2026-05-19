@@ -1575,6 +1575,37 @@ fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
     })
 }
 
+fn pg_index_static_primary_index_oid(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    relation_oid: Oid,
+) -> Option<Oid> {
+    let relation_matches = static_row_column_oid(table, row, "indrelid")
+        .is_some_and(|indrelid| indrelid == relation_oid);
+    let is_primary = static_row_column_bool(table, row, "indisprimary").unwrap_or(false);
+    if !relation_matches || !is_primary {
+        return None;
+    }
+    static_row_column_oid(table, row, "indexrelid")
+}
+
+fn pg_index_row_primary_index_oid(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    relation_oid: Oid,
+) -> Option<Oid> {
+    let relation_matches = catalog_row_value(table, row, "indrelid")
+        .and_then(catalog_value_oid)
+        .is_some_and(|indrelid| indrelid == relation_oid);
+    let is_primary = catalog_row_value(table, row, "indisprimary")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    if !relation_matches || !is_primary {
+        return None;
+    }
+    catalog_row_value(table, row, "indexrelid").and_then(catalog_value_oid)
+}
+
 pub fn index_record_by_index_oid(index_oid: Oid) -> Option<IndexRecord> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
     catalog_rows_matching_static(
@@ -1689,8 +1720,24 @@ fn primary_key_pg_index_row(relation_oid: Oid) -> Option<CatalogRow> {
 
 pub fn primary_key_index_oid_for_relation_oid(relation_oid: Oid) -> Option<Oid> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
-    let row = primary_key_pg_index_row(relation_oid)?;
-    catalog_row_value(table, &row, "indexrelid").and_then(catalog_value_oid)
+    let session_overlays = visible_session_overlays();
+    with_catalog_read(|state| {
+        let mut rows = BTreeMap::<u64, Oid>::new();
+        for row in table.rows {
+            if let Some(index_oid) = pg_index_static_primary_index_oid(table, row, relation_oid) {
+                rows.insert(row.row_id, index_oid);
+            }
+        }
+        let row_matches =
+            |row: &CatalogRow| pg_index_row_primary_index_oid(table, row, relation_oid);
+        state
+            .overlay
+            .apply_to_filtered_values(table.oid, &mut rows, &row_matches);
+        for overlay in &session_overlays {
+            overlay.apply_to_filtered_values(table.oid, &mut rows, &row_matches);
+        }
+        rows.into_values().next()
+    })
 }
 
 pub fn primary_key_index_record_for_relation_oid(relation_oid: Oid) -> Option<IndexRecord> {
@@ -2627,6 +2674,10 @@ mod tests {
         assert_eq!(
             unique_index_oids_for_relation_oid(relation.oid),
             vec![index_oid]
+        );
+        assert_eq!(
+            primary_key_index_oid_for_relation_oid(relation.oid),
+            Some(index_oid)
         );
         assert_eq!(
             primary_key_index_record_for_relation_oid(relation.oid)
