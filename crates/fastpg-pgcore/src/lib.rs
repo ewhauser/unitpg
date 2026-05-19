@@ -135,6 +135,16 @@ impl PgCoreSession {
             storage_session: self.storage_session.clone(),
         })
     }
+
+    pub fn execute_with_params(
+        &self,
+        sql: &str,
+        params: &[PgCoreParam],
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+        let statement = self.inner.prepare(sql)?;
+        statement.execute_with_params(params)
+    }
 }
 
 impl Default for PgCoreSession {

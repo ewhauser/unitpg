@@ -262,11 +262,7 @@ impl QueryExecutor {
             .map(pgcore_param_value)
             .collect::<Vec<_>>();
 
-        let statement = match self.pgcore_session.prepare(sql) {
-            Ok(statement) => statement,
-            Err(error) => return pgcore_error_execution(error),
-        };
-        let execution_result = statement.execute_with_params(&parameters);
+        let execution_result = self.pgcore_session.execute_with_params(sql, &parameters);
 
         match execution_result {
             Ok(result) => pgcore_execution_to_query_execution(result),
