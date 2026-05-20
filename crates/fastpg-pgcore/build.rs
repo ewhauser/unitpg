@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -119,6 +120,7 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
             build_dir.display()
         );
     }
+    dedupe_objects(&mut objects);
 
     run_command(
         Command::new(ar_program())
@@ -259,9 +261,9 @@ fn archive_members(archive: &Path) -> Vec<String> {
 }
 
 fn archive_has_member(archive: &Path, member: &str) -> bool {
-    archive_members(archive)
-        .iter()
-        .any(|candidate| candidate == member)
+    archive_members(archive).iter().any(|candidate| {
+        candidate == member || Path::new(candidate).file_name() == Some(OsStr::new(member))
+    })
 }
 
 fn resolve_thin_archive_member(build_dir: &Path, archive: &Path, member: &str) -> PathBuf {
@@ -283,6 +285,15 @@ fn resolve_thin_archive_member(build_dir: &Path, archive: &Path, member: &str) -
         archive_dir.display(),
         build_dir.display()
     );
+}
+
+fn dedupe_objects(objects: &mut Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    objects.retain(|path| seen.insert(object_identity(path)));
+}
+
+fn object_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn ar_program() -> String {

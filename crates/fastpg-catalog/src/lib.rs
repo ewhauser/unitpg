@@ -622,30 +622,8 @@ impl CatalogSnapshot {
             .collect()
     }
 
-    fn remove_relation_cascade(&mut self, row_id: u64) {
-        let Some(relation) = self.relations.remove(&row_id) else {
-            return;
-        };
-        let relation_oid = relation.oid;
-        let relation_oid_raw = relation_oid.0;
-
-        self.columns
-            .retain(|_, column| column.relation_oid != relation_oid);
-        self.types
-            .retain(|_, pg_type| pg_type.record.typrelid != relation_oid);
-        self.indexes.retain(|_, index| {
-            index.record.relation_oid != relation_oid && index.record.index_oid != relation_oid
-        });
-        self.constraints.retain(|_, constraint| {
-            constraint.relation_oid != relation_oid && constraint.index_oid != relation_oid
-        });
-
-        if relation.relkind == b'r' {
-            self.indexes
-                .retain(|_, index| index.record.relation_oid.0 != relation_oid_raw);
-            self.constraints
-                .retain(|_, constraint| constraint.relation_oid.0 != relation_oid_raw);
-        }
+    fn remove_relation(&mut self, row_id: u64) {
+        self.relations.remove(&row_id);
     }
 }
 
@@ -732,7 +710,7 @@ impl CatalogDraft {
                     snapshot.relations.insert(*row_id, relation.clone());
                 }
                 None => {
-                    snapshot.remove_relation_cascade(*row_id);
+                    snapshot.remove_relation(*row_id);
                 }
             }
         }
