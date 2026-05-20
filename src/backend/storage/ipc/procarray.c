@@ -1681,7 +1681,25 @@ ComputeXidHorizons(ComputeXidHorizonsResult *h)
 	ProcArrayStruct *arrayP = procArray;
 	TransactionId kaxmin;
 	bool		in_recovery = RecoveryInProgress();
-	TransactionId *other_xids = ProcGlobal->xids;
+	TransactionId *other_xids;
+
+	if (ProcGlobal == NULL || procArray == NULL)
+	{
+		TransactionId horizon = FirstNormalTransactionId;
+
+		h->latest_completed = FullTransactionIdFromEpochAndXid(0, horizon);
+		h->oldest_considered_running = horizon;
+		h->shared_oldest_nonremovable = horizon;
+		h->data_oldest_nonremovable = horizon;
+		h->catalog_oldest_nonremovable = horizon;
+		h->temp_oldest_nonremovable = horizon;
+		h->slot_xmin = InvalidTransactionId;
+		h->slot_catalog_xmin = InvalidTransactionId;
+		h->shared_oldest_nonremovable_raw = horizon;
+		return;
+	}
+
+	other_xids = ProcGlobal->xids;
 
 	/* inferred after ProcArrayLock is released */
 	h->catalog_oldest_nonremovable = InvalidTransactionId;

@@ -1188,13 +1188,13 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 		fastpg_pgcore_repair_session_authorization_reset(utility_stmt);
 #endif
 
-		if (snapshot_pushed)
+		if (snapshot_pushed && ActiveSnapshotSet())
 			PopActiveSnapshot();
 		snapshot_pushed = false;
 	}
 	PG_CATCH();
 	{
-		if (snapshot_pushed)
+		if (snapshot_pushed && ActiveSnapshotSet())
 			PopActiveSnapshot();
 		PG_RE_THROW();
 	}

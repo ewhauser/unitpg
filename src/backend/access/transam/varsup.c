@@ -284,6 +284,9 @@ ReadNextFullTransactionId(void)
 {
 	FullTransactionId fullXid;
 
+	if (TransamVariables == NULL)
+		return FullTransactionIdFromEpochAndXid(0, FirstNormalTransactionId);
+
 	LWLockAcquire(XidGenLock, LW_SHARED);
 	fullXid = TransamVariables->nextXid;
 	LWLockRelease(XidGenLock);

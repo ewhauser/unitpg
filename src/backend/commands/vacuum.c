@@ -1128,6 +1128,15 @@ vacuum_get_cutoffs(Relation rel, const VacuumParams *params,
 	cutoffs->relfrozenxid = rel->rd_rel->relfrozenxid;
 	cutoffs->relminmxid = rel->rd_rel->relminmxid;
 
+	if (TransamVariables == NULL)
+	{
+		cutoffs->OldestXmin = FirstNormalTransactionId;
+		cutoffs->OldestMxact = FirstMultiXactId;
+		cutoffs->FreezeLimit = FirstNormalTransactionId;
+		cutoffs->MultiXactCutoff = FirstMultiXactId;
+		return false;
+	}
+
 	/*
 	 * Acquire OldestXmin.
 	 *

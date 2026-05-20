@@ -700,6 +700,13 @@ ReadNextMultiXactId(void)
 void
 ReadMultiXactIdRange(MultiXactId *oldest, MultiXactId *next)
 {
+	if (MultiXactState == NULL)
+	{
+		*oldest = FirstMultiXactId;
+		*next = FirstMultiXactId;
+		return;
+	}
+
 	LWLockAcquire(MultiXactGenLock, LW_SHARED);
 	*oldest = MultiXactState->oldestMultiXactId;
 	*next = MultiXactState->nextMXact;
@@ -2383,6 +2390,11 @@ MultiXactId
 GetOldestMultiXactId(void)
 {
 	MultiXactId oldestMXact;
+
+	if (MultiXactState == NULL ||
+		OldestMemberMXactId == NULL ||
+		OldestVisibleMXactId == NULL)
+		return FirstMultiXactId;
 
 	/*
 	 * This is the oldest valid value among all the OldestMemberMXactId[] and
