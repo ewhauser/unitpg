@@ -18,6 +18,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_language.h"
@@ -905,6 +906,36 @@ fastpg_pgcore_should_noop_utility(Node *utility_stmt)
 	}
 }
 
+#ifdef USE_FASTPG
+static bool
+fastpg_pgcore_resets_session_authorization(Node *utility_stmt)
+{
+	VariableSetStmt *stmt;
+
+	if (!IsA(utility_stmt, VariableSetStmt))
+		return false;
+
+	stmt = (VariableSetStmt *) utility_stmt;
+	if (stmt->kind == VAR_RESET_ALL)
+		return true;
+	if (stmt->name == NULL || strcmp(stmt->name, "session_authorization") != 0)
+		return false;
+
+	return stmt->kind == VAR_RESET || stmt->kind == VAR_SET_DEFAULT;
+}
+
+static void
+fastpg_pgcore_repair_session_authorization_reset(Node *utility_stmt)
+{
+	if (IsUnderPostmaster ||
+		!fastpg_pgcore_resets_session_authorization(utility_stmt))
+		return;
+
+	SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
+	SetCurrentRoleId(InvalidOid, false);
+}
+#endif
+
 static void
 fastpg_pgcore_execute_utility(PlannedStmt *statement,
 							  const char *source_text,
@@ -956,6 +987,10 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 					   NULL,
 					   dest,
 					   &qc);
+
+#ifdef USE_FASTPG
+		fastpg_pgcore_repair_session_authorization_reset(utility_stmt);
+#endif
 
 		if (snapshot_pushed)
 			PopActiveSnapshot();
