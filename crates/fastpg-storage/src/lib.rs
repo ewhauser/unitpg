@@ -23,10 +23,11 @@ use fastpg_catalog::{
     primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
     relation_by_oid, relation_column_by_attnum, relation_column_count,
     relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
-    relation_physical_column_by_attnum, relation_summary_by_name_in_namespace,
-    relation_summary_by_oid, static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
-    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
-    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
+    relation_physical_column_by_attnum, relation_planner_stats_by_oid, relation_rowtype_oid_by_oid,
+    relation_summary_by_name_in_namespace, relation_summary_by_oid, static_catalog_by_name,
+    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
+    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
+    virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -40,6 +41,7 @@ static NEXT_STORAGE_REGION_ID: AtomicU64 = AtomicU64::new(1);
 static STORAGE_ARENA_REWINDS: AtomicU64 = AtomicU64::new(0);
 static STORAGE_MEMORY_LIMIT_REJECTIONS: AtomicU64 = AtomicU64::new(0);
 const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+const DATUM_ALIGNMENT: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -364,19 +366,26 @@ impl ArenaChunk {
         }
     }
 
-    fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.used)
+    fn aligned_used(&self) -> usize {
+        align_usize(self.used, DATUM_ALIGNMENT)
     }
 
-    fn alloc_bytes(&mut self, bytes: &[u8]) -> Option<usize> {
-        if bytes.len() > self.remaining() {
+    fn can_alloc_bytes(&self, len: usize) -> bool {
+        self.aligned_used()
+            .checked_add(len)
+            .is_some_and(|end| end <= self.bytes.len())
+    }
+
+    fn alloc_bytes(&mut self, bytes: &[u8]) -> Option<(usize, usize)> {
+        let start = self.aligned_used();
+        let end = start.checked_add(bytes.len())?;
+        if end > self.bytes.len() {
             return None;
         }
-        let start = self.used;
-        let end = start.saturating_add(bytes.len());
+        let consumed = end.saturating_sub(self.used);
         self.bytes[start..end].copy_from_slice(bytes);
         self.used = end;
-        Some(self.bytes[start..].as_ptr() as usize)
+        Some((self.bytes[start..].as_ptr() as usize, consumed))
     }
 }
 
@@ -388,18 +397,18 @@ impl RowArena {
         if self
             .chunks
             .last()
-            .is_none_or(|chunk| chunk.remaining() < bytes.len())
+            .is_none_or(|chunk| !chunk.can_alloc_bytes(bytes.len()))
         {
             self.chunks.push(ArenaChunk::new(
                 ROW_ARENA_DEFAULT_CHUNK_SIZE.max(bytes.len()),
             ));
         }
-        let ptr = self
+        let (ptr, consumed) = self
             .chunks
             .last_mut()
             .and_then(|chunk| chunk.alloc_bytes(bytes))
             .expect("arena chunk was sized for allocation");
-        self.bytes_allocated = self.bytes_allocated.saturating_add(bytes.len());
+        self.bytes_allocated = self.bytes_allocated.saturating_add(consumed);
         ptr
     }
 
@@ -424,6 +433,11 @@ impl RowArena {
         self.chunks.append(&mut other.chunks);
         other.bytes_allocated = 0;
     }
+}
+
+fn align_usize(value: usize, align: usize) -> usize {
+    debug_assert!(align.is_power_of_two());
+    (value + (align - 1)) & !(align - 1)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -3130,6 +3144,48 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_by_oid(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// C callers must pass a valid output pointer.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_rowtype_oid_by_oid(
+    relation_oid: u32,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let Some(rowtype_oid) = relation_rowtype_oid_by_oid(Oid(relation_oid)) else {
+        return false;
+    };
+    unsafe {
+        *oid_out = rowtype_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_planner_stats_by_oid(
+    relation_oid: u32,
+    relpages_out: *mut i32,
+    reltuples_out: *mut f32,
+) -> bool {
+    if relpages_out.is_null() || reltuples_out.is_null() {
+        return false;
+    }
+    let Some(stats) = relation_planner_stats_by_oid(Oid(relation_oid)) else {
+        return false;
+    };
+    unsafe {
+        *relpages_out = stats.relpages;
+        *reltuples_out = stats.reltuples;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// C callers must pass valid output pointers where required; any C strings or
 /// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
@@ -4637,6 +4693,21 @@ fn push_i8(bytes: &mut Vec<u8>, value: i8) {
     bytes.push(value as u8);
 }
 
+fn push_1d_array_header(
+    bytes: &mut Vec<u8>,
+    total_len: usize,
+    elemtype: Oid,
+    element_count: usize,
+    lower_bound: i32,
+) {
+    push_u32_ne(bytes, varlena_4b_header(total_len));
+    push_i32_ne(bytes, 1);
+    push_i32_ne(bytes, 0);
+    push_u32_ne(bytes, elemtype.0);
+    push_i32_ne(bytes, element_count.min(i32::MAX as usize) as i32);
+    push_i32_ne(bytes, lower_bound);
+}
+
 fn parse_pg_array_elements(value: &str) -> Option<Vec<Option<String>>> {
     let body = value.strip_prefix('{')?.strip_suffix('}')?;
     if body.is_empty() {
@@ -4701,12 +4772,17 @@ fn parse_pg_array_values<T>(value: &str, parse: impl Fn(&str) -> Option<T>) -> O
 fn int2vector_datum(values: &[i16], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
-    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
-    push_i32_ne(&mut bytes, 1);
-    push_i32_ne(&mut bytes, 0);
-    push_u32_ne(&mut bytes, INT2_OID.0);
-    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
-    push_i32_ne(&mut bytes, 0);
+    push_1d_array_header(&mut bytes, total_len, INT2_OID, values.len(), 0);
+    for value in values {
+        push_i16_ne(&mut bytes, *value);
+    }
+    byref_datum(&bytes, region)
+}
+
+fn int2array_datum(values: &[i16], region: &mut StorageRegion) -> Cell {
+    let total_len = 24 + std::mem::size_of_val(values);
+    let mut bytes = Vec::with_capacity(total_len);
+    push_1d_array_header(&mut bytes, total_len, INT2_OID, values.len(), 1);
     for value in values {
         push_i16_ne(&mut bytes, *value);
     }
@@ -4716,12 +4792,17 @@ fn int2vector_datum(values: &[i16], region: &mut StorageRegion) -> Cell {
 fn oidvector_datum(values: &[u32], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
-    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
-    push_i32_ne(&mut bytes, 1);
-    push_i32_ne(&mut bytes, 0);
-    push_u32_ne(&mut bytes, OID_OID.0);
-    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
-    push_i32_ne(&mut bytes, 0);
+    push_1d_array_header(&mut bytes, total_len, OID_OID, values.len(), 0);
+    for value in values {
+        push_u32_ne(&mut bytes, *value);
+    }
+    byref_datum(&bytes, region)
+}
+
+fn oidarray_datum(values: &[u32], region: &mut StorageRegion) -> Cell {
+    let total_len = 24 + std::mem::size_of_val(values);
+    let mut bytes = Vec::with_capacity(total_len);
+    push_1d_array_header(&mut bytes, total_len, OID_OID, values.len(), 1);
     for value in values {
         push_u32_ne(&mut bytes, *value);
     }
@@ -4731,12 +4812,7 @@ fn oidvector_datum(values: &[u32], region: &mut StorageRegion) -> Cell {
 fn int4array_datum(values: &[i32], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + std::mem::size_of_val(values);
     let mut bytes = Vec::with_capacity(total_len);
-    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
-    push_i32_ne(&mut bytes, 1);
-    push_i32_ne(&mut bytes, 0);
-    push_u32_ne(&mut bytes, INT4_OID.0);
-    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
-    push_i32_ne(&mut bytes, 0);
+    push_1d_array_header(&mut bytes, total_len, INT4_OID, values.len(), 1);
     for value in values {
         push_i32_ne(&mut bytes, *value);
     }
@@ -4746,12 +4822,13 @@ fn int4array_datum(values: &[i32], region: &mut StorageRegion) -> Cell {
 fn chararray_datum(values: &[u8], region: &mut StorageRegion) -> Cell {
     let total_len = 24 + values.len();
     let mut bytes = Vec::with_capacity(total_len);
-    push_u32_ne(&mut bytes, varlena_4b_header(total_len));
-    push_i32_ne(&mut bytes, 1);
-    push_i32_ne(&mut bytes, 0);
-    push_u32_ne(&mut bytes, fastpg_catalog::CHAR_OID.0);
-    push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
-    push_i32_ne(&mut bytes, 0);
+    push_1d_array_header(
+        &mut bytes,
+        total_len,
+        fastpg_catalog::CHAR_OID,
+        values.len(),
+        1,
+    );
     for value in values {
         push_i8(&mut bytes, *value as i8);
     }
@@ -4765,7 +4842,7 @@ fn textarray_datum(values: &[String], region: &mut StorageRegion) -> Cell {
     push_i32_ne(&mut bytes, 0);
     push_u32_ne(&mut bytes, TEXT_OID.0);
     push_i32_ne(&mut bytes, values.len().min(i32::MAX as usize) as i32);
-    push_i32_ne(&mut bytes, 0);
+    push_i32_ne(&mut bytes, 1);
     for value in values {
         while bytes.len() % 4 != 0 {
             bytes.push(0);
@@ -4857,13 +4934,13 @@ fn catalog_value_to_cell(
                 int2vector_datum(&values, region)
             }
             INT2_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<i16>().ok())
-                .map(|values| int2vector_datum(&values, region))
+                .map(|values| int2array_datum(&values, region))
                 .unwrap_or_else(null_datum),
             INT4_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<i32>().ok())
                 .map(|values| int4array_datum(&values, region))
                 .unwrap_or_else(null_datum),
             OID_ARRAY_OID => parse_pg_array_values(value, |part| part.parse::<u32>().ok())
-                .map(|values| oidvector_datum(&values, region))
+                .map(|values| oidarray_datum(&values, region))
                 .unwrap_or_else(null_datum),
             CHAR_ARRAY_OID => parse_pg_array_values(value, |part| part.as_bytes().first().copied())
                 .map(|values| chararray_datum(&values, region))
@@ -5057,7 +5134,8 @@ unsafe fn copy_row_to_outputs(
 mod tests {
     use super::*;
     use fastpg_catalog::{
-        PUBLIC_NAMESPACE_OID, builtin_namespaces, static_catalog_by_name, upsert_catalog_row,
+        INFORMATION_SCHEMA_NAMESPACE_OID, PUBLIC_NAMESPACE_OID, builtin_namespaces,
+        static_catalog_by_name, upsert_catalog_row,
     };
     use std::collections::BTreeMap;
     use std::ffi::CString;
@@ -5091,6 +5169,32 @@ mod tests {
 
     fn next_relid() -> u32 {
         NEXT_RELID.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn i32_from_bytes(bytes: &[u8], offset: usize) -> i32 {
+        i32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("i32 bytes"))
+    }
+
+    fn u32_from_bytes(bytes: &[u8], offset: usize) -> u32 {
+        u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("u32 bytes"))
+    }
+
+    #[test]
+    fn catalog_arrays_use_sql_array_bounds_not_vector_bounds() {
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+        let _unaligned_prefix = text_datum("x", &mut region);
+        let oid_array = oidarray_datum(&[23, 26], &mut region);
+        assert_eq!(oid_array.output_value() % DATUM_ALIGNMENT, 0);
+        let oid_array_bytes = oid_array.byref_bytes().expect("oid array bytes");
+        assert_eq!(u32_from_bytes(oid_array_bytes, 12), OID_OID.0);
+        assert_eq!(i32_from_bytes(oid_array_bytes, 16), 2);
+        assert_eq!(i32_from_bytes(oid_array_bytes, 20), 1);
+        assert_eq!(u32_from_bytes(oid_array_bytes, 24), 23);
+        assert_eq!(u32_from_bytes(oid_array_bytes, 28), 26);
+
+        let oid_vector = oidvector_datum(&[23, 26], &mut region);
+        let oid_vector_bytes = oid_vector.byref_bytes().expect("oidvector bytes");
+        assert_eq!(i32_from_bytes(oid_vector_bytes, 20), 0);
     }
 
     fn upsert_named_catalog_row(table_name: &str, row_id: u64, values: &[(&str, &str)]) -> u64 {
@@ -5547,6 +5651,13 @@ mod tests {
                     1,
                 )
             })
+            .chain(std::iter::once((
+                INFORMATION_SCHEMA_NAMESPACE_OID.0 as u64,
+                INFORMATION_SCHEMA_NAMESPACE_OID.0,
+                "information_schema".to_owned(),
+                10,
+                1,
+            )))
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
     }

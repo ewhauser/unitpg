@@ -48,22 +48,37 @@ pub const C_COLLATION_OID: Oid = Oid(950);
 const INVALID_OID: Oid = Oid(0);
 const POSTGRES_ROLE_OID: Oid = Oid(10);
 pub const PG_CATALOG_NAMESPACE_OID: Oid = Oid(11);
+pub const INFORMATION_SCHEMA_NAMESPACE_OID: Oid = Oid(14_000);
 pub const PUBLIC_NAMESPACE_OID: Oid = Oid(2200);
 const PG_CLASS_RELATION_OID: Oid = Oid(1259);
 const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
 const PG_TYPE_RELATION_OID: Oid = Oid(1247);
 const PG_PROC_RELATION_OID: Oid = Oid(1255);
+const PG_AGGREGATE_RELATION_OID: Oid = Oid(2600);
+const PG_OPERATOR_RELATION_OID: Oid = Oid(2617);
 const PG_DATABASE_RELATION_OID: Oid = Oid(1262);
 const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
+const PG_DESCRIPTION_RELATION_OID: Oid = Oid(2609);
 const PG_ENUM_RELATION_OID: Oid = Oid(3501);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
 const SYNTHETIC_CATALOG_ROWTYPE_OID_BASE: u32 = 0xF000_0000;
+const PG_AGGREGATE_FNOID_INDEX_OID: Oid = Oid(2650);
+const OID_BTREE_OPCLASS_OID: Oid = Oid(1981);
 const TEMPLATE1_DATABASE_OID: Oid = Oid(1);
 const TEMPLATE0_DATABASE_OID: Oid = Oid(4);
 const POSTGRES_DATABASE_OID: Oid = Oid(5);
 const SYNTHETIC_DATABASE_OID_BASE: u32 = 0xE100_0000;
+const SYNTHETIC_ROWTYPE_OID_BASE: u32 = 0xE200_0000;
+const SYNTHETIC_DESCRIPTION_ROW_ID_BASE: u64 = 0xD200_0000;
+const SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG: u64 = 0x8000;
+
+const INFORMATION_SCHEMA_NAMESPACE: PgNamespaceRecord = PgNamespaceRecord {
+    oid: INFORMATION_SCHEMA_NAMESPACE_OID,
+    name: "information_schema",
+    owner: POSTGRES_ROLE_OID,
+};
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
 pub const VIRTUAL_CATALOG_DYNAMIC: u8 = 2;
@@ -252,6 +267,9 @@ pub fn builtin_namespaces() -> &'static [PgNamespaceRecord] {
 }
 
 pub fn builtin_namespace_by_oid(oid: Oid) -> Option<&'static PgNamespaceRecord> {
+    if oid == INFORMATION_SCHEMA_NAMESPACE.oid {
+        return Some(&INFORMATION_SCHEMA_NAMESPACE);
+    }
     generated_catalog::STATIC_NAMESPACES
         .iter()
         .find(|record| record.oid == oid)
@@ -259,6 +277,9 @@ pub fn builtin_namespace_by_oid(oid: Oid) -> Option<&'static PgNamespaceRecord> 
 
 pub fn builtin_namespace_by_name(name: &str) -> Option<&'static PgNamespaceRecord> {
     let name = normalize_identifier(name);
+    if name == INFORMATION_SCHEMA_NAMESPACE.name {
+        return Some(&INFORMATION_SCHEMA_NAMESPACE);
+    }
     generated_catalog::STATIC_NAMESPACES
         .iter()
         .find(|record| record.name == name.as_str())
@@ -335,6 +356,12 @@ pub struct RelationSummaryRecord {
     pub column_count: u16,
     pub has_primary_key: bool,
     pub has_indexes: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct RelationPlannerStats {
+    pub relpages: i32,
+    pub reltuples: f32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1636,6 +1663,9 @@ fn normalize_pg_proc_bootstrap_defaults(table: &StaticCatalogTable, values: &mut
     if defaults.len() > pronargs || arg_types.len() < pronargs {
         return;
     }
+    values[pronargdefaults_index] =
+        CatalogValue::Int16(defaults.len().min(i16::MAX as usize) as i16);
+
     let default_arg_types = &arg_types[pronargs - defaults.len()..pronargs];
     let Some(nodes) = default_arg_types
         .iter()
@@ -1645,8 +1675,6 @@ fn normalize_pg_proc_bootstrap_defaults(table: &StaticCatalogTable, values: &mut
     else {
         return;
     };
-    values[pronargdefaults_index] =
-        CatalogValue::Int16(defaults.len().min(i16::MAX as usize) as i16);
     values[proargdefaults_index] = CatalogValue::Text(format!("({})", nodes.join(" ")));
 }
 
@@ -1664,6 +1692,1000 @@ fn static_row_to_catalog_row(table: &StaticCatalogTable, row: &StaticCatalogRow)
         row_id: row.row_id,
         values,
     }
+}
+
+fn synthetic_static_relation_rowtype_row(
+    pg_type_table: &StaticCatalogTable,
+    relation_table: &StaticCatalogTable,
+) -> Option<CatalogRow> {
+    let rowtype_oid = synthetic_static_relation_rowtype_oid(relation_table);
+    let template = pg_type_table
+        .rows
+        .iter()
+        .find(|row| static_row_column_identifier_matches(pg_type_table, row, "typname", "pg_proc"))
+        .or_else(|| {
+            pg_type_table.rows.iter().find(|row| {
+                static_row_column_oid(pg_type_table, row, "typrelid")
+                    .is_some_and(|typrelid| typrelid != INVALID_OID)
+            })
+        })?;
+    let mut row = static_row_to_catalog_row(pg_type_table, template);
+    row.row_id = u64::from(rowtype_oid.0);
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "oid",
+        CatalogValue::Oid(rowtype_oid),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typname",
+        CatalogValue::Name(relation_table.name.to_owned()),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typnamespace",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typowner",
+        CatalogValue::Oid(POSTGRES_ROLE_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typrelid",
+        CatalogValue::Oid(relation_table.oid),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typelem",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typarray",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    Some(row)
+}
+
+fn synthetic_information_schema_namespace_row(
+    pg_namespace_table: &StaticCatalogTable,
+) -> Option<CatalogRow> {
+    let template = pg_namespace_table.rows.first()?;
+    let mut row = static_row_to_catalog_row(pg_namespace_table, template);
+    row.row_id = u64::from(INFORMATION_SCHEMA_NAMESPACE.oid.0);
+    set_catalog_row_value(
+        pg_namespace_table,
+        &mut row,
+        "oid",
+        CatalogValue::Oid(INFORMATION_SCHEMA_NAMESPACE.oid),
+    );
+    set_catalog_row_value(
+        pg_namespace_table,
+        &mut row,
+        "nspname",
+        CatalogValue::Name(INFORMATION_SCHEMA_NAMESPACE.name.to_owned()),
+    );
+    set_catalog_row_value(
+        pg_namespace_table,
+        &mut row,
+        "nspowner",
+        CatalogValue::Oid(INFORMATION_SCHEMA_NAMESPACE.owner),
+    );
+    Some(row)
+}
+
+#[derive(Clone, Copy)]
+struct InformationSchemaDomainSpec {
+    oid: Oid,
+    name: &'static str,
+    base_type: Oid,
+    type_mod: i32,
+    collation: Oid,
+}
+
+const INFORMATION_SCHEMA_DOMAIN_SPECS: &[InformationSchemaDomainSpec] = &[
+    InformationSchemaDomainSpec {
+        oid: Oid(14_001),
+        name: "cardinal_number",
+        base_type: INT4_OID,
+        type_mod: -1,
+        collation: INVALID_OID,
+    },
+    InformationSchemaDomainSpec {
+        oid: Oid(14_002),
+        name: "character_data",
+        base_type: VARCHAR_OID,
+        type_mod: -1,
+        collation: C_COLLATION_OID,
+    },
+    InformationSchemaDomainSpec {
+        oid: Oid(14_003),
+        name: "sql_identifier",
+        base_type: NAME_OID,
+        type_mod: -1,
+        collation: C_COLLATION_OID,
+    },
+    InformationSchemaDomainSpec {
+        oid: Oid(14_004),
+        name: "time_stamp",
+        base_type: TIMESTAMPTZ_OID,
+        type_mod: 2,
+        collation: INVALID_OID,
+    },
+    InformationSchemaDomainSpec {
+        oid: Oid(14_005),
+        name: "yes_or_no",
+        base_type: VARCHAR_OID,
+        type_mod: 7,
+        collation: C_COLLATION_OID,
+    },
+];
+
+fn synthetic_information_schema_domain_row(
+    pg_type_table: &StaticCatalogTable,
+    spec: InformationSchemaDomainSpec,
+) -> Option<CatalogRow> {
+    let template = pg_type_table
+        .rows
+        .iter()
+        .find(|row| static_row_column_oid(pg_type_table, row, "oid") == Some(spec.base_type))?;
+    let base_type = lookup_builtin_type(spec.base_type)?;
+    let mut row = static_row_to_catalog_row(pg_type_table, template);
+    row.row_id = u64::from(spec.oid.0);
+    set_catalog_row_value(pg_type_table, &mut row, "oid", CatalogValue::Oid(spec.oid));
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typname",
+        CatalogValue::Name(spec.name.to_owned()),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typnamespace",
+        CatalogValue::Oid(INFORMATION_SCHEMA_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typowner",
+        CatalogValue::Oid(POSTGRES_ROLE_OID),
+    );
+    set_catalog_row_value(pg_type_table, &mut row, "typtype", CatalogValue::Char(b'd'));
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typispreferred",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typinput",
+        CatalogValue::Oid(Oid(2597)),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typoutput",
+        CatalogValue::Oid(base_type.typoutput),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typreceive",
+        CatalogValue::Oid(Oid(2598)),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typsend",
+        CatalogValue::Oid(base_type.typsend),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typmodin",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typmodout",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typrelid",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typelem",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typarray",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typbasetype",
+        CatalogValue::Oid(spec.base_type),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typtypmod",
+        CatalogValue::Int32(spec.type_mod),
+    );
+    set_catalog_row_value(
+        pg_type_table,
+        &mut row,
+        "typcollation",
+        CatalogValue::Oid(spec.collation),
+    );
+    set_catalog_row_value(pg_type_table, &mut row, "typdefaultbin", CatalogValue::Null);
+    set_catalog_row_value(pg_type_table, &mut row, "typdefault", CatalogValue::Null);
+    set_catalog_row_value(pg_type_table, &mut row, "typacl", CatalogValue::Null);
+    Some(row)
+}
+
+fn empty_catalog_row(table: &StaticCatalogTable, row_id: u64) -> CatalogRow {
+    CatalogRow {
+        relation_oid: table.oid,
+        row_id,
+        values: vec![CatalogValue::Null; table.columns.len()],
+    }
+}
+
+fn synthetic_pg_aggregate_fnoid_index_class_row(pg_class_table: &StaticCatalogTable) -> CatalogRow {
+    let mut row = empty_catalog_row(pg_class_table, u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "oid",
+        CatalogValue::Oid(PG_AGGREGATE_FNOID_INDEX_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relname",
+        CatalogValue::Name("pg_aggregate_fnoid_index".to_owned()),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relnamespace",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "reltype",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "reloftype",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relowner",
+        CatalogValue::Oid(POSTGRES_ROLE_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relam",
+        CatalogValue::Oid(BTREE_INDEX_AM_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relfilenode",
+        CatalogValue::Oid(PG_AGGREGATE_FNOID_INDEX_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "reltablespace",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(pg_class_table, &mut row, "relpages", CatalogValue::Int32(1));
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "reltuples",
+        CatalogValue::Float32(1.0),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relallvisible",
+        CatalogValue::Int32(0),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relallfrozen",
+        CatalogValue::Int32(0),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "reltoastrelid",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relhasindex",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relisshared",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relpersistence",
+        CatalogValue::Char(b'p'),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relkind",
+        CatalogValue::Char(b'i'),
+    );
+    set_catalog_row_value(pg_class_table, &mut row, "relnatts", CatalogValue::Int16(1));
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relchecks",
+        CatalogValue::Int16(0),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relhasrules",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relhastriggers",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relhassubclass",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relrowsecurity",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relforcerowsecurity",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relispopulated",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relreplident",
+        CatalogValue::Char(b'n'),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relispartition",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relrewrite",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relfrozenxid",
+        CatalogValue::Raw("3".to_owned()),
+    );
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relminmxid",
+        CatalogValue::Raw("1".to_owned()),
+    );
+    set_catalog_row_value(pg_class_table, &mut row, "relacl", CatalogValue::Null);
+    set_catalog_row_value(pg_class_table, &mut row, "reloptions", CatalogValue::Null);
+    set_catalog_row_value(pg_class_table, &mut row, "relpartbound", CatalogValue::Null);
+    row
+}
+
+fn synthetic_pg_aggregate_fnoid_index_row(pg_index_table: &StaticCatalogTable) -> CatalogRow {
+    let mut row = empty_catalog_row(pg_index_table, u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indexrelid",
+        CatalogValue::Oid(PG_AGGREGATE_FNOID_INDEX_OID),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indrelid",
+        CatalogValue::Oid(PG_AGGREGATE_RELATION_OID),
+    );
+    set_catalog_row_value(pg_index_table, &mut row, "indnatts", CatalogValue::Int16(1));
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indnkeyatts",
+        CatalogValue::Int16(1),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisunique",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indnullsnotdistinct",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisprimary",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisexclusion",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indimmediate",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisclustered",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisvalid",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indcheckxmin",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisready",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indislive",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indisreplident",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indkey",
+        CatalogValue::Int2Vector(vec![1]),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indcollation",
+        CatalogValue::OidVector(vec![INVALID_OID]),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indclass",
+        CatalogValue::OidVector(vec![OID_BTREE_OPCLASS_OID]),
+    );
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indoption",
+        CatalogValue::Int2Vector(vec![0]),
+    );
+    set_catalog_row_value(pg_index_table, &mut row, "indexprs", CatalogValue::Null);
+    set_catalog_row_value(pg_index_table, &mut row, "indpred", CatalogValue::Null);
+    row
+}
+
+fn synthetic_static_attribute_row(
+    pg_attribute_table: &StaticCatalogTable,
+    relation_table: &StaticCatalogTable,
+    column: &StaticCatalogColumn,
+    attnum: i16,
+) -> Option<CatalogRow> {
+    let template = pg_attribute_table.rows.first()?;
+    let type_record = lookup_builtin_type(column.type_oid)?;
+    let mut row = static_row_to_catalog_row(pg_attribute_table, template);
+    row.row_id = (u64::from(relation_table.oid.0) << 16)
+        | SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG
+        | u64::from(attnum as u16);
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attrelid",
+        CatalogValue::Oid(relation_table.oid),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attname",
+        CatalogValue::Name(column.name.to_owned()),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atttypid",
+        CatalogValue::Oid(column.type_oid),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attstattarget",
+        CatalogValue::Int16(-1),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attlen",
+        CatalogValue::Int16(type_record.typlen),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attnum",
+        CatalogValue::Int16(attnum),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attndims",
+        CatalogValue::Int32(column.attndims),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attcacheoff",
+        CatalogValue::Int32(-1),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atttypmod",
+        CatalogValue::Int32(-1),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attbyval",
+        CatalogValue::Bool(type_record.typbyval),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attalign",
+        CatalogValue::Char(type_record.typalign),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attstorage",
+        CatalogValue::Char(type_record.typstorage),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attcompression",
+        CatalogValue::Char(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attnotnull",
+        CatalogValue::Bool(column.attnotnull),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atthasdef",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atthasmissing",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attidentity",
+        CatalogValue::Char(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attgenerated",
+        CatalogValue::Char(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attisdropped",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attislocal",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attinhcount",
+        CatalogValue::Int16(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attcollation",
+        CatalogValue::Oid(type_record.typcollation),
+    );
+    set_catalog_row_value(pg_attribute_table, &mut row, "attacl", CatalogValue::Null);
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attoptions",
+        CatalogValue::Null,
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attfdwoptions",
+        CatalogValue::Null,
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attmissingval",
+        CatalogValue::Null,
+    );
+    Some(row)
+}
+
+#[derive(Clone, Copy)]
+struct SystemAttributeSpec {
+    name: &'static str,
+    attnum: i16,
+    type_oid: Oid,
+}
+
+const SYSTEM_ATTRIBUTE_SPECS: &[SystemAttributeSpec] = &[
+    SystemAttributeSpec {
+        name: "ctid",
+        attnum: -1,
+        type_oid: TID_OID,
+    },
+    SystemAttributeSpec {
+        name: "xmin",
+        attnum: -2,
+        type_oid: XID_OID,
+    },
+    SystemAttributeSpec {
+        name: "cmin",
+        attnum: -3,
+        type_oid: CID_OID,
+    },
+    SystemAttributeSpec {
+        name: "xmax",
+        attnum: -4,
+        type_oid: XID_OID,
+    },
+    SystemAttributeSpec {
+        name: "cmax",
+        attnum: -5,
+        type_oid: CID_OID,
+    },
+    SystemAttributeSpec {
+        name: "tableoid",
+        attnum: -6,
+        type_oid: OID_OID,
+    },
+];
+
+fn synthetic_system_attribute_row(
+    pg_attribute_table: &StaticCatalogTable,
+    relation_table: &StaticCatalogTable,
+    spec: SystemAttributeSpec,
+) -> Option<CatalogRow> {
+    let template = pg_attribute_table.rows.first()?;
+    let type_record = lookup_builtin_type(spec.type_oid)?;
+    let mut row = static_row_to_catalog_row(pg_attribute_table, template);
+    row.row_id = (u64::from(relation_table.oid.0) << 16) | u64::from(spec.attnum.unsigned_abs());
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attrelid",
+        CatalogValue::Oid(relation_table.oid),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attname",
+        CatalogValue::Name(spec.name.to_owned()),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atttypid",
+        CatalogValue::Oid(spec.type_oid),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attstattarget",
+        CatalogValue::Int16(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attlen",
+        CatalogValue::Int16(type_record.typlen),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attnum",
+        CatalogValue::Int16(spec.attnum),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attndims",
+        CatalogValue::Int32(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attcacheoff",
+        CatalogValue::Int32(-1),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atttypmod",
+        CatalogValue::Int32(-1),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attbyval",
+        CatalogValue::Bool(type_record.typbyval),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attalign",
+        CatalogValue::Char(type_record.typalign),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attstorage",
+        CatalogValue::Char(type_record.typstorage),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attcompression",
+        CatalogValue::Char(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attnotnull",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atthasdef",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "atthasmissing",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attidentity",
+        CatalogValue::Char(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attgenerated",
+        CatalogValue::Char(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attisdropped",
+        CatalogValue::Bool(false),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attislocal",
+        CatalogValue::Bool(true),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attinhcount",
+        CatalogValue::Int16(0),
+    );
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attcollation",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    Some(row)
+}
+
+fn catalog_rows_have_attribute(
+    table: &StaticCatalogTable,
+    rows: &BTreeMap<u64, CatalogRow>,
+    relation_oid: Oid,
+    attnum: i16,
+) -> bool {
+    rows.values().any(|row| {
+        catalog_row_value(table, row, "attrelid").and_then(catalog_value_oid) == Some(relation_oid)
+            && catalog_row_value(table, row, "attnum").and_then(catalog_value_i16) == Some(attnum)
+    })
+}
+
+fn catalog_rows_have_description(
+    table: &StaticCatalogTable,
+    rows: &BTreeMap<u64, CatalogRow>,
+    class_oid: Oid,
+    object_oid: Oid,
+    object_subid: i32,
+) -> bool {
+    rows.values().any(|row| {
+        catalog_row_value(table, row, "classoid").and_then(catalog_value_oid) == Some(class_oid)
+            && catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)
+                == Some(object_oid)
+            && catalog_row_value(table, row, "objsubid").and_then(catalog_value_i32)
+                == Some(object_subid)
+    })
+}
+
+fn catalog_description_text(
+    table: &StaticCatalogTable,
+    rows: &BTreeMap<u64, CatalogRow>,
+    class_oid: Oid,
+    object_oid: Oid,
+    object_subid: i32,
+) -> Option<String> {
+    rows.values().find_map(|row| {
+        let matches = catalog_row_value(table, row, "classoid").and_then(catalog_value_oid)
+            == Some(class_oid)
+            && catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)
+                == Some(object_oid)
+            && catalog_row_value(table, row, "objsubid").and_then(catalog_value_i32)
+                == Some(object_subid);
+        matches
+            .then(|| catalog_row_value(table, row, "description").and_then(catalog_value_string))?
+    })
+}
+
+fn synthetic_operator_proc_description_row(
+    pg_description_table: &StaticCatalogTable,
+    proc_oid: Oid,
+    description: String,
+) -> Option<CatalogRow> {
+    if proc_oid == INVALID_OID {
+        return None;
+    }
+    let template = pg_description_table.rows.first()?;
+    let mut row = static_row_to_catalog_row(pg_description_table, template);
+    row.row_id = SYNTHETIC_DESCRIPTION_ROW_ID_BASE | u64::from(proc_oid.0);
+    set_catalog_row_value(
+        pg_description_table,
+        &mut row,
+        "objoid",
+        CatalogValue::Oid(proc_oid),
+    );
+    set_catalog_row_value(
+        pg_description_table,
+        &mut row,
+        "classoid",
+        CatalogValue::Oid(PG_PROC_RELATION_OID),
+    );
+    set_catalog_row_value(
+        pg_description_table,
+        &mut row,
+        "objsubid",
+        CatalogValue::Int32(0),
+    );
+    set_catalog_row_value(
+        pg_description_table,
+        &mut row,
+        "description",
+        CatalogValue::Text(description),
+    );
+    Some(row)
 }
 
 fn static_row_column_value(
@@ -1769,11 +2791,16 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
         }
         match relation_oid {
             PG_NAMESPACE_RELATION_OID => {
+                if let Some(row) = synthetic_information_schema_namespace_row(table) {
+                    rows.entry(row.row_id).or_insert(row);
+                }
                 for namespace in snapshot.namespaces.values() {
                     rows.insert(namespace.row_id, namespace.row.clone());
                 }
             }
             PG_CLASS_RELATION_OID => {
+                let row = synthetic_pg_aggregate_fnoid_index_class_row(table);
+                rows.entry(row.row_id).or_insert(row);
                 for relation in snapshot.relations.values() {
                     rows.insert(relation.row_id, relation.row.clone());
                 }
@@ -1782,13 +2809,57 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                 for column in snapshot.columns.values() {
                     rows.insert(column.row_id, column.row.clone());
                 }
+                for relation_table in static_catalogs() {
+                    for (index, column) in relation_table.columns.iter().enumerate() {
+                        let attnum = i16::try_from(index + 1).ok();
+                        let Some(attnum) = attnum else {
+                            continue;
+                        };
+                        if catalog_rows_have_attribute(table, &rows, relation_table.oid, attnum) {
+                            continue;
+                        }
+                        if let Some(row) =
+                            synthetic_static_attribute_row(table, relation_table, column, attnum)
+                        {
+                            rows.insert(row.row_id, row);
+                        }
+                    }
+                    for spec in SYSTEM_ATTRIBUTE_SPECS {
+                        if catalog_rows_have_attribute(
+                            table,
+                            &rows,
+                            relation_table.oid,
+                            spec.attnum,
+                        ) {
+                            continue;
+                        }
+                        if let Some(row) =
+                            synthetic_system_attribute_row(table, relation_table, *spec)
+                        {
+                            rows.insert(row.row_id, row);
+                        }
+                    }
+                }
             }
             PG_TYPE_RELATION_OID => {
                 for pg_type in snapshot.types.values() {
                     rows.insert(pg_type.row_id, pg_type.row.clone());
                 }
+                for spec in INFORMATION_SCHEMA_DOMAIN_SPECS {
+                    if let Some(row) = synthetic_information_schema_domain_row(table, *spec) {
+                        rows.entry(row.row_id).or_insert(row);
+                    }
+                }
+                for relation_table in static_catalogs() {
+                    if let Some(row) = synthetic_static_relation_rowtype_row(table, relation_table)
+                    {
+                        rows.entry(row.row_id).or_insert(row);
+                    }
+                }
             }
             PG_INDEX_RELATION_OID => {
+                let row = synthetic_pg_aggregate_fnoid_index_row(table);
+                rows.entry(row.row_id).or_insert(row);
                 for index in snapshot.indexes.values() {
                     rows.insert(index.row_id, index.row.clone());
                 }
@@ -1798,10 +2869,72 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                     rows.insert(constraint.row_id, constraint.row.clone());
                 }
             }
+            PG_DESCRIPTION_RELATION_OID => {
+                let mut proc_descriptions = BTreeMap::<u32, String>::new();
+                for operator in generated_catalog::STATIC_OPERATORS {
+                    if operator.code == INVALID_OID {
+                        continue;
+                    }
+                    let operator_description = catalog_description_text(
+                        table,
+                        &rows,
+                        PG_OPERATOR_RELATION_OID,
+                        operator.oid,
+                        0,
+                    );
+                    if operator_description
+                        .as_deref()
+                        .is_some_and(|description| description.starts_with("deprecated"))
+                    {
+                        continue;
+                    }
+                    proc_descriptions
+                        .entry(operator.code.0)
+                        .or_insert_with(|| format!("implementation of {} operator", operator.name));
+                }
+                for (proc_oid, description) in proc_descriptions {
+                    let proc_oid = Oid(proc_oid);
+                    if catalog_rows_have_description(
+                        table,
+                        &rows,
+                        PG_PROC_RELATION_OID,
+                        proc_oid,
+                        0,
+                    ) {
+                        continue;
+                    }
+                    if let Some(row) =
+                        synthetic_operator_proc_description_row(table, proc_oid, description)
+                    {
+                        rows.entry(row.row_id).or_insert(row);
+                    }
+                }
+            }
             _ => {}
         }
         snapshot.compat_rows.apply_to_rows(relation_oid, &mut rows);
         rows.into_values().collect()
+    })
+}
+
+pub fn relation_rowtype_oid_by_oid(relation_oid: Oid) -> Option<Oid> {
+    if let Some(table) = static_catalog_by_relation_oid(relation_oid) {
+        return Some(synthetic_static_relation_rowtype_oid(table));
+    }
+    relation_by_oid(relation_oid).map(|relation| relation.type_oid)
+}
+
+pub fn relation_planner_stats_by_oid(relation_oid: Oid) -> Option<RelationPlannerStats> {
+    static_catalog_by_relation_oid(relation_oid)?;
+    let row_count = catalog_rows(relation_oid).len();
+    let relpages = if row_count == 0 {
+        0
+    } else {
+        row_count.div_ceil(32).min(i32::MAX as usize) as i32
+    };
+    Some(RelationPlannerStats {
+        relpages,
+        reltuples: row_count as f32,
     })
 }
 
@@ -1828,6 +2961,18 @@ fn synthetic_database_oid(name: &str) -> Oid {
             Oid(SYNTHETIC_DATABASE_OID_BASE | (hash & 0x00ff_ffff))
         }
     }
+}
+
+fn synthetic_static_relation_rowtype_oid(table: &StaticCatalogTable) -> Oid {
+    if table.rowtype_oid != INVALID_OID {
+        return table.rowtype_oid;
+    }
+    let mut hash = 0x811c_9dc5u32;
+    for byte in table.name.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    Oid(SYNTHETIC_ROWTYPE_OID_BASE | (hash & 0x00ff_ffff))
 }
 
 fn database_oid_by_name(name: &str) -> Option<Oid> {
@@ -3869,6 +5014,20 @@ mod tests {
     }
 
     #[test]
+    fn pg_proc_bootstrap_default_count_is_normalized_for_unhandled_nodes() {
+        let row = catalog_rows(PG_PROC_RELATION_OID)
+            .into_iter()
+            .find(|row| {
+                value_name(row_value("pg_proc", row, "proname")) == Some("jsonb_path_exists")
+            })
+            .expect("jsonb_path_exists proc row");
+        assert_eq!(
+            value_i16(row_value("pg_proc", &row, "pronargdefaults")),
+            Some(2)
+        );
+    }
+
+    #[test]
     fn ensure_database_adds_synthetic_pg_database_row() {
         let _guard = catalog_test_lock();
         clear_for_tests();
@@ -3924,6 +5083,203 @@ mod tests {
                 .unwrap_or_else(|| panic!("{name} should have virtual catalog policy"));
             assert_eq!(record.policy, policy, "{name}");
         }
+    }
+
+    #[test]
+    fn virtual_catalog_relation_metadata_includes_rowtype_and_stats() {
+        let proc_table = static_catalog_by_name("pg_proc").expect("pg_proc catalog");
+        let rowtype_oid = relation_rowtype_oid_by_oid(proc_table.oid).expect("rowtype oid");
+        assert_eq!(rowtype_oid, proc_table.rowtype_oid);
+
+        let stats = relation_planner_stats_by_oid(proc_table.oid).expect("planner stats");
+        assert_eq!(stats.reltuples, catalog_rows(proc_table.oid).len() as f32);
+        assert!(stats.relpages > 0);
+    }
+
+    #[test]
+    fn virtual_catalog_rowtypes_are_visible_in_pg_type() {
+        let operator_table = static_catalog_by_name("pg_operator").expect("pg_operator catalog");
+        let pg_type = static_catalog_by_name("pg_type").expect("pg_type catalog");
+        let row = catalog_rows(pg_type.oid)
+            .into_iter()
+            .find(|row| {
+                catalog_row_value(pg_type, row, "oid").and_then(catalog_value_oid)
+                    == relation_rowtype_oid_by_oid(operator_table.oid)
+            })
+            .expect("pg_operator rowtype");
+
+        assert_eq!(
+            catalog_row_value(pg_type, &row, "typname").and_then(catalog_value_string),
+            Some("pg_operator".to_owned())
+        );
+        assert_eq!(
+            catalog_row_value(pg_type, &row, "typrelid").and_then(catalog_value_oid),
+            Some(operator_table.oid)
+        );
+    }
+
+    #[test]
+    fn virtual_catalog_system_attributes_are_visible_in_pg_attribute() {
+        let operator_table = static_catalog_by_name("pg_operator").expect("pg_operator catalog");
+        let pg_attribute = static_catalog_by_name("pg_attribute").expect("pg_attribute catalog");
+        let rows = catalog_rows(pg_attribute.oid);
+
+        for (attname, attnum, type_oid) in [("ctid", -1, TID_OID), ("tableoid", -6, OID_OID)] {
+            let row = rows
+                .iter()
+                .find(|row| {
+                    catalog_row_value(pg_attribute, row, "attrelid").and_then(catalog_value_oid)
+                        == Some(operator_table.oid)
+                        && catalog_row_value(pg_attribute, row, "attnum")
+                            .and_then(catalog_value_i16)
+                            == Some(attnum)
+                })
+                .unwrap_or_else(|| panic!("{attname} system attribute"));
+            assert_eq!(
+                catalog_row_value(pg_attribute, row, "attname").and_then(catalog_value_string),
+                Some(attname.to_owned())
+            );
+            assert_eq!(
+                catalog_row_value(pg_attribute, row, "atttypid").and_then(catalog_value_oid),
+                Some(type_oid)
+            );
+        }
+    }
+
+    #[test]
+    fn static_catalog_attributes_are_visible_in_pg_attribute() {
+        let pg_attribute = static_catalog_by_name("pg_attribute").expect("pg_attribute catalog");
+        let aggregate_table = static_catalog_by_name("pg_aggregate").expect("pg_aggregate catalog");
+        let rows = catalog_rows(pg_attribute.oid);
+        let row = rows
+            .iter()
+            .find(|row| {
+                catalog_row_value(pg_attribute, row, "attrelid").and_then(catalog_value_oid)
+                    == Some(aggregate_table.oid)
+                    && catalog_row_value(pg_attribute, row, "attname")
+                        .and_then(catalog_value_string)
+                        == Some("aggfnoid".to_owned())
+            })
+            .expect("pg_aggregate.aggfnoid attribute");
+
+        assert_eq!(
+            catalog_row_value(pg_attribute, row, "atttypid").and_then(catalog_value_oid),
+            Some(Oid(24))
+        );
+    }
+
+    #[test]
+    fn information_schema_domains_mark_domain_input() {
+        let pg_namespace = static_catalog_by_name("pg_namespace").expect("pg_namespace catalog");
+        let namespace_rows = catalog_rows(pg_namespace.oid);
+        assert!(namespace_rows.iter().any(|row| {
+            catalog_row_value(pg_namespace, row, "oid").and_then(catalog_value_oid)
+                == Some(INFORMATION_SCHEMA_NAMESPACE_OID)
+                && catalog_row_value(pg_namespace, row, "nspname").and_then(catalog_value_string)
+                    == Some("information_schema".to_owned())
+        }));
+        assert_eq!(
+            builtin_namespace_by_name("information_schema").map(|record| record.oid),
+            Some(INFORMATION_SCHEMA_NAMESPACE_OID)
+        );
+
+        let pg_type = static_catalog_by_name("pg_type").expect("pg_type catalog");
+        let type_rows = catalog_rows(pg_type.oid);
+        let row = type_rows
+            .iter()
+            .find(|row| {
+                catalog_row_value(pg_type, row, "typnamespace").and_then(catalog_value_oid)
+                    == Some(INFORMATION_SCHEMA_NAMESPACE_OID)
+                    && catalog_row_value(pg_type, row, "typname").and_then(catalog_value_string)
+                        == Some("cardinal_number".to_owned())
+            })
+            .expect("information_schema.cardinal_number type");
+
+        assert_eq!(
+            catalog_row_value(pg_type, row, "typtype").and_then(catalog_value_u8),
+            Some(b'd')
+        );
+        assert_eq!(
+            catalog_row_value(pg_type, row, "typinput").and_then(catalog_value_oid),
+            Some(Oid(2597))
+        );
+        assert_eq!(
+            catalog_row_value(pg_type, row, "typbasetype").and_then(catalog_value_oid),
+            Some(INT4_OID)
+        );
+    }
+
+    #[test]
+    fn pg_aggregate_fnoid_index_metadata_is_visible() {
+        let pg_class = static_catalog_by_name("pg_class").expect("pg_class catalog");
+        let class_rows = catalog_rows(pg_class.oid);
+        assert!(class_rows.iter().any(|row| {
+            catalog_row_value(pg_class, row, "oid").and_then(catalog_value_oid)
+                == Some(PG_AGGREGATE_FNOID_INDEX_OID)
+                && catalog_row_value(pg_class, row, "relname").and_then(catalog_value_string)
+                    == Some("pg_aggregate_fnoid_index".to_owned())
+                && catalog_row_value(pg_class, row, "relkind").and_then(catalog_value_u8)
+                    == Some(b'i')
+        }));
+
+        let pg_index = static_catalog_by_name("pg_index").expect("pg_index catalog");
+        let index_rows = catalog_rows(pg_index.oid);
+        let row = index_rows
+            .iter()
+            .find(|row| {
+                catalog_row_value(pg_index, row, "indexrelid").and_then(catalog_value_oid)
+                    == Some(PG_AGGREGATE_FNOID_INDEX_OID)
+            })
+            .expect("pg_aggregate_fnoid_index row");
+
+        assert_eq!(
+            catalog_row_value(pg_index, row, "indrelid").and_then(catalog_value_oid),
+            Some(PG_AGGREGATE_RELATION_OID)
+        );
+        assert_eq!(
+            catalog_row_value(pg_index, row, "indkey").and_then(catalog_value_int2_vector),
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn operator_implementation_proc_descriptions_are_synthesized() {
+        let pg_description =
+            static_catalog_by_name("pg_description").expect("pg_description catalog");
+        let rows = catalog_rows(pg_description.oid);
+        let synthesized_description = |oid| {
+            rows.iter()
+                .find_map(|row| {
+                    let matches = catalog_row_value(pg_description, row, "classoid")
+                        .and_then(catalog_value_oid)
+                        == Some(PG_PROC_RELATION_OID)
+                        && catalog_row_value(pg_description, row, "objoid")
+                            .and_then(catalog_value_oid)
+                            == Some(oid);
+                    matches.then(|| {
+                        catalog_row_value(pg_description, row, "description")
+                            .and_then(catalog_value_string)
+                    })?
+                })
+                .unwrap_or_else(|| panic!("description for proc {oid:?}"))
+        };
+
+        assert_eq!(
+            synthesized_description(Oid(56)),
+            "implementation of < operator"
+        );
+        assert_eq!(
+            synthesized_description(Oid(125)),
+            "implementation of && operator"
+        );
+        assert_eq!(
+            synthesized_description(Oid(131)),
+            "implementation of |>> operator"
+        );
+        assert_eq!(
+            synthesized_description(Oid(3634)),
+            "implementation of @@ operator"
+        );
     }
 
     #[test]

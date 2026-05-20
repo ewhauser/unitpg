@@ -436,6 +436,9 @@ FastPgBuildPgClassTuple(Oid targetRelId)
 	Datum		values[Natts_pg_class];
 	bool		nulls[Natts_pg_class];
 	NameData	relname;
+	uint32_t	rowtype_oid = InvalidOid;
+	int32_t		relpages = 0;
+	float4		reltuples = -1.0;
 
 	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) targetRelId,
 											 &fastpg_relation))
@@ -444,13 +447,17 @@ FastPgBuildPgClassTuple(Oid targetRelId)
 	memset(values, 0, sizeof(values));
 	memset(nulls, false, sizeof(nulls));
 	namestrcpy(&relname, fastpg_relation.name);
+	fastpg_rust_catalog_relation_rowtype_oid_by_oid(fastpg_relation.oid,
+													&rowtype_oid);
+	fastpg_rust_catalog_relation_planner_stats_by_oid(fastpg_relation.oid,
+													  &relpages,
+													  &reltuples);
 
 	values[Anum_pg_class_oid - 1] = ObjectIdGetDatum((Oid) fastpg_relation.oid);
 	values[Anum_pg_class_relname - 1] = NameGetDatum(&relname);
 	values[Anum_pg_class_relnamespace - 1] =
 		ObjectIdGetDatum((Oid) fastpg_relation.namespace_oid);
-	values[Anum_pg_class_reltype - 1] =
-		ObjectIdGetDatum((Oid) fastpg_relation.type_oid);
+	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum((Oid) rowtype_oid);
 	values[Anum_pg_class_reloftype - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_class_relowner - 1] =
 		ObjectIdGetDatum((Oid) fastpg_relation.owner_oid);
@@ -460,8 +467,8 @@ FastPgBuildPgClassTuple(Oid targetRelId)
 	values[Anum_pg_class_relfilenode - 1] =
 		ObjectIdGetDatum((Oid) fastpg_relation.oid);
 	values[Anum_pg_class_reltablespace - 1] = ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_class_relpages - 1] = Int32GetDatum(0);
-	values[Anum_pg_class_reltuples - 1] = Float4GetDatum(-1.0);
+	values[Anum_pg_class_relpages - 1] = Int32GetDatum(relpages);
+	values[Anum_pg_class_reltuples - 1] = Float4GetDatum(reltuples);
 	values[Anum_pg_class_relallvisible - 1] = Int32GetDatum(0);
 	values[Anum_pg_class_relallfrozen - 1] = Int32GetDatum(0);
 	values[Anum_pg_class_reltoastrelid - 1] = ObjectIdGetDatum(InvalidOid);

@@ -652,6 +652,88 @@ FastPgCatalogCacheBuildEmptyList(CatCache *cache, int nkeys,
 	return cl;
 }
 
+static int
+FastPgCompareOidAscending(Oid left, Oid right)
+{
+	if (left < right)
+		return -1;
+	if (left > right)
+		return 1;
+	return 0;
+}
+
+static int
+FastPgCompareInt16Ascending(int16 left, int16 right)
+{
+	if (left < right)
+		return -1;
+	if (left > right)
+		return 1;
+	return 0;
+}
+
+static int
+FastPgCompareAmopStrategyListMembers(const ListCell *left_cell,
+									 const ListCell *right_cell)
+{
+	const CatCTup *left_tuple = (const CatCTup *) lfirst(left_cell);
+	const CatCTup *right_tuple = (const CatCTup *) lfirst(right_cell);
+	Form_pg_amop left = (Form_pg_amop) GETSTRUCT(&left_tuple->tuple);
+	Form_pg_amop right = (Form_pg_amop) GETSTRUCT(&right_tuple->tuple);
+	int			cmp;
+
+	cmp = FastPgCompareOidAscending(left->amopfamily, right->amopfamily);
+	if (cmp != 0)
+		return cmp;
+	cmp = FastPgCompareOidAscending(left->amoplefttype, right->amoplefttype);
+	if (cmp != 0)
+		return cmp;
+	cmp = FastPgCompareOidAscending(left->amoprighttype, right->amoprighttype);
+	if (cmp != 0)
+		return cmp;
+	return FastPgCompareInt16Ascending(left->amopstrategy, right->amopstrategy);
+}
+
+static int
+FastPgCompareAmprocNumListMembers(const ListCell *left_cell,
+								  const ListCell *right_cell)
+{
+	const CatCTup *left_tuple = (const CatCTup *) lfirst(left_cell);
+	const CatCTup *right_tuple = (const CatCTup *) lfirst(right_cell);
+	Form_pg_amproc left = (Form_pg_amproc) GETSTRUCT(&left_tuple->tuple);
+	Form_pg_amproc right = (Form_pg_amproc) GETSTRUCT(&right_tuple->tuple);
+	int			cmp;
+
+	cmp = FastPgCompareOidAscending(left->amprocfamily, right->amprocfamily);
+	if (cmp != 0)
+		return cmp;
+	cmp = FastPgCompareOidAscending(left->amproclefttype, right->amproclefttype);
+	if (cmp != 0)
+		return cmp;
+	cmp = FastPgCompareOidAscending(left->amprocrighttype, right->amprocrighttype);
+	if (cmp != 0)
+		return cmp;
+	return FastPgCompareInt16Ascending(left->amprocnum, right->amprocnum);
+}
+
+static bool
+FastPgCatalogCacheSortListForOrdering(CatCache *cache, List *ctlist)
+{
+	if (cache->cc_reloid == AccessMethodOperatorRelationId &&
+		cache->cc_indexoid == AccessMethodStrategyIndexId)
+	{
+		list_sort(ctlist, FastPgCompareAmopStrategyListMembers);
+		return true;
+	}
+	if (cache->cc_reloid == AccessMethodProcedureRelationId &&
+		cache->cc_indexoid == AccessMethodProcedureIndexId)
+	{
+		list_sort(ctlist, FastPgCompareAmprocNumListMembers);
+		return true;
+	}
+	return false;
+}
+
 static CatCList *
 FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 							Datum *arguments,
@@ -668,6 +750,7 @@ FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 	CatCList   *cl;
 	CatCTup    *ct;
 	MemoryContext oldcxt;
+	bool		ordered;
 	int			nmembers;
 	int			i = 0;
 
@@ -741,6 +824,7 @@ FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 	fastpg_rust_scan_end(scan_handle);
 	pfree(values);
 	pfree(isnull);
+	ordered = FastPgCatalogCacheSortListForOrdering(cache, ctlist);
 
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 	nmembers = list_length(ctlist);
@@ -754,7 +838,7 @@ FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 	cl->my_cache = cache;
 	cl->refcount = 1;
 	cl->dead = false;
-	cl->ordered = false;
+	cl->ordered = ordered;
 	cl->nkeys = nkeys;
 	cl->hash_value = lHashValue;
 	cl->n_members = nmembers;
@@ -785,13 +869,21 @@ FastPgBuildClassTuple(TupleDesc tupdesc,
 	bool		nulls[Natts_pg_class] = {false};
 	NameData	relname;
 	HeapTuple	tuple;
+	uint32_t	rowtype_oid = InvalidOid;
+	int32_t		relpages = 0;
+	float4		reltuples = -1.0;
 
 	namestrcpy(&relname, relation->name);
+	fastpg_rust_catalog_relation_rowtype_oid_by_oid(relation->oid,
+													&rowtype_oid);
+	fastpg_rust_catalog_relation_planner_stats_by_oid(relation->oid,
+													  &relpages,
+													  &reltuples);
 
 	values[Anum_pg_class_oid - 1] = ObjectIdGetDatum((Oid) relation->oid);
 	values[Anum_pg_class_relname - 1] = NameGetDatum(&relname);
 	values[Anum_pg_class_relnamespace - 1] = ObjectIdGetDatum((Oid) relation->namespace_oid);
-	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum((Oid) relation->type_oid);
+	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum((Oid) rowtype_oid);
 	values[Anum_pg_class_reloftype - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_class_relowner - 1] = ObjectIdGetDatum(BOOTSTRAP_SUPERUSERID);
 	values[Anum_pg_class_relam - 1] =
@@ -799,8 +891,8 @@ FastPgBuildClassTuple(TupleDesc tupdesc,
 						 BTREE_AM_OID : HEAP_TABLE_AM_OID);
 	values[Anum_pg_class_relfilenode - 1] = ObjectIdGetDatum((Oid) relation->oid);
 	values[Anum_pg_class_reltablespace - 1] = ObjectIdGetDatum(InvalidOid);
-	values[Anum_pg_class_relpages - 1] = Int32GetDatum(0);
-	values[Anum_pg_class_reltuples - 1] = Float4GetDatum(-1.0);
+	values[Anum_pg_class_relpages - 1] = Int32GetDatum(relpages);
+	values[Anum_pg_class_reltuples - 1] = Float4GetDatum(reltuples);
 	values[Anum_pg_class_relallvisible - 1] = Int32GetDatum(0);
 	values[Anum_pg_class_relallfrozen - 1] = Int32GetDatum(0);
 	values[Anum_pg_class_reltoastrelid - 1] = ObjectIdGetDatum(InvalidOid);
@@ -1567,7 +1659,6 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 				return FastPgBuildCastTuple(cache->cc_tupdesc, &cast);
 		}
 	}
-
 	return FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
 }
 #endif

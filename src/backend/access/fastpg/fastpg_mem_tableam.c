@@ -1531,6 +1531,15 @@ fastpg_mem_index_validate_scan(Relation table_rel,
 static uint64
 fastpg_mem_relation_size(Relation rel, ForkNumber forkNumber)
 {
+	int32_t		relpages = 0;
+	float4		reltuples = 0;
+
+	if (forkNumber == MAIN_FORKNUM &&
+		fastpg_rust_catalog_relation_planner_stats_by_oid((uint32_t) RelationGetRelid(rel),
+														  &relpages,
+														  &reltuples))
+		return (uint64) relpages * BLCKSZ;
+
 	return 0;
 }
 
@@ -1564,15 +1573,27 @@ fastpg_mem_relation_estimate_size(Relation rel,
 								  double *tuples,
 								  double *allvisfrac)
 {
-	size_t		row_count;
+	int32_t		relpages = 0;
+	float4		reltuples = 0;
 	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+	size_t		row_count;
+
+	if (fastpg_rust_catalog_relation_planner_stats_by_oid(relid,
+														  &relpages,
+														  &reltuples))
+	{
+		*tuples = reltuples;
+		*pages = relpages;
+		*allvisfrac = 1.0;
+		return;
+	}
 
 	if (fastpg_rust_catalog_policy_by_relation_oid(relid) != 0)
 		row_count = fastpg_rust_catalog_row_count(relid);
 	else
 		row_count = fastpg_mem_use_storage2_for_relid(relid) ?
-			fastpg_storage2_relation_row_count(relid) :
-			fastpg_rust_relation_row_count(relid);
+			fastpg_storage2_relation_row_count(RelationGetRelid(rel)) :
+			fastpg_rust_relation_row_count(RelationGetRelid(rel));
 
 	*tuples = row_count;
 	*pages = row_count == 0 ? 0 :
