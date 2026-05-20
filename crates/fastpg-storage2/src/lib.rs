@@ -419,6 +419,36 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_rebuild_primary_key_index(index_relid: u32) -> bool {
+    clear_last_storage_error();
+    let Some(index_spec) = primary_index_spec_for_index_oid(Oid(index_relid)) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        let relid = index_spec.relation_oid.0;
+        let entries = state
+            .visible_tids(session, relid)
+            .into_iter()
+            .filter_map(|tid| {
+                state
+                    .find_visible_tuple(session, relid, tid)
+                    .and_then(|tuple| index_key_for_decoded(&index_spec, &tuple.values))
+                    .map(|key| (key, tid))
+            })
+            .collect::<Vec<_>>();
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        for (key, tid) in entries {
+            overlay.insert_primary_key(relid, key, tid);
+        }
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
 /// # Safety
 ///
 /// C callers must pass valid key input arrays and an optional valid output pointer.

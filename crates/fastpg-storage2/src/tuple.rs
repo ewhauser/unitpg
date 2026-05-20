@@ -304,28 +304,32 @@ pub(crate) fn copy_tuple_to_outputs(
     if tuple.len() < TUPLE_HEADER_LEN || tuple.get(0..4) != Some(TUPLE_MAGIC) {
         return false;
     }
-    let Some(tuple_natts) = read_u16(tuple, 4).map(usize::from) else {
-        return false;
-    };
+    let base = tuple.as_ptr();
+    let tuple_natts = unsafe { std::ptr::read_unaligned(base.add(4) as *const u16) } as usize;
     if tuple_natts != natts {
         return false;
     }
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
         return false;
     }
-    let base = tuple.as_ptr();
-    let null_bitmap_len = unsafe { std::ptr::read_unaligned(base.add(6) as *const u16) } as usize;
-    let attr_dir_offset = unsafe { std::ptr::read_unaligned(base.add(8) as *const u32) } as usize;
-    let payload_offset = unsafe { std::ptr::read_unaligned(base.add(12) as *const u32) } as usize;
-    if attr_dir_offset != TUPLE_HEADER_LEN + null_bitmap_len {
+    let null_bitmap_len = natts.div_ceil(8);
+    let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
+    let payload_offset = attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN));
+    if payload_offset > tuple.len() {
         return false;
     }
-    if payload_offset < attr_dir_offset
-        || payload_offset > tuple.len()
-        || payload_offset != attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN))
-    {
-        return false;
-    }
+    debug_assert_eq!(
+        unsafe { std::ptr::read_unaligned(base.add(6) as *const u16) } as usize,
+        null_bitmap_len
+    );
+    debug_assert_eq!(
+        unsafe { std::ptr::read_unaligned(base.add(8) as *const u32) } as usize,
+        attr_dir_offset
+    );
+    debug_assert_eq!(
+        unsafe { std::ptr::read_unaligned(base.add(12) as *const u32) } as usize,
+        payload_offset
+    );
 
     for index in 0..natts {
         let null_byte = unsafe { *base.add(TUPLE_HEADER_LEN + index / 8) };

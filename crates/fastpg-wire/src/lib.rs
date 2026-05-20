@@ -411,12 +411,10 @@ impl ExecutionDispatcher {
             .acquire_owned()
             .await
             .map_err(api_io_error)?;
-        tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::block_in_place(move || {
             let _permit = permit;
             operation()
-        })
-        .await
-        .map_err(api_io_error)
+        }))
     }
 }
 

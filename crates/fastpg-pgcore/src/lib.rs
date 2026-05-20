@@ -134,6 +134,24 @@ pub struct ExecutionResult {
     pub notices: Vec<PgCoreNotice>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgCoreTransactionCommand {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl PgCoreTransactionCommand {
+    #[cfg_attr(not(feature = "postgres-execution"), allow(dead_code))]
+    fn command_tag(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct PgCoreSession {
     inner: inner::PgCoreSession,
@@ -202,6 +220,24 @@ impl PgCoreSession {
     ) -> Result<ExecutionResult, PgCoreError> {
         let _guard = self.enter_storage();
         self.inner.execute_with_params(sql, params)
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    pub fn execute_transaction_command(
+        &self,
+        command: PgCoreTransactionCommand,
+    ) -> ExecutionResult {
+        let _guard = self.enter_storage();
+        self.inner.execute_transaction_command(command);
+        ExecutionResult {
+            statements: vec![ExecutionStatement {
+                command_tag: command.command_tag().into(),
+                fields: Vec::new(),
+                rows: Vec::new(),
+                copy_in: None,
+            }],
+            notices: Vec::new(),
+        }
     }
 
     pub fn input_text_datum(
@@ -299,8 +335,8 @@ mod inner {
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField,
-        PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice, PgCoreParam, PgCoreValue,
-        RawParseSummary, StatementDescription,
+        PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice, PgCoreParam, PgCoreTransactionCommand,
+        PgCoreValue, RawParseSummary, StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
@@ -418,6 +454,9 @@ mod inner {
 
     unsafe extern "C" {
         fn fastpg_pgcore_raw_parse(sql: *const c_char) -> *mut FastPgPgCoreParseResult;
+        fn fastpg_xid_begin();
+        fn fastpg_xid_commit();
+        fn fastpg_xid_rollback();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_set_database(database_oid: u32);
         fn fastpg_pgcore_notice_capture_begin();
@@ -846,6 +885,34 @@ mod inner {
                 result.notices = notices;
                 result
             })
+        }
+
+        pub fn execute_transaction_command(&self, command: PgCoreTransactionCommand) {
+            let _guard = enter_pgcore_lane("transaction_command");
+            self.set_database();
+            match command {
+                PgCoreTransactionCommand::Begin => {
+                    unsafe {
+                        fastpg_xid_begin();
+                    }
+                    fastpg_storage::begin_explicit_transaction();
+                    fastpg_storage2::fastpg_storage2_xact_begin();
+                }
+                PgCoreTransactionCommand::Commit => {
+                    unsafe {
+                        fastpg_xid_commit();
+                    }
+                    fastpg_storage::commit_explicit_transaction();
+                    fastpg_storage2::fastpg_storage2_xact_commit();
+                }
+                PgCoreTransactionCommand::Rollback => {
+                    unsafe {
+                        fastpg_xid_rollback();
+                    }
+                    fastpg_storage::abort_explicit_transaction();
+                    fastpg_storage2::fastpg_storage2_xact_abort();
+                }
+            }
         }
 
         pub fn input_text_datum(

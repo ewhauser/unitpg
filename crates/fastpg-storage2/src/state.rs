@@ -641,18 +641,21 @@ pub(crate) fn relation_update_impl(
 
         let tuple = build_tuple(&input)?;
         let new_tid = state.append_pending_tuple(session, relid, &tuple)?;
+        let new_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
+            .and_then(|index_spec| index_key_for_input(&index_spec, &input));
 
         let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
         overlay.invalidate(relid, old_tid);
-        if let Some(key) = old_primary_key {
+        if old_primary_key.is_some()
+            && old_primary_key != new_primary_key
+            && let Some(key) = old_primary_key
+        {
             overlay.delete_primary_key(relid, key);
         }
-        if let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid))
-            && let Some(key) = index_key_for_input(&index_spec, &input)
-        {
+        if let Some(key) = new_primary_key {
             overlay.insert_primary_key(relid, key, new_tid);
         }
         session.mark_scans_visibility_delta(relid);

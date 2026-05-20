@@ -25,9 +25,11 @@
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "nodes/pathnodes.h"
+#include "nodes/primnodes.h"
 #include "storage/off.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
+#include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
 
@@ -184,6 +186,7 @@ extern bool fastpg_storage2_primary_key_index_lookup(uint32_t index_relid,
 													 const uint8_t *isnull,
 													 size_t nkeys,
 													 uint64_t *tid);
+extern bool fastpg_storage2_rebuild_primary_key_index(uint32_t index_relid);
 extern bool fastpg_storage2_unique_index_conflict(uint32_t index_relid,
 												  const uintptr_t *values,
 												  const uint8_t *isnull,
@@ -906,6 +909,9 @@ fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
 {
 	IndexBuildResult *result = palloc0_object(IndexBuildResult);
 
+	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation)))
+		(void) fastpg_storage2_rebuild_primary_key_index((uint32_t) RelationGetRelid(indexRelation));
+
 	result->heap_tuples = 0.0;
 	result->index_tuples = 0.0;
 	return result;
@@ -1008,6 +1014,44 @@ fastpg_mem_index_vacuum_cleanup(IndexVacuumInfo *info,
 	return stats;
 }
 
+static bool
+fastpg_mem_index_path_has_only_equality_keys(IndexPath *path)
+{
+	IndexOptInfo *index = path->indexinfo;
+	ListCell   *lc;
+
+	if (path->indexclauses == NIL || index == NULL)
+		return false;
+
+	foreach(lc, path->indexclauses)
+	{
+		IndexClause *iclause = lfirst_node(IndexClause, lc);
+		ListCell   *qual_lc;
+		int			indexcol = iclause->indexcol;
+
+		if (indexcol < 0 || indexcol >= index->nkeycolumns)
+			return false;
+
+		foreach(qual_lc, iclause->indexquals)
+		{
+			RestrictInfo *rinfo = lfirst_node(RestrictInfo, qual_lc);
+			Node	   *clause = rinfo->clause;
+			Oid			clause_op;
+
+			if (!IsA(clause, OpExpr))
+				return false;
+
+			clause_op = ((OpExpr *) clause)->opno;
+			if (get_op_opfamily_strategy(clause_op,
+										 index->opfamily[indexcol]) !=
+				BTEqualStrategyNumber)
+				return false;
+		}
+	}
+
+	return true;
+}
+
 static void
 fastpg_mem_index_cost_estimate(PlannerInfo *root,
 							   IndexPath *path,
@@ -1018,8 +1062,18 @@ fastpg_mem_index_cost_estimate(PlannerInfo *root,
 							   double *indexCorrelation,
 							   double *indexPages)
 {
+	if (!fastpg_mem_index_path_has_only_equality_keys(path))
+	{
+		*indexStartupCost = 1000000.0;
+		*indexTotalCost = 1000000.0;
+		*indexSelectivity = 1.0;
+		*indexCorrelation = 0.0;
+		*indexPages = 1.0;
+		return;
+	}
+
 	*indexStartupCost = 0.0;
-	*indexTotalCost = 1.0;
+	*indexTotalCost = 0.01;
 	*indexSelectivity = 0.00001;
 	*indexCorrelation = 1.0;
 	*indexPages = 1.0;
@@ -1227,13 +1281,6 @@ fastpg_mem_index_get_tuple(IndexScanDesc scan, ScanDirection direction)
 	scan->xs_recheck = false;
 	scan->xs_recheckorderby = false;
 	return true;
-}
-
-static int64
-fastpg_mem_index_get_bitmap(IndexScanDesc scan, TIDBitmap *tbm)
-{
-	fastpg_mem_index_unsupported("bitmap scans");
-	return 0;
 }
 
 static void
@@ -1628,6 +1675,7 @@ fastpg_mem_relation_estimate_size(Relation rel,
 	float4		reltuples = 0;
 	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
 	size_t		row_count;
+	BlockNumber estimated_pages;
 
 	if (fastpg_rust_catalog_relation_planner_stats_by_oid(relid,
 														  &relpages,
@@ -1646,11 +1694,14 @@ fastpg_mem_relation_estimate_size(Relation rel,
 			fastpg_storage2_relation_row_count(RelationGetRelid(rel)) :
 			fastpg_rust_relation_row_count(RelationGetRelid(rel));
 
-	*tuples = row_count;
-	*pages = row_count == 0 ? 0 :
+	estimated_pages = row_count == 0 ? 0 :
 		(BlockNumber) (((uint64_t) row_count +
 						(uint64_t) MaxOffsetNumber - 1) /
 					   (uint64_t) MaxOffsetNumber);
+	if (row_count > 0 && fastpg_mem_use_storage2_for_relid(relid))
+		estimated_pages = Max(estimated_pages, 8);
+	*tuples = row_count;
+	*pages = estimated_pages;
 	*allvisfrac = 1.0;
 }
 
@@ -1782,7 +1833,7 @@ static const IndexAmRoutine fastpg_mem_index_methods = {
 	.ambeginscan = fastpg_mem_index_begin_scan,
 	.amrescan = fastpg_mem_index_rescan,
 	.amgettuple = fastpg_mem_index_get_tuple,
-	.amgetbitmap = fastpg_mem_index_get_bitmap,
+	.amgetbitmap = NULL,
 	.amendscan = fastpg_mem_index_end_scan,
 	.ammarkpos = NULL,
 	.amrestrpos = NULL,
