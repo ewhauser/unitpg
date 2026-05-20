@@ -1,0 +1,341 @@
+use crate::*;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DecodedDatum<'a> {
+    Null,
+    ByValue(usize),
+    ByRef(&'a [u8]),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct DecodedTuple<'a> {
+    pub(crate) tid: Tid,
+    pub(crate) values: Vec<DecodedDatum<'a>>,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct RowInput<'a> {
+    pub(crate) values: &'a [usize],
+    pub(crate) is_null: &'a [u8],
+    pub(crate) byval: &'a [u8],
+    pub(crate) value_lens: &'a [usize],
+}
+
+pub(crate) fn input_arrays<'a>(
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+) -> Option<RowInput<'a>> {
+    if natts > 0
+        && (values.is_null() || is_null.is_null() || byval.is_null() || value_lens.is_null())
+    {
+        return None;
+    }
+    Some(RowInput {
+        values: if natts == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(values, natts) }
+        },
+        is_null: if natts == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(is_null, natts) }
+        },
+        byval: if natts == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(byval, natts) }
+        },
+        value_lens: if natts == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(value_lens, natts) }
+        },
+    })
+}
+
+pub(crate) fn key_arrays<'a>(
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+) -> Option<(&'a [usize], &'a [u8])> {
+    if nkeys > 0 && (values.is_null() || is_null.is_null()) {
+        return None;
+    }
+    Some((
+        if nkeys == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(values, nkeys) }
+        },
+        if nkeys == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(is_null, nkeys) }
+        },
+    ))
+}
+
+pub(crate) fn build_tuple(input: &RowInput<'_>) -> Result<Vec<u8>, CatalogError> {
+    if input.values.len() != input.is_null.len()
+        || input.values.len() != input.byval.len()
+        || input.values.len() != input.value_lens.len()
+    {
+        return Err(invalid_ffi_argument(
+            "row input arrays have mismatched lengths",
+        ));
+    }
+
+    let natts = input.values.len();
+    let null_bitmap_len = natts.div_ceil(8);
+    let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
+    let payload_offset = attr_dir_offset + natts.saturating_mul(ATTR_ENTRY_LEN);
+    let mut bytes = vec![0; payload_offset];
+    bytes[0..4].copy_from_slice(TUPLE_MAGIC);
+    write_u16(
+        &mut bytes,
+        4,
+        natts.try_into().map_err(|_| {
+            invalid_ffi_argument("row input has too many attributes for storage2 tuple")
+        })?,
+    );
+    write_u16(
+        &mut bytes,
+        6,
+        null_bitmap_len
+            .try_into()
+            .map_err(|_| invalid_ffi_argument("null bitmap is too large"))?,
+    );
+    write_u32(
+        &mut bytes,
+        8,
+        attr_dir_offset
+            .try_into()
+            .map_err(|_| invalid_ffi_argument("attribute directory offset is too large"))?,
+    );
+    write_u32(
+        &mut bytes,
+        12,
+        payload_offset
+            .try_into()
+            .map_err(|_| invalid_ffi_argument("tuple payload offset is too large"))?,
+    );
+
+    for index in 0..natts {
+        let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
+        if input.is_null[index] != 0 {
+            bytes[TUPLE_HEADER_LEN + index / 8] |= 1 << (index % 8);
+            bytes[entry] = 0;
+            continue;
+        }
+
+        if input.byval[index] != 0 {
+            bytes[entry] = 1;
+            write_u64(&mut bytes, entry + 8, input.values[index] as u64);
+            continue;
+        }
+
+        let len = input.value_lens[index];
+        if input.values[index] == 0 && len > 0 {
+            return Err(invalid_ffi_argument(
+                "non-null by-reference value has null pointer",
+            ));
+        }
+        let source = if len == 0 {
+            &[]
+        } else {
+            unsafe { slice::from_raw_parts(input.values[index] as *const u8, len) }
+        };
+        let offset = bytes.len() - payload_offset;
+        bytes.extend_from_slice(source);
+        bytes[entry] = 2;
+        write_u64(&mut bytes, entry + 8, offset as u64);
+        write_u64(&mut bytes, entry + 16, len as u64);
+    }
+
+    if bytes.len() > u32::MAX as usize {
+        return Err(storage_limit_error("storage2 tuple is too large"));
+    }
+    Ok(bytes)
+}
+
+pub(crate) fn decode_tuple(tid: Tid, tuple: &[u8]) -> Option<DecodedTuple<'_>> {
+    if tuple.len() < TUPLE_HEADER_LEN || tuple.get(0..4)? != TUPLE_MAGIC {
+        return None;
+    }
+    let natts = read_u16(tuple, 4)? as usize;
+    let null_bitmap_len = read_u16(tuple, 6)? as usize;
+    let attr_dir_offset = read_u32(tuple, 8)? as usize;
+    let payload_offset = read_u32(tuple, 12)? as usize;
+    if attr_dir_offset != TUPLE_HEADER_LEN + null_bitmap_len {
+        return None;
+    }
+    if payload_offset < attr_dir_offset
+        || payload_offset.checked_add(0)? > tuple.len()
+        || payload_offset != attr_dir_offset.checked_add(natts.checked_mul(ATTR_ENTRY_LEN)?)?
+    {
+        return None;
+    }
+
+    let mut values = Vec::with_capacity(natts);
+    for index in 0..natts {
+        let null = tuple
+            .get(TUPLE_HEADER_LEN + index / 8)
+            .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
+        let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
+        let tag = *tuple.get(entry)?;
+        if null || tag == 0 {
+            values.push(DecodedDatum::Null);
+            continue;
+        }
+        match tag {
+            1 => values.push(DecodedDatum::ByValue(read_u64(tuple, entry + 8)? as usize)),
+            2 => {
+                let offset = read_u64(tuple, entry + 8)? as usize;
+                let len = read_u64(tuple, entry + 16)? as usize;
+                let start = payload_offset.checked_add(offset)?;
+                let end = start.checked_add(len)?;
+                values.push(DecodedDatum::ByRef(tuple.get(start..end)?));
+            }
+            _ => return None,
+        }
+    }
+    Some(DecodedTuple { tid, values })
+}
+
+pub(crate) fn byref_len(typlen: i16, value: usize, fallback_len: Option<usize>) -> Option<usize> {
+    if typlen > 0 {
+        return Some(typlen as usize);
+    }
+    if let Some(len) = fallback_len
+        && len > 0
+    {
+        return Some(len);
+    }
+    match typlen {
+        -1 => varlena_payload_len(value),
+        -2 => c_string_payload_len(value),
+        _ => None,
+    }
+}
+
+pub(crate) fn byref_len_from_bytes(typlen: i16, bytes: &[u8]) -> Option<usize> {
+    if typlen > 0 {
+        return Some((typlen as usize).min(bytes.len()));
+    }
+    match typlen {
+        -1 => varlena_payload_len(bytes.as_ptr() as usize).filter(|len| *len <= bytes.len()),
+        -2 => bytes
+            .iter()
+            .position(|byte| *byte == 0)
+            .map(|index| index + 1),
+        _ => Some(bytes.len()),
+    }
+}
+
+pub(crate) fn varlena_payload_len(value: usize) -> Option<usize> {
+    if value == 0 {
+        return None;
+    }
+    let raw = unsafe { std::ptr::read_unaligned(value as *const u32) };
+    let len = if cfg!(target_endian = "little") {
+        (raw >> 2) as usize
+    } else {
+        raw as usize
+    };
+    (len >= 4).then_some(len)
+}
+
+pub(crate) fn c_string_payload_len(value: usize) -> Option<usize> {
+    if value == 0 {
+        return None;
+    }
+    let mut len = 0usize;
+    loop {
+        let byte = unsafe { std::ptr::read((value as *const u8).add(len)) };
+        len = len.checked_add(1)?;
+        if byte == 0 {
+            return Some(len);
+        }
+    }
+}
+
+pub(crate) fn write_u16(bytes: &mut [u8], offset: usize, value: u16) {
+    bytes[offset..offset + 2].copy_from_slice(&value.to_ne_bytes());
+}
+
+pub(crate) fn write_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_ne_bytes());
+}
+
+pub(crate) fn write_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_ne_bytes());
+}
+
+pub(crate) fn read_u16(bytes: &[u8], offset: usize) -> Option<u16> {
+    let mut value = [0u8; 2];
+    value.copy_from_slice(bytes.get(offset..offset + 2)?);
+    Some(u16::from_ne_bytes(value))
+}
+
+pub(crate) fn read_u32(bytes: &[u8], offset: usize) -> Option<u32> {
+    let mut value = [0u8; 4];
+    value.copy_from_slice(bytes.get(offset..offset + 4)?);
+    Some(u32::from_ne_bytes(value))
+}
+
+pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
+    let mut value = [0u8; 8];
+    value.copy_from_slice(bytes.get(offset..offset + 8)?);
+    Some(u64::from_ne_bytes(value))
+}
+
+pub(crate) fn copy_decoded_to_outputs(
+    tuple: &DecodedTuple<'_>,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    tid_out: *mut u64,
+) -> bool {
+    if tuple.values.len() != natts {
+        return false;
+    }
+    if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
+        return false;
+    }
+    let values_out = if natts == 0 {
+        &mut []
+    } else {
+        unsafe { slice::from_raw_parts_mut(values_out, natts) }
+    };
+    let is_null_out = if natts == 0 {
+        &mut []
+    } else {
+        unsafe { slice::from_raw_parts_mut(is_null_out, natts) }
+    };
+    for (index, value) in tuple.values.iter().enumerate() {
+        match value {
+            DecodedDatum::Null => {
+                values_out[index] = 0;
+                is_null_out[index] = 1;
+            }
+            DecodedDatum::ByValue(value) => {
+                values_out[index] = *value;
+                is_null_out[index] = 0;
+            }
+            DecodedDatum::ByRef(bytes) => {
+                values_out[index] = bytes.as_ptr() as usize;
+                is_null_out[index] = 0;
+            }
+        }
+    }
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tuple.tid.pack();
+        }
+    }
+    true
+}
