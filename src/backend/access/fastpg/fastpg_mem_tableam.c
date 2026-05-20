@@ -84,6 +84,10 @@ extern bool fastpg_rust_relation_delete(uint32_t relid, uint64_t row_id);
 extern bool fastpg_rust_relation_contains_row(uint32_t relid,
 											  uint64_t row_id);
 extern uint64_t fastpg_rust_scan_begin(uint32_t relid);
+extern uint64_t fastpg_rust_scan_begin_filtered(uint32_t relid,
+												const int16_t *attnums,
+												const uintptr_t *values,
+												size_t nkeys);
 extern void fastpg_rust_scan_reset(uint64_t scan_handle);
 extern void fastpg_rust_scan_end(uint64_t scan_handle);
 extern bool fastpg_rust_scan_next(uint64_t scan_handle,
@@ -552,6 +556,53 @@ fastpg_mem_slot_callbacks(Relation rel)
 	return &TTSOpsVirtual;
 }
 
+static uint64_t
+fastpg_mem_scan_begin_storage1(Relation rel, int nkeys, ScanKeyData *key)
+{
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+	int16_t		stack_attnums[FASTPG_MEM_STACK_NATTS];
+	uintptr_t	stack_values[FASTPG_MEM_STACK_NATTS];
+	int16_t    *attnums = stack_attnums;
+	uintptr_t  *values = stack_values;
+	size_t		filter_count = 0;
+	uint64_t	scan_handle;
+	bool		heap_buffers;
+
+	if (nkeys <= 0 || key == NULL ||
+		fastpg_rust_catalog_policy_by_relation_oid(relid) == 0)
+		return fastpg_rust_scan_begin(relid);
+
+	heap_buffers = nkeys > FASTPG_MEM_STACK_NATTS;
+	if (heap_buffers)
+	{
+		attnums = palloc_array(int16_t, nkeys);
+		values = palloc_array(uintptr_t, nkeys);
+	}
+
+	for (int index = 0; index < nkeys; index++)
+	{
+		if (key[index].sk_attno <= 0 ||
+			key[index].sk_strategy != BTEqualStrategyNumber ||
+			(key[index].sk_flags & SK_ISNULL) != 0)
+			continue;
+
+		attnums[filter_count] = (int16_t) key[index].sk_attno;
+		values[filter_count] = (uintptr_t) key[index].sk_argument;
+		filter_count++;
+	}
+
+	scan_handle = filter_count == 0 ?
+		fastpg_rust_scan_begin(relid) :
+		fastpg_rust_scan_begin_filtered(relid, attnums, values, filter_count);
+
+	if (heap_buffers)
+	{
+		pfree(attnums);
+		pfree(values);
+	}
+	return scan_handle;
+}
+
 static TableScanDesc
 fastpg_mem_scan_begin(Relation rel,
 					  Snapshot snapshot,
@@ -581,7 +632,7 @@ fastpg_mem_scan_begin(Relation rel,
 	scan->storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
 	scan->scan_handle = scan->storage2 ?
 		fastpg_storage2_scan_begin(RelationGetRelid(rel)) :
-		fastpg_rust_scan_begin(RelationGetRelid(rel));
+		fastpg_mem_scan_begin_storage1(rel, nkeys, key);
 	if (scan->scan_handle == 0)
 		fastpg_mem_raise_storage_error("fastpg_mem failed to create Rust scan handle");
 

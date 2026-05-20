@@ -12,6 +12,22 @@ use crate::state::{
     with_visible_catalog_snapshot,
 };
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CatalogFilterValue {
+    Bool(bool),
+    Char(u8),
+    Int16(i16),
+    Int32(i32),
+    Oid(Oid),
+    Name(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CatalogRowFilter {
+    pub attnum: i16,
+    pub value: CatalogFilterValue,
+}
+
 pub fn static_catalogs() -> &'static [StaticCatalogTable] {
     generated_catalog::STATIC_CATALOG_TABLES
 }
@@ -1761,6 +1777,87 @@ where
         snapshot.compat_rows.apply_to_rows(relation_oid, &mut rows);
         rows.into_values().filter(|row| row_matches(row)).collect()
     })
+}
+
+fn catalog_value_matches_filter(value: &CatalogValue, filter: &CatalogFilterValue) -> bool {
+    match (value, filter) {
+        (CatalogValue::Bool(left), CatalogFilterValue::Bool(right)) => left == right,
+        (CatalogValue::Char(left), CatalogFilterValue::Char(right)) => left == right,
+        (CatalogValue::Int16(left), CatalogFilterValue::Int16(right)) => left == right,
+        (CatalogValue::Int32(left), CatalogFilterValue::Int32(right)) => left == right,
+        (CatalogValue::Oid(left), CatalogFilterValue::Oid(right)) => left == right,
+        (CatalogValue::Name(left), CatalogFilterValue::Name(right))
+        | (CatalogValue::Text(left), CatalogFilterValue::Name(right))
+        | (CatalogValue::Raw(left), CatalogFilterValue::Name(right)) => left == right,
+        _ => false,
+    }
+}
+
+fn static_row_matches_filters(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+    filters: &[CatalogRowFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(column_index) = filter
+            .attnum
+            .checked_sub(1)
+            .and_then(|attnum| usize::try_from(attnum).ok())
+        else {
+            return false;
+        };
+        let Some(column) = table.columns.get(column_index) else {
+            return false;
+        };
+        let Some(value) = row.values.get(column_index).copied() else {
+            return false;
+        };
+        if value == StaticCatalogValue::Null {
+            return false;
+        }
+        let value = static_value_to_catalog_value(column, value);
+        catalog_value_matches_filter(&value, &filter.value)
+    })
+}
+
+fn catalog_row_matches_filters(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    filters: &[CatalogRowFilter],
+) -> bool {
+    filters.iter().all(|filter| {
+        let Some(column_index) = filter
+            .attnum
+            .checked_sub(1)
+            .and_then(|attnum| usize::try_from(attnum).ok())
+        else {
+            return false;
+        };
+        let Some(value) = row.values.get(column_index) else {
+            return false;
+        };
+        if value == &CatalogValue::Null || column_index >= table.columns.len() {
+            return false;
+        }
+        catalog_value_matches_filter(value, &filter.value)
+    })
+}
+
+pub fn catalog_rows_matching_filters(
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Vec<CatalogRow> {
+    if filters.is_empty() {
+        return catalog_rows(relation_oid);
+    }
+    catalog_rows_matching_static(
+        relation_oid,
+        |table, row| static_row_matches_filters(table, row, filters),
+        |row| {
+            static_catalog_by_relation_oid(relation_oid)
+                .is_some_and(|table| catalog_row_matches_filters(table, row, filters))
+        },
+    )
 }
 
 fn insert_matching_row(

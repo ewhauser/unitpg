@@ -9,25 +9,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BPCHAR_OID, CHAR_ARRAY_OID, CID_OID,
-    CatalogError, CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
-    INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
-    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, TEXT_ARRAY_OID, TEXT_OID,
-    TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
-    btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
-    builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
-    builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
-    catalog_row_value, catalog_rows, current_generation, delete_catalog_row,
-    enum_oids_by_sort_order, has_uncommitted_catalog_changes, index_record_by_index_oid,
-    index_records_for_relation_oid, lookup_type, primary_key_index_oid_for_relation_oid,
-    primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
-    relation_by_oid, relation_column_by_attnum, relation_column_count,
-    relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
-    relation_physical_column_by_attnum, relation_planner_stats_by_oid, relation_rowtype_oid_by_oid,
-    relation_summary_by_name_in_namespace, relation_summary_by_oid, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid,
+    ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BOOL_OID, BPCHAR_OID, CHAR_ARRAY_OID, CHAR_OID,
+    CID_OID, CatalogError, CatalogFilterValue, CatalogRow, CatalogRowFilter, CatalogValue,
+    ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID, INT4_ARRAY_OID, INT4_OID,
+    INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID, PG_CATALOG_NAMESPACE_OID,
+    PG_NODE_TREE_OID, PhysicalColumnRecord, REGCLASS_OID, TEXT_ARRAY_OID, TEXT_OID, TID_OID,
+    TIMESTAMP_OID, VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
+    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
+    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
+    builtin_operators_by_name, catalog_row_value, catalog_rows, catalog_rows_matching_filters,
+    current_generation, delete_catalog_row, enum_oids_by_sort_order,
+    has_uncommitted_catalog_changes, index_record_by_index_oid, index_records_for_relation_oid,
+    lookup_type, primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
+    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
+    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_exists,
+    relation_oid_for_index_oid, relation_physical_column_by_attnum, relation_planner_stats_by_oid,
+    relation_rowtype_oid_by_oid, relation_summary_by_name_in_namespace, relation_summary_by_oid,
+    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -5126,11 +5126,14 @@ fn catalog_value_to_cell(
     }
 }
 
-fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
+fn catalog_scan_state_from_rows(
+    relation_oid: Oid,
+    catalog_rows: impl IntoIterator<Item = CatalogRow>,
+) -> Option<ScanState> {
     let table = static_catalog_by_relation_oid(relation_oid)?;
     let mut region = StorageRegion::new(StorageRegionKind::Scan);
     let mut rows = Vec::new();
-    for catalog_row in catalog_rows(relation_oid) {
+    for catalog_row in catalog_rows {
         if catalog_row.values.len() != table.columns.len() {
             continue;
         }
@@ -5154,6 +5157,23 @@ fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
     })
 }
 
+fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
+    catalog_scan_state_from_rows(relation_oid, catalog_rows(relation_oid))
+}
+
+fn catalog_scan_state_filtered(
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Option<ScanState> {
+    if filters.is_empty() {
+        return catalog_scan_state(relation_oid);
+    }
+    catalog_scan_state_from_rows(
+        relation_oid,
+        catalog_rows_matching_filters(relation_oid, filters),
+    )
+}
+
 fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
     if has_uncommitted_catalog_changes() {
         return catalog_scan_state_uncached(relation_oid);
@@ -5174,11 +5194,108 @@ fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
     Some(scan_state_from_cached_catalog_scan(cached))
 }
 
+unsafe fn catalog_name_filter_value(datum: usize) -> Option<String> {
+    if datum == 0 {
+        return None;
+    }
+    let bytes = unsafe { slice::from_raw_parts(datum as *const u8, NAMEDATALEN) };
+    let len = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len]).ok().map(str::to_owned)
+}
+
+unsafe fn catalog_scan_filters_from_datums(
+    relation_oid: Oid,
+    attnums: *const i16,
+    values: *const usize,
+    nkeys: usize,
+) -> Vec<CatalogRowFilter> {
+    if nkeys == 0 || attnums.is_null() || values.is_null() {
+        return Vec::new();
+    }
+    let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
+        return Vec::new();
+    };
+    let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let values = unsafe { slice::from_raw_parts(values, nkeys) };
+    let mut filters = Vec::with_capacity(nkeys);
+    for (attnum, datum) in attnums.iter().copied().zip(values.iter().copied()) {
+        let Some(column_index) = attnum
+            .checked_sub(1)
+            .and_then(|attnum| usize::try_from(attnum).ok())
+        else {
+            continue;
+        };
+        let Some(column) = table.columns.get(column_index) else {
+            continue;
+        };
+        let value = match column.type_oid {
+            BOOL_OID => CatalogFilterValue::Bool(datum != 0),
+            CHAR_OID => CatalogFilterValue::Char(datum as u8),
+            INT2_OID => CatalogFilterValue::Int16(datum as i16),
+            INT4_OID => CatalogFilterValue::Int32(datum as i32),
+            OID_OID | REGCLASS_OID => CatalogFilterValue::Oid(Oid(datum as u32)),
+            NAME_OID => {
+                let Some(value) = (unsafe { catalog_name_filter_value(datum) }) else {
+                    continue;
+                };
+                CatalogFilterValue::Name(value)
+            }
+            _ => continue,
+        };
+        filters.push(CatalogRowFilter { attnum, value });
+    }
+    filters
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
     clear_last_storage_error();
     let virtual_scan =
         virtual_catalog_by_relation_oid(Oid(relid)).and_then(|_| catalog_scan_state(Oid(relid)));
+
+    let result = with_storage(|state, session| -> Result<u64, CatalogError> {
+        let scan = match virtual_scan {
+            Some(scan) => scan,
+            None => {
+                state.relations.entry(relid).or_default();
+                state.visible_scan_state(session, relid)?
+            }
+        };
+        state.check_scan_limit(scan.bytes())?;
+        let handle = session.allocate_scan_handle();
+        session.scans.insert(handle, scan);
+        Ok(handle)
+    });
+
+    match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            set_last_storage_error(error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass `attnums` and `values` arrays with at least `nkeys`
+/// entries when `nkeys` is non-zero. Datum values are interpreted according to
+/// the target catalog column metadata.
+pub unsafe extern "C" fn fastpg_rust_scan_begin_filtered(
+    relid: u32,
+    attnums: *const i16,
+    values: *const usize,
+    nkeys: usize,
+) -> u64 {
+    clear_last_storage_error();
+    let relation_oid = Oid(relid);
+    let filters = unsafe { catalog_scan_filters_from_datums(relation_oid, attnums, values, nkeys) };
+    let virtual_scan = virtual_catalog_by_relation_oid(relation_oid)
+        .and_then(|_| catalog_scan_state_filtered(relation_oid, &filters));
 
     let result = with_storage(|state, session| -> Result<u64, CatalogError> {
         let scan = match virtual_scan {
@@ -5884,6 +6001,55 @@ mod tests {
             )))
             .collect::<Vec<_>>();
         assert_eq!(rows, expected);
+    }
+
+    #[test]
+    fn catalog_scan_filters_simple_oid_keys() {
+        const PG_NAMESPACE_RELATION_ID: u32 = 2615;
+        const PG_NAMESPACE_ATTRIBUTE_COUNT: usize = 4;
+
+        let _guard = test_guard();
+        let attnums = [1i16];
+        let values = [PG_CATALOG_NAMESPACE_OID.0 as usize];
+        let scan = unsafe {
+            fastpg_rust_scan_begin_filtered(
+                PG_NAMESPACE_RELATION_ID,
+                attnums.as_ptr(),
+                values.as_ptr(),
+                attnums.len(),
+            )
+        };
+        assert_ne!(scan, 0);
+
+        let mut tuple_values = [0usize; PG_NAMESPACE_ATTRIBUTE_COUNT];
+        let mut nulls = [0u8; PG_NAMESPACE_ATTRIBUTE_COUNT];
+        let mut row_id = 0;
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                1,
+                tuple_values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                tuple_values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(tuple_values[0] as u32, PG_CATALOG_NAMESPACE_OID.0);
+        let name = unsafe { CStr::from_ptr(tuple_values[1] as *const c_char) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, "pg_catalog");
+        unsafe {
+            assert!(!fastpg_rust_scan_next(
+                scan,
+                1,
+                tuple_values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                tuple_values.len(),
+                &mut row_id,
+            ));
+        }
+        fastpg_rust_scan_end(scan);
     }
 
     #[test]
