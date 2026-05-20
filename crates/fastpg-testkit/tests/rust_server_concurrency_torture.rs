@@ -28,11 +28,11 @@ async fn rust_server_handles_concurrent_client_transactions() -> TestResult {
     let metrics = fastpg_pgcore::pgcore_lane_metrics();
     assert!(
         metrics.operations >= (CLIENTS * QUERIES_PER_CLIENT) as u64,
-        "expected pgcore lane to observe the concurrent workload, got {metrics:?}"
+        "expected pgcore metrics to observe the concurrent workload, got {metrics:?}"
     );
-    assert_eq!(
-        metrics.max_active, 1,
-        "pgcore lane must serialize PostgreSQL backend globals, got {metrics:?}"
+    assert!(
+        metrics.max_active > 1,
+        "expected overlapping pgcore execution under concurrent clients, got {metrics:?}"
     );
 
     Ok(())

@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 
+#include <pthread.h>
 #include <stdint.h>
 #include <unistd.h>
 #ifdef __APPLE__
@@ -284,7 +285,7 @@ static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteSt
 														   MemoryContext context);
 static char *fastpg_pgcore_strdup(const char *value);
 
-static bool fastpg_pgcore_initialized = false;
+static pthread_once_t fastpg_pgcore_initialized = PTHREAD_ONCE_INIT;
 static FastPgPgCoreExecuteResult *fastpg_pgcore_active_notice_result = NULL;
 static const char *fastpg_pgcore_active_notice_source_text = NULL;
 static emit_log_hook_type fastpg_pgcore_previous_client_message_hook = NULL;
@@ -492,7 +493,6 @@ fastpg_pgcore_notice_hook(ErrorData *edata)
 				edata->internalpos;
 	}
 }
-
 static void
 fastpg_pgcore_configure_library_paths(void)
 {
@@ -551,8 +551,6 @@ fastpg_pgcore_init_rust_catalog_once(void)
 	EnablePortalManager();
 	namespace_search_path = pstrdup("\"$user\", public");
 	InitializeSearchPath();
-
-	fastpg_pgcore_initialized = true;
 }
 
 static const char *
@@ -664,16 +662,11 @@ fastpg_pgcore_init_postgres_catalog_once(void)
 	IgnoreSystemIndexes = old_ignore_system_indexes;
 	SetProcessingMode(NormalProcessing);
 	MyBackendType = B_BACKEND;
-
-	fastpg_pgcore_initialized = true;
 }
 
 static void
 fastpg_pgcore_init_once(void)
 {
-	if (fastpg_pgcore_initialized)
-		return;
-
 	if (fastpg_catalog_mode_uses_postgres())
 		fastpg_pgcore_init_postgres_catalog_once();
 	else
@@ -683,7 +676,7 @@ fastpg_pgcore_init_once(void)
 static void
 fastpg_pgcore_enter(void)
 {
-	fastpg_pgcore_init_once();
+	pthread_once(&fastpg_pgcore_initialized, fastpg_pgcore_init_once);
 	(void) set_stack_base();
 }
 
