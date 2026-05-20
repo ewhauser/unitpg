@@ -2169,6 +2169,11 @@ pg_notification_queue_usage(PG_FUNCTION_ARGS)
 {
 	double		usage;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && asyncQueueControl == NULL)
+		PG_RETURN_FLOAT8(0.0);
+#endif
+
 	/* Advance the queue tail so we don't report a too-large result */
 	asyncQueueAdvanceTail();
 
