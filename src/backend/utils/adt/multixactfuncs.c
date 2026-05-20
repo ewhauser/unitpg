@@ -114,6 +114,24 @@ pg_get_multixact_stats(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("return type must be a row type")));
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (!has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS))
+			memset(nulls, true, sizeof(bool) * tupdesc->natts);
+		else
+		{
+			values[0] = UInt32GetDatum(0);
+			values[1] = Int64GetDatum(0);
+			values[2] = Int64GetDatum(0);
+			values[3] = UInt32GetDatum(FirstMultiXactId);
+			memset(nulls, false, sizeof(nulls));
+		}
+
+		return HeapTupleGetDatum(heap_form_tuple(tupdesc, values, nulls));
+	}
+#endif
+
 	GetMultiXactInfo(&multixacts, &nextOffset, &oldestMultiXactId, &oldestOffset);
 	members = nextOffset - oldestOffset;
 
