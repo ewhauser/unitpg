@@ -131,53 +131,46 @@ Useful validation commands after harness edits:
 ```sh
 python3 -m py_compile benches/pgbench_compare.py
 python3 -m py_compile benches/open_latest_profile.py
+python3 -m py_compile benches/upstream_regression_inventory.py
 cargo test -p fastpg-storage
 make -C benches pgbench-simple-indexed
 make -C benches pgbench-tpcb
 make -C benches regression
 ```
 
-## SQL regression comparison harness
+## Upstream SQL regression inventory
 
-The curated SQL regression harness also lives under `benches/`.
+The SQL regression inventory harness also lives under `benches/`.
 
-Run the strict SQL regression comparison with:
+Run the upstream PostgreSQL regression inventory with:
 
 ```sh
 make -C benches regression
 ```
 
 The harness builds/reuses the same normal Postgres client install as the
-pgbench harness, starts normal Postgres first, runs every SQL file in
-`benches/regression/core/`, then starts the Rust single-process server through
-the full PostgreSQL execution path and compares each case's stdout.
-
-Current core coverage is broader than pgbench and is intentionally small enough
-to be a correctness gate:
-
-- DDL, INSERT, UPDATE, DELETE, TRUNCATE, and `count(*)`
-- `COPY FROM STDIN`
-- BEGIN/COMMIT/ROLLBACK behavior
-- primary key catalog visibility and primary-key lookups
-- plain `count(*)` over Rust-backed storage
+pgbench harness, starts normal Postgres first, runs the SQL cases from
+PostgreSQL's `src/test/regress/parallel_schedule`, then starts the Rust
+single-process server through the full PostgreSQL execution path and compares
+each case's stdout. FastPG runs in one server process, matching the normal
+Postgres shape, so crashes stop the remaining inventory instead of being hidden
+by per-case restarts.
 
 Results are written under:
 
 ```text
-benches/results/regression/<timestamp>/
+benches/results/upstream-regression/<timestamp>/
 ```
 
-For compatibility inventory work where fastpg failures should be recorded
-without making the command fail:
+Useful knobs:
 
 ```sh
-make -C benches regression REGRESSION_SUITE=inventory REGRESSION_ALLOW_FAILURES=1
+make -C benches regression STORAGE_ENGINE=storage2
+make -C benches regression UPSTREAM_REGRESSION_LIMIT=17
+make -C benches regression UPSTREAM_REGRESSION_CASES="uuid infinite_recurse"
+make -C benches regression REGRESSION_GLOBAL_TIMEOUT=120
+make -C benches regression REGRESSION_FAIL_ON_DIFFERENCES=1
 ```
-
-The inventory suite lives under `benches/regression/inventory/`. It is for
-known compatibility gaps, not for the blocking correctness gate. Current
-inventory probes cover deeper `pg_attribute`/`pg_index` catalog scans, joins,
-and grouped aggregation.
 
 To run the current validation bundle:
 

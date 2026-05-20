@@ -15,7 +15,9 @@ use crate::rows::{
     static_row_column_identifier_matches, static_row_column_oid, static_row_to_catalog_row,
 };
 #[cfg(test)]
-use crate::state::{CATALOG_GENERATION, CatalogState, with_catalog};
+use crate::state::{
+    CATALOG_GENERATION, CatalogState, clear_current_catalog_session_for_tests, with_catalog,
+};
 use crate::state::{
     CATALOG_LOOKUP_CACHE, CatalogLookupCache, CatalogSnapshot, PRIMARY_KEY_INDEX_OID_CACHE,
     PrimaryKeyIndexOidCache, RelationMeta, current_generation, has_uncommitted_catalog_changes,
@@ -170,6 +172,7 @@ fn with_catalog_lookup_cache<R>(f: impl FnOnce(&mut CatalogLookupCache) -> R) ->
     if cache.generation != generation {
         cache.generation = generation;
         cache.relation_columns.clear();
+        cache.relation_physical_columns.clear();
         cache.index_records_by_oid.clear();
         cache.index_records_by_relation.clear();
         cache.unique_index_records_by_relation.clear();
@@ -196,6 +199,36 @@ fn relation_column_cache_store(relation_oid: Oid, attnum: i16, column: Option<Co
     with_catalog_lookup_cache(|cache| {
         cache
             .relation_columns
+            .insert((relation_oid.0, attnum), column);
+    });
+}
+
+fn relation_physical_column_cache_lookup(
+    relation_oid: Oid,
+    attnum: i16,
+) -> Option<Option<PhysicalColumnRecord>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .relation_physical_columns
+            .get(&(relation_oid.0, attnum))
+            .cloned()
+    })
+}
+
+fn relation_physical_column_cache_store(
+    relation_oid: Oid,
+    attnum: i16,
+    column: Option<PhysicalColumnRecord>,
+) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .relation_physical_columns
             .insert((relation_oid.0, attnum), column);
     });
 }
@@ -275,6 +308,7 @@ pub(crate) fn clear_catalog_lookup_caches() {
         let mut cache = cache.lock().expect("catalog lookup cache mutex poisoned");
         cache.generation = current_generation();
         cache.relation_columns.clear();
+        cache.relation_physical_columns.clear();
         cache.index_records_by_oid.clear();
         cache.index_records_by_relation.clear();
         cache.unique_index_records_by_relation.clear();
@@ -283,6 +317,18 @@ pub(crate) fn clear_catalog_lookup_caches() {
 
 fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    if let Some(row) = with_visible_catalog_snapshot(|snapshot| {
+        pg_class_compat_row_by_oid(snapshot, table, oid).cloned()
+    }) {
+        return Some(row);
+    }
+    if let Some(static_row) = table
+        .rows
+        .iter()
+        .find(|row| static_row_column_oid(table, row, "oid").is_some_and(|row_oid| row_oid == oid))
+    {
+        return Some(static_row_to_catalog_row(table, static_row));
+    }
     catalog_rows_matching_static(
         table.oid,
         |table, row| static_row_column_oid(table, row, "oid").is_some_and(|row_oid| row_oid == oid),
@@ -294,6 +340,25 @@ fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
     )
     .into_iter()
     .next()
+}
+
+fn pg_class_compat_row_by_oid<'a>(
+    snapshot: &'a CatalogSnapshot,
+    table: &StaticCatalogTable,
+    oid: Oid,
+) -> Option<&'a CatalogRow> {
+    snapshot
+        .compat_rows
+        .rows
+        .get(&PG_CLASS_RELATION_OID.0)
+        .into_iter()
+        .flat_map(|rows| rows.values())
+        .find(|row| {
+            catalog_row_value(table, row, "oid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_oid| row_oid == oid)
+        })
+        .map(|row| row.as_ref())
 }
 
 fn pg_class_row_oid_by_name_in_namespace(
@@ -323,6 +388,14 @@ pub(crate) fn catalog_value_int2_vector(value: &CatalogValue) -> Option<Vec<i16>
 }
 
 fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
+    if let Some(relation_table) = static_catalog_by_relation_oid(relation_oid) {
+        return relation_table
+            .columns
+            .iter()
+            .map(|column| column_record_from_static_catalog_column(relation_oid, column))
+            .collect();
+    }
+
     let Some(table) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID) else {
         return Vec::new();
     };
@@ -343,6 +416,21 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
     .collect::<Vec<_>>();
     columns.sort_by_key(|(attnum, _)| *attnum);
     columns.into_iter().map(|(_, column)| column).collect()
+}
+
+fn column_record_from_static_catalog_column(
+    relation_oid: Oid,
+    column: &StaticCatalogColumn,
+) -> ColumnRecord {
+    ColumnRecord {
+        row_id: static_attribute_row_id(relation_oid, column.attnum),
+        name: normalize_identifier(column.name),
+        type_oid: column.type_oid,
+        type_mod: -1,
+        is_not_null: column.attnotnull,
+        has_default: false,
+        generated: 0,
+    }
 }
 
 pub(crate) fn column_record_from_pg_attribute_row(
@@ -381,6 +469,7 @@ pub(crate) fn column_record_from_pg_attribute_row(
     Some((
         attnum,
         ColumnRecord {
+            row_id: row.row_id,
             name: normalize_identifier(&name),
             type_oid,
             type_mod,
@@ -448,6 +537,7 @@ fn physical_column_record_from_pg_attribute_row(
     Some((
         attnum,
         PhysicalColumnRecord {
+            row_id: row.row_id,
             name: normalize_identifier(&name),
             type_oid,
             type_mod,
@@ -462,6 +552,95 @@ fn physical_column_record_from_pg_attribute_row(
             attcollation,
         },
     ))
+}
+
+pub fn static_attribute_row_id(relation_oid: Oid, attnum: i16) -> u64 {
+    (u64::from(relation_oid.0) << 16)
+        | SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG
+        | u64::from(attnum as u16)
+}
+
+fn catalog_row_matches_attribute(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    relation_oid: Oid,
+    attnum: i16,
+) -> bool {
+    let relation_matches = catalog_row_value(table, row, "attrelid")
+        .and_then(catalog_value_oid)
+        .is_some_and(|attrelid| attrelid == relation_oid);
+    let attnum_matches = catalog_row_value(table, row, "attnum")
+        .and_then(catalog_value_i16)
+        .is_some_and(|row_attnum| row_attnum == attnum);
+    relation_matches && attnum_matches
+}
+
+fn physical_column_from_static_catalog_column(
+    relation_oid: Oid,
+    column: &StaticCatalogColumn,
+) -> Option<PhysicalColumnRecord> {
+    let type_record = lookup_builtin_type(column.type_oid)?;
+    Some(PhysicalColumnRecord {
+        row_id: static_attribute_row_id(relation_oid, column.attnum),
+        name: normalize_identifier(column.name),
+        type_oid: column.type_oid,
+        type_mod: -1,
+        is_not_null: column.attnotnull,
+        has_default: false,
+        generated: 0,
+        is_dropped: false,
+        attlen: type_record.typlen,
+        attbyval: type_record.typbyval,
+        attalign: type_record.typalign,
+        attstorage: type_record.typstorage,
+        attcollation: type_record.typcollation,
+    })
+}
+
+fn relation_physical_column_from_snapshot(
+    snapshot: &CatalogSnapshot,
+    table: &StaticCatalogTable,
+    relation_oid: Oid,
+    attnum: i16,
+) -> Option<Option<PhysicalColumnRecord>> {
+    if let Some(row) = snapshot
+        .compat_rows
+        .rows
+        .get(&PG_ATTRIBUTE_RELATION_OID.0)
+        .into_iter()
+        .flat_map(|rows| rows.values())
+        .find(|row| catalog_row_matches_attribute(table, row, relation_oid, attnum))
+    {
+        return Some(
+            physical_column_record_from_pg_attribute_row(table, row, relation_oid)
+                .map(|(_, column)| column),
+        );
+    }
+
+    if let Some(row_id) = snapshot
+        .columns_by_relation
+        .get(&relation_oid.0)
+        .and_then(|columns| columns.get(&attnum))
+        && let Some(column) = snapshot.columns.get(row_id)
+    {
+        return Some(
+            physical_column_record_from_pg_attribute_row(table, &column.row, relation_oid)
+                .map(|(_, column)| column),
+        );
+    }
+
+    if snapshot
+        .compat_rows
+        .tombstones
+        .get(&PG_ATTRIBUTE_RELATION_OID.0)
+        .is_some_and(|tombstones| {
+            tombstones.contains(&static_attribute_row_id(relation_oid, attnum))
+        })
+    {
+        return Some(None);
+    }
+
+    None
 }
 
 pub fn relation_column_by_attnum(relation_oid: Oid, attnum: i16) -> Option<ColumnRecord> {
@@ -480,6 +659,12 @@ fn relation_column_by_attnum_uncached(relation_oid: Oid, attnum: i16) -> Option<
     if let Some(column) = with_visible_catalog_snapshot(|snapshot| {
         relation_column_from_snapshot(snapshot, relation_oid, attnum)
     }) {
+        return Some(column);
+    }
+    if let Some(column) = static_catalog_by_relation_oid(relation_oid)
+        .and_then(|table| table.columns.get(usize::try_from(attnum - 1).ok()?))
+        .map(|column| column_record_from_static_catalog_column(relation_oid, column))
+    {
         return Some(column);
     }
     let table = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)?;
@@ -515,31 +700,36 @@ pub fn relation_physical_column_by_attnum(
     if attnum <= 0 {
         return None;
     }
+    if let Some(cached) = relation_physical_column_cache_lookup(relation_oid, attnum) {
+        return cached;
+    }
+    let result = relation_physical_column_by_attnum_uncached(relation_oid, attnum);
+    relation_physical_column_cache_store(relation_oid, attnum, result.clone());
+    result
+}
+
+fn relation_physical_column_by_attnum_uncached(
+    relation_oid: Oid,
+    attnum: i16,
+) -> Option<PhysicalColumnRecord> {
     let table = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)?;
-    catalog_rows_matching_static(
-        table.oid,
-        |table, row| {
-            static_row_column_oid(table, row, "attrelid")
-                .is_some_and(|attrelid| attrelid == relation_oid)
-                && static_row_column_i16(table, row, "attnum")
-                    .is_some_and(|row_attnum| row_attnum == attnum)
-        },
-        |row| {
-            let relation_matches = catalog_row_value(table, row, "attrelid")
-                .and_then(catalog_value_oid)
-                .is_some_and(|attrelid| attrelid == relation_oid);
-            let attnum_matches = catalog_row_value(table, row, "attnum")
-                .and_then(catalog_value_i16)
-                .is_some_and(|row_attnum| row_attnum == attnum);
-            relation_matches && attnum_matches
-        },
-    )
-    .into_iter()
-    .find_map(|row| {
-        let (row_attnum, column) =
-            physical_column_record_from_pg_attribute_row(table, &row, relation_oid)?;
-        (row_attnum == attnum).then_some(column)
-    })
+    if let Some(column) = with_visible_catalog_snapshot(|snapshot| {
+        relation_physical_column_from_snapshot(snapshot, table, relation_oid, attnum)
+    }) {
+        return column;
+    }
+    if let Some(column) = static_catalog_by_relation_oid(relation_oid)
+        .and_then(|relation_table| {
+            relation_table
+                .columns
+                .get(usize::try_from(attnum - 1).ok()?)
+        })
+        .and_then(|column| physical_column_from_static_catalog_column(relation_oid, column))
+    {
+        return Some(column);
+    }
+
+    None
 }
 
 pub(crate) fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
@@ -558,6 +748,7 @@ pub(crate) fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> 
     }
 
     Some(IndexRecord {
+        row_id: row.row_id,
         index_oid,
         relation_oid,
         key_attnums,
@@ -1238,7 +1429,20 @@ pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
 }
 
 pub fn relation_oid_exists(oid: Oid) -> bool {
-    relation_by_oid(oid).is_some()
+    if static_catalog_by_relation_oid(oid).is_some()
+        || virtual_catalog_by_relation_oid(oid).is_some()
+        || oid == PG_AGGREGATE_FNOID_INDEX_OID
+    {
+        return true;
+    }
+
+    let Some(table) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID) else {
+        return false;
+    };
+    with_visible_catalog_snapshot(|snapshot| {
+        snapshot.relation_meta_by_oid(oid).is_some()
+            || pg_class_compat_row_by_oid(snapshot, table, oid).is_some()
+    })
 }
 
 pub fn relation_summary_by_oid(oid: Oid) -> Option<RelationSummaryRecord> {
@@ -1270,6 +1474,7 @@ pub fn clear_for_tests() {
         CATALOG_GENERATION.store(state.snapshot.generation, Ordering::Relaxed);
     });
     clear_catalog_lookup_caches();
+    clear_current_catalog_session_for_tests();
 }
 
 fn catalog_type_from_row(

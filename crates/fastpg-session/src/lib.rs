@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-pub use fastpg_exec::{CopyTarget, QueryDescription, QueryExecution, QueryResult};
+pub use fastpg_exec::{CopyTarget, QueryDescription, QueryExecution, QueryNotice, QueryResult};
 pub use fastpg_types::{Column, PgType, Value};
 
 use std::collections::BTreeMap;

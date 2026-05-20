@@ -9,25 +9,25 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    ACLITEM_ARRAY_OID, ANYARRAY_OID, BPCHAR_OID, CHAR_ARRAY_OID, CID_OID, CatalogError,
-    CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
-    INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
-    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, TEXT_ARRAY_OID, TEXT_OID,
-    TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
-    btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
-    builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
-    builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
-    catalog_row_value, catalog_rows, current_generation, delete_catalog_row,
-    enum_oids_by_sort_order, has_uncommitted_catalog_changes, index_record_by_index_oid,
-    index_records_for_relation_oid, lookup_type, primary_key_index_oid_for_relation_oid,
-    primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
-    relation_by_oid, relation_column_by_attnum, relation_column_count,
-    relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
-    relation_physical_column_by_attnum, relation_planner_stats_by_oid, relation_rowtype_oid_by_oid,
-    relation_summary_by_name_in_namespace, relation_summary_by_oid, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid,
+    ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BOOL_OID, BPCHAR_OID, CHAR_ARRAY_OID, CHAR_OID,
+    CID_OID, CatalogError, CatalogFilterValue, CatalogRow, CatalogRowFilter, CatalogValue,
+    ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID, INT4_ARRAY_OID, INT4_OID,
+    INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID, PG_CATALOG_NAMESPACE_OID,
+    PG_NODE_TREE_OID, PhysicalColumnRecord, REGCLASS_OID, TEXT_ARRAY_OID, TEXT_OID, TID_OID,
+    TIMESTAMP_OID, VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
+    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
+    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
+    builtin_operators_by_name, catalog_row_count, catalog_row_value, catalog_rows,
+    catalog_rows_matching_filters, current_generation, delete_catalog_row, enum_oids_by_sort_order,
+    has_uncommitted_catalog_changes, index_record_by_index_oid, index_records_for_relation_oid,
+    lookup_type, primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
+    relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
+    relation_column_count, relation_oid_by_name_in_namespace, relation_oid_exists,
+    relation_oid_for_index_oid, relation_physical_column_by_attnum, relation_planner_stats_by_oid,
+    relation_rowtype_oid_by_oid, relation_summary_by_name_in_namespace, relation_summary_by_oid,
+    static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -108,11 +108,13 @@ pub struct FastPgRustCatalogColumn {
     pub attalign: u8,
     pub attstorage: u8,
     pub _padding: u8,
+    pub row_id: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FastPgRustPrimaryKeyIndexInfo {
+    pub row_id: u64,
     pub index_oid: u32,
     pub heap_oid: u32,
     pub key_count: u16,
@@ -923,10 +925,11 @@ impl Default for TransactionOverlay {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct ScanState {
     rows: Vec<Row>,
     region: StorageRegion,
+    shared_scan: Option<Arc<CachedCatalogScan>>,
     next_index: usize,
 }
 
@@ -944,12 +947,89 @@ impl ScanState {
         Ok(Self {
             rows,
             region,
+            shared_scan: None,
             next_index: 0,
         })
     }
 
+    fn rows(&self) -> &[Row] {
+        self.shared_scan
+            .as_ref()
+            .map_or(self.rows.as_slice(), |scan| scan.rows.as_slice())
+    }
+
     fn bytes(&self) -> usize {
-        self.region.bytes()
+        self.region.bytes().saturating_add(
+            self.shared_scan
+                .as_ref()
+                .map_or(0, |scan| scan.region.bytes()),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CachedCatalogScan {
+    rows: Vec<Row>,
+    region: Arc<StorageRegion>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CatalogScanFilterCacheKey {
+    relation_oid: u32,
+    filters: Vec<CatalogRowFilter>,
+}
+
+#[derive(Debug)]
+struct CatalogScanCache {
+    generation: u64,
+    entries: HashMap<u32, Arc<CachedCatalogScan>>,
+    filtered_entries: HashMap<CatalogScanFilterCacheKey, Arc<CachedCatalogScan>>,
+}
+
+impl Default for CatalogScanCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: HashMap::new(),
+            filtered_entries: HashMap::new(),
+        }
+    }
+}
+
+static CATALOG_SCAN_CACHE: OnceLock<Mutex<CatalogScanCache>> = OnceLock::new();
+
+fn catalog_scan_cache() -> &'static Mutex<CatalogScanCache> {
+    CATALOG_SCAN_CACHE.get_or_init(|| Mutex::new(CatalogScanCache::default()))
+}
+
+fn with_catalog_scan_cache<R>(f: impl FnOnce(&mut CatalogScanCache) -> R) -> R {
+    let generation = current_generation();
+    let mut cache = catalog_scan_cache()
+        .lock()
+        .expect("catalog scan cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+        cache.filtered_entries.clear();
+    }
+    f(&mut cache)
+}
+
+fn clear_catalog_scan_cache() {
+    if let Some(cache) = CATALOG_SCAN_CACHE.get() {
+        let mut cache = cache.lock().expect("catalog scan cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+        cache.filtered_entries.clear();
+    }
+}
+
+fn scan_state_from_cached_catalog_scan(cache: Arc<CachedCatalogScan>) -> ScanState {
+    ScanState {
+        rows: Vec::new(),
+        region: StorageRegion::new(StorageRegionKind::Scan),
+        shared_scan: Some(cache),
+        next_index: 0,
     }
 }
 
@@ -1462,11 +1542,28 @@ impl StorageState {
     }
 
     fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
-        self.relations.insert(relid, RelationRows::default());
-        for overlay in &mut session.transaction_stack {
-            overlay.relations.remove(&relid);
-            overlay.deleted_row_ids.remove(&relid);
+        if session.transaction_stack.is_empty() {
+            self.relations.insert(relid, RelationRows::default());
+            return;
         }
+
+        let visible_row_ids = self
+            .visible_rows(session, relid)
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect::<BTreeSet<_>>();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction stack was checked");
+        if let Some(segment) = overlay.relations.get_mut(&relid) {
+            segment.remove_row_ids(&visible_row_ids);
+        }
+        overlay
+            .deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .extend(visible_row_ids);
     }
 
     fn commit_top_overlay(&mut self, session: &mut SessionStorage) -> BTreeSet<u32> {
@@ -2068,6 +2165,7 @@ fn column_to_ffi(column: &ColumnRecord) -> FastPgRustCatalogColumn {
         attalign: pg_type.as_ref().map_or(b'i', |pg_type| pg_type.typalign),
         attstorage: pg_type.as_ref().map_or(b'p', |pg_type| pg_type.typstorage),
         _padding: 0,
+        row_id: column.row_id,
     }
 }
 
@@ -2086,10 +2184,12 @@ fn physical_column_to_ffi(column: &PhysicalColumnRecord) -> FastPgRustCatalogCol
         attalign: column.attalign,
         attstorage: column.attstorage,
         _padding: 0,
+        row_id: column.row_id,
     }
 }
 
 fn static_catalog_column_to_ffi(
+    relation_oid: Oid,
     column: &fastpg_catalog::StaticCatalogColumn,
 ) -> FastPgRustCatalogColumn {
     FastPgRustCatalogColumn {
@@ -2106,6 +2206,7 @@ fn static_catalog_column_to_ffi(
         attalign: column.attalign,
         attstorage: column.attstorage,
         _padding: 0,
+        row_id: fastpg_catalog::static_attribute_row_id(relation_oid, column.attnum),
     }
 }
 
@@ -2661,6 +2762,7 @@ fn primary_key_index_cache_entry(
     }
 
     let info = FastPgRustPrimaryKeyIndexInfo {
+        row_id: record.row_id,
         index_oid: index_oid.0,
         heap_oid: relation.oid.0,
         key_count: key_count as u16,
@@ -3196,16 +3298,14 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
     if out.is_null() {
         return false;
     }
-    if relation_by_oid(Oid(relation_oid)).is_some() {
-        let Some(attnum) = column_index
-            .checked_add(1)
-            .and_then(|attnum| i16::try_from(attnum).ok())
-        else {
-            return false;
-        };
-        let Some(column) = relation_physical_column_by_attnum(Oid(relation_oid), attnum) else {
-            return false;
-        };
+    let Some(attnum) = column_index
+        .checked_add(1)
+        .and_then(|attnum| i16::try_from(attnum).ok())
+    else {
+        return false;
+    };
+
+    if let Some(column) = relation_physical_column_by_attnum(Oid(relation_oid), attnum) {
         unsafe {
             *out = physical_column_to_ffi(&column);
         }
@@ -3223,7 +3323,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
             return false;
         };
         unsafe {
-            *out = static_catalog_column_to_ffi(column);
+            *out = static_catalog_column_to_ffi(Oid(relation_oid), column);
         }
         true
     } else {
@@ -3955,7 +4055,7 @@ pub extern "C" fn fastpg_rust_relation_row_count(relid: u32) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_catalog_row_count(relid: u32) -> usize {
-    catalog_rows(Oid(relid)).len()
+    catalog_row_count(Oid(relid)).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
@@ -4027,6 +4127,7 @@ pub extern "C" fn fastpg_rust_storage_set_limits(
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_storage_reset_limits() {
     with_storage(|state, _session| state.reset_limits());
+    clear_catalog_scan_cache();
     clear_last_storage_error();
 }
 
@@ -4685,6 +4786,10 @@ fn push_u32_ne(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
 
+fn push_u64_ne(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
 fn push_i16_ne(bytes: &mut Vec<u8>, value: i16) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
@@ -4856,6 +4961,95 @@ fn textarray_datum(values: &[String], region: &mut StorageRegion) -> Cell {
     byref_datum(&bytes, region)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AclItemDatum {
+    grantee: Oid,
+    grantor: Oid,
+    rights: u64,
+}
+
+fn acl_privilege_bit(ch: char) -> Option<u64> {
+    match ch {
+        'a' => Some(1 << 0),
+        'r' => Some(1 << 1),
+        'w' => Some(1 << 2),
+        'd' => Some(1 << 3),
+        'D' => Some(1 << 4),
+        'x' => Some(1 << 5),
+        't' => Some(1 << 6),
+        'X' => Some(1 << 7),
+        'U' => Some(1 << 8),
+        'C' => Some(1 << 9),
+        'T' => Some(1 << 10),
+        'c' => Some(1 << 11),
+        's' => Some(1 << 12),
+        'A' => Some(1 << 13),
+        'm' => Some(1 << 14),
+        _ => None,
+    }
+}
+
+fn acl_role_oid(name: &str) -> Option<Oid> {
+    if name.is_empty() {
+        return Some(Oid(0));
+    }
+    if let Ok(oid) = name.parse::<u32>() {
+        return Some(Oid(oid));
+    }
+
+    let table = static_catalog_by_name("pg_authid")?;
+    catalog_rows(table.oid)
+        .into_iter()
+        .find(|row| {
+            catalog_row_value(table, row, "rolname")
+                .and_then(catalog_value_name)
+                .is_some_and(|rolname| rolname == name)
+        })
+        .and_then(|row| catalog_row_value(table, &row, "oid").and_then(catalog_value_oid))
+}
+
+fn parse_aclitem(value: &str) -> Option<AclItemDatum> {
+    let (grantee, rest) = value.split_once('=')?;
+    let (privileges, grantor) = rest.split_once('/').unwrap_or((rest, "10"));
+    let grantee = acl_role_oid(grantee)?;
+    let grantor = acl_role_oid(grantor)?;
+    let mut privs = 0u64;
+    let mut goptions = 0u64;
+    let mut last_privilege = 0u64;
+
+    for ch in privileges.chars() {
+        if ch == '*' {
+            if last_privilege == 0 {
+                return None;
+            }
+            goptions |= last_privilege;
+            continue;
+        }
+        let bit = acl_privilege_bit(ch)?;
+        privs |= bit;
+        last_privilege = bit;
+    }
+
+    Some(AclItemDatum {
+        grantee,
+        grantor,
+        rights: privs | (goptions << 32),
+    })
+}
+
+fn aclitem_array_datum(value: &str, region: &mut StorageRegion) -> Option<Cell> {
+    let values = parse_pg_array_values(value, parse_aclitem)?;
+    let total_len = 24 + values.len() * 16;
+    let mut bytes = Vec::with_capacity(total_len);
+    push_1d_array_header(&mut bytes, total_len, ACLITEM_OID, values.len(), 1);
+    for value in values {
+        push_u32_ne(&mut bytes, value.grantee.0);
+        push_u32_ne(&mut bytes, value.grantor.0);
+        push_u64_ne(&mut bytes, value.rights);
+    }
+    Some(byref_datum(&bytes, region))
+}
+
 fn parse_lsn(value: &str) -> Option<u64> {
     let (high, low) = value.split_once('/')?;
     let high = u64::from_str_radix(high, 16).ok()?;
@@ -4948,17 +5142,21 @@ fn catalog_value_to_cell(
             TEXT_ARRAY_OID => parse_pg_array_values(value, |part| Some(part.to_owned()))
                 .map(|values| textarray_datum(&values, region))
                 .unwrap_or_else(null_datum),
-            ACLITEM_ARRAY_OID | ANYARRAY_OID => null_datum(),
+            ACLITEM_ARRAY_OID => aclitem_array_datum(value, region).unwrap_or_else(null_datum),
+            ANYARRAY_OID => null_datum(),
             _ => null_datum(),
         },
     }
 }
 
-fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
+fn catalog_scan_state_from_rows(
+    relation_oid: Oid,
+    catalog_rows: impl IntoIterator<Item = CatalogRow>,
+) -> Option<ScanState> {
     let table = static_catalog_by_relation_oid(relation_oid)?;
     let mut region = StorageRegion::new(StorageRegionKind::Scan);
     let mut rows = Vec::new();
-    for catalog_row in catalog_rows(relation_oid) {
+    for catalog_row in catalog_rows {
         if catalog_row.values.len() != table.columns.len() {
             continue;
         }
@@ -4977,8 +5175,131 @@ fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
     Some(ScanState {
         rows,
         region,
+        shared_scan: None,
         next_index: 0,
     })
+}
+
+fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
+    catalog_scan_state_from_rows(relation_oid, catalog_rows(relation_oid))
+}
+
+fn catalog_scan_state_filtered(
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Option<ScanState> {
+    if filters.is_empty() {
+        return catalog_scan_state(relation_oid);
+    }
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_filtered_uncached(relation_oid, filters);
+    }
+    let cache_key = CatalogScanFilterCacheKey {
+        relation_oid: relation_oid.0,
+        filters: filters.to_vec(),
+    };
+    if let Some(cached) =
+        with_catalog_scan_cache(|cache| cache.filtered_entries.get(&cache_key).map(Arc::clone))
+    {
+        return Some(scan_state_from_cached_catalog_scan(cached));
+    }
+    let scan = catalog_scan_state_filtered_uncached(relation_oid, filters)?;
+    let cached = Arc::new(CachedCatalogScan {
+        rows: scan.rows,
+        region: Arc::new(scan.region),
+    });
+    with_catalog_scan_cache(|cache| {
+        cache
+            .filtered_entries
+            .insert(cache_key, Arc::clone(&cached));
+    });
+    Some(scan_state_from_cached_catalog_scan(cached))
+}
+
+fn catalog_scan_state_filtered_uncached(
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Option<ScanState> {
+    catalog_scan_state_from_rows(
+        relation_oid,
+        catalog_rows_matching_filters(relation_oid, filters),
+    )
+}
+
+fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_uncached(relation_oid);
+    }
+    if let Some(cached) =
+        with_catalog_scan_cache(|cache| cache.entries.get(&relation_oid.0).map(Arc::clone))
+    {
+        return Some(scan_state_from_cached_catalog_scan(cached));
+    }
+    let scan = catalog_scan_state_uncached(relation_oid)?;
+    let cached = Arc::new(CachedCatalogScan {
+        rows: scan.rows,
+        region: Arc::new(scan.region),
+    });
+    with_catalog_scan_cache(|cache| {
+        cache.entries.insert(relation_oid.0, Arc::clone(&cached));
+    });
+    Some(scan_state_from_cached_catalog_scan(cached))
+}
+
+unsafe fn catalog_name_filter_value(datum: usize) -> Option<String> {
+    if datum == 0 {
+        return None;
+    }
+    let bytes = unsafe { slice::from_raw_parts(datum as *const u8, NAMEDATALEN) };
+    let len = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    std::str::from_utf8(&bytes[..len]).ok().map(str::to_owned)
+}
+
+unsafe fn catalog_scan_filters_from_datums(
+    relation_oid: Oid,
+    attnums: *const i16,
+    values: *const usize,
+    nkeys: usize,
+) -> Vec<CatalogRowFilter> {
+    if nkeys == 0 || attnums.is_null() || values.is_null() {
+        return Vec::new();
+    }
+    let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
+        return Vec::new();
+    };
+    let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let values = unsafe { slice::from_raw_parts(values, nkeys) };
+    let mut filters = Vec::with_capacity(nkeys);
+    for (attnum, datum) in attnums.iter().copied().zip(values.iter().copied()) {
+        let Some(column_index) = attnum
+            .checked_sub(1)
+            .and_then(|attnum| usize::try_from(attnum).ok())
+        else {
+            continue;
+        };
+        let Some(column) = table.columns.get(column_index) else {
+            continue;
+        };
+        let value = match column.type_oid {
+            BOOL_OID => CatalogFilterValue::Bool(datum != 0),
+            CHAR_OID => CatalogFilterValue::Char(datum as u8),
+            INT2_OID => CatalogFilterValue::Int16(datum as i16),
+            INT4_OID => CatalogFilterValue::Int32(datum as i32),
+            OID_OID | REGCLASS_OID => CatalogFilterValue::Oid(Oid(datum as u32)),
+            NAME_OID => {
+                let Some(value) = (unsafe { catalog_name_filter_value(datum) }) else {
+                    continue;
+                };
+                CatalogFilterValue::Name(value)
+            }
+            _ => continue,
+        };
+        filters.push(CatalogRowFilter { attnum, value });
+    }
+    filters
 }
 
 #[unsafe(no_mangle)]
@@ -4986,6 +5307,47 @@ pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
     clear_last_storage_error();
     let virtual_scan =
         virtual_catalog_by_relation_oid(Oid(relid)).and_then(|_| catalog_scan_state(Oid(relid)));
+
+    let result = with_storage(|state, session| -> Result<u64, CatalogError> {
+        let scan = match virtual_scan {
+            Some(scan) => scan,
+            None => {
+                state.relations.entry(relid).or_default();
+                state.visible_scan_state(session, relid)?
+            }
+        };
+        state.check_scan_limit(scan.bytes())?;
+        let handle = session.allocate_scan_handle();
+        session.scans.insert(handle, scan);
+        Ok(handle)
+    });
+
+    match result {
+        Ok(handle) => handle,
+        Err(error) => {
+            set_last_storage_error(error);
+            0
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass `attnums` and `values` arrays with at least `nkeys`
+/// entries when `nkeys` is non-zero. Datum values are interpreted according to
+/// the target catalog column metadata.
+pub unsafe extern "C" fn fastpg_rust_scan_begin_filtered(
+    relid: u32,
+    attnums: *const i16,
+    values: *const usize,
+    nkeys: usize,
+) -> u64 {
+    clear_last_storage_error();
+    let relation_oid = Oid(relid);
+    let filters = unsafe { catalog_scan_filters_from_datums(relation_oid, attnums, values, nkeys) };
+    let virtual_scan = virtual_catalog_by_relation_oid(relation_oid)
+        .and_then(|_| catalog_scan_state_filtered(relation_oid, &filters));
 
     let result = with_storage(|state, session| -> Result<u64, CatalogError> {
         let scan = match virtual_scan {
@@ -5045,7 +5407,7 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
             None => return false,
         };
 
-        let row_count = scan.rows.len();
+        let row_count = scan.rows().len();
         let row_index = if forward != 0 {
             if scan.next_index >= row_count {
                 return false;
@@ -5064,7 +5426,7 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
             scan.next_index
         };
 
-        let Some(row) = scan.rows.get(row_index) else {
+        let Some(row) = scan.rows().get(row_index) else {
             return false;
         };
         unsafe { copy_row_to_outputs(row, values_out, is_null_out, natts, row_id_out) }
@@ -5179,6 +5541,10 @@ mod tests {
         u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("u32 bytes"))
     }
 
+    fn u64_from_bytes(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_ne_bytes(bytes[offset..offset + 8].try_into().expect("u64 bytes"))
+    }
+
     #[test]
     fn catalog_arrays_use_sql_array_bounds_not_vector_bounds() {
         let mut region = StorageRegion::new(StorageRegionKind::Scan);
@@ -5195,6 +5561,33 @@ mod tests {
         let oid_vector = oidvector_datum(&[23, 26], &mut region);
         let oid_vector_bytes = oid_vector.byref_bytes().expect("oidvector bytes");
         assert_eq!(i32_from_bytes(oid_vector_bytes, 20), 0);
+    }
+
+    #[test]
+    fn aclitem_arrays_render_as_postgres_acl_datums() {
+        let _guard = test_guard();
+        upsert_named_catalog_row(
+            "pg_authid",
+            60_001,
+            &[("oid", "60001"), ("rolname", "regress_acl_user")],
+        );
+
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+        let cell = aclitem_array_datum(
+            "{regress_acl_user=a*r/regress_acl_user,=r/regress_acl_user}",
+            &mut region,
+        )
+        .expect("aclitem array");
+        let bytes = cell.byref_bytes().expect("aclitem array bytes");
+        assert_eq!(u32_from_bytes(bytes, 12), ACLITEM_OID.0);
+        assert_eq!(i32_from_bytes(bytes, 16), 2);
+        assert_eq!(i32_from_bytes(bytes, 20), 1);
+        assert_eq!(u32_from_bytes(bytes, 24), 60_001);
+        assert_eq!(u32_from_bytes(bytes, 28), 60_001);
+        assert_eq!(u64_from_bytes(bytes, 32), (1 | 2) | (1u64 << 32));
+        assert_eq!(u32_from_bytes(bytes, 40), 0);
+        assert_eq!(u32_from_bytes(bytes, 44), 60_001);
+        assert_eq!(u64_from_bytes(bytes, 48), 2);
     }
 
     fn upsert_named_catalog_row(table_name: &str, row_id: u64, values: &[(&str, &str)]) -> u64 {
@@ -5663,6 +6056,55 @@ mod tests {
     }
 
     #[test]
+    fn catalog_scan_filters_simple_oid_keys() {
+        const PG_NAMESPACE_RELATION_ID: u32 = 2615;
+        const PG_NAMESPACE_ATTRIBUTE_COUNT: usize = 4;
+
+        let _guard = test_guard();
+        let attnums = [1i16];
+        let values = [PG_CATALOG_NAMESPACE_OID.0 as usize];
+        let scan = unsafe {
+            fastpg_rust_scan_begin_filtered(
+                PG_NAMESPACE_RELATION_ID,
+                attnums.as_ptr(),
+                values.as_ptr(),
+                attnums.len(),
+            )
+        };
+        assert_ne!(scan, 0);
+
+        let mut tuple_values = [0usize; PG_NAMESPACE_ATTRIBUTE_COUNT];
+        let mut nulls = [0u8; PG_NAMESPACE_ATTRIBUTE_COUNT];
+        let mut row_id = 0;
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                1,
+                tuple_values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                tuple_values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(tuple_values[0] as u32, PG_CATALOG_NAMESPACE_OID.0);
+        let name = unsafe { CStr::from_ptr(tuple_values[1] as *const c_char) }
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(name, "pg_catalog");
+        unsafe {
+            assert!(!fastpg_rust_scan_next(
+                scan,
+                1,
+                tuple_values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                tuple_values.len(),
+                &mut row_id,
+            ));
+        }
+        fastpg_rust_scan_end(scan);
+    }
+
+    #[test]
     fn committed_rows_survive_top_level_commit() {
         let _guard = test_guard();
         let relid = next_relid();
@@ -5854,6 +6296,48 @@ mod tests {
         assert_eq!(fastpg_rust_relation_row_count(relid), 1);
         assert!(fastpg_rust_relation_contains_row(relid, parent_row_id));
         assert!(!fastpg_rust_relation_contains_row(relid, nested_row_id));
+    }
+
+    #[test]
+    fn subxact_abort_restores_parent_relation_clear() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut parent_row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut parent_row_id));
+        }
+        fastpg_rust_subxact_begin();
+        fastpg_rust_relation_clear(relid);
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, parent_row_id));
+        fastpg_rust_subxact_abort();
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert!(fastpg_rust_relation_contains_row(relid, parent_row_id));
+    }
+
+    #[test]
+    fn subxact_commit_preserves_relation_clear() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut parent_row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut parent_row_id));
+        }
+        fastpg_rust_subxact_begin();
+        fastpg_rust_relation_clear(relid);
+        fastpg_rust_subxact_commit();
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, parent_row_id));
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, parent_row_id));
     }
 
     #[test]
@@ -6453,6 +6937,7 @@ mod tests {
             row_id: 0,
         };
         let mut index_info = FastPgRustPrimaryKeyIndexInfo {
+            row_id: 0,
             index_oid: 0,
             heap_oid: 0,
             key_count: 0,

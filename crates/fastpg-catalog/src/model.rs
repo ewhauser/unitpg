@@ -54,16 +54,27 @@ pub(crate) const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 pub(crate) const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 pub(crate) const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 pub(crate) const PG_DESCRIPTION_RELATION_OID: Oid = Oid(2609);
+pub(crate) const PG_INIT_PRIVS_RELATION_OID: Oid = Oid(3394);
 pub(crate) const PG_ENUM_RELATION_OID: Oid = Oid(3501);
+pub(crate) const PG_TS_DICT_RELATION_OID: Oid = Oid(3600);
+pub(crate) const PG_TS_CONFIG_RELATION_OID: Oid = Oid(3602);
+pub(crate) const PG_TS_CONFIG_MAP_RELATION_OID: Oid = Oid(3603);
 pub(crate) const BTREE_INDEX_AM_OID: Oid = Oid(403);
 pub(crate) const PG_AGGREGATE_FNOID_INDEX_OID: Oid = Oid(2650);
 pub(crate) const OID_BTREE_OPCLASS_OID: Oid = Oid(1981);
+pub(crate) const DEFAULT_TS_PARSER_OID: Oid = Oid(3722);
+pub(crate) const SIMPLE_TS_DICT_OID: Oid = Oid(3765);
+pub(crate) const SNOWBALL_TS_TEMPLATE_OID: Oid = Oid(100_100);
+pub(crate) const ENGLISH_TS_CONFIG_OID: Oid = Oid(100_101);
+pub(crate) const ENGLISH_TS_DICT_OID: Oid = Oid(100_102);
 pub(crate) const TEMPLATE1_DATABASE_OID: Oid = Oid(1);
 pub(crate) const TEMPLATE0_DATABASE_OID: Oid = Oid(4);
 pub(crate) const POSTGRES_DATABASE_OID: Oid = Oid(5);
 pub(crate) const SYNTHETIC_DATABASE_OID_BASE: u32 = 0xE100_0000;
 pub(crate) const SYNTHETIC_CATALOG_ROWTYPE_OID_BASE: u32 = 0xF000_0000;
 pub(crate) const SYNTHETIC_DESCRIPTION_ROW_ID_BASE: u64 = 0xD200_0000;
+pub(crate) const SYNTHETIC_INIT_PRIVS_ROW_ID_BASE: u64 = 0xD400_0000;
+pub(crate) const SYNTHETIC_TS_CONFIG_MAP_ROW_ID_BASE: u64 = 0xD500_0000;
 pub(crate) const SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG: u64 = 0x8000;
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
@@ -203,6 +214,7 @@ pub struct RelationName {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnRecord {
+    pub row_id: u64,
     pub name: String,
     pub type_oid: Oid,
     pub type_mod: i32,
@@ -214,6 +226,7 @@ pub struct ColumnRecord {
 impl ColumnRecord {
     pub fn new(name: impl Into<String>, type_oid: Oid, type_mod: i32, is_not_null: bool) -> Self {
         Self {
+            row_id: 0,
             name: normalize_identifier(&name.into()),
             type_oid,
             type_mod,
@@ -226,6 +239,7 @@ impl ColumnRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalColumnRecord {
+    pub row_id: u64,
     pub name: String,
     pub type_oid: Oid,
     pub type_mod: i32,
@@ -276,6 +290,7 @@ pub struct RelationPlannerStats {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRecord {
+    pub row_id: u64,
     pub index_oid: Oid,
     pub relation_oid: Oid,
     pub key_attnums: Vec<i16>,

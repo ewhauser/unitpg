@@ -171,6 +171,42 @@ fn savepoint_abort_drops_nested_pages() {
 }
 
 #[test]
+fn savepoint_abort_restores_parent_relation_clear() {
+    let _guard = test_guard();
+    let relid = 460;
+    fastpg_storage2_xact_begin();
+    let parent_tid = insert_i32(relid, 5);
+
+    fastpg_storage2_subxact_begin();
+    fastpg_storage2_relation_clear(relid);
+    assert_eq!(fetch_i32(relid, parent_tid), None);
+    assert_eq!(fastpg_storage2_relation_row_count(relid), 0);
+    fastpg_storage2_subxact_abort();
+
+    assert_eq!(fetch_i32(relid, parent_tid), Some(5));
+    assert_eq!(fastpg_storage2_relation_row_count(relid), 1);
+    fastpg_storage2_xact_commit();
+    assert_eq!(fetch_i32(relid, parent_tid), Some(5));
+}
+
+#[test]
+fn savepoint_commit_preserves_relation_clear() {
+    let _guard = test_guard();
+    let relid = 461;
+    fastpg_storage2_xact_begin();
+    let parent_tid = insert_i32(relid, 5);
+
+    fastpg_storage2_subxact_begin();
+    fastpg_storage2_relation_clear(relid);
+    fastpg_storage2_subxact_commit();
+
+    assert_eq!(fetch_i32(relid, parent_tid), None);
+    assert_eq!(fastpg_storage2_relation_row_count(relid), 0);
+    fastpg_storage2_xact_commit();
+    assert_eq!(fetch_i32(relid, parent_tid), None);
+}
+
+#[test]
 fn scan_tracks_tids_not_materialized_rows() {
     let _guard = test_guard();
     let relid = 47;

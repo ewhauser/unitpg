@@ -7,8 +7,9 @@ use std::sync::Arc;
 use fastpg_catalog::relation_by_name;
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
-    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreParam,
-    PgCoreSession, PgCoreValue, PreparedStatement, TEXT_OID, VARCHAR_OID,
+    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreNotice,
+    PgCoreParam, PgCoreSession, PgCoreTransactionCommand, PgCoreValue, PreparedStatement, TEXT_OID,
+    VARCHAR_OID,
 };
 use fastpg_types::{Column, PgType, Value};
 
@@ -62,6 +63,17 @@ impl QueryResult {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryNotice {
+    pub severity: String,
+    pub sqlstate: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub context: Option<String>,
+    pub cursorpos: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CopyTarget {
     pub table: String,
     pub columns: usize,
@@ -70,6 +82,10 @@ pub struct CopyTarget {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryExecution {
+    WithNotices {
+        notices: Vec<QueryNotice>,
+        execution: Box<QueryExecution>,
+    },
     Empty,
     Rows(QueryResult),
     Command {
@@ -90,6 +106,15 @@ pub enum QueryExecution {
         hint: Option<String>,
         cursorpos: i32,
     },
+}
+
+impl QueryExecution {
+    pub fn into_notices_and_execution(self) -> (Vec<QueryNotice>, QueryExecution) {
+        match self {
+            QueryExecution::WithNotices { notices, execution } => (notices, *execution),
+            execution => (Vec::new(), execution),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -318,6 +343,14 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
+        if parameters.is_empty()
+            && let Some(command) = fast_transaction_command(sql)
+        {
+            return pgcore_execution_to_query_execution(
+                self.pgcore_session.execute_transaction_command(command),
+            );
+        }
+
         let parameters = parameters
             .iter()
             .map(pgcore_param_value)
@@ -334,6 +367,21 @@ impl QueryExecutor {
     #[cfg(feature = "postgres-execution")]
     fn prepare_pgcore(&self, sql: &str) -> Result<PreparedStatement, fastpg_pgcore::PgCoreError> {
         self.pgcore_session.prepare(sql)
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn fast_transaction_command(sql: &str) -> Option<PgCoreTransactionCommand> {
+    let trimmed = sql.trim();
+    let command = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
+    if command.eq_ignore_ascii_case("BEGIN") {
+        Some(PgCoreTransactionCommand::Begin)
+    } else if command.eq_ignore_ascii_case("COMMIT") || command.eq_ignore_ascii_case("END") {
+        Some(PgCoreTransactionCommand::Commit)
+    } else if command.eq_ignore_ascii_case("ROLLBACK") {
+        Some(PgCoreTransactionCommand::Rollback)
+    } else {
+        None
     }
 }
 
@@ -393,7 +441,41 @@ fn query_description_from_pgcore(statement: &PreparedStatement) -> QueryDescript
 
 #[cfg(feature = "postgres-execution")]
 fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryExecution {
-    let Some(statement) = result.statements.into_iter().next() else {
+    let notices = result
+        .notices
+        .into_iter()
+        .map(query_notice_from_pgcore)
+        .collect::<Vec<_>>();
+    let execution = pgcore_statements_to_query_execution(result.statements);
+
+    if notices.is_empty() {
+        execution
+    } else {
+        QueryExecution::WithNotices {
+            notices,
+            execution: Box::new(execution),
+        }
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn query_notice_from_pgcore(notice: PgCoreNotice) -> QueryNotice {
+    QueryNotice {
+        severity: notice.severity,
+        sqlstate: notice.sqlstate,
+        message: notice.message,
+        detail: notice.detail,
+        hint: notice.hint,
+        context: notice.context,
+        cursorpos: notice.cursorpos,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_statements_to_query_execution(
+    statements: Vec<fastpg_pgcore::ExecutionStatement>,
+) -> QueryExecution {
+    let Some(statement) = statements.into_iter().next() else {
         return QueryExecution::Empty;
     };
 
@@ -563,6 +645,27 @@ mod tests {
         assert_eq!(
             executor.execute("/* comment-only query should be empty */", &[]),
             QueryExecution::Empty
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn executes_simple_transaction_commands_without_pgcore_parse() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        assert_eq!(
+            executor.execute("BEGIN;", &[]),
+            QueryExecution::Command {
+                tag: "BEGIN".into(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute("ROLLBACK;", &[]),
+            QueryExecution::Command {
+                tag: "ROLLBACK".into(),
+                rows: 0,
+            }
         );
     }
 

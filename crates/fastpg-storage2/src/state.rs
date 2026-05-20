@@ -144,16 +144,35 @@ impl StorageState {
     }
 
     pub(crate) fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
-        self.relations.insert(relid, RelationStorage::default());
-        for overlay in &mut session.transaction_stack {
-            overlay.relation_checkpoints.remove(&relid);
-            overlay.page_checkpoints.remove(&relid);
-            overlay.new_pages.remove(&relid);
-            overlay.inserted_tids.remove(&relid);
-            overlay.invalidated_tids.remove(&relid);
-            overlay.primary_key_inserts.remove(&relid);
-            overlay.primary_key_deletes.remove(&relid);
+        if session.transaction_stack.is_empty() {
+            self.relations.insert(relid, RelationStorage::default());
+            return;
         }
+
+        let visible_tids = self.visible_tids(session, relid);
+        let primary_keys = primary_index_spec_for_relation_oid(Oid(relid))
+            .map(|index_spec| {
+                visible_tids
+                    .iter()
+                    .filter_map(|tid| {
+                        self.find_visible_tuple(session, relid, *tid)
+                            .and_then(|tuple| index_key_for_decoded(&index_spec, &tuple.values))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction stack was checked");
+        for tid in visible_tids {
+            overlay.invalidate(relid, tid);
+        }
+        for key in primary_keys {
+            overlay.delete_primary_key(relid, key);
+        }
+        session.mark_scans_visibility_delta(relid);
     }
 
     pub(crate) fn append_pending_tuple(
@@ -195,21 +214,33 @@ impl StorageState {
         relid: u32,
         tid: Tid,
     ) -> Option<DecodedTuple<'a>> {
-        for overlay in session.transaction_stack.iter().rev() {
-            if overlay
-                .invalidated_tids
-                .get(&relid)
-                .is_some_and(|tids| tids.contains(&tid))
-            {
-                return None;
-            }
-        }
+        self.find_visible_tuple_in_overlays(&session.transaction_stack, relid, tid)
+    }
 
-        let tuple = self
-            .relations
+    pub(crate) fn find_visible_tuple_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        tid: Tid,
+    ) -> Option<DecodedTuple<'a>> {
+        decode_tuple(
+            tid,
+            self.visible_tuple_slice_in_overlays(overlays, relid, tid)?,
+        )
+    }
+
+    pub(crate) fn visible_tuple_slice_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        tid: Tid,
+    ) -> Option<&'a [u8]> {
+        if overlays_invalidate_tid(overlays, relid, tid) {
+            return None;
+        }
+        self.relations
             .get(&relid)?
-            .tuple_slice(tid, session.owns_inserted_tid(relid, tid))?;
-        decode_tuple(tid, tuple)
+            .tuple_slice(tid, overlays_own_inserted_tid(overlays, relid, tid))
     }
 
     pub(crate) fn visible_tids(&self, session: &SessionStorage, relid: u32) -> Vec<Tid> {
@@ -239,14 +270,14 @@ impl StorageState {
             .saturating_sub(session.transaction_invalidated_live_count(relid))
     }
 
-    pub(crate) fn next_visible_tid(
-        &self,
-        session: &SessionStorage,
+    pub(crate) fn next_visible_tuple_slice_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
         relid: u32,
         cursor: ScanCursor,
         high_water_offsets: &[u16],
         forward: bool,
-    ) -> Option<Tid> {
+    ) -> Option<(Tid, &'a [u8])> {
         let relation = self.relations.get(&relid)?;
         if forward {
             let mut block = cursor.block;
@@ -268,8 +299,9 @@ impl StorageState {
                 };
                 while offset <= max_offset {
                     let tid = Tid { block, offset };
-                    if self.find_visible_tuple(session, relid, tid).is_some() {
-                        return Some(tid);
+                    if let Some(tuple) = self.visible_tuple_slice_in_overlays(overlays, relid, tid)
+                    {
+                        return Some((tid, tuple));
                     }
                     offset = offset.checked_add(1)?;
                 }
@@ -298,8 +330,80 @@ impl StorageState {
                 };
                 while offset > 0 {
                     let tid = Tid { block, offset };
-                    if self.find_visible_tuple(session, relid, tid).is_some() {
-                        return Some(tid);
+                    if let Some(tuple) = self.visible_tuple_slice_in_overlays(overlays, relid, tid)
+                    {
+                        return Some((tid, tuple));
+                    }
+                    offset -= 1;
+                }
+            }
+            if block == 0 {
+                return None;
+            }
+            block -= 1;
+        }
+    }
+
+    pub(crate) fn next_committed_tuple_slice<'a>(
+        &'a self,
+        relid: u32,
+        cursor: ScanCursor,
+        high_water_offsets: &[u16],
+        forward: bool,
+    ) -> Option<(Tid, &'a [u8])> {
+        let relation = self.relations.get(&relid)?;
+        if forward {
+            let mut block = cursor.block;
+            while usize::try_from(block).ok()? < high_water_offsets.len() {
+                let max_offset = high_water_offsets[block as usize];
+                if relation
+                    .pages
+                    .get(block as usize)
+                    .and_then(Option::as_ref)
+                    .is_none()
+                {
+                    block = block.checked_add(1)?;
+                    continue;
+                }
+                let mut offset = if block == cursor.block {
+                    cursor.offset
+                } else {
+                    1
+                };
+                while offset <= max_offset {
+                    let tid = Tid { block, offset };
+                    if let Some(tuple) = relation.tuple_slice(tid, false) {
+                        return Some((tid, tuple));
+                    }
+                    offset = offset.checked_add(1)?;
+                }
+                block = block.checked_add(1)?;
+            }
+            return None;
+        }
+
+        let mut block = if cursor.block == u32::MAX {
+            high_water_offsets.len().checked_sub(1)?.try_into().ok()?
+        } else {
+            cursor.block
+        };
+        loop {
+            let max_offset = high_water_offsets.get(block as usize).copied()?;
+            if relation
+                .pages
+                .get(block as usize)
+                .and_then(Option::as_ref)
+                .is_some()
+            {
+                let mut offset = if block == cursor.block && cursor.offset != u16::MAX {
+                    cursor.offset.min(max_offset)
+                } else {
+                    max_offset
+                };
+                while offset > 0 {
+                    let tid = Tid { block, offset };
+                    if let Some(tuple) = relation.tuple_slice(tid, false) {
+                        return Some((tid, tuple));
                     }
                     offset -= 1;
                 }
@@ -537,20 +641,24 @@ pub(crate) fn relation_update_impl(
 
         let tuple = build_tuple(&input)?;
         let new_tid = state.append_pending_tuple(session, relid, &tuple)?;
+        let new_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
+            .and_then(|index_spec| index_key_for_input(&index_spec, &input));
 
         let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
         overlay.invalidate(relid, old_tid);
-        if let Some(key) = old_primary_key {
+        if old_primary_key.is_some()
+            && old_primary_key != new_primary_key
+            && let Some(key) = old_primary_key
+        {
             overlay.delete_primary_key(relid, key);
         }
-        if let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid))
-            && let Some(key) = index_key_for_input(&index_spec, &input)
-        {
+        if let Some(key) = new_primary_key {
             overlay.insert_primary_key(relid, key, new_tid);
         }
+        session.mark_scans_visibility_delta(relid);
         Ok(Some(new_tid))
     });
 

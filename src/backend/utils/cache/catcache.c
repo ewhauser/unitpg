@@ -443,6 +443,10 @@ GetCCHashEqFuncs(Oid keytype, CCHashFN *hashfunc, RegProcedure *eqfunc, CCFastEq
 
 #ifdef USE_FASTPG
 extern uint64_t fastpg_rust_scan_begin(uint32_t relid);
+extern uint64_t fastpg_rust_scan_begin_filtered(uint32_t relid,
+												const int16_t *attnums,
+												const uintptr_t *values,
+												size_t nkeys);
 extern void fastpg_rust_scan_end(uint64_t scan_handle);
 extern bool fastpg_rust_scan_next(uint64_t scan_handle,
 								  uint8_t forward,
@@ -577,6 +581,35 @@ FastPgBuildNamespaceTuple(TupleDesc tupdesc,
 	nulls[Anum_pg_namespace_nspacl - 1] = true;
 
 	return heap_form_tuple(tupdesc, values, nulls);
+}
+
+static uint64_t
+FastPgCatalogScanBeginForKeys(CatCache *cache, int nkeys, Datum *arguments)
+{
+	int16_t		attnums[CATCACHE_MAXKEYS];
+	uintptr_t	values[CATCACHE_MAXKEYS];
+	size_t		filter_count = 0;
+
+	if (nkeys <= 0 || arguments == NULL)
+		return fastpg_rust_scan_begin((uint32_t) cache->cc_reloid);
+
+	for (int index = 0; index < nkeys; index++)
+	{
+		int			attnum = cache->cc_keyno[index];
+
+		if (attnum <= 0)
+			continue;
+		attnums[filter_count] = (int16_t) attnum;
+		values[filter_count] = (uintptr_t) arguments[index];
+		filter_count++;
+	}
+
+	if (filter_count == 0)
+		return fastpg_rust_scan_begin((uint32_t) cache->cc_reloid);
+	return fastpg_rust_scan_begin_filtered((uint32_t) cache->cc_reloid,
+										   attnums,
+										   values,
+										   filter_count);
 }
 
 static bool
@@ -763,7 +796,7 @@ FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 	natts = (size_t) cache->cc_tupdesc->natts;
 	values = palloc0_array(Datum, natts);
 	isnull = palloc0_array(uint8_t, natts);
-	scan_handle = fastpg_rust_scan_begin((uint32_t) cache->cc_reloid);
+	scan_handle = FastPgCatalogScanBeginForKeys(cache, nkeys, arguments);
 
 	while (fastpg_rust_scan_next(scan_handle,
 								 true,
@@ -968,6 +1001,7 @@ static HeapTuple
 FastPgBuildIndexTuple(TupleDesc tupdesc,
 					  const FastPgRustPrimaryKeyIndexInfo *index_info)
 {
+	HeapTuple	tuple;
 	Datum		values[Natts_pg_index] = {0};
 	bool		nulls[Natts_pg_index] = {false};
 	int16		indkey_values[FASTPG_MAX_INDEX_KEYS] = {0};
@@ -1019,7 +1053,14 @@ FastPgBuildIndexTuple(TupleDesc tupdesc,
 	nulls[Anum_pg_index_indexprs - 1] = true;
 	nulls[Anum_pg_index_indpred - 1] = true;
 
-	return heap_form_tuple(tupdesc, values, nulls);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	tuple->t_tableOid = IndexRelationId;
+	if (index_info->row_id != 0 &&
+		!FastPgCatalogRowIdToTid(index_info->row_id, &tuple->t_self))
+		elog(ERROR,
+			 "fastpg catalog row id %llu cannot be converted to a pg_index TID",
+			 (unsigned long long) index_info->row_id);
+	return tuple;
 }
 
 static HeapTuple
@@ -1029,6 +1070,7 @@ FastPgBuildAttributeTuple(TupleDesc tupdesc,
 						  const FastPgRustCatalogColumn *column)
 {
 	FastPgRustCatalogType type;
+	HeapTuple	tuple;
 	Datum		values[Natts_pg_attribute] = {0};
 	bool		nulls[Natts_pg_attribute] = {false};
 	NameData	attname;
@@ -1044,30 +1086,38 @@ FastPgBuildAttributeTuple(TupleDesc tupdesc,
 	values[Anum_pg_attribute_attrelid - 1] = ObjectIdGetDatum(relation_oid);
 	values[Anum_pg_attribute_attname - 1] = NameGetDatum(&attname);
 	values[Anum_pg_attribute_atttypid - 1] = ObjectIdGetDatum((Oid) column->type_oid);
-	values[Anum_pg_attribute_attlen - 1] = Int16GetDatum(type.typlen);
+	values[Anum_pg_attribute_attlen - 1] = Int16GetDatum(column->attlen);
 	values[Anum_pg_attribute_attnum - 1] = Int16GetDatum(attnum);
 	values[Anum_pg_attribute_atttypmod - 1] = Int32GetDatum(column->type_mod);
 	values[Anum_pg_attribute_attndims - 1] = Int16GetDatum(0);
-	values[Anum_pg_attribute_attbyval - 1] = BoolGetDatum(type.typbyval != 0);
-	values[Anum_pg_attribute_attalign - 1] = CharGetDatum((char) type.typalign);
-	values[Anum_pg_attribute_attstorage - 1] = CharGetDatum((char) type.typstorage);
+	values[Anum_pg_attribute_attbyval - 1] = BoolGetDatum(column->attbyval != 0);
+	values[Anum_pg_attribute_attalign - 1] = CharGetDatum((char) column->attalign);
+	values[Anum_pg_attribute_attstorage - 1] = CharGetDatum((char) column->attstorage);
 	values[Anum_pg_attribute_attcompression - 1] = CharGetDatum('\0');
 	values[Anum_pg_attribute_attnotnull - 1] = BoolGetDatum(column->is_not_null != 0);
-	values[Anum_pg_attribute_atthasdef - 1] = BoolGetDatum(false);
+	values[Anum_pg_attribute_atthasdef - 1] = BoolGetDatum(column->has_default != 0);
 	values[Anum_pg_attribute_atthasmissing - 1] = BoolGetDatum(false);
 	values[Anum_pg_attribute_attidentity - 1] = CharGetDatum('\0');
-	values[Anum_pg_attribute_attgenerated - 1] = CharGetDatum('\0');
-	values[Anum_pg_attribute_attisdropped - 1] = BoolGetDatum(false);
+	values[Anum_pg_attribute_attgenerated - 1] = CharGetDatum((char) column->generated);
+	values[Anum_pg_attribute_attisdropped - 1] = BoolGetDatum(column->is_dropped != 0);
 	values[Anum_pg_attribute_attislocal - 1] = BoolGetDatum(true);
 	values[Anum_pg_attribute_attinhcount - 1] = Int16GetDatum(0);
-	values[Anum_pg_attribute_attcollation - 1] = ObjectIdGetDatum((Oid) type.typcollation);
+	values[Anum_pg_attribute_attcollation - 1] =
+		ObjectIdGetDatum((Oid) column->attcollation);
 	values[Anum_pg_attribute_attstattarget - 1] = Int16GetDatum(-1);
 	nulls[Anum_pg_attribute_attacl - 1] = true;
 	nulls[Anum_pg_attribute_attoptions - 1] = true;
 	nulls[Anum_pg_attribute_attfdwoptions - 1] = true;
 	nulls[Anum_pg_attribute_attmissingval - 1] = true;
 
-	return heap_form_tuple(tupdesc, values, nulls);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	tuple->t_tableOid = AttributeRelationId;
+	if (column->row_id != 0 &&
+		!FastPgCatalogRowIdToTid(column->row_id, &tuple->t_self))
+		elog(ERROR,
+			 "fastpg catalog row id %llu cannot be converted to a pg_attribute TID",
+			 (unsigned long long) column->row_id);
+	return tuple;
 }
 
 static HeapTuple
@@ -1347,7 +1397,7 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 	natts = (size_t) cache->cc_tupdesc->natts;
 	values = palloc0_array(Datum, natts);
 	isnull = palloc0_array(uint8_t, natts);
-	scan_handle = fastpg_rust_scan_begin((uint32_t) cache->cc_reloid);
+	scan_handle = FastPgCatalogScanBeginForKeys(cache, nkeys, arguments);
 
 	while (fastpg_rust_scan_next(scan_handle,
 								 true,
@@ -1383,6 +1433,7 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 			for (size_t index = 0; index < natts; index++)
 				nulls[index] = isnull[index] != 0;
 			tuple = heap_form_tuple(cache->cc_tupdesc, values, nulls);
+			tuple->t_tableOid = cache->cc_reloid;
 			if (!FastPgCatalogRowIdToTid(row_id, &tuple->t_self))
 				elog(ERROR,
 					 "fastpg catalog row id %llu cannot be represented as a CTID",
@@ -1400,6 +1451,16 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 static HeapTuple
 FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 {
+	if (cache->cc_reloid == RelationRelationId &&
+		fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
+	{
+		HeapTuple	tuple;
+
+		tuple = FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
+		if (tuple != NULL)
+			return tuple;
+	}
+
 	if (cache->cc_reloid == RelationRelationId)
 	{
 		FastPgRustCatalogRelation relation;

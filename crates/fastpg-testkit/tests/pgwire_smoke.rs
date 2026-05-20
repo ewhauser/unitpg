@@ -5,7 +5,7 @@ use std::error::Error;
 use fastpg_testkit::TestServer;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tokio_postgres_simple_query_smoke() -> Result<(), Box<dyn Error>> {
     let server = TestServer::start().await?;
     let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
@@ -36,7 +36,7 @@ async fn tokio_postgres_simple_query_smoke() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tokio_postgres_extended_query_smoke() -> Result<(), Box<dyn Error>> {
     let server = TestServer::start().await?;
     let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
@@ -60,7 +60,7 @@ async fn tokio_postgres_extended_query_smoke() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_are_isolated_per_client() -> Result<(), Box<dyn Error>> {
     let server = TestServer::start().await?;
     let (client_a, connection_a) =

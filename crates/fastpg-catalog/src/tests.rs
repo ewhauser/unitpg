@@ -5,7 +5,9 @@ use std::sync::{Mutex, MutexGuard};
 use fastpg_types::Oid;
 
 use crate::lookups::catalog_value_int2_vector;
-use crate::rows::{catalog_value_i16, catalog_value_oid, catalog_value_string, catalog_value_u8};
+use crate::rows::{
+    catalog_value_i16, catalog_value_i32, catalog_value_oid, catalog_value_string, catalog_value_u8,
+};
 
 static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -140,6 +142,75 @@ fn generated_static_catalog_has_core_rows() {
     );
     assert!(btree_opclass_for_type(INT4_OID).is_some());
     assert!(builtin_cast_by_source_target(INT4_OID, OID_OID).is_some());
+}
+
+#[test]
+fn pg_init_privs_exposes_bootstrap_schema_privileges() {
+    let table = static_catalog_by_name("pg_init_privs").expect("pg_init_privs");
+    let rows = catalog_rows(table.oid);
+    let row = rows
+        .iter()
+        .find(|row| {
+            catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)
+                == Some(PG_CATALOG_NAMESPACE_OID)
+        })
+        .expect("pg_catalog init privs row");
+
+    assert_eq!(
+        catalog_row_value(table, row, "classoid").and_then(catalog_value_oid),
+        Some(PG_NAMESPACE_RELATION_OID)
+    );
+    assert_eq!(
+        catalog_row_value(table, row, "privtype").and_then(catalog_value_u8),
+        Some(b'i')
+    );
+    assert!(
+        catalog_row_value(table, row, "initprivs")
+            .and_then(catalog_value_string)
+            .is_some_and(|initprivs| initprivs.contains("=U/postgres"))
+    );
+}
+
+#[test]
+fn text_search_catalog_exposes_initdb_english_config() {
+    let config_table = static_catalog_by_name("pg_ts_config").expect("pg_ts_config");
+    let config_row = catalog_rows(PG_TS_CONFIG_RELATION_OID)
+        .into_iter()
+        .find(|row| {
+            catalog_row_value(config_table, row, "cfgname").and_then(catalog_value_string)
+                == Some("english".to_owned())
+        })
+        .expect("english text search config");
+
+    assert_eq!(
+        catalog_row_value(config_table, &config_row, "oid").and_then(catalog_value_oid),
+        Some(ENGLISH_TS_CONFIG_OID)
+    );
+    assert_eq!(
+        catalog_row_value(config_table, &config_row, "cfgparser").and_then(catalog_value_oid),
+        Some(DEFAULT_TS_PARSER_OID)
+    );
+
+    let map_table = static_catalog_by_name("pg_ts_config_map").expect("pg_ts_config_map");
+    let english_map_rows = catalog_rows(PG_TS_CONFIG_MAP_RELATION_OID)
+        .into_iter()
+        .filter(|row| {
+            catalog_row_value(map_table, row, "mapcfg").and_then(catalog_value_oid)
+                == Some(ENGLISH_TS_CONFIG_OID)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(english_map_rows.len(), 19);
+    assert!(english_map_rows.iter().any(|row| {
+        catalog_row_value(map_table, row, "maptokentype").and_then(catalog_value_i32) == Some(1)
+            && catalog_row_value(map_table, row, "mapdict").and_then(catalog_value_oid)
+                == Some(ENGLISH_TS_DICT_OID)
+    }));
+    assert!(english_map_rows.iter().any(|row| {
+        catalog_row_value(map_table, row, "maptokentype").and_then(catalog_value_i32) == Some(3)
+            && catalog_row_value(map_table, row, "mapdict").and_then(catalog_value_oid)
+                == Some(SIMPLE_TS_DICT_OID)
+    }));
 }
 
 #[test]
@@ -316,6 +387,32 @@ fn static_catalog_attributes_are_visible_in_pg_attribute() {
 }
 
 #[test]
+fn static_catalog_physical_columns_resolve_from_typed_schema() {
+    let aggregate_table = static_catalog_by_name("pg_aggregate").expect("pg_aggregate catalog");
+    let column =
+        relation_physical_column_by_attnum(aggregate_table.oid, 1).expect("pg_aggregate.aggfnoid");
+
+    assert_eq!(column.name, "aggfnoid");
+    assert_eq!(column.type_oid, Oid(24));
+    assert_eq!(column.type_mod, -1);
+    assert!(!column.is_dropped);
+    assert_eq!(column.is_not_null, aggregate_table.columns[0].attnotnull);
+    assert_eq!(column.attlen, 4);
+    assert!(column.attbyval);
+    assert_eq!(column.attalign, b'i');
+    assert_eq!(column.attstorage, b'p');
+}
+
+#[test]
+fn relation_oid_exists_uses_typed_membership() {
+    let pg_class = static_catalog_by_name("pg_class").expect("pg_class catalog");
+
+    assert!(relation_oid_exists(pg_class.oid));
+    assert!(relation_oid_exists(PG_AGGREGATE_FNOID_INDEX_OID));
+    assert!(!relation_oid_exists(Oid(0xEE00_0001)));
+}
+
+#[test]
 fn information_schema_domains_mark_domain_input() {
     let pg_namespace = static_catalog_by_name("pg_namespace").expect("pg_namespace catalog");
     let namespace_rows = catalog_rows(pg_namespace.oid);
@@ -424,6 +521,67 @@ fn operator_implementation_proc_descriptions_are_synthesized() {
         synthesized_description(Oid(3634)),
         "implementation of @@ operator"
     );
+}
+
+#[test]
+fn visible_catalog_snapshot_is_cached_until_overlay_changes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+    let relation_oid = Oid(50_010);
+
+    upsert_named_catalog_row(
+        "pg_class",
+        relation_oid.0 as u64,
+        &[
+            ("oid", "50010"),
+            ("relname", "cached_snapshot_before_change"),
+            ("relnamespace", "2200"),
+            ("reltype", "50011"),
+            ("relowner", "10"),
+            ("relam", "2"),
+            ("relfilenode", "50010"),
+            ("relhasindex", "f"),
+            ("relpersistence", "p"),
+            ("relkind", "r"),
+            ("relnatts", "0"),
+        ],
+    );
+
+    crate::state::reset_visible_catalog_snapshot_materializations_for_tests();
+    assert!(relation_oid_exists(relation_oid));
+    assert!(relation_oid_exists(relation_oid));
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    upsert_named_catalog_row(
+        "pg_class",
+        relation_oid.0 as u64,
+        &[
+            ("oid", "50010"),
+            ("relname", "cached_snapshot_after_change"),
+            ("relnamespace", "2200"),
+            ("reltype", "50011"),
+            ("relowner", "10"),
+            ("relam", "2"),
+            ("relfilenode", "50010"),
+            ("relhasindex", "f"),
+            ("relpersistence", "p"),
+            ("relkind", "r"),
+            ("relnatts", "0"),
+        ],
+    );
+    assert!(relation_by_name("cached_snapshot_after_change").is_some());
+    assert!(relation_oid_exists(relation_oid));
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        2
+    );
+
+    abort_implicit_transaction();
+    assert!(!relation_oid_exists(relation_oid));
 }
 
 #[test]

@@ -20,6 +20,7 @@
  */
 #include "postgres.h"
 
+#include "access/xact.h"
 #include "access/htup_details.h"
 #include "catalog/pg_authid.h"
 #include "miscadmin.h"
@@ -59,11 +60,23 @@ bool
 superuser_arg(Oid roleid)
 {
 #ifdef USE_FASTPG
-	/*
-	 * fastpg runs as a single-user in-memory engine.  Treat every role check
-	 * as superuser so PostgreSQL does not consult pg_authid.
-	 */
-	return true;
+	HeapTuple	rtup;
+	bool		result;
+
+	if (!IsUnderPostmaster && roleid == BOOTSTRAP_SUPERUSERID)
+		return true;
+
+	if (!IsTransactionState())
+		return false;
+
+	rtup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
+	if (!HeapTupleIsValid(rtup))
+		return false;
+
+	result = ((Form_pg_authid) GETSTRUCT(rtup))->rolsuper;
+	ReleaseSysCache(rtup);
+
+	return result;
 #else
 	bool		result;
 	HeapTuple	rtup;

@@ -293,48 +293,90 @@ pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_ne_bytes(value))
 }
 
-pub(crate) fn copy_decoded_to_outputs(
-    tuple: &DecodedTuple<'_>,
+pub(crate) fn copy_tuple_to_outputs(
+    tid: Tid,
+    tuple: &[u8],
     values_out: *mut usize,
     is_null_out: *mut u8,
     natts: usize,
     tid_out: *mut u64,
 ) -> bool {
-    if tuple.values.len() != natts {
+    if tuple.len() < TUPLE_HEADER_LEN || tuple.get(0..4) != Some(TUPLE_MAGIC) {
+        return false;
+    }
+    let base = tuple.as_ptr();
+    let tuple_natts = unsafe { std::ptr::read_unaligned(base.add(4) as *const u16) } as usize;
+    if tuple_natts != natts {
         return false;
     }
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
         return false;
     }
-    let values_out = if natts == 0 {
-        &mut []
-    } else {
-        unsafe { slice::from_raw_parts_mut(values_out, natts) }
-    };
-    let is_null_out = if natts == 0 {
-        &mut []
-    } else {
-        unsafe { slice::from_raw_parts_mut(is_null_out, natts) }
-    };
-    for (index, value) in tuple.values.iter().enumerate() {
-        match value {
-            DecodedDatum::Null => {
-                values_out[index] = 0;
-                is_null_out[index] = 1;
+    let null_bitmap_len = natts.div_ceil(8);
+    let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
+    let payload_offset = attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN));
+    if payload_offset > tuple.len() {
+        return false;
+    }
+    debug_assert_eq!(
+        unsafe { std::ptr::read_unaligned(base.add(6) as *const u16) } as usize,
+        null_bitmap_len
+    );
+    debug_assert_eq!(
+        unsafe { std::ptr::read_unaligned(base.add(8) as *const u32) } as usize,
+        attr_dir_offset
+    );
+    debug_assert_eq!(
+        unsafe { std::ptr::read_unaligned(base.add(12) as *const u32) } as usize,
+        payload_offset
+    );
+
+    for index in 0..natts {
+        let null_byte = unsafe { *base.add(TUPLE_HEADER_LEN + index / 8) };
+        let null = null_byte & (1 << (index % 8)) != 0;
+        let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
+        let entry_ptr = unsafe { base.add(entry) };
+        let tag = unsafe { *entry_ptr };
+        if null || tag == 0 {
+            unsafe {
+                values_out.add(index).write(0);
+                is_null_out.add(index).write(1);
             }
-            DecodedDatum::ByValue(value) => {
-                values_out[index] = *value;
-                is_null_out[index] = 0;
+            continue;
+        }
+        match tag {
+            1 => {
+                let value = unsafe { std::ptr::read_unaligned(entry_ptr.add(8) as *const u64) };
+                unsafe {
+                    values_out.add(index).write(value as usize);
+                    is_null_out.add(index).write(0);
+                }
             }
-            DecodedDatum::ByRef(bytes) => {
-                values_out[index] = bytes.as_ptr() as usize;
-                is_null_out[index] = 0;
+            2 => {
+                let offset =
+                    unsafe { std::ptr::read_unaligned(entry_ptr.add(8) as *const u64) } as usize;
+                let len =
+                    unsafe { std::ptr::read_unaligned(entry_ptr.add(16) as *const u64) } as usize;
+                let Some(start) = payload_offset.checked_add(offset) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(len) else {
+                    return false;
+                };
+                if end > tuple.len() {
+                    return false;
+                }
+                unsafe {
+                    values_out.add(index).write(base.add(start) as usize);
+                    is_null_out.add(index).write(0);
+                }
             }
+            _ => return false,
         }
     }
     if !tid_out.is_null() {
         unsafe {
-            *tid_out = tuple.tid.pack();
+            *tid_out = tid.pack();
         }
     }
     true

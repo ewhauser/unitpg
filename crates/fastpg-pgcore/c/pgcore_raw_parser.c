@@ -18,6 +18,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_language.h"
@@ -125,6 +126,17 @@ typedef struct FastPgPgCoreExecuteRow
 	FastPgPgCoreExecuteCell *cells;
 } FastPgPgCoreExecuteRow;
 
+typedef struct FastPgPgCoreNotice
+{
+	char	   *severity;
+	char		sqlstate[6];
+	char	   *message;
+	char	   *detail;
+	char	   *hint;
+	char	   *context;
+	int			cursorpos;
+} FastPgPgCoreNotice;
+
 typedef struct FastPgPgCoreExecuteStatement
 {
 	CmdType		command_type;
@@ -178,8 +190,97 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 
 static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteStatement *statement,
 														   MemoryContext context);
+static char *fastpg_pgcore_strdup(const char *value);
 
 static bool fastpg_pgcore_initialized = false;
+
+static struct
+{
+	bool		active;
+	emit_log_hook_type previous_hook;
+	int			previous_log_min_messages;
+	FastPgPgCoreNotice *notices;
+	int			count;
+	int			capacity;
+} fastpg_pgcore_notice_capture;
+
+static const char *
+fastpg_pgcore_notice_severity(int elevel)
+{
+	if (elevel == INFO)
+		return "INFO";
+	if (elevel == WARNING || elevel == WARNING_CLIENT_ONLY)
+		return "WARNING";
+	if (elevel >= NOTICE && elevel < WARNING)
+		return "NOTICE";
+	if (elevel == LOG || elevel == LOG_SERVER_ONLY)
+		return "LOG";
+	return "DEBUG";
+}
+
+static bool
+fastpg_pgcore_should_capture_notice(int elevel)
+{
+	return elevel == INFO || (elevel >= NOTICE && elevel < ERROR);
+}
+
+static char *
+fastpg_pgcore_strdup_or_null(const char *value)
+{
+	if (value == NULL)
+		return NULL;
+	return fastpg_pgcore_strdup(value);
+}
+
+static void
+fastpg_pgcore_notice_hook(ErrorData *edata)
+{
+	if (fastpg_pgcore_notice_capture.previous_hook != NULL)
+		(*fastpg_pgcore_notice_capture.previous_hook) (edata);
+
+	if (!fastpg_pgcore_notice_capture.active)
+		return;
+
+	/*
+	 * We lower log_min_messages only while capturing so PostgreSQL considers
+	 * client-facing notices interesting in this standalone embedding.  The hook
+	 * then suppresses server-log output; Rust will forward the client-facing
+	 * messages over the pgwire connection instead.
+	 */
+	edata->output_to_server = false;
+
+	if (!fastpg_pgcore_should_capture_notice(edata->elevel) ||
+		edata->message == NULL)
+		return;
+
+	if (fastpg_pgcore_notice_capture.count == fastpg_pgcore_notice_capture.capacity)
+	{
+		int			next_capacity =
+			fastpg_pgcore_notice_capture.capacity == 0 ? 8 :
+			fastpg_pgcore_notice_capture.capacity * 2;
+		FastPgPgCoreNotice *next_notices =
+			(FastPgPgCoreNotice *) realloc(fastpg_pgcore_notice_capture.notices,
+										   sizeof(FastPgPgCoreNotice) * next_capacity);
+
+		if (next_notices == NULL)
+			return;
+
+		fastpg_pgcore_notice_capture.notices = next_notices;
+		fastpg_pgcore_notice_capture.capacity = next_capacity;
+	}
+
+	FastPgPgCoreNotice *notice =
+		&fastpg_pgcore_notice_capture.notices[fastpg_pgcore_notice_capture.count++];
+	memset(notice, 0, sizeof(*notice));
+	notice->severity = fastpg_pgcore_strdup(fastpg_pgcore_notice_severity(edata->elevel));
+	strlcpy(notice->sqlstate, unpack_sql_state(edata->sqlerrcode),
+			sizeof(notice->sqlstate));
+	notice->message = fastpg_pgcore_strdup(edata->message);
+	notice->detail = fastpg_pgcore_strdup_or_null(edata->detail);
+	notice->hint = fastpg_pgcore_strdup_or_null(edata->hint);
+	notice->context = fastpg_pgcore_strdup_or_null(edata->context);
+	notice->cursorpos = edata->cursorpos;
+}
 
 static void
 fastpg_pgcore_configure_library_paths(void)
@@ -251,6 +352,144 @@ fastpg_pgcore_enter(void)
 {
 	fastpg_pgcore_init_once();
 	(void) set_stack_base();
+}
+
+static void
+fastpg_pgcore_notice_free(FastPgPgCoreNotice *notice)
+{
+	if (notice == NULL)
+		return;
+	free(notice->severity);
+	free(notice->message);
+	free(notice->detail);
+	free(notice->hint);
+	free(notice->context);
+	memset(notice, 0, sizeof(*notice));
+}
+
+void
+fastpg_pgcore_notice_capture_clear(void)
+{
+	for (int i = 0; i < fastpg_pgcore_notice_capture.count; i++)
+		fastpg_pgcore_notice_free(&fastpg_pgcore_notice_capture.notices[i]);
+	free(fastpg_pgcore_notice_capture.notices);
+	fastpg_pgcore_notice_capture.notices = NULL;
+	fastpg_pgcore_notice_capture.count = 0;
+	fastpg_pgcore_notice_capture.capacity = 0;
+}
+
+void
+fastpg_pgcore_notice_capture_begin(void)
+{
+	fastpg_pgcore_enter();
+	if (fastpg_pgcore_notice_capture.active)
+		return;
+
+	fastpg_pgcore_notice_capture_clear();
+	fastpg_pgcore_notice_capture.previous_hook = emit_log_hook;
+	fastpg_pgcore_notice_capture.previous_log_min_messages =
+		log_min_messages[MyBackendType];
+	emit_log_hook = fastpg_pgcore_notice_hook;
+	if (log_min_messages[MyBackendType] > INFO)
+		log_min_messages[MyBackendType] = INFO;
+	fastpg_pgcore_notice_capture.active = true;
+}
+
+void
+fastpg_pgcore_notice_capture_end(void)
+{
+	if (!fastpg_pgcore_notice_capture.active)
+		return;
+
+	emit_log_hook = fastpg_pgcore_notice_capture.previous_hook;
+	log_min_messages[MyBackendType] =
+		fastpg_pgcore_notice_capture.previous_log_min_messages;
+	fastpg_pgcore_notice_capture.previous_hook = NULL;
+	fastpg_pgcore_notice_capture.active = false;
+}
+
+int
+fastpg_pgcore_notice_capture_count(void)
+{
+	return fastpg_pgcore_notice_capture.count;
+}
+
+static const FastPgPgCoreNotice *
+fastpg_pgcore_notice_capture_get(int index)
+{
+	if (index < 0 || index >= fastpg_pgcore_notice_capture.count)
+		return NULL;
+	return &fastpg_pgcore_notice_capture.notices[index];
+}
+
+const char *
+fastpg_pgcore_notice_capture_severity(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL || notice->severity == NULL)
+		return "";
+	return notice->severity;
+}
+
+const char *
+fastpg_pgcore_notice_capture_sqlstate(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL || notice->sqlstate[0] == '\0')
+		return "00000";
+	return notice->sqlstate;
+}
+
+const char *
+fastpg_pgcore_notice_capture_message(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL || notice->message == NULL)
+		return "";
+	return notice->message;
+}
+
+const char *
+fastpg_pgcore_notice_capture_detail(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL || notice->detail == NULL)
+		return "";
+	return notice->detail;
+}
+
+const char *
+fastpg_pgcore_notice_capture_hint(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL || notice->hint == NULL)
+		return "";
+	return notice->hint;
+}
+
+const char *
+fastpg_pgcore_notice_capture_context(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL || notice->context == NULL)
+		return "";
+	return notice->context;
+}
+
+int
+fastpg_pgcore_notice_capture_cursorpos(int index)
+{
+	const FastPgPgCoreNotice *notice = fastpg_pgcore_notice_capture_get(index);
+
+	if (notice == NULL)
+		return 0;
+	return notice->cursorpos;
 }
 
 void
@@ -618,6 +857,9 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			fastpg_rust_subxact_begin();
 			fastpg_storage2_subxact_abort();
 			fastpg_storage2_subxact_begin();
+			FastPgReconcileRelcacheAfterCatalogRollback();
+			InvalidateSystemCaches();
+			RelationCacheInvalidate(false);
 #endif
 			summary->command_tag = "ROLLBACK";
 			break;
@@ -651,7 +893,6 @@ fastpg_pgcore_should_noop_utility(Node *utility_stmt)
 	{
 		case T_GrantStmt:
 		case T_GrantRoleStmt:
-		case T_AlterDefaultPrivilegesStmt:
 		case T_CreateTableSpaceStmt:
 		case T_DropTableSpaceStmt:
 		case T_AlterTableSpaceOptionsStmt:
@@ -663,6 +904,36 @@ fastpg_pgcore_should_noop_utility(Node *utility_stmt)
 			return false;
 	}
 }
+
+#ifdef USE_FASTPG
+static bool
+fastpg_pgcore_resets_session_authorization(Node *utility_stmt)
+{
+	VariableSetStmt *stmt;
+
+	if (!IsA(utility_stmt, VariableSetStmt))
+		return false;
+
+	stmt = (VariableSetStmt *) utility_stmt;
+	if (stmt->kind == VAR_RESET_ALL)
+		return true;
+	if (stmt->name == NULL || strcmp(stmt->name, "session_authorization") != 0)
+		return false;
+
+	return stmt->kind == VAR_RESET || stmt->kind == VAR_SET_DEFAULT;
+}
+
+static void
+fastpg_pgcore_repair_session_authorization_reset(Node *utility_stmt)
+{
+	if (IsUnderPostmaster ||
+		!fastpg_pgcore_resets_session_authorization(utility_stmt))
+		return;
+
+	SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
+	SetCurrentRoleId(InvalidOid, false);
+}
+#endif
 
 static void
 fastpg_pgcore_execute_utility(PlannedStmt *statement,
@@ -715,6 +986,10 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 					   NULL,
 					   dest,
 					   &qc);
+
+#ifdef USE_FASTPG
+		fastpg_pgcore_repair_session_authorization_reset(utility_stmt);
+#endif
 
 		if (snapshot_pushed)
 			PopActiveSnapshot();

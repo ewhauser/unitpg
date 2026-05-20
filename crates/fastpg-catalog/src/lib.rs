@@ -17,13 +17,14 @@ pub use lookups::{
     relation_by_oid, relation_column_by_attnum, relation_column_count,
     relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
     relation_physical_column_by_attnum, relation_summary_by_name_in_namespace,
-    relation_summary_by_oid, relations, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid, virtual_catalogs,
+    relation_summary_by_oid, relations, static_attribute_row_id, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid, virtual_catalogs,
 };
 pub use model::*;
 pub use rows::{
-    catalog_row_value, catalog_rows, delete_catalog_row, ensure_database,
+    CatalogFilterValue, CatalogRowFilter, catalog_row_count, catalog_row_value, catalog_rows,
+    catalog_rows_matching_filters, delete_catalog_row, ensure_database,
     relation_planner_stats_by_oid, relation_rowtype_oid_by_oid, resolve_generated_catalog_oid_name,
     static_catalog_by_name, static_catalog_by_relation_oid, static_catalog_rowtype_oid,
     static_catalogs, upsert_catalog_row,

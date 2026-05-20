@@ -8,8 +8,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::{BufMut, BytesMut};
 use fastpg_session::{
-    Column, PgType, QueryDescription, QueryExecution, QueryResult, ServerState, SessionState,
-    StartupParameters, Value,
+    Column, PgType, QueryDescription, QueryExecution, QueryNotice, QueryResult, ServerState,
+    SessionState, StartupParameters, Value,
 };
 use futures::{Sink, SinkExt, stream};
 use pgwire::api::auth::StartupHandler;
@@ -238,6 +238,8 @@ impl SimpleQueryHandler for FastPgWireHandler {
         let execution = self
             .execute_query(session.clone(), query.to_owned(), vec![])
             .await?;
+        let (notices, execution) = execution.into_notices_and_execution();
+        send_notices(client, &notices).await?;
         remember_copy_target(&session, &execution);
         Ok(vec![execution_to_response(execution, FieldFormat::Text)?])
     }
@@ -320,6 +322,8 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         let execution = self
             .execute_query(session.clone(), query, parameters)
             .await?;
+        let (notices, execution) = execution.into_notices_and_execution();
+        send_notices(client, &notices).await?;
         remember_copy_target(&session, &execution);
 
         execution_to_response(execution, portal.result_column_format.format_for(0))
@@ -407,12 +411,10 @@ impl ExecutionDispatcher {
             .acquire_owned()
             .await
             .map_err(api_io_error)?;
-        tokio::task::spawn_blocking(move || {
+        Ok(tokio::task::block_in_place(move || {
             let _permit = permit;
             operation()
-        })
-        .await
-        .map_err(api_io_error)
+        }))
     }
 }
 
@@ -542,6 +544,7 @@ fn decode_parameters(
 
 fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWireResult<Response> {
     match execution {
+        QueryExecution::WithNotices { execution, .. } => execution_to_response(*execution, format),
         QueryExecution::Empty => Ok(Response::EmptyQuery),
         QueryExecution::Rows(result) => query_result_response(result, format),
         QueryExecution::Command { tag, rows } => Ok(command_response(tag.as_ref(), rows)),
@@ -560,6 +563,32 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
             cursorpos,
         } => Ok(error_response(&sqlstate, &message, detail, hint, cursorpos)),
     }
+}
+
+async fn send_notices<C>(client: &mut C, notices: &[QueryNotice]) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin + Send,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    for notice in notices {
+        let mut info = ErrorInfo::new(
+            notice.severity.clone(),
+            notice.sqlstate.clone(),
+            notice.message.clone(),
+        );
+        info.detail = notice.detail.clone();
+        info.hint = notice.hint.clone();
+        info.where_context = notice.context.clone();
+        info.severity_nonlocalized = Some(notice.severity.clone());
+        if notice.cursorpos > 0 {
+            info.position = Some(notice.cursorpos.to_string());
+        }
+        client
+            .send(PgWireBackendMessage::NoticeResponse(info.into()))
+            .await?;
+    }
+    Ok(())
 }
 
 fn query_result_response(result: QueryResult, format: FieldFormat) -> PgWireResult<Response> {

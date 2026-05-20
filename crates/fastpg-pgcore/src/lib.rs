@@ -103,6 +103,17 @@ pub struct PgCoreInputDatum {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreNotice {
+    pub severity: String,
+    pub sqlstate: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub context: Option<String>,
+    pub cursorpos: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreCopyIn {
     pub table: String,
     pub columns: usize,
@@ -120,6 +131,25 @@ pub struct ExecutionStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
     pub statements: Vec<ExecutionStatement>,
+    pub notices: Vec<PgCoreNotice>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgCoreTransactionCommand {
+    Begin,
+    Commit,
+    Rollback,
+}
+
+impl PgCoreTransactionCommand {
+    #[cfg_attr(not(feature = "postgres-execution"), allow(dead_code))]
+    fn command_tag(self) -> &'static str {
+        match self {
+            Self::Begin => "BEGIN",
+            Self::Commit => "COMMIT",
+            Self::Rollback => "ROLLBACK",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -190,6 +220,24 @@ impl PgCoreSession {
     ) -> Result<ExecutionResult, PgCoreError> {
         let _guard = self.enter_storage();
         self.inner.execute_with_params(sql, params)
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    pub fn execute_transaction_command(
+        &self,
+        command: PgCoreTransactionCommand,
+    ) -> ExecutionResult {
+        let _guard = self.enter_storage();
+        self.inner.execute_transaction_command(command);
+        ExecutionResult {
+            statements: vec![ExecutionStatement {
+                command_tag: command.command_tag().into(),
+                fields: Vec::new(),
+                rows: Vec::new(),
+                copy_in: None,
+            }],
+            notices: Vec::new(),
+        }
     }
 
     pub fn input_text_datum(
@@ -287,8 +335,8 @@ mod inner {
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField,
-        PgCoreInputDatum, PgCoreLaneMetrics, PgCoreParam, PgCoreValue, RawParseSummary,
-        StatementDescription,
+        PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice, PgCoreParam, PgCoreTransactionCommand,
+        PgCoreValue, RawParseSummary, StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
@@ -406,8 +454,22 @@ mod inner {
 
     unsafe extern "C" {
         fn fastpg_pgcore_raw_parse(sql: *const c_char) -> *mut FastPgPgCoreParseResult;
+        fn fastpg_xid_begin();
+        fn fastpg_xid_commit();
+        fn fastpg_xid_rollback();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_set_database(database_oid: u32);
+        fn fastpg_pgcore_notice_capture_begin();
+        fn fastpg_pgcore_notice_capture_end();
+        fn fastpg_pgcore_notice_capture_clear();
+        fn fastpg_pgcore_notice_capture_count() -> i32;
+        fn fastpg_pgcore_notice_capture_severity(index: i32) -> *const c_char;
+        fn fastpg_pgcore_notice_capture_sqlstate(index: i32) -> *const c_char;
+        fn fastpg_pgcore_notice_capture_message(index: i32) -> *const c_char;
+        fn fastpg_pgcore_notice_capture_detail(index: i32) -> *const c_char;
+        fn fastpg_pgcore_notice_capture_hint(index: i32) -> *const c_char;
+        fn fastpg_pgcore_notice_capture_context(index: i32) -> *const c_char;
+        fn fastpg_pgcore_notice_capture_cursorpos(index: i32) -> i32;
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
         fn fastpg_pgcore_parse_result_statement_count(
@@ -662,6 +724,59 @@ mod inner {
         if value.is_empty() { None } else { Some(value) }
     }
 
+    struct NoticeCaptureGuard {
+        active: bool,
+    }
+
+    impl NoticeCaptureGuard {
+        fn begin() -> Self {
+            unsafe {
+                fastpg_pgcore_notice_capture_begin();
+            }
+            Self { active: true }
+        }
+
+        fn finish(mut self) -> Vec<PgCoreNotice> {
+            let notices = self.finish_inner();
+            self.active = false;
+            notices
+        }
+
+        fn finish_inner(&self) -> Vec<PgCoreNotice> {
+            unsafe {
+                fastpg_pgcore_notice_capture_end();
+            }
+            let notice_count = unsafe { fastpg_pgcore_notice_capture_count() }.max(0);
+            let notices = (0..notice_count)
+                .map(|index| PgCoreNotice {
+                    severity: unsafe { c_string(fastpg_pgcore_notice_capture_severity(index)) },
+                    sqlstate: unsafe { c_string(fastpg_pgcore_notice_capture_sqlstate(index)) },
+                    message: unsafe { c_string(fastpg_pgcore_notice_capture_message(index)) },
+                    detail: unsafe {
+                        optional_c_string(fastpg_pgcore_notice_capture_detail(index))
+                    },
+                    hint: unsafe { optional_c_string(fastpg_pgcore_notice_capture_hint(index)) },
+                    context: unsafe {
+                        optional_c_string(fastpg_pgcore_notice_capture_context(index))
+                    },
+                    cursorpos: unsafe { fastpg_pgcore_notice_capture_cursorpos(index) },
+                })
+                .collect();
+            unsafe {
+                fastpg_pgcore_notice_capture_clear();
+            }
+            notices
+        }
+    }
+
+    impl Drop for NoticeCaptureGuard {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self.finish_inner();
+            }
+        }
+    }
+
     unsafe fn command_tag(value: *const c_char) -> Cow<'static, str> {
         if value.is_null() {
             return Cow::Borrowed("");
@@ -746,8 +861,10 @@ mod inner {
             let encoded_params = EncodedParams::new(params)?;
             let _guard = enter_pgcore_lane("prepare_execute");
             self.set_database();
+            let notice_capture = NoticeCaptureGuard::begin();
             let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
             let Some(prepared) = NonNull::new(prepared) else {
+                let _ = notice_capture.finish();
                 return Err(PgCoreError::new(
                     "XX000",
                     "PostgreSQL prepare returned a null result",
@@ -763,7 +880,39 @@ mod inner {
             unsafe {
                 fastpg_pgcore_prepared_free(prepared.as_ptr());
             }
-            result
+            let notices = notice_capture.finish();
+            result.map(|mut result| {
+                result.notices = notices;
+                result
+            })
+        }
+
+        pub fn execute_transaction_command(&self, command: PgCoreTransactionCommand) {
+            let _guard = enter_pgcore_lane("transaction_command");
+            self.set_database();
+            match command {
+                PgCoreTransactionCommand::Begin => {
+                    unsafe {
+                        fastpg_xid_begin();
+                    }
+                    fastpg_storage::begin_explicit_transaction();
+                    fastpg_storage2::fastpg_storage2_xact_begin();
+                }
+                PgCoreTransactionCommand::Commit => {
+                    unsafe {
+                        fastpg_xid_commit();
+                    }
+                    fastpg_storage::commit_explicit_transaction();
+                    fastpg_storage2::fastpg_storage2_xact_commit();
+                }
+                PgCoreTransactionCommand::Rollback => {
+                    unsafe {
+                        fastpg_xid_rollback();
+                    }
+                    fastpg_storage::abort_explicit_transaction();
+                    fastpg_storage2::fastpg_storage2_xact_abort();
+                }
+            }
         }
 
         pub fn input_text_datum(
@@ -904,14 +1053,26 @@ mod inner {
             if params.is_empty() {
                 let _guard = enter_pgcore_lane("execute");
                 self.set_database();
+                let notice_capture = NoticeCaptureGuard::begin();
                 let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
-                return execution_result_from_ptr(result);
+                let result = execution_result_from_ptr(result);
+                let notices = notice_capture.finish();
+                return result.map(|mut result| {
+                    result.notices = notices;
+                    result
+                });
             }
 
             let encoded_params = EncodedParams::new(params)?;
             let _guard = enter_pgcore_lane("execute");
             self.set_database();
-            execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params)
+            let notice_capture = NoticeCaptureGuard::begin();
+            let result = execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params);
+            let notices = notice_capture.finish();
+            result.map(|mut result| {
+                result.notices = notices;
+                result
+            })
         }
     }
 
@@ -1159,7 +1320,10 @@ mod inner {
                     copy_in,
                 });
             }
-            ExecutionResult { statements }
+            ExecutionResult {
+                statements,
+                notices: Vec::new(),
+            }
         }
     }
 
