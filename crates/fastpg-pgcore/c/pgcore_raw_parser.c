@@ -21,6 +21,7 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_class.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
@@ -881,6 +882,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			fastpg_xid_commit();
 			fastpg_rust_xact_commit();
 			fastpg_storage2_xact_commit();
+			FastPgReleaseStandaloneStatementResources(true);
 #endif
 			summary->command_tag = "COMMIT";
 			break;
@@ -889,6 +891,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			fastpg_xid_rollback();
 			fastpg_rust_xact_abort();
 			fastpg_storage2_xact_abort();
+			FastPgReleaseStandaloneStatementResources(false);
 #endif
 			summary->command_tag = "ROLLBACK";
 			break;
@@ -988,6 +991,92 @@ fastpg_pgcore_repair_session_authorization_reset(Node *utility_stmt)
 	SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
 	SetCurrentRoleId(InvalidOid, false);
 }
+
+static bool
+fastpg_pgcore_reindex_param_is_concurrently(const DefElem *opt)
+{
+	return opt->defname != NULL && strcmp(opt->defname, "concurrently") == 0;
+}
+
+static bool
+fastpg_pgcore_reindex_stmt_has_concurrently(const ReindexStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->params)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (fastpg_pgcore_reindex_param_is_concurrently(opt))
+			return true;
+	}
+
+	return false;
+}
+
+static List *
+fastpg_pgcore_reindex_params_without_concurrently(List *params)
+{
+	List	   *result = NIL;
+	ListCell   *lc;
+
+	foreach(lc, params)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (!fastpg_pgcore_reindex_param_is_concurrently(opt))
+			result = lappend(result, opt);
+	}
+
+	return result;
+}
+
+static bool
+fastpg_pgcore_reindex_uses_internal_transactions(const ReindexStmt *stmt)
+{
+	Oid			relid;
+	char		relkind;
+
+	switch (stmt->kind)
+	{
+		case REINDEX_OBJECT_SCHEMA:
+		case REINDEX_OBJECT_SYSTEM:
+		case REINDEX_OBJECT_DATABASE:
+			return true;
+		case REINDEX_OBJECT_INDEX:
+		case REINDEX_OBJECT_TABLE:
+			break;
+		default:
+			return false;
+	}
+
+	if (stmt->relation == NULL)
+		return false;
+
+	relid = RangeVarGetRelid(stmt->relation, NoLock, true);
+	if (!OidIsValid(relid))
+		return false;
+
+	relkind = get_rel_relkind(relid);
+	return (stmt->kind == REINDEX_OBJECT_INDEX &&
+			relkind == RELKIND_PARTITIONED_INDEX) ||
+		(stmt->kind == REINDEX_OBJECT_TABLE &&
+		 relkind == RELKIND_PARTITIONED_TABLE);
+}
+
+static void
+fastpg_pgcore_reject_internal_transaction_reindex(Node *utility_stmt)
+{
+	if (IsUnderPostmaster || !IsA(utility_stmt, ReindexStmt))
+		return;
+
+	if (!fastpg_pgcore_reindex_uses_internal_transactions((ReindexStmt *) utility_stmt))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("fastpg pgcore does not support REINDEX commands that run internal transactions")));
+}
 #endif
 
 static void
@@ -998,6 +1087,11 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 							  MemoryContext result_context)
 {
 	Node	   *utility_stmt = statement->utilityStmt;
+	PlannedStmt fastpg_statement;
+	IndexStmt	fastpg_index_stmt;
+	DropStmt	fastpg_drop_stmt;
+	ReindexStmt fastpg_reindex_stmt;
+	bool		use_fastpg_statement = false;
 	DestReceiver *dest = NULL;
 	QueryCompletion qc;
 	volatile bool snapshot_pushed = false;
@@ -1021,11 +1115,48 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 		return;
 	}
 
+#ifdef USE_FASTPG
+	fastpg_pgcore_reject_internal_transaction_reindex(utility_stmt);
+
+	if (!IsUnderPostmaster &&
+		IsA(utility_stmt, IndexStmt) &&
+		((IndexStmt *) utility_stmt)->concurrent)
+	{
+		fastpg_statement = *statement;
+		fastpg_index_stmt = *((IndexStmt *) utility_stmt);
+		fastpg_index_stmt.concurrent = false;
+		fastpg_statement.utilityStmt = (Node *) &fastpg_index_stmt;
+		use_fastpg_statement = true;
+	}
+	else if (!IsUnderPostmaster &&
+			 IsA(utility_stmt, DropStmt) &&
+			 ((DropStmt *) utility_stmt)->removeType == OBJECT_INDEX &&
+			 ((DropStmt *) utility_stmt)->concurrent)
+	{
+		fastpg_statement = *statement;
+		fastpg_drop_stmt = *((DropStmt *) utility_stmt);
+		fastpg_drop_stmt.concurrent = false;
+		fastpg_statement.utilityStmt = (Node *) &fastpg_drop_stmt;
+		use_fastpg_statement = true;
+	}
+	else if (!IsUnderPostmaster &&
+			 IsA(utility_stmt, ReindexStmt) &&
+			 fastpg_pgcore_reindex_stmt_has_concurrently((ReindexStmt *) utility_stmt))
+	{
+		fastpg_statement = *statement;
+		fastpg_reindex_stmt = *((ReindexStmt *) utility_stmt);
+		fastpg_reindex_stmt.params =
+			fastpg_pgcore_reindex_params_without_concurrently(fastpg_reindex_stmt.params);
+		fastpg_statement.utilityStmt = (Node *) &fastpg_reindex_stmt;
+		use_fastpg_statement = true;
+	}
+#endif
+
 	InitializeQueryCompletion(&qc);
 	dest = fastpg_pgcore_create_capture_receiver(summary, result_context);
 	fastpg_pgcore_ensure_execution_owner();
 
-	if (PlannedStmtRequiresSnapshot(statement))
+	if (PlannedStmtRequiresSnapshot(use_fastpg_statement ? &fastpg_statement : statement))
 	{
 		PushActiveSnapshot(GetTransactionSnapshot());
 		snapshot_pushed = true;
@@ -1033,7 +1164,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 
 	PG_TRY();
 	{
-		ProcessUtility(statement,
+		ProcessUtility(use_fastpg_statement ? &fastpg_statement : statement,
 					   source_text,
 					   false,
 					   PROCESS_UTILITY_TOPLEVEL,

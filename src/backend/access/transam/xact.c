@@ -1477,6 +1477,13 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	FastPgEnsureStandaloneTransactionState();
 	s = CurrentTransactionState;
 
+	/*
+	 * Standalone FastPG catches ERRORs without running PostgreSQL's full abort
+	 * path.  Keep the WAL construction workspace from leaking into the next
+	 * statement if control escaped after XLogBeginInsert().
+	 */
+	XLogResetInsertion();
+
 	if (TopTransactionResourceOwner != NULL)
 	{
 		CurrentResourceOwner = TopTransactionResourceOwner;

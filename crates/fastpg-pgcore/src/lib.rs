@@ -2469,7 +2469,9 @@ mod tests {
         let temp_table = format!("fastpg_pgcore_temp_after_restricted_{}", std::process::id());
 
         session
-            .prepare(&format!("create table {table}(id int not null, denominator int not null)"))
+            .prepare(&format!(
+                "create table {table}(id int not null, denominator int not null)"
+            ))
             .unwrap()
             .execute()
             .unwrap();
@@ -2508,6 +2510,205 @@ mod tests {
             .unwrap();
         session
             .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_create_index_concurrently_uses_embedded_index_build() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_concurrent_index_{}", std::process::id());
+        let index = format!("fastpg_pgcore_concurrent_index_{}_idx", std::process::id());
+
+        session
+            .prepare(&format!("create table {table}(id int not null, name text)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "insert into {table} values (1, 'one'), (2, 'two')"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        let create_index = session
+            .prepare(&format!(
+                "create index concurrently {index} on {table}(name, id)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create_index.statements[0].command_tag, "CREATE INDEX");
+
+        let result = session
+            .prepare(&format!("select id from {table} where name = 'two'"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("2".to_owned())]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_drop_index_concurrently_uses_embedded_index_drop() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_concurrent_drop_{}", std::process::id());
+        let index = format!("fastpg_pgcore_concurrent_drop_{}_idx", std::process::id());
+
+        session
+            .prepare(&format!("create table {table}(id int not null, name text)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create index {index} on {table}(name)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let drop_index = session
+            .prepare(&format!("drop index concurrently {index}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(drop_index.statements[0].command_tag, "DROP INDEX");
+
+        let result = session
+            .prepare(&format!("select to_regclass('{index}') is null"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("t".to_owned())]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_reindex_concurrently_uses_embedded_reindex() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_concurrent_reindex_{}", std::process::id());
+        let index = format!(
+            "fastpg_pgcore_concurrent_reindex_{}_idx",
+            std::process::id()
+        );
+
+        session
+            .prepare(&format!("create table {table}(id int not null, name text)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create index {index} on {table}(name)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let reindex_index = session
+            .prepare(&format!("reindex index concurrently {index}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(reindex_index.statements[0].command_tag, "REINDEX");
+
+        let reindex_table = session
+            .prepare(&format!("reindex table concurrently {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(reindex_table.statements[0].command_tag, "REINDEX");
+
+        let result = session
+            .prepare(&format!("select to_regclass('{index}') is not null"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("t".to_owned())]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_rollback_releases_pgcore_error_resources() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_reindex_partition_{}", std::process::id());
+        let partition = format!("fastpg_pgcore_reindex_partition_{}_p", std::process::id());
+        let index = format!("fastpg_pgcore_reindex_partition_{}_idx", std::process::id());
+        let cleanup_table = format!("fastpg_pgcore_after_rollback_{}", std::process::id());
+
+        session
+            .prepare(&format!(
+                "create table {table}(id int) partition by range (id)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create table {partition} partition of {table} for values from (0) to (10)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create index {index} on {table}(id)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        session.prepare("begin").unwrap().execute().unwrap();
+        let reindex_error = session
+            .prepare(&format!("reindex index {index}"))
+            .unwrap()
+            .execute()
+            .unwrap_err();
+        assert!(
+            reindex_error.message.contains("WAL")
+                || reindex_error.message.contains("transaction block")
+                || reindex_error.message.contains("internal transactions")
+        );
+        session.prepare("rollback").unwrap().execute().unwrap();
+
+        session
+            .prepare(&format!("create table {cleanup_table}(id int)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        session
+            .prepare(&format!("drop table if exists {cleanup_table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("drop table if exists {table} cascade"))
             .unwrap()
             .execute()
             .unwrap();
