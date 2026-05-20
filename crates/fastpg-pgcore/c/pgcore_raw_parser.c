@@ -963,6 +963,12 @@ fastpg_pgcore_should_noop_utility(Node *utility_stmt)
 		case T_SecLabelStmt:
 		case T_VacuumStmt:
 			return true;
+		case T_CheckPointStmt:
+#ifdef USE_FASTPG
+			return !IsUnderPostmaster;
+#else
+			return false;
+#endif
 		default:
 			return false;
 	}
