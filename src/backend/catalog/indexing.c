@@ -24,9 +24,11 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
+#include "catalog/pg_type.h"
 #include "executor/executor.h"
 #include "fmgr.h"
 #include "utils/catcache.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -79,6 +81,37 @@ FastPgInvalidateVirtualCatalog(Relation heapRel)
 }
 
 static void
+FastPgInvalidateVirtualCatalogTuple(Relation heapRel, HeapTuple tup)
+{
+	CatalogCacheFlushCatalog(RelationGetRelid(heapRel));
+	CacheInvalidateHeapTuple(heapRel, tup, NULL);
+}
+
+static bool
+FastPgCatalogTypeOutputsOid(Oid type_oid)
+{
+	switch (type_oid)
+	{
+		case OIDOID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGCLASSOID:
+		case REGCOLLATIONOID:
+		case REGTYPEOID:
+		case REGROLEOID:
+		case REGNAMESPACEOID:
+		case REGDATABASEOID:
+		case REGCONFIGOID:
+		case REGDICTIONARYOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static void
 FastPgCatalogTupleToTextArrays(Relation heapRel,
 							   HeapTuple tup,
 							   const char ***values_out,
@@ -112,6 +145,12 @@ FastPgCatalogTupleToTextArrays(Relation heapRel,
 			strcmp(NameStr(attr->attname), "oid") == 0)
 			*row_id_out = DatumGetObjectId(value);
 
+		if (FastPgCatalogTypeOutputsOid(attr->atttypid))
+		{
+			values[index] = psprintf("%u", DatumGetObjectId(value));
+			continue;
+		}
+
 		getTypeOutputInfo(attr->atttypid, &output_function, &type_is_varlena);
 		values[index] = OidOutputFunctionCall(output_function, value);
 	}
@@ -140,7 +179,7 @@ FastPgCatalogUpsertTuple(Relation heapRel, HeapTuple tup, uint64_t row_id)
 	if (!FastPgCatalogRowIdToTid(stored_row_id, &tup->t_self))
 		elog(ERROR, "fastpg catalog row id %llu cannot be represented as a CTID",
 			 (unsigned long long) stored_row_id);
-	FastPgInvalidateVirtualCatalog(heapRel);
+	FastPgInvalidateVirtualCatalogTuple(heapRel, tup);
 }
 
 static void

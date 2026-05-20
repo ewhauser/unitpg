@@ -2185,6 +2185,69 @@ fn operator_to_ffi(record: &fastpg_catalog::PgOperatorRecord) -> FastPgRustCatal
     }
 }
 
+fn operator_row_to_ffi(row: &fastpg_catalog::CatalogRow) -> Option<FastPgRustCatalogOperator> {
+    let table = static_catalog_by_name("pg_operator")?;
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let namespace_oid =
+        catalog_row_value(table, row, "oprnamespace").and_then(catalog_value_oid)?;
+    let owner_oid = catalog_row_value(table, row, "oprowner")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let name = catalog_row_value(table, row, "oprname").and_then(catalog_value_name)?;
+    let kind = catalog_row_value(table, row, "oprkind")
+        .and_then(catalog_value_char)
+        .unwrap_or(b'b');
+    let can_merge = catalog_row_value(table, row, "oprcanmerge")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    let can_hash = catalog_row_value(table, row, "oprcanhash")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    let left_type_oid = catalog_row_value(table, row, "oprleft")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let right_type_oid = catalog_row_value(table, row, "oprright")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let result_type_oid = catalog_row_value(table, row, "oprresult")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let commutator_oid = catalog_row_value(table, row, "oprcom")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let negator_oid = catalog_row_value(table, row, "oprnegate")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let code_fn_oid = catalog_row_value(table, row, "oprcode")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let rest_fn_oid = catalog_row_value(table, row, "oprrest")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let join_fn_oid = catalog_row_value(table, row, "oprjoin")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+
+    Some(FastPgRustCatalogOperator {
+        oid: oid.0,
+        namespace_oid: namespace_oid.0,
+        owner_oid: owner_oid.0,
+        name: fixed_c_name(name),
+        kind,
+        can_merge: u8::from(can_merge),
+        can_hash: u8::from(can_hash),
+        _padding: 0,
+        left_type_oid: left_type_oid.0,
+        right_type_oid: right_type_oid.0,
+        result_type_oid: result_type_oid.0,
+        commutator_oid: commutator_oid.0,
+        negator_oid: negator_oid.0,
+        code_fn_oid: code_fn_oid.0,
+        rest_fn_oid: rest_fn_oid.0,
+        join_fn_oid: join_fn_oid.0,
+    })
+}
+
 fn cast_to_ffi(record: &fastpg_catalog::PgCastRecord) -> FastPgRustCatalogCast {
     FastPgRustCatalogCast {
         oid: record.oid.0,
@@ -2195,6 +2258,34 @@ fn cast_to_ffi(record: &fastpg_catalog::PgCastRecord) -> FastPgRustCatalogCast {
         method: record.method,
         _padding: [0; 2],
     }
+}
+
+fn cast_row_to_ffi(row: &fastpg_catalog::CatalogRow) -> Option<FastPgRustCatalogCast> {
+    let table = static_catalog_by_name("pg_cast")?;
+    let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let source_type_oid =
+        catalog_row_value(table, row, "castsource").and_then(catalog_value_oid)?;
+    let target_type_oid =
+        catalog_row_value(table, row, "casttarget").and_then(catalog_value_oid)?;
+    let function_oid = catalog_row_value(table, row, "castfunc")
+        .and_then(catalog_value_oid)
+        .unwrap_or(Oid(0));
+    let context = catalog_row_value(table, row, "castcontext")
+        .and_then(catalog_value_char)
+        .unwrap_or(b'e');
+    let method = catalog_row_value(table, row, "castmethod")
+        .and_then(catalog_value_char)
+        .unwrap_or(b'f');
+
+    Some(FastPgRustCatalogCast {
+        oid: oid.0,
+        source_type_oid: source_type_oid.0,
+        target_type_oid: target_type_oid.0,
+        function_oid: function_oid.0,
+        context,
+        method,
+        _padding: [0; 2],
+    })
 }
 
 fn catalog_value_oid(value: &CatalogValue) -> Option<Oid> {
@@ -3379,12 +3470,22 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_oid(
     if out.is_null() {
         return false;
     }
-    let Some(record) = builtin_operator_by_oid(Oid(oid)) else {
+    let record = static_catalog_by_name("pg_operator")
+        .and_then(|table| {
+            catalog_rows(table.oid).into_iter().find_map(|row| {
+                let row_oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
+                (row_oid == Oid(oid))
+                    .then(|| operator_row_to_ffi(&row))
+                    .flatten()
+            })
+        })
+        .or_else(|| builtin_operator_by_oid(Oid(oid)).map(operator_to_ffi));
+    let Some(record) = record else {
         return false;
     };
 
     unsafe {
-        *out = operator_to_ffi(record);
+        *out = record;
     }
     true
 }
@@ -3407,17 +3508,32 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_signature(
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return false;
     };
-    let Some(record) = builtin_operator_by_signature(
-        &name,
-        Oid(left_type_oid),
-        Oid(right_type_oid),
-        Oid(namespace_oid),
-    ) else {
+    let left_type = Oid(left_type_oid);
+    let right_type = Oid(right_type_oid);
+    let namespace = Oid(namespace_oid);
+    let normalized = name.trim().to_ascii_lowercase();
+    let record = static_catalog_by_name("pg_operator")
+        .and_then(|table| {
+            catalog_rows(table.oid).into_iter().find_map(|row| {
+                let record = operator_row_to_ffi(&row)?;
+                let record_name = c_name_to_string(&record.name);
+                (record_name == normalized
+                    && record.left_type_oid == left_type.0
+                    && record.right_type_oid == right_type.0
+                    && record.namespace_oid == namespace.0)
+                    .then_some(record)
+            })
+        })
+        .or_else(|| {
+            builtin_operator_by_signature(&name, left_type, right_type, namespace)
+                .map(operator_to_ffi)
+        });
+    let Some(record) = record else {
         return false;
     };
 
     unsafe {
-        *out = operator_to_ffi(record);
+        *out = record;
     }
     true
 }
@@ -3430,7 +3546,19 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_count_by_name(name: *const
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return 0;
     };
-    builtin_operators_by_name(&name).count()
+    let normalized = name.trim().to_ascii_lowercase();
+    static_catalog_by_name("pg_operator")
+        .map(|table| {
+            catalog_rows(table.oid)
+                .into_iter()
+                .filter(|row| {
+                    catalog_row_value(table, row, "oprname")
+                        .and_then(catalog_value_name)
+                        .is_some_and(|row_name| row_name == normalized)
+                })
+                .count()
+        })
+        .unwrap_or_else(|| builtin_operators_by_name(&normalized).count())
 }
 
 #[unsafe(no_mangle)]
@@ -3449,12 +3577,29 @@ pub unsafe extern "C" fn fastpg_rust_catalog_operator_by_name_index(
     let Ok(name) = (unsafe { c_str_to_string(name) }) else {
         return false;
     };
-    let Some(record) = builtin_operators_by_name(&name).nth(index) else {
+    let normalized = name.trim().to_ascii_lowercase();
+    let records = static_catalog_by_name("pg_operator")
+        .map(|table| {
+            catalog_rows(table.oid)
+                .into_iter()
+                .filter_map(|row| {
+                    let record = operator_row_to_ffi(&row)?;
+                    let record_name = c_name_to_string(&record.name);
+                    (record_name == normalized).then_some(record)
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_else(|| {
+            builtin_operators_by_name(&normalized)
+                .map(operator_to_ffi)
+                .collect()
+        });
+    let Some(record) = records.into_iter().nth(index) else {
         return false;
     };
 
     unsafe {
-        *out = operator_to_ffi(record);
+        *out = record;
     }
     true
 }
@@ -3471,13 +3616,23 @@ pub unsafe extern "C" fn fastpg_rust_catalog_cast_by_source_target(
     if out.is_null() {
         return false;
     }
-    let Some(record) = builtin_cast_by_source_target(Oid(source_type_oid), Oid(target_type_oid))
-    else {
+    let source_type = Oid(source_type_oid);
+    let target_type = Oid(target_type_oid);
+    let record = static_catalog_by_name("pg_cast")
+        .and_then(|table| {
+            catalog_rows(table.oid).into_iter().find_map(|row| {
+                let record = cast_row_to_ffi(&row)?;
+                (record.source_type_oid == source_type.0 && record.target_type_oid == target_type.0)
+                    .then_some(record)
+            })
+        })
+        .or_else(|| builtin_cast_by_source_target(source_type, target_type).map(cast_to_ffi));
+    let Some(record) = record else {
         return false;
     };
 
     unsafe {
-        *out = cast_to_ffi(record);
+        *out = record;
     }
     true
 }

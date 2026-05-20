@@ -1895,15 +1895,22 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 #ifdef USE_FASTPG
 	{
 		FastPgRustCatalogOperator fastpg_operator;
+		ListCell   *nsp;
 
-		if (fastpg_rust_catalog_operator_by_signature(opername,
-													  (uint32_t) oprleft,
-													  (uint32_t) oprright,
-													  PG_CATALOG_NAMESPACE,
-													  &fastpg_operator))
-			return (Oid) fastpg_operator.oid;
-		if (!IsUnderPostmaster)
-			return InvalidOid;
+		recomputeNamespacePath();
+		foreach(nsp, activeSearchPath)
+		{
+			Oid			namespaceId = lfirst_oid(nsp);
+
+			if (namespaceId == myTempNamespace)
+				continue;
+			if (fastpg_rust_catalog_operator_by_signature(opername,
+														  (uint32_t) oprleft,
+														  (uint32_t) oprright,
+														  (uint32_t) namespaceId,
+														  &fastpg_operator))
+				return (Oid) fastpg_operator.oid;
+		}
 	}
 #endif
 
@@ -2024,9 +2031,6 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok,
 		if (operator_count > 0)
 		{
 			FuncCandidateList *tail = &resultList;
-
-			if (OidIsValid(namespaceId) && namespaceId != PG_CATALOG_NAMESPACE)
-				return NULL;
 
 			for (size_t fastpg_index = 0; fastpg_index < operator_count; fastpg_index++)
 			{

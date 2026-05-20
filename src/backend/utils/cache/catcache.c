@@ -582,6 +582,9 @@ FastPgBuildNamespaceTuple(TupleDesc tupdesc,
 static bool
 FastPgCatalogCacheHandlesMiss(CatCache *cache, int nkeys)
 {
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
+		return true;
+
 	if (FastPgCatalogCacheIsEmpty(cache))
 		return true;
 

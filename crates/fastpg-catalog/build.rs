@@ -561,7 +561,19 @@ fn emit_raw_tables(
     for table in tables {
         let policy = if matches!(
             table.name.as_str(),
-            "pg_class" | "pg_attribute" | "pg_index" | "pg_constraint" | "pg_type"
+            "pg_class"
+                | "pg_attribute"
+                | "pg_index"
+                | "pg_constraint"
+                | "pg_type"
+                | "pg_proc"
+                | "pg_operator"
+                | "pg_cast"
+                | "pg_opclass"
+                | "pg_opfamily"
+                | "pg_amop"
+                | "pg_amproc"
+                | "pg_rewrite"
         ) {
             "VirtualCatalogPolicy::Dynamic"
         } else {
