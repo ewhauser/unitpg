@@ -2285,6 +2285,63 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_heap_compatible_table_am_materialized_view_avoids_heap_storage() {
+        let session = PgCoreSession::new();
+        let table_am = unique_pg_name("fastpg_pgcore_heapam");
+        let table = unique_pg_name("fastpg_pgcore_heapam_tbl");
+        let matview = unique_pg_name("fastpg_pgcore_heapam_mv");
+
+        session
+            .prepare(&format!(
+                "create access method {table_am} type table handler heap_tableam_handler"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create table {table}(f1 int) using {table_am}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create materialized view {matview} using {table_am} as select * from {table}"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let select = session
+            .prepare(&format!("select f1 from {matview} order by f1"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(select.statements.len(), 1);
+
+        session
+            .prepare(&format!("drop materialized view if exists {matview}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("drop access method if exists {table_am}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_regress_compatibility_noop_utilities() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_noop_{}", std::process::id());

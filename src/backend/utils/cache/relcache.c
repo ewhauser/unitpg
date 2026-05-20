@@ -2359,8 +2359,19 @@ UseFastPgMemTableAm(Relation relation)
 {
 	Oid			relnamespace = RelationGetNamespace(relation);
 
-	return relation->rd_rel->relkind == RELKIND_RELATION &&
+	return RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) &&
 		relation->rd_rel->relam == HEAP_TABLE_AM_OID &&
+		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
+		!IsToastNamespace(relnamespace);
+}
+
+static bool
+UseFastPgMemTableAmForHandler(Relation relation, Oid amhandler)
+{
+	Oid			relnamespace = RelationGetNamespace(relation);
+
+	return RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) &&
+		amhandler == F_HEAP_TABLEAM_HANDLER &&
 		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
 		!IsToastNamespace(relnamespace);
 }
@@ -2424,6 +2435,13 @@ RelationInitTableAccessMethod(Relation relation)
 		aform = (Form_pg_am) GETSTRUCT(tuple);
 		relation->rd_amhandler = aform->amhandler;
 		ReleaseSysCache(tuple);
+#ifdef USE_FASTPG
+		if (UseFastPgMemTableAmForHandler(relation, relation->rd_amhandler))
+		{
+			relation->rd_tableam = GetFastPgMemTableAmRoutine();
+			return;
+		}
+#endif
 	}
 
 	/*
