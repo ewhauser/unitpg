@@ -20,6 +20,17 @@ fn main() {
         .and_then(Path::parent)
         .expect("fastpg-pgcore must live under <repo>/crates/fastpg-pgcore")
         .to_path_buf();
+    for relative in [
+        "src/backend/access/fastpg/fastpg_mem_tableam.c",
+        "src/backend/utils/cache/catcache.c",
+        "src/backend/utils/cache/relcache.c",
+        "src/include/access/fastpg_catalog.h",
+    ] {
+        println!(
+            "cargo:rerun-if-changed={}",
+            source_root.join(relative).display()
+        );
+    }
     let build_dir = env::var_os("FASTPG_POSTGRES_BUILD_DIR")
         .map(PathBuf::from)
         .expect("FASTPG_POSTGRES_BUILD_DIR must point at a Meson Postgres build directory");

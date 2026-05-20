@@ -373,7 +373,7 @@ class PgBenchCompare:
             "pgcore_build_dir": pgcore_build_dir,
         }
         paths["pgcore_build_dir"] = Path(build_env["FASTPG_POSTGRES_BUILD_DIR"])
-        paths["pgcore_libdir"] = paths["pgcore_build_dir"] / "src/pl/plpgsql/src"
+        paths["pgcore_libdir"] = self.prepare_fastpg_pgcore_libdir(paths["pgcore_build_dir"])
         return paths
 
     def ensure_fastpg_pgcore_build(self, variant_name: str, output_dir: Path) -> Path:
@@ -419,6 +419,29 @@ class PgBenchCompare:
             "meson-compile-fastpg-pl",
         )
         return build_dir
+
+    def prepare_fastpg_pgcore_libdir(self, build_dir: Path) -> Path:
+        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
+        libdir = build_dir / "fastpg-pgcore-libdir"
+        libdir.mkdir(parents=True, exist_ok=True)
+
+        candidates = [build_dir / "src/pl/plpgsql/src" / f"plpgsql{suffix}"]
+        conversion_dir = build_dir / "src/backend/utils/mb/conversion_procs"
+        if conversion_dir.exists():
+            candidates.extend(sorted(conversion_dir.glob(f"*{suffix}")))
+
+        for source in candidates:
+            if not source.exists():
+                continue
+            dest = libdir / source.name
+            if dest.exists() or dest.is_symlink():
+                dest.unlink()
+            try:
+                dest.symlink_to(source)
+            except OSError:
+                shutil.copy2(source, dest)
+
+        return libdir
 
     def repair_macos_libpq_names(self, variant: str, bindir: Path, libdir: Path, output_dir: Path) -> None:
         if platform.system() != "Darwin":

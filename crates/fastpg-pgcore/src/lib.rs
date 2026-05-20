@@ -1265,6 +1265,17 @@ mod inner {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres-execution")]
+    fn unique_pg_name(prefix: &str) -> String {
+        static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+        format!(
+            "{prefix}_{}_{}",
+            std::process::id(),
+            NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        )
+    }
+
     #[test]
     fn raw_parse_smoke() {
         let summary = raw_parse("select 1").unwrap();
@@ -1756,6 +1767,274 @@ mod tests {
         assert_eq!(
             opclass_lookup.statements[0].rows,
             vec![vec![PgCoreValue::Text(opclass)]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_view_rewrite_uses_dynamic_pg_rewrite_catalog() {
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fp_view_base");
+        let view = unique_pg_name("fp_view");
+
+        session
+            .prepare(&format!(
+                "create table {table}(id int not null, label text)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1, 'one')"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let create = session
+            .prepare(&format!(
+                "create view {view} as select id, label from {table} where id >= 0"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(create.statements[0].command_tag, "CREATE VIEW");
+
+        let rewrite = session
+            .prepare(&format!(
+                "select rulename from pg_rewrite where ev_class = '{view}'::regclass"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            rewrite.statements[0].rows,
+            vec![vec![PgCoreValue::Text("_RETURN".to_owned())]]
+        );
+
+        session
+            .prepare(&format!(
+                "select c.relchecks, c.relkind, c.relhasindex, c.relhasrules, \
+                 c.relhastriggers, c.relrowsecurity, c.relforcerowsecurity, \
+                 false as relhasoids, c.relispartition, \
+                 pg_catalog.array_to_string(c.reloptions || array(select 'toast.' || x from pg_catalog.unnest(tc.reloptions) x), ', '), \
+                 c.reltablespace, \
+                 case when c.reloftype = 0 then '' else c.reloftype::pg_catalog.regtype::pg_catalog.text end, \
+                 c.relpersistence, c.relreplident, am.amname \
+                 from pg_catalog.pg_class c \
+                 left join pg_catalog.pg_class tc on (c.reltoastrelid = tc.oid) \
+                 left join pg_catalog.pg_am am on (c.relam = am.oid) \
+                 where c.oid = '{view}'::regclass::oid"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let view_definition = session
+            .prepare(&format!(
+                "/* Get view's definition */\nselect pg_catalog.pg_get_viewdef('{view}'::regclass::oid, true)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert!(matches!(
+            &view_definition.statements[0].rows[0][0],
+            PgCoreValue::Text(value) if value.contains(&table)
+        ));
+
+        let select = session
+            .prepare(&format!("select id, label from {view}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            select.statements[0].rows,
+            vec![vec![
+                PgCoreValue::Text("1".to_owned()),
+                PgCoreValue::Text("one".to_owned())
+            ]]
+        );
+
+        session
+            .prepare(&format!("drop view if exists {view}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_user_defined_operator_metadata_uses_dynamic_catalogs() {
+        let session = PgCoreSession::new();
+        let typ = unique_pg_name("fp_myint");
+        let input = unique_pg_name("fp_myintin");
+        let output = unique_pg_name("fp_myintout");
+        let hash = unique_pg_name("fp_myinthash");
+        let eq = unique_pg_name("fp_myinteq");
+        let opclass = unique_pg_name("fp_myint_ops");
+        let table = unique_pg_name("fp_inttest");
+
+        session
+            .prepare(&format!("create type {typ}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create function {input}(cstring) returns {typ} strict immutable \
+                 language internal as 'int4in'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create function {output}({typ}) returns cstring strict immutable \
+                 language internal as 'int4out'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create function {hash}({typ}) returns integer strict immutable \
+                 language internal as 'hashint4'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create type {typ} (input = {input}, output = {output}, like = int4)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create cast (int4 as {typ}) without function"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create cast ({typ} as int4) without function"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create function {eq}({typ}, {typ}) returns bool strict immutable \
+                 language internal as 'int4eq'"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let operator = session
+            .prepare(&format!(
+                "create operator = (
+                    leftarg = {typ},
+                    rightarg = {typ},
+                    procedure = {eq},
+                    restrict = eqsel,
+                    join = eqjoinsel,
+                    hashes
+                )"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(operator.statements[0].command_tag, "CREATE OPERATOR");
+
+        let opclass_result = session
+            .prepare(&format!(
+                "create operator class {opclass} default for type {typ} using hash as \
+                 operator 1 = ({typ}, {typ}), function 1 {hash}({typ})"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            opclass_result.statements[0].command_tag,
+            "CREATE OPERATOR CLASS"
+        );
+
+        let type_metadata = session
+            .prepare(&format!(
+                "select typinput::oid, typoutput::oid, typisdefined::text, typlen::text, \
+                 typbyval::text from pg_type where oid = '{typ}'::regtype"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap()
+            .statements[0]
+            .rows
+            .clone();
+        assert_eq!(type_metadata.len(), 1);
+        assert_ne!(type_metadata[0][0], PgCoreValue::Text("0".to_owned()));
+        assert_ne!(type_metadata[0][1], PgCoreValue::Text("0".to_owned()));
+        assert_eq!(type_metadata[0][2], PgCoreValue::Text("true".to_owned()));
+        assert_eq!(type_metadata[0][3], PgCoreValue::Text("4".to_owned()));
+        assert_eq!(type_metadata[0][4], PgCoreValue::Text("true".to_owned()));
+
+        let cast_metadata = session
+            .prepare(&format!(
+                "select castfunc::oid, castcontext::text, castmethod::text from pg_cast \
+                 where castsource = 'int4'::regtype and casttarget = '{typ}'::regtype"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap()
+            .statements[0]
+            .rows
+            .clone();
+        assert_eq!(
+            cast_metadata,
+            vec![vec![
+                PgCoreValue::Text("0".to_owned()),
+                PgCoreValue::Text("e".to_owned()),
+                PgCoreValue::Text("b".to_owned())
+            ]]
+        );
+
+        session
+            .prepare(&format!("create table {table}(a {typ})"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "insert into {table} values (null), (0::{typ}), (1::{typ})"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let select = session
+            .prepare(&format!(
+                "select a::int4, a in (1::{typ}, 2::{typ}, 3::{typ}, 4::{typ}, \
+                 5::{typ}, 6::{typ}, 7::{typ}, 8::{typ}, 9::{typ}) \
+                 from {table} order by a::int4 nulls first"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            select.statements[0].rows,
+            vec![
+                vec![PgCoreValue::Null, PgCoreValue::Null],
+                vec![
+                    PgCoreValue::Text("0".to_owned()),
+                    PgCoreValue::Text("f".to_owned())
+                ],
+                vec![
+                    PgCoreValue::Text("1".to_owned()),
+                    PgCoreValue::Text("t".to_owned())
+                ],
+            ]
         );
     }
 

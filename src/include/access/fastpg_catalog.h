@@ -228,6 +228,11 @@ extern bool fastpg_rust_catalog_relation_by_name(const char *name,
 												 FastPgRustCatalogRelation *out);
 extern bool fastpg_rust_catalog_relation_by_oid(uint32_t oid,
 												FastPgRustCatalogRelation *out);
+extern bool fastpg_rust_catalog_relation_rowtype_oid_by_oid(uint32_t relation_oid,
+															uint32_t *oid_out);
+extern bool fastpg_rust_catalog_relation_planner_stats_by_oid(uint32_t relation_oid,
+															  int32_t *relpages_out,
+															  float4 *reltuples_out);
 extern bool fastpg_rust_catalog_relation_column_by_index(uint32_t relation_oid,
 														 size_t column_index,
 														 FastPgRustCatalogColumn *out);
