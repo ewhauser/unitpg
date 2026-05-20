@@ -30,6 +30,7 @@ SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
 SVG_TOTAL_SAMPLES_RE = re.compile(r'<svg id="frames"[^>]*\btotal_samples="([\d,]+)"')
 HOTSPOT_RE = re.compile(r"^(.*) \(([\d,]+) samples?, ([0-9.]+)%\)$")
 DEFAULT_PGBENCH_INIT_STEPS = "dtgvp"
+TIMEOUT_RETURN_CODE = 124
 PROFILE_COMPONENT_ORDER = [
     "Socket / protocol",
     "Query dispatch",
@@ -792,9 +793,9 @@ class PgBenchCompare:
         }
 
         if socket_path is None:
-            ready = wait_for_tcp_server(process, host, port)
+            ready = wait_for_tcp_server(process, host, port, timeout_seconds=self.server_start_timeout_seconds())
         else:
-            ready = wait_for_unix_server(process, socket_path)
+            ready = wait_for_unix_server(process, socket_path, timeout_seconds=self.server_start_timeout_seconds())
         if not ready:
             stdout_file.flush()
             stderr_file.flush()
@@ -1269,27 +1270,67 @@ class PgBenchCompare:
     ) -> CommandResult:
         output_dir.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
-        completed = subprocess.run(
-            command,
-            cwd=self.source_root,
-            env=env,
-            text=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            check=False,
-        )
+        timeout = self.command_timeout_seconds()
+        if timeout == 0.0:
+            result = CommandResult(
+                command=command,
+                cwd=str(self.source_root),
+                returncode=TIMEOUT_RETURN_CODE,
+                stdout="",
+                stderr="global timeout elapsed before command started",
+                seconds=time.monotonic() - started,
+            )
+            (output_dir / f"{label}.stdout").write_text(result.stdout)
+            (output_dir / f"{label}.stderr").write_text(result.stderr)
+            (output_dir / f"{label}.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
+            return result
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=self.source_root,
+                env=env,
+                text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                check=False,
+                timeout=timeout,
+            )
+            returncode = completed.returncode
+            stdout = completed.stdout
+            stderr = completed.stderr
+        except subprocess.TimeoutExpired as timeout_error:
+            returncode = TIMEOUT_RETURN_CODE
+            stdout = timeout_output(timeout_error.stdout)
+            stderr = timeout_output(timeout_error.stderr)
+            message = f"global timeout elapsed after {time.monotonic() - started:.3f}s"
+            stderr = f"{stderr}\n{message}" if stderr else message
         result = CommandResult(
             command=command,
             cwd=str(self.source_root),
-            returncode=completed.returncode,
-            stdout=completed.stdout,
-            stderr=completed.stderr,
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
             seconds=time.monotonic() - started,
         )
         (output_dir / f"{label}.stdout").write_text(result.stdout)
         (output_dir / f"{label}.stderr").write_text(result.stderr)
         (output_dir / f"{label}.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
         return result
+
+    def command_timeout_seconds(self) -> float | None:
+        deadline = getattr(self.args, "global_timeout_deadline", None)
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0.0:
+            return 0.0
+        return remaining
+
+    def server_start_timeout_seconds(self) -> float:
+        timeout = self.command_timeout_seconds()
+        if timeout is None:
+            return 5.0
+        return min(5.0, max(timeout, 0.001))
 
     def write_results(self) -> None:
         result_json = self.result_root / "summary.json"
@@ -2604,6 +2645,14 @@ def html_hotspot_cell(hotspots: list[dict[str, Any]], index: int) -> str:
     hotspot = hotspots[index]
     name = html.escape(str(hotspot["name"]))
     return f"<code>{name}</code><br>{hotspot['percent']:.2f}% ({hotspot['samples']} samples)"
+
+
+def timeout_output(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode(errors="replace")
+    return value
 
 
 def tail(text: str, limit: int = 4000) -> str:

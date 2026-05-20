@@ -52,9 +52,12 @@ class UpstreamRegressionInventory:
         self.bench_root = self.source_root / "benches"
         self.input_dir = Path(args.input_dir).resolve() if args.input_dir else self.source_root / "src/test/regress"
         self.schedule = Path(args.schedule).resolve() if args.schedule else self.input_dir / "parallel_schedule"
+        self.global_timeout_deadline = time.monotonic() + args.global_timeout
         timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        helper_namespace = helper_args(args)
+        helper_namespace.global_timeout_deadline = self.global_timeout_deadline
         self.helper = PgBenchCompare(
-            helper_args(args),
+            helper_namespace,
             result_subdir="upstream-regression",
             timestamp=timestamp,
         )
@@ -82,6 +85,7 @@ class UpstreamRegressionInventory:
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "storage_engine": args.storage_engine,
+                "global_timeout": args.global_timeout,
                 "fastpg_case_timeout": args.fastpg_case_timeout,
             },
             "cases": [
@@ -95,17 +99,21 @@ class UpstreamRegressionInventory:
     def run(self) -> int:
         print(f"results: {self.result_root}")
         try:
+            self.check_global_timeout("setup", self.result_root)
             normal_paths = self.helper.ensure_variant_install(
                 Variant("normal", False, "postgres"),
                 self.result_root / "normal" / "setup",
             )
             self.helper.pgbench_client_paths = normal_paths
+            self.check_global_timeout("normal", self.result_root / "normal" / "run")
             normal_cases = self.run_postgres_suite(normal_paths)
 
+            self.check_global_timeout("setup", self.result_root / "fastpg" / "setup")
             fastpg_paths = self.helper.ensure_rust_server_install(
                 Variant("fastpg", True, "rust-server"),
                 self.result_root / "fastpg" / "setup",
             )
+            self.check_global_timeout("fastpg", self.result_root / "fastpg" / "run")
             fastpg_cases = self.run_rust_server_suite(fastpg_paths)
             compare_fastpg_cases(fastpg_cases, normal_cases)
 
@@ -126,6 +134,40 @@ class UpstreamRegressionInventory:
             self.write_results()
             print_failure(failure, self.result_root)
             return 1
+
+    def global_timeout_remaining(self) -> float:
+        return self.global_timeout_deadline - time.monotonic()
+
+    def check_global_timeout(self, phase: str, output_dir: Path) -> None:
+        if self.global_timeout_remaining() > 0.0:
+            return
+        raise self.global_timeout_failure("harness", phase, output_dir)
+
+    def global_timeout_failure(
+        self,
+        variant: str,
+        phase: str,
+        output_dir: Path,
+        result: CommandResult | None = None,
+    ) -> BenchmarkFailure:
+        if result is None:
+            result = CommandResult(
+                ["upstream_regression_inventory.py"],
+                str(self.source_root),
+                TIMEOUT_RETURN_CODE,
+                "",
+                f"global timeout of {self.args.global_timeout:.1f}s exceeded",
+                self.args.global_timeout,
+            )
+        return BenchmarkFailure(variant, f"{phase}-global-timeout", result, output_dir)
+
+    def psql_timeout(self, requested_timeout: float | None) -> tuple[float, bool]:
+        remaining = self.global_timeout_remaining()
+        if remaining <= 0.0:
+            return 0.001, True
+        if requested_timeout is None or remaining < requested_timeout:
+            return remaining, True
+        return requested_timeout, False
 
     def run_postgres_suite(self, paths: dict[str, Path]) -> list[dict[str, Any]]:
         variant_dir = self.result_root / "normal"
@@ -413,6 +455,7 @@ class UpstreamRegressionInventory:
         for index, case in enumerate(self.cases, start=1):
             print(f"[{variant}] upstream regression case {index}/{len(self.cases)} {case.name} start", flush=True)
             output_dir = run_dir / "cases" / case.name
+            effective_timeout, global_timeout_bound = self.psql_timeout(timeout)
             result, transcript = run_psql_transcript(
                 bindir,
                 host,
@@ -422,9 +465,12 @@ class UpstreamRegressionInventory:
                 output_dir,
                 env,
                 self.source_root,
-                timeout=timeout,
+                timeout=effective_timeout,
+                timeout_kind="global" if global_timeout_bound else "case",
             )
             timed_out = result.returncode == TIMEOUT_RETURN_CODE
+            if timed_out and global_timeout_bound:
+                raise self.global_timeout_failure(variant, "run", output_dir, result)
             case_result = {
                 "case": case.name,
                 "group": case.group,
@@ -446,7 +492,7 @@ class UpstreamRegressionInventory:
                 case_result["difference"] = {
                     "kind": "timeout",
                     "seconds": result.seconds,
-                    "timeout": timeout,
+                    "timeout": effective_timeout,
                 }
             if server_exited:
                 case_result["status"] = "server-crash"
@@ -496,6 +542,7 @@ def run_psql_transcript(
     env: dict[str, str],
     cwd: Path,
     timeout: float | None = None,
+    timeout_kind: str = "case",
 ) -> tuple[CommandResult, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     transcript = output_dir / f"{case.name}.out"
@@ -537,7 +584,10 @@ def run_psql_transcript(
         except subprocess.TimeoutExpired:
             timed_out = True
             returncode = TIMEOUT_RETURN_CODE
-            stderr = f"psql timed out after {timeout:.1f}s" if timeout is not None else "psql timed out"
+            if timeout_kind == "global":
+                stderr = f"global timeout reached while running psql after {timeout:.1f}s"
+            else:
+                stderr = f"psql timed out after {timeout:.1f}s" if timeout is not None else "psql timed out"
     result = CommandResult(
         command=command + ["<", str(case.path), ">", str(transcript)],
         cwd=str(cwd),
@@ -548,7 +598,10 @@ def run_psql_transcript(
     )
     if timed_out:
         with transcript.open("a") as output_file:
-            output_file.write(f"\nERROR:  fastpg upstream inventory timed out after {timeout:.1f}s\n")
+            if timeout_kind == "global":
+                output_file.write(f"\nERROR:  upstream inventory global timeout reached after {timeout:.1f}s\n")
+            else:
+                output_file.write(f"\nERROR:  fastpg upstream inventory timed out after {timeout:.1f}s\n")
         result.stdout = read_text(transcript)
     (output_dir / "psql.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
     return result, transcript
@@ -837,6 +890,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
     )
     parser.add_argument(
+        "--global-timeout",
+        type=float,
+        default=60.0,
+        help="seconds before the whole upstream inventory run fails",
+    )
+    parser.add_argument(
         "--fastpg-case-timeout",
         type=float,
         default=60.0,
@@ -850,6 +909,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
+    if args.global_timeout <= 0:
+        parser.error("--global-timeout must be positive")
     if args.fastpg_case_timeout is not None and args.fastpg_case_timeout <= 0:
         parser.error("--fastpg-case-timeout must be positive")
     return args

@@ -168,6 +168,7 @@ Useful knobs:
 make -C benches regression STORAGE_ENGINE=storage2
 make -C benches regression UPSTREAM_REGRESSION_LIMIT=17
 make -C benches regression UPSTREAM_REGRESSION_CASES="uuid infinite_recurse"
+make -C benches regression REGRESSION_GLOBAL_TIMEOUT=120
 make -C benches regression REGRESSION_FAIL_ON_DIFFERENCES=1
 ```
 
