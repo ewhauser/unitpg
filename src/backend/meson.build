@@ -43,19 +43,14 @@ backend_link_depends = []
 if get_option('fastpg')
   fastpg_cargo = find_program('cargo', required: true)
   fastpg_sh = find_program('sh', required: true)
-  fastpg_storage_inputs = files(
+  fastpg_backend_inputs = files(
     '../../Cargo.toml',
+    '../../crates/fastpg-backend/Cargo.toml',
+    '../../crates/fastpg-backend/src/lib.rs',
     '../../crates/fastpg-catalog/Cargo.toml',
     '../../crates/fastpg-catalog/src/lib.rs',
     '../../crates/fastpg-storage/Cargo.toml',
     '../../crates/fastpg-storage/src/lib.rs',
-    '../../crates/fastpg-types/Cargo.toml',
-    '../../crates/fastpg-types/src/lib.rs',
-  )
-  fastpg_storage2_inputs = files(
-    '../../Cargo.toml',
-    '../../crates/fastpg-catalog/Cargo.toml',
-    '../../crates/fastpg-catalog/src/lib.rs',
     '../../crates/fastpg-storage2/Cargo.toml',
     '../../crates/fastpg-storage2/src/copy.rs',
     '../../crates/fastpg-storage2/src/error.rs',
@@ -73,35 +68,21 @@ if get_option('fastpg')
     '../../crates/fastpg-types/src/lib.rs',
   )
   fastpg_storage_target_dir = meson.current_build_dir() / 'fastpg-cargo-target'
-  fastpg_storage_static = custom_target('backend_fastpg_storage_static',
-    input: fastpg_storage_inputs,
-    output: 'libfastpg_storage_backend.a',
+  fastpg_backend_static = custom_target('backend_fastpg_backend_static',
+    input: fastpg_backend_inputs,
+    output: 'libfastpg_backend.a',
     command: [
       fastpg_sh, '-c',
-      'set -eu; target_dir="$1"; output="$2"; manifest="$3"; cargo build --manifest-path "$manifest" --package fastpg-storage --release --target-dir "$target_dir"; cp "$target_dir/release/libfastpg_storage.a" "$output"',
-      'backend_fastpg_storage_static',
-      fastpg_storage_target_dir,
-      '@OUTPUT@',
-      meson.project_source_root() / 'Cargo.toml',
-    ],
-  )
-  fastpg_storage2_static = custom_target('backend_fastpg_storage2_static',
-    input: fastpg_storage2_inputs,
-    output: 'libfastpg_storage2_backend.a',
-    command: [
-      fastpg_sh, '-c',
-      'set -eu; target_dir="$1"; output="$2"; manifest="$3"; cargo build --manifest-path "$manifest" --package fastpg-storage2 --release --target-dir "$target_dir"; cp "$target_dir/release/libfastpg_storage2.a" "$output"',
-      'backend_fastpg_storage2_static',
+      'set -eu; target_dir="$1"; output="$2"; manifest="$3"; cargo build --manifest-path "$manifest" --package fastpg-backend --release --target-dir "$target_dir"; cp "$target_dir/release/libfastpg_backend.a" "$output"',
+      'backend_fastpg_backend_static',
       fastpg_storage_target_dir,
       '@OUTPUT@',
       meson.project_source_root() / 'Cargo.toml',
     ],
   )
 
-  backend_link_args += fastpg_storage_static.full_path()
-  backend_link_args += fastpg_storage2_static.full_path()
-  backend_link_depends += fastpg_storage_static
-  backend_link_depends += fastpg_storage2_static
+  backend_link_args += fastpg_backend_static.full_path()
+  backend_link_depends += fastpg_backend_static
 endif
 
 

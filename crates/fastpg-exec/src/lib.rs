@@ -120,15 +120,23 @@ impl QueryExecutor {
     }
 
     pub fn with_shared(shared: Arc<QueryExecutorShared>) -> Self {
+        Self::with_shared_for_database(shared, "postgres")
+    }
+
+    pub fn with_shared_for_database(
+        shared: Arc<QueryExecutorShared>,
+        database: impl Into<String>,
+    ) -> Self {
         #[cfg(feature = "postgres-execution")]
         {
             let storage_session = fastpg_storage::new_session_storage();
             let storage2_session = fastpg_storage2::new_session_storage();
             Self {
                 shared,
-                pgcore_session: PgCoreSession::with_storage_sessions(
+                pgcore_session: PgCoreSession::with_storage_sessions_and_database(
                     storage_session.clone(),
                     storage2_session.clone(),
+                    database,
                 ),
                 storage_session,
                 storage2_session,
@@ -136,6 +144,7 @@ impl QueryExecutor {
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
+            let _ = database.into();
             Self { shared }
         }
     }

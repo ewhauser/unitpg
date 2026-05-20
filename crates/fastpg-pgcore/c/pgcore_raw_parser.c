@@ -240,7 +240,7 @@ fastpg_pgcore_init_once(void)
 	InitCatalogCache();
 	InitializeSession();
 	EnablePortalManager();
-	namespace_search_path = pstrdup("pg_catalog, public");
+	namespace_search_path = pstrdup("\"$user\", public");
 	InitializeSearchPath();
 
 	fastpg_pgcore_initialized = true;
@@ -251,6 +251,25 @@ fastpg_pgcore_enter(void)
 {
 	fastpg_pgcore_init_once();
 	(void) set_stack_base();
+}
+
+void
+fastpg_pgcore_set_database(uint32_t database_oid)
+{
+	MemoryContext old_context;
+
+	fastpg_pgcore_enter();
+	if (!OidIsValid((Oid) database_oid))
+		database_oid = PostgresDbOid;
+
+	MyDatabaseId = (Oid) database_oid;
+	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
+
+	if (DatabasePath != NULL)
+		pfree(DatabasePath);
+	old_context = MemoryContextSwitchTo(TopMemoryContext);
+	DatabasePath = psprintf("base/%u", database_oid);
+	MemoryContextSwitchTo(old_context);
 }
 
 void

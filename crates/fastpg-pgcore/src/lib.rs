@@ -134,6 +134,14 @@ impl PgCoreSession {
         Self::with_storage_session(fastpg_storage::new_session_storage())
     }
 
+    pub fn with_database(database: impl Into<String>) -> Self {
+        Self::with_storage_sessions_and_database(
+            fastpg_storage::new_session_storage(),
+            fastpg_storage2::new_session_storage(),
+            database,
+        )
+    }
+
     pub fn with_storage_session(storage_session: fastpg_storage::SessionStorageHandle) -> Self {
         Self::with_storage_sessions(storage_session, fastpg_storage2::new_session_storage())
     }
@@ -142,8 +150,18 @@ impl PgCoreSession {
         storage_session: fastpg_storage::SessionStorageHandle,
         storage2_session: fastpg_storage2::SessionStorageHandle,
     ) -> Self {
+        Self::with_storage_sessions_and_database(storage_session, storage2_session, "postgres")
+    }
+
+    pub fn with_storage_sessions_and_database(
+        storage_session: fastpg_storage::SessionStorageHandle,
+        storage2_session: fastpg_storage2::SessionStorageHandle,
+        database: impl Into<String>,
+    ) -> Self {
+        let database = database.into();
+        let database_oid = fastpg_catalog::ensure_database(&database).0;
         Self {
-            inner: inner::PgCoreSession::new(),
+            inner: inner::PgCoreSession::new(database_oid),
             storage_session,
             storage2_session,
         }
@@ -389,6 +407,7 @@ mod inner {
     unsafe extern "C" {
         fn fastpg_pgcore_raw_parse(sql: *const c_char) -> *mut FastPgPgCoreParseResult;
         fn fastpg_pgcore_invalidate_system_caches();
+        fn fastpg_pgcore_set_database(database_oid: u32);
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
         fn fastpg_pgcore_parse_result_statement_count(
@@ -670,17 +689,26 @@ mod inner {
     }
 
     #[derive(Clone, Debug)]
-    pub struct PgCoreSession;
+    pub struct PgCoreSession {
+        database_oid: u32,
+    }
 
     impl PgCoreSession {
-        pub fn new() -> Self {
+        pub fn new(database_oid: u32) -> Self {
             let _ = fastpg_storage::fastpg_rust_relation_row_count(0);
-            Self
+            Self { database_oid }
+        }
+
+        fn set_database(&self) {
+            unsafe {
+                fastpg_pgcore_set_database(self.database_oid);
+            }
         }
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
             check_sql(sql)?;
             let _guard = enter_pgcore_lane("prepare");
+            self.set_database();
             let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
             let Some(prepared) = NonNull::new(prepared) else {
                 return Err(PgCoreError::new(
@@ -689,7 +717,10 @@ mod inner {
                     0,
                 ));
             };
-            let prepared = PreparedStatement(prepared);
+            let prepared = PreparedStatement {
+                prepared,
+                database_oid: self.database_oid,
+            };
             if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
                 drop(_guard);
                 Ok(prepared)
@@ -714,6 +745,7 @@ mod inner {
             check_sql(sql)?;
             let encoded_params = EncodedParams::new(params)?;
             let _guard = enter_pgcore_lane("prepare_execute");
+            self.set_database();
             let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
             let Some(prepared) = NonNull::new(prepared) else {
                 return Err(PgCoreError::new(
@@ -744,6 +776,7 @@ mod inner {
                 PgCoreError::new("22023", "COPY text value contains an embedded NUL byte", 0)
             })?;
             let _guard = enter_pgcore_lane("input_text_datum");
+            self.set_database();
             let result =
                 unsafe { fastpg_pgcore_input_text_datum(type_oid, typmod, value.as_ptr()) };
             let Some(result) = NonNull::new(result) else {
@@ -816,15 +849,25 @@ mod inner {
     }
 
     #[derive(Debug)]
-    pub struct PreparedStatement(NonNull<FastPgPgCorePrepared>);
+    pub struct PreparedStatement {
+        prepared: NonNull<FastPgPgCorePrepared>,
+        database_oid: u32,
+    }
 
     impl PreparedStatement {
         fn as_ptr(&self) -> *const FastPgPgCorePrepared {
-            self.0.as_ptr()
+            self.prepared.as_ptr()
+        }
+
+        fn set_database(&self) {
+            unsafe {
+                fastpg_pgcore_set_database(self.database_oid);
+            }
         }
 
         pub fn describe(&self) -> StatementDescription {
             let _guard = enter_pgcore_lane("describe");
+            self.set_database();
             let parameter_count =
                 unsafe { fastpg_pgcore_prepared_parameter_count(self.as_ptr()) }.max(0);
             let field_count = unsafe { fastpg_pgcore_prepared_field_count(self.as_ptr()) }.max(0);
@@ -860,12 +903,14 @@ mod inner {
         ) -> Result<ExecutionResult, PgCoreError> {
             if params.is_empty() {
                 let _guard = enter_pgcore_lane("execute");
+                self.set_database();
                 let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
                 return execution_result_from_ptr(result);
             }
 
             let encoded_params = EncodedParams::new(params)?;
             let _guard = enter_pgcore_lane("execute");
+            self.set_database();
             execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params)
         }
     }
@@ -990,7 +1035,7 @@ mod inner {
         fn drop(&mut self) {
             let _guard = enter_pgcore_lane("prepared_free");
             unsafe {
-                fastpg_pgcore_prepared_free(self.0.as_ptr());
+                fastpg_pgcore_prepared_free(self.prepared.as_ptr());
             }
         }
     }
@@ -1146,7 +1191,7 @@ mod inner {
     pub struct PgCoreSession;
 
     impl PgCoreSession {
-        pub fn new() -> Self {
+        pub fn new(_database_oid: u32) -> Self {
             Self
         }
 
@@ -1258,6 +1303,67 @@ mod tests {
         assert_eq!(
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("1".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn current_database_uses_session_database() {
+        let session = PgCoreSession::with_database("regression");
+        let result = session
+            .execute_with_params(
+                "select current_database(), current_catalog = current_database()",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![
+                PgCoreValue::Text("regression".to_owned()),
+                PgCoreValue::Text("t".to_owned()),
+            ]]
+        );
+
+        let result = session
+            .execute_with_params(
+                "select datname from pg_database where oid = (select oid from pg_database where datname = current_database())",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("regression".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn current_schema_uses_default_public_search_path() {
+        let session = PgCoreSession::new();
+        let result = session
+            .execute_with_params("select current_schema", &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("public".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn prepared_statements_restore_their_session_database() {
+        let first = PgCoreSession::with_database("fastpg_db_a");
+        let second = PgCoreSession::with_database("fastpg_db_b");
+        let first_statement = first.prepare("select current_database()").unwrap();
+        let second_statement = second.prepare("select current_database()").unwrap();
+
+        assert_eq!(
+            second_statement.execute().unwrap().statements[0].rows,
+            vec![vec![PgCoreValue::Text("fastpg_db_b".to_owned())]]
+        );
+        assert_eq!(
+            first_statement.execute().unwrap().statements[0].rows,
+            vec![vec![PgCoreValue::Text("fastpg_db_a".to_owned())]]
         );
     }
 

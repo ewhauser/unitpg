@@ -53,12 +53,17 @@ const PG_CLASS_RELATION_OID: Oid = Oid(1259);
 const PG_ATTRIBUTE_RELATION_OID: Oid = Oid(1249);
 const PG_TYPE_RELATION_OID: Oid = Oid(1247);
 const PG_PROC_RELATION_OID: Oid = Oid(1255);
+const PG_DATABASE_RELATION_OID: Oid = Oid(1262);
 const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 const PG_ENUM_RELATION_OID: Oid = Oid(3501);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
 const SYNTHETIC_CATALOG_ROWTYPE_OID_BASE: u32 = 0xF000_0000;
+const TEMPLATE1_DATABASE_OID: Oid = Oid(1);
+const TEMPLATE0_DATABASE_OID: Oid = Oid(4);
+const POSTGRES_DATABASE_OID: Oid = Oid(5);
+const SYNTHETIC_DATABASE_OID_BASE: u32 = 0xE100_0000;
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
 pub const VIRTUAL_CATALOG_DYNAMIC: u8 = 2;
@@ -1800,6 +1805,92 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
     })
 }
 
+fn canonical_database_name(name: &str) -> String {
+    let name = name.trim();
+    if name.is_empty() {
+        "postgres".to_owned()
+    } else {
+        name.to_owned()
+    }
+}
+
+fn synthetic_database_oid(name: &str) -> Oid {
+    match name {
+        "template1" => TEMPLATE1_DATABASE_OID,
+        "template0" => TEMPLATE0_DATABASE_OID,
+        "postgres" => POSTGRES_DATABASE_OID,
+        _ => {
+            let mut hash = 0x811c_9dc5u32;
+            for byte in name.as_bytes() {
+                hash ^= u32::from(*byte);
+                hash = hash.wrapping_mul(0x0100_0193);
+            }
+            Oid(SYNTHETIC_DATABASE_OID_BASE | (hash & 0x00ff_ffff))
+        }
+    }
+}
+
+fn database_oid_by_name(name: &str) -> Option<Oid> {
+    let table = static_catalog_by_relation_oid(PG_DATABASE_RELATION_OID)?;
+    catalog_rows(PG_DATABASE_RELATION_OID)
+        .into_iter()
+        .find(|row| catalog_row_identifier_matches(table, row, "datname", name))
+        .and_then(|row| catalog_row_value(table, &row, "oid").and_then(catalog_value_oid))
+}
+
+fn database_row_by_oid(oid: Oid) -> Option<CatalogRow> {
+    let table = static_catalog_by_relation_oid(PG_DATABASE_RELATION_OID)?;
+    catalog_rows(PG_DATABASE_RELATION_OID)
+        .into_iter()
+        .find(|row| {
+            catalog_row_value(table, row, "oid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_oid| row_oid == oid)
+        })
+}
+
+fn synthetic_database_row(table: &StaticCatalogTable, oid: Oid, name: &str) -> Option<CatalogRow> {
+    let base = table.rows.iter().find(|row| {
+        static_row_column_oid(table, row, "oid")
+            .is_some_and(|row_oid| row_oid == TEMPLATE1_DATABASE_OID)
+    })?;
+    let mut row = static_row_to_catalog_row(table, base);
+    row.row_id = u64::from(oid.0);
+    set_catalog_row_value(table, &mut row, "oid", CatalogValue::Oid(oid));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "datname",
+        CatalogValue::Name(name.to_owned()),
+    );
+    set_catalog_row_value(table, &mut row, "datistemplate", CatalogValue::Bool(false));
+    set_catalog_row_value(table, &mut row, "datallowconn", CatalogValue::Bool(true));
+    set_catalog_row_value(table, &mut row, "dathasloginevt", CatalogValue::Bool(false));
+    set_catalog_row_value(table, &mut row, "datconnlimit", CatalogValue::Int32(-1));
+    Some(row)
+}
+
+pub fn ensure_database(name: &str) -> Oid {
+    let name = canonical_database_name(name);
+    if let Some(oid) = database_oid_by_name(&name) {
+        return oid;
+    }
+    let oid = synthetic_database_oid(&name);
+    if database_row_by_oid(oid).is_some() {
+        return oid;
+    }
+    let Some(table) = static_catalog_by_relation_oid(PG_DATABASE_RELATION_OID) else {
+        return oid;
+    };
+    let Some(row) = synthetic_database_row(table, oid, &name) else {
+        return oid;
+    };
+    let mut draft = CatalogDraft::default();
+    draft.upsert_catalog_row(table, row);
+    commit_catalog_draft(draft);
+    oid
+}
+
 pub fn catalog_row_value<'a>(
     table: &'a StaticCatalogTable,
     row: &'a CatalogRow,
@@ -1810,6 +1901,22 @@ pub fn catalog_row_value<'a>(
         .iter()
         .position(|column| column.name == column_name)
         .and_then(|index| row.values.get(index))
+}
+
+fn set_catalog_row_value(
+    table: &StaticCatalogTable,
+    row: &mut CatalogRow,
+    column_name: &str,
+    value: CatalogValue,
+) {
+    if let Some(index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == column_name)
+        && let Some(slot) = row.values.get_mut(index)
+    {
+        *slot = value;
+    }
 }
 
 fn catalog_value_from_text(column: &StaticCatalogColumn, value: Option<&str>) -> CatalogValue {
@@ -3759,6 +3866,28 @@ mod tests {
             .expect("proargdefaults");
         assert!(defaults.starts_with("({CONST :consttype 16"));
         assert!(defaults.contains(":constvalue 1 [ 1 0 0 0 0 0 0 0 ]"));
+    }
+
+    #[test]
+    fn ensure_database_adds_synthetic_pg_database_row() {
+        let _guard = catalog_test_lock();
+        clear_for_tests();
+        abort_implicit_transaction();
+        let oid = ensure_database("regression");
+        let table = static_catalog_by_name("pg_database").expect("pg_database");
+        let row = catalog_rows(PG_DATABASE_RELATION_OID)
+            .into_iter()
+            .find(|row| {
+                row_value("pg_database", row, "datname")
+                    == &CatalogValue::Name("regression".to_owned())
+            })
+            .expect("regression database row");
+
+        assert_eq!(
+            catalog_row_value(table, &row, "oid").and_then(catalog_value_oid),
+            Some(oid)
+        );
+        assert_eq!(row.row_id, u64::from(oid.0));
     }
 
     #[test]
