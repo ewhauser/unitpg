@@ -58,6 +58,7 @@ const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 const PG_ENUM_RELATION_OID: Oid = Oid(3501);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
+const SYNTHETIC_CATALOG_ROWTYPE_OID_BASE: u32 = 0xF000_0000;
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
 pub const VIRTUAL_CATALOG_DYNAMIC: u8 = 2;
@@ -305,6 +306,7 @@ pub struct PhysicalColumnRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationRecord {
+    pub row_id: u64,
     pub oid: Oid,
     pub type_oid: Oid,
     pub namespace: Oid,
@@ -318,7 +320,9 @@ pub struct RelationRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RelationSummaryRecord {
+    pub row_id: u64,
     pub oid: Oid,
+    pub type_oid: Oid,
     pub namespace: Oid,
     pub owner: Oid,
     pub name: String,
@@ -1341,6 +1345,28 @@ pub fn static_catalog_by_name(name: &str) -> Option<&'static StaticCatalogTable>
     generated_catalog::STATIC_CATALOG_TABLES
         .iter()
         .find(|table| table.name == name.as_str())
+}
+
+fn synthetic_catalog_rowtype_oid(relation_oid: Oid) -> Oid {
+    Oid(SYNTHETIC_CATALOG_ROWTYPE_OID_BASE | relation_oid.0)
+}
+
+fn static_catalog_table_rowtype_oid(table: &StaticCatalogTable) -> Oid {
+    if table.rowtype_oid != INVALID_OID {
+        table.rowtype_oid
+    } else {
+        synthetic_catalog_rowtype_oid(table.oid)
+    }
+}
+
+pub fn static_catalog_rowtype_oid(relation_oid: Oid) -> Option<Oid> {
+    static_catalog_by_relation_oid(relation_oid).map(static_catalog_table_rowtype_oid)
+}
+
+fn static_catalog_by_rowtype_oid(rowtype_oid: Oid) -> Option<&'static StaticCatalogTable> {
+    generated_catalog::STATIC_CATALOG_TABLES
+        .iter()
+        .find(|table| static_catalog_table_rowtype_oid(table) == rowtype_oid)
 }
 
 fn static_value_as_u32(value: StaticCatalogValue) -> Option<u32> {
@@ -2883,6 +2909,7 @@ fn relation_record_from_meta(
     let (primary_key, primary_key_constraint_oid) =
         relation_primary_key_from_snapshot(snapshot, relation.oid, &columns);
     RelationRecord {
+        row_id: relation.row_id,
         oid: relation.oid,
         type_oid: relation.type_oid,
         namespace: relation.namespace,
@@ -2906,7 +2933,9 @@ fn relation_summary_from_meta(
         || has_primary_key
         || !snapshot.index_metas_for_relation(relation.oid).is_empty();
     RelationSummaryRecord {
+        row_id: relation.row_id,
         oid: relation.oid,
+        type_oid: relation.type_oid,
         namespace: relation.namespace,
         owner: relation.owner,
         name: relation.name.clone(),
@@ -2939,6 +2968,7 @@ fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord>
     let (primary_key, primary_key_constraint_oid) =
         relation_primary_key_from_pg_index(oid, &columns);
     Some(RelationRecord {
+        row_id: row.row_id,
         oid,
         type_oid,
         namespace,
@@ -2954,6 +2984,9 @@ fn relation_record_from_pg_class_row(row: &CatalogRow) -> Option<RelationRecord>
 fn relation_summary_from_pg_class_row(row: &CatalogRow) -> Option<RelationSummaryRecord> {
     let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
     let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
+    let type_oid = catalog_row_value(table, row, "reltype")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
     let namespace = catalog_row_value(table, row, "relnamespace")
         .and_then(catalog_value_oid)
         .unwrap_or(PUBLIC_NAMESPACE_OID);
@@ -2976,7 +3009,9 @@ fn relation_summary_from_pg_class_row(row: &CatalogRow) -> Option<RelationSummar
         || has_primary_key;
 
     Some(RelationSummaryRecord {
+        row_id: row.row_id,
         oid,
+        type_oid,
         namespace,
         owner,
         name: normalize_identifier(&name),
@@ -3320,6 +3355,38 @@ fn catalog_type_from_row(
     })
 }
 
+fn synthetic_catalog_rowtype_for_table(table: &StaticCatalogTable) -> Option<CatalogTypeRecord> {
+    let template: CatalogTypeRecord = lookup_builtin_type(Oid(83))?.into();
+    Some(CatalogTypeRecord {
+        oid: static_catalog_table_rowtype_oid(table),
+        name: table.name.to_owned(),
+        namespace: PG_CATALOG_NAMESPACE_OID,
+        owner: POSTGRES_ROLE_OID,
+        typlen: template.typlen,
+        typbyval: template.typbyval,
+        typalign: template.typalign,
+        typdelim: template.typdelim,
+        typinput: template.typinput,
+        typoutput: template.typoutput,
+        typreceive: template.typreceive,
+        typsend: template.typsend,
+        typmodin: template.typmodin,
+        typmodout: template.typmodout,
+        typisdefined: true,
+        typtype: b'c',
+        typcategory: b'C',
+        typispreferred: false,
+        typrelid: table.oid,
+        typelem: INVALID_OID,
+        typarray: INVALID_OID,
+        typbasetype: INVALID_OID,
+        typtypmod: -1,
+        typcollation: INVALID_OID,
+        typsubscript: INVALID_OID,
+        typstorage: b'x',
+    })
+}
+
 pub fn lookup_builtin_type(oid: Oid) -> Option<PgTypeRecord> {
     generated_catalog::STATIC_TYPES
         .iter()
@@ -3358,6 +3425,11 @@ pub fn lookup_type(oid: Oid) -> Option<CatalogTypeRecord> {
     }) {
         return Some(pg_type);
     }
+    if let Some(pg_type) =
+        static_catalog_by_rowtype_oid(oid).and_then(synthetic_catalog_rowtype_for_table)
+    {
+        return Some(pg_type);
+    }
 
     let table = static_catalog_by_relation_oid(PG_TYPE_RELATION_OID)?;
     catalog_rows(PG_TYPE_RELATION_OID)
@@ -3383,6 +3455,12 @@ pub fn type_by_name(name: &str, namespace: Oid) -> Option<CatalogTypeRecord> {
         .find_map(|row| {
             let record = catalog_type_from_row(table, &row)?;
             (record.namespace == namespace && record.name == canonical_name).then_some(record)
+        })
+        .or_else(|| {
+            (namespace == PG_CATALOG_NAMESPACE_OID)
+                .then(|| static_catalog_by_name(&canonical_name))
+                .flatten()
+                .and_then(synthetic_catalog_rowtype_for_table)
         })
 }
 
@@ -3637,6 +3715,27 @@ mod tests {
         );
         assert!(btree_opclass_for_type(INT4_OID).is_some());
         assert!(builtin_cast_by_source_target(INT4_OID, OID_OID).is_some());
+    }
+
+    #[test]
+    fn static_virtual_catalog_rowtypes_are_lookupable() {
+        let pg_operator = static_catalog_by_name("pg_operator").expect("pg_operator");
+        assert_eq!(pg_operator.rowtype_oid, INVALID_OID);
+
+        let rowtype_oid = static_catalog_rowtype_oid(pg_operator.oid).expect("rowtype oid");
+        assert_ne!(rowtype_oid, INVALID_OID);
+
+        let rowtype = lookup_type(rowtype_oid).expect("synthetic catalog rowtype");
+        assert_eq!(rowtype.oid, rowtype_oid);
+        assert_eq!(rowtype.name, "pg_operator");
+        assert_eq!(rowtype.namespace, PG_CATALOG_NAMESPACE_OID);
+        assert_eq!(rowtype.typtype, b'c');
+        assert_eq!(rowtype.typcategory, b'C');
+        assert_eq!(rowtype.typrelid, pg_operator.oid);
+
+        let by_name =
+            type_by_name("pg_operator", PG_CATALOG_NAMESPACE_OID).expect("rowtype by name");
+        assert_eq!(by_name, rowtype);
     }
 
     #[test]

@@ -449,7 +449,8 @@ FastPgBuildPgClassTuple(Oid targetRelId)
 	values[Anum_pg_class_relname - 1] = NameGetDatum(&relname);
 	values[Anum_pg_class_relnamespace - 1] =
 		ObjectIdGetDatum((Oid) fastpg_relation.namespace_oid);
-	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_reltype - 1] =
+		ObjectIdGetDatum((Oid) fastpg_relation.type_oid);
 	values[Anum_pg_class_reloftype - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_class_relowner - 1] =
 		ObjectIdGetDatum((Oid) fastpg_relation.owner_oid);
