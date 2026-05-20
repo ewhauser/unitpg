@@ -140,21 +140,11 @@ impl TransactionOverlay {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct SessionStorage {
     pub(crate) transaction_stack: Vec<TransactionOverlay>,
     pub(crate) explicit_transaction: bool,
     pub(crate) scans: Vec<Option<ScanState>>,
-}
-
-impl Default for SessionStorage {
-    fn default() -> Self {
-        Self {
-            transaction_stack: Vec::new(),
-            explicit_transaction: false,
-            scans: Vec::new(),
-        }
-    }
 }
 
 impl SessionStorage {

@@ -1896,12 +1896,8 @@ fn catalog_rows_matching_pg_attribute_filters(
         let row_matches = |row: &CatalogRow| catalog_row_matches_filters(table, row, filters);
         let static_matches =
             |static_row: &StaticCatalogRow| static_row_matches_filters(table, static_row, filters);
-        let attnum_matches = |attnum: i16| attnum_filter.map_or(true, |wanted| wanted == attnum);
-        let name_matches = |name: &str| {
-            attname_filter
-                .as_ref()
-                .map_or(true, |wanted| wanted == name)
-        };
+        let attnum_matches = |attnum: i16| attnum_filter.is_none_or(|wanted| wanted == attnum);
+        let name_matches = |name: &str| attname_filter.as_ref().is_none_or(|wanted| wanted == name);
         let mut rows = BTreeMap::<u64, CatalogRow>::new();
 
         for static_row in table.rows.iter().filter(|row| static_matches(row)) {
@@ -1975,12 +1971,11 @@ pub fn catalog_rows_matching_filters(
     if filters.is_empty() {
         return catalog_rows(relation_oid);
     }
-    if relation_oid == PG_ATTRIBUTE_RELATION_OID {
-        if let Some(rows) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)
+    if relation_oid == PG_ATTRIBUTE_RELATION_OID
+        && let Some(rows) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)
             .and_then(|table| catalog_rows_matching_pg_attribute_filters(table, filters))
-        {
-            return rows;
-        }
+    {
+        return rows;
     }
     catalog_rows_matching_static(
         relation_oid,

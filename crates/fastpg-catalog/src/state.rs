@@ -907,7 +907,7 @@ pub(crate) fn with_visible_catalog_snapshot<R>(f: impl FnOnce(&CatalogSnapshot) 
     if let Some(snapshot) = visible_snapshot {
         f(&snapshot)
     } else {
-        return with_catalog_read(|state| f(&state.snapshot));
+        with_catalog_read(|state| f(&state.snapshot))
     }
 }
 
