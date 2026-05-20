@@ -243,6 +243,7 @@ pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -
         if let Some(key) = old_primary_key {
             overlay.delete_primary_key(relid, key);
         }
+        session.mark_scans_visibility_delta(relid);
         true
     })
 }
@@ -267,15 +268,16 @@ pub extern "C" fn fastpg_storage2_scan_begin(relid: u32) -> u64 {
             })
             .unwrap_or_default();
         let handle = session.allocate_scan_handle();
-        session.scans.insert(
-            handle,
-            ScanState {
-                relid,
-                high_water_offsets,
-                forward_cursor: ScanCursor::forward_start(),
-                backward_cursor: ScanCursor::backward_start(),
-            },
-        );
+        let scan = ScanState {
+            relid,
+            high_water_offsets,
+            forward_cursor: ScanCursor::forward_start(),
+            backward_cursor: ScanCursor::backward_start(),
+            has_visibility_deltas: session.transaction_has_visibility_deltas(relid),
+        };
+        if !session.insert_scan(handle, scan) {
+            return 0;
+        }
         handle
     })
 }
@@ -283,9 +285,15 @@ pub extern "C" fn fastpg_storage2_scan_begin(relid: u32) -> u64 {
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_scan_reset(scan_handle: u64) {
     with_storage(|_state, session| {
-        if let Some(scan) = session.scans.get_mut(&scan_handle) {
+        let has_visibility_deltas = session
+            .scan_slot(scan_handle)
+            .map(|scan| session.transaction_has_visibility_deltas(scan.relid));
+        if let Some(scan) = session.scan_slot_mut(scan_handle) {
             scan.forward_cursor = ScanCursor::forward_start();
             scan.backward_cursor = ScanCursor::backward_start();
+            if let Some(has_visibility_deltas) = has_visibility_deltas {
+                scan.has_visibility_deltas = has_visibility_deltas;
+            }
         }
     });
 }
@@ -293,7 +301,7 @@ pub extern "C" fn fastpg_storage2_scan_reset(scan_handle: u64) {
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_scan_end(scan_handle: u64) {
     with_storage(|_state, session| {
-        session.scans.remove(&scan_handle);
+        session.remove_scan(scan_handle);
     });
 }
 
@@ -310,8 +318,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next(
     tid_out: *mut u64,
 ) -> bool {
     with_storage(|state, session| {
-        let overlays = &session.transaction_stack;
-        let Some(scan) = session.scans.get_mut(&scan_handle) else {
+        let Some(scan) = session.scan_slot(scan_handle) else {
             return false;
         };
         let is_forward = forward != 0;
@@ -321,19 +328,26 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next(
             scan.backward_cursor
         };
         let relid = scan.relid;
-        let Some((tid, tuple)) = state.next_visible_tuple_slice_in_overlays(
-            overlays,
-            relid,
-            cursor,
-            &scan.high_water_offsets,
-            is_forward,
-        ) else {
+        let tuple = if scan.has_visibility_deltas {
+            state.next_visible_tuple_slice_in_overlays(
+                &session.transaction_stack,
+                relid,
+                cursor,
+                &scan.high_water_offsets,
+                is_forward,
+            )
+        } else {
+            state.next_committed_tuple_slice(relid, cursor, &scan.high_water_offsets, is_forward)
+        };
+        let Some((tid, tuple)) = tuple else {
             return false;
         };
-        if is_forward {
-            scan.forward_cursor = ScanCursor::after(tid);
-        } else {
-            scan.backward_cursor = ScanCursor::before(tid);
+        if let Some(scan) = session.scan_slot_mut(scan_handle) {
+            if is_forward {
+                scan.forward_cursor = ScanCursor::after(tid);
+            } else {
+                scan.backward_cursor = ScanCursor::before(tid);
+            }
         }
         copy_tuple_to_outputs(tid, tuple, values_out, is_null_out, natts, tid_out)
     })
@@ -369,7 +383,6 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
         )
     })
 }
-
 #[unsafe(no_mangle)]
 /// # Safety
 ///

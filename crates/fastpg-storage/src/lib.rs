@@ -973,10 +973,17 @@ struct CachedCatalogScan {
     region: Arc<StorageRegion>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CatalogScanFilterCacheKey {
+    relation_oid: u32,
+    filters: Vec<CatalogRowFilter>,
+}
+
 #[derive(Debug)]
 struct CatalogScanCache {
     generation: u64,
     entries: HashMap<u32, Arc<CachedCatalogScan>>,
+    filtered_entries: HashMap<CatalogScanFilterCacheKey, Arc<CachedCatalogScan>>,
 }
 
 impl Default for CatalogScanCache {
@@ -984,6 +991,7 @@ impl Default for CatalogScanCache {
         Self {
             generation: current_generation(),
             entries: HashMap::new(),
+            filtered_entries: HashMap::new(),
         }
     }
 }
@@ -1002,6 +1010,7 @@ fn with_catalog_scan_cache<R>(f: impl FnOnce(&mut CatalogScanCache) -> R) -> R {
     if cache.generation != generation {
         cache.generation = generation;
         cache.entries.clear();
+        cache.filtered_entries.clear();
     }
     f(&mut cache)
 }
@@ -1011,6 +1020,7 @@ fn clear_catalog_scan_cache() {
         let mut cache = cache.lock().expect("catalog scan cache mutex poisoned");
         cache.generation = current_generation();
         cache.entries.clear();
+        cache.filtered_entries.clear();
     }
 }
 
@@ -5181,6 +5191,35 @@ fn catalog_scan_state_filtered(
     if filters.is_empty() {
         return catalog_scan_state(relation_oid);
     }
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_filtered_uncached(relation_oid, filters);
+    }
+    let cache_key = CatalogScanFilterCacheKey {
+        relation_oid: relation_oid.0,
+        filters: filters.to_vec(),
+    };
+    if let Some(cached) =
+        with_catalog_scan_cache(|cache| cache.filtered_entries.get(&cache_key).map(Arc::clone))
+    {
+        return Some(scan_state_from_cached_catalog_scan(cached));
+    }
+    let scan = catalog_scan_state_filtered_uncached(relation_oid, filters)?;
+    let cached = Arc::new(CachedCatalogScan {
+        rows: scan.rows,
+        region: Arc::new(scan.region),
+    });
+    with_catalog_scan_cache(|cache| {
+        cache
+            .filtered_entries
+            .insert(cache_key, Arc::clone(&cached));
+    });
+    Some(scan_state_from_cached_catalog_scan(cached))
+}
+
+fn catalog_scan_state_filtered_uncached(
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Option<ScanState> {
     catalog_scan_state_from_rows(
         relation_oid,
         catalog_rows_matching_filters(relation_oid, filters),

@@ -59,6 +59,16 @@ impl TransactionOverlay {
             .insert(key, tid);
     }
 
+    pub(crate) fn has_visibility_deltas(&self, relid: u32) -> bool {
+        self.inserted_tids
+            .get(&relid)
+            .is_some_and(|tids| !tids.is_empty())
+            || self
+                .invalidated_tids
+                .get(&relid)
+                .is_some_and(|tids| !tids.is_empty())
+    }
+
     pub(crate) fn append_from(&mut self, other: &mut Self) {
         for (relid, checkpoint) in other.relation_checkpoints.drain() {
             self.relation_checkpoints.entry(relid).or_insert(checkpoint);
@@ -134,8 +144,7 @@ impl TransactionOverlay {
 pub struct SessionStorage {
     pub(crate) transaction_stack: Vec<TransactionOverlay>,
     pub(crate) explicit_transaction: bool,
-    pub(crate) scans: HashMap<u64, ScanState>,
-    pub(crate) next_scan_handle: u64,
+    pub(crate) scans: Vec<Option<ScanState>>,
 }
 
 impl Default for SessionStorage {
@@ -143,8 +152,7 @@ impl Default for SessionStorage {
         Self {
             transaction_stack: Vec::new(),
             explicit_transaction: false,
-            scans: HashMap::new(),
-            next_scan_handle: 1,
+            scans: Vec::new(),
         }
     }
 }
@@ -157,12 +165,53 @@ impl SessionStorage {
     }
 
     pub(crate) fn allocate_scan_handle(&mut self) -> u64 {
-        let handle = self.next_scan_handle;
-        self.next_scan_handle = self.next_scan_handle.checked_add(1).unwrap_or(1);
-        if self.next_scan_handle == 0 {
-            self.next_scan_handle = 1;
+        if let Some(index) = self.scans.iter().position(Option::is_none) {
+            return u64::try_from(index + 1).unwrap_or(u64::MAX);
         }
-        handle
+        self.scans.push(None);
+        self.scans.len().try_into().unwrap_or(u64::MAX)
+    }
+
+    pub(crate) fn scan_slot(&self, handle: u64) -> Option<&ScanState> {
+        let index = usize::try_from(handle.checked_sub(1)?).ok()?;
+        self.scans.get(index)?.as_ref()
+    }
+
+    pub(crate) fn scan_slot_mut(&mut self, handle: u64) -> Option<&mut ScanState> {
+        let index = usize::try_from(handle.checked_sub(1)?).ok()?;
+        self.scans.get_mut(index)?.as_mut()
+    }
+
+    pub(crate) fn insert_scan(&mut self, handle: u64, scan: ScanState) -> bool {
+        let Some(index) = handle
+            .checked_sub(1)
+            .and_then(|handle| usize::try_from(handle).ok())
+        else {
+            return false;
+        };
+        let Some(slot) = self.scans.get_mut(index) else {
+            return false;
+        };
+        *slot = Some(scan);
+        true
+    }
+
+    pub(crate) fn remove_scan(&mut self, handle: u64) {
+        if let Some(index) = handle
+            .checked_sub(1)
+            .and_then(|handle| usize::try_from(handle).ok())
+            && let Some(slot) = self.scans.get_mut(index)
+        {
+            *slot = None;
+        }
+    }
+
+    pub(crate) fn mark_scans_visibility_delta(&mut self, relid: u32) {
+        for scan in self.scans.iter_mut().filter_map(Option::as_mut) {
+            if scan.relid == relid {
+                scan.has_visibility_deltas = true;
+            }
+        }
     }
 
     pub(crate) fn transaction_bytes(&self) -> usize {
@@ -195,7 +244,8 @@ impl SessionStorage {
 
     pub(crate) fn scan_bytes(&self) -> usize {
         self.scans
-            .values()
+            .iter()
+            .filter_map(Option::as_ref)
             .map(|scan| {
                 std::mem::size_of::<ScanState>()
                     + scan
@@ -208,6 +258,12 @@ impl SessionStorage {
 
     pub(crate) fn owns_inserted_tid(&self, relid: u32, tid: Tid) -> bool {
         overlays_own_inserted_tid(&self.transaction_stack, relid, tid)
+    }
+
+    pub(crate) fn transaction_has_visibility_deltas(&self, relid: u32) -> bool {
+        self.transaction_stack
+            .iter()
+            .any(|overlay| overlay.has_visibility_deltas(relid))
     }
 
     pub(crate) fn transaction_visible_insert_count(&self, relid: u32) -> usize {

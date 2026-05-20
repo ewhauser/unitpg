@@ -55,4 +55,5 @@ pub(crate) struct ScanState {
     pub(crate) high_water_offsets: Vec<u16>,
     pub(crate) forward_cursor: ScanCursor,
     pub(crate) backward_cursor: ScanCursor,
+    pub(crate) has_visibility_deltas: bool,
 }

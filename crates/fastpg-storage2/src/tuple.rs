@@ -313,15 +313,10 @@ pub(crate) fn copy_tuple_to_outputs(
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
         return false;
     }
-    let Some(null_bitmap_len) = read_u16(tuple, 6).map(usize::from) else {
-        return false;
-    };
-    let Some(attr_dir_offset) = read_u32(tuple, 8).map(|value| value as usize) else {
-        return false;
-    };
-    let Some(payload_offset) = read_u32(tuple, 12).map(|value| value as usize) else {
-        return false;
-    };
+    let base = tuple.as_ptr();
+    let null_bitmap_len = unsafe { std::ptr::read_unaligned(base.add(6) as *const u16) } as usize;
+    let attr_dir_offset = unsafe { std::ptr::read_unaligned(base.add(8) as *const u32) } as usize;
+    let payload_offset = unsafe { std::ptr::read_unaligned(base.add(12) as *const u32) } as usize;
     if attr_dir_offset != TUPLE_HEADER_LEN + null_bitmap_len {
         return false;
     }
@@ -332,55 +327,45 @@ pub(crate) fn copy_tuple_to_outputs(
         return false;
     }
 
-    let values_out = if natts == 0 {
-        &mut []
-    } else {
-        unsafe { slice::from_raw_parts_mut(values_out, natts) }
-    };
-    let is_null_out = if natts == 0 {
-        &mut []
-    } else {
-        unsafe { slice::from_raw_parts_mut(is_null_out, natts) }
-    };
     for index in 0..natts {
-        let null = tuple
-            .get(TUPLE_HEADER_LEN + index / 8)
-            .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
+        let null_byte = unsafe { *base.add(TUPLE_HEADER_LEN + index / 8) };
+        let null = null_byte & (1 << (index % 8)) != 0;
         let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
-        let Some(tag) = tuple.get(entry).copied() else {
-            return false;
-        };
+        let entry_ptr = unsafe { base.add(entry) };
+        let tag = unsafe { *entry_ptr };
         if null || tag == 0 {
-            values_out[index] = 0;
-            is_null_out[index] = 1;
+            unsafe {
+                values_out.add(index).write(0);
+                is_null_out.add(index).write(1);
+            }
             continue;
         }
         match tag {
             1 => {
-                let Some(value) = read_u64(tuple, entry + 8) else {
-                    return false;
-                };
-                values_out[index] = value as usize;
-                is_null_out[index] = 0;
+                let value = unsafe { std::ptr::read_unaligned(entry_ptr.add(8) as *const u64) };
+                unsafe {
+                    values_out.add(index).write(value as usize);
+                    is_null_out.add(index).write(0);
+                }
             }
             2 => {
-                let Some(offset) = read_u64(tuple, entry + 8).map(|value| value as usize) else {
-                    return false;
-                };
-                let Some(len) = read_u64(tuple, entry + 16).map(|value| value as usize) else {
-                    return false;
-                };
+                let offset =
+                    unsafe { std::ptr::read_unaligned(entry_ptr.add(8) as *const u64) } as usize;
+                let len =
+                    unsafe { std::ptr::read_unaligned(entry_ptr.add(16) as *const u64) } as usize;
                 let Some(start) = payload_offset.checked_add(offset) else {
                     return false;
                 };
                 let Some(end) = start.checked_add(len) else {
                     return false;
                 };
-                let Some(bytes) = tuple.get(start..end) else {
+                if end > tuple.len() {
                     return false;
-                };
-                values_out[index] = bytes.as_ptr() as usize;
-                is_null_out[index] = 0;
+                }
+                unsafe {
+                    values_out.add(index).write(base.add(start) as usize);
+                    is_null_out.add(index).write(0);
+                }
             }
             _ => return false,
         }

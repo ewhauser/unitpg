@@ -12,7 +12,7 @@ use crate::state::{
     with_visible_catalog_snapshot,
 };
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub enum CatalogFilterValue {
     Bool(bool),
     Char(u8),
@@ -22,7 +22,7 @@ pub enum CatalogFilterValue {
     Name(String),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CatalogRowFilter {
     pub attnum: i16,
     pub value: CatalogFilterValue,
@@ -1843,12 +1843,144 @@ fn catalog_row_matches_filters(
     })
 }
 
+fn filter_attnum_for_column(table: &StaticCatalogTable, column_name: &str) -> Option<i16> {
+    table
+        .columns
+        .iter()
+        .position(|column| column.name == column_name)
+        .and_then(|index| i16::try_from(index + 1).ok())
+}
+
+fn filter_oid(filters: &[CatalogRowFilter], attnum: i16) -> Option<Oid> {
+    filters
+        .iter()
+        .find(|filter| filter.attnum == attnum)
+        .and_then(|filter| match filter.value {
+            CatalogFilterValue::Oid(oid) => Some(oid),
+            _ => None,
+        })
+}
+
+fn filter_i16(filters: &[CatalogRowFilter], attnum: i16) -> Option<i16> {
+    filters
+        .iter()
+        .find(|filter| filter.attnum == attnum)
+        .and_then(|filter| match filter.value {
+            CatalogFilterValue::Int16(value) => Some(value),
+            _ => None,
+        })
+}
+
+fn filter_name(filters: &[CatalogRowFilter], attnum: i16) -> Option<String> {
+    filters
+        .iter()
+        .find(|filter| filter.attnum == attnum)
+        .and_then(|filter| match &filter.value {
+            CatalogFilterValue::Name(value) => Some(value.clone()),
+            _ => None,
+        })
+}
+
+fn catalog_rows_matching_pg_attribute_filters(
+    table: &StaticCatalogTable,
+    filters: &[CatalogRowFilter],
+) -> Option<Vec<CatalogRow>> {
+    let relid_attnum = filter_attnum_for_column(table, "attrelid")?;
+    let attnum_attnum = filter_attnum_for_column(table, "attnum")?;
+    let attname_attnum = filter_attnum_for_column(table, "attname")?;
+    let relation_oid = filter_oid(filters, relid_attnum)?;
+    let attnum_filter = filter_i16(filters, attnum_attnum);
+    let attname_filter = filter_name(filters, attname_attnum);
+
+    with_visible_catalog_snapshot(|snapshot| {
+        let row_matches = |row: &CatalogRow| catalog_row_matches_filters(table, row, filters);
+        let static_matches =
+            |static_row: &StaticCatalogRow| static_row_matches_filters(table, static_row, filters);
+        let attnum_matches = |attnum: i16| attnum_filter.map_or(true, |wanted| wanted == attnum);
+        let name_matches = |name: &str| {
+            attname_filter
+                .as_ref()
+                .map_or(true, |wanted| wanted == name)
+        };
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+
+        for static_row in table.rows.iter().filter(|row| static_matches(row)) {
+            if let Some(row) = static_catalog_cached_row(table, static_row) {
+                rows.insert(row.row_id, row.clone());
+            }
+        }
+
+        if let Some(column_row_ids) = snapshot.columns_by_relation.get(&relation_oid.0) {
+            for (attnum, row_id) in column_row_ids {
+                if !attnum_matches(*attnum) {
+                    continue;
+                }
+                if let Some(column) = snapshot.columns.get(row_id) {
+                    insert_matching_row(&mut rows, Some(column.row.clone()), &row_matches);
+                }
+            }
+        }
+
+        let mut existing_attributes: HashSet<(Oid, i16)> = rows
+            .values()
+            .filter_map(|row| catalog_row_attribute_key(table, row))
+            .collect();
+        if let Some(relation_table) = static_catalog_by_relation_oid(relation_oid) {
+            for (index, column) in relation_table.columns.iter().enumerate() {
+                let Some(attnum) = i16::try_from(index + 1).ok() else {
+                    continue;
+                };
+                if !attnum_matches(attnum) || !name_matches(column.name) {
+                    continue;
+                }
+                if existing_attributes.contains(&(relation_table.oid, attnum)) {
+                    continue;
+                }
+                if let Some(row) =
+                    synthetic_static_attribute_row(table, relation_table, column, attnum)
+                {
+                    existing_attributes.insert((relation_table.oid, attnum));
+                    insert_matching_row(&mut rows, Some(row), &row_matches);
+                }
+            }
+            for spec in SYSTEM_ATTRIBUTE_SPECS {
+                if !attnum_matches(spec.attnum) || !name_matches(spec.name) {
+                    continue;
+                }
+                if existing_attributes.contains(&(relation_table.oid, spec.attnum)) {
+                    continue;
+                }
+                if let Some(row) = synthetic_system_attribute_row(table, relation_table, *spec) {
+                    existing_attributes.insert((relation_table.oid, spec.attnum));
+                    insert_matching_row(&mut rows, Some(row), &row_matches);
+                }
+            }
+        }
+
+        snapshot
+            .compat_rows
+            .apply_to_rows(PG_ATTRIBUTE_RELATION_OID, &mut rows);
+        Some(
+            rows.into_values()
+                .filter(|row| catalog_row_matches_filters(table, row, filters))
+                .collect(),
+        )
+    })
+}
+
 pub fn catalog_rows_matching_filters(
     relation_oid: Oid,
     filters: &[CatalogRowFilter],
 ) -> Vec<CatalogRow> {
     if filters.is_empty() {
         return catalog_rows(relation_oid);
+    }
+    if relation_oid == PG_ATTRIBUTE_RELATION_OID {
+        if let Some(rows) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)
+            .and_then(|table| catalog_rows_matching_pg_attribute_filters(table, filters))
+        {
+            return rows;
+        }
     }
     catalog_rows_matching_static(
         relation_oid,

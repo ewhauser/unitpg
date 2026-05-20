@@ -172,6 +172,7 @@ impl StorageState {
         for key in primary_keys {
             overlay.delete_primary_key(relid, key);
         }
+        session.mark_scans_visibility_delta(relid);
     }
 
     pub(crate) fn append_pending_tuple(
@@ -331,6 +332,77 @@ impl StorageState {
                     let tid = Tid { block, offset };
                     if let Some(tuple) = self.visible_tuple_slice_in_overlays(overlays, relid, tid)
                     {
+                        return Some((tid, tuple));
+                    }
+                    offset -= 1;
+                }
+            }
+            if block == 0 {
+                return None;
+            }
+            block -= 1;
+        }
+    }
+
+    pub(crate) fn next_committed_tuple_slice<'a>(
+        &'a self,
+        relid: u32,
+        cursor: ScanCursor,
+        high_water_offsets: &[u16],
+        forward: bool,
+    ) -> Option<(Tid, &'a [u8])> {
+        let relation = self.relations.get(&relid)?;
+        if forward {
+            let mut block = cursor.block;
+            while usize::try_from(block).ok()? < high_water_offsets.len() {
+                let max_offset = high_water_offsets[block as usize];
+                if relation
+                    .pages
+                    .get(block as usize)
+                    .and_then(Option::as_ref)
+                    .is_none()
+                {
+                    block = block.checked_add(1)?;
+                    continue;
+                }
+                let mut offset = if block == cursor.block {
+                    cursor.offset
+                } else {
+                    1
+                };
+                while offset <= max_offset {
+                    let tid = Tid { block, offset };
+                    if let Some(tuple) = relation.tuple_slice(tid, false) {
+                        return Some((tid, tuple));
+                    }
+                    offset = offset.checked_add(1)?;
+                }
+                block = block.checked_add(1)?;
+            }
+            return None;
+        }
+
+        let mut block = if cursor.block == u32::MAX {
+            high_water_offsets.len().checked_sub(1)?.try_into().ok()?
+        } else {
+            cursor.block
+        };
+        loop {
+            let max_offset = high_water_offsets.get(block as usize).copied()?;
+            if relation
+                .pages
+                .get(block as usize)
+                .and_then(Option::as_ref)
+                .is_some()
+            {
+                let mut offset = if block == cursor.block && cursor.offset != u16::MAX {
+                    cursor.offset.min(max_offset)
+                } else {
+                    max_offset
+                };
+                while offset > 0 {
+                    let tid = Tid { block, offset };
+                    if let Some(tuple) = relation.tuple_slice(tid, false) {
                         return Some((tid, tuple));
                     }
                     offset -= 1;
@@ -583,6 +655,7 @@ pub(crate) fn relation_update_impl(
         {
             overlay.insert_primary_key(relid, key, new_tid);
         }
+        session.mark_scans_visibility_delta(relid);
         Ok(Some(new_tid))
     });
 
