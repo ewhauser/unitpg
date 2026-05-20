@@ -72,12 +72,14 @@ pub struct FastPgRustCatalogType {
     pub typsubscript: u32,
     pub typstorage: u8,
     pub _trailing_padding: [u8; 3],
+    pub row_id: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FastPgRustCatalogRelation {
     pub oid: u32,
+    pub type_oid: u32,
     pub namespace_oid: u32,
     pub owner_oid: u32,
     pub name: [c_char; NAMEDATALEN],
@@ -85,6 +87,7 @@ pub struct FastPgRustCatalogRelation {
     pub relkind: u8,
     pub has_primary_key: u8,
     pub has_indexes: u8,
+    pub row_id: u64,
 }
 
 #[repr(C)]
@@ -1962,6 +1965,7 @@ unsafe fn write_catalog_error(
 fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatalogRelation {
     FastPgRustCatalogRelation {
         oid: relation.oid.0,
+        type_oid: relation.type_oid.0,
         namespace_oid: relation.namespace.0,
         owner_oid: relation.owner.0,
         name: fixed_c_name(&relation.name),
@@ -1969,6 +1973,7 @@ fn relation_to_ffi(relation: &fastpg_catalog::RelationRecord) -> FastPgRustCatal
         relkind: relation.relkind,
         has_primary_key: u8::from(!relation.primary_key.is_empty()),
         has_indexes: u8::from(!index_records_for_relation_oid(relation.oid).is_empty()),
+        row_id: relation.row_id,
     }
 }
 
@@ -1977,6 +1982,7 @@ fn relation_summary_to_ffi(
 ) -> FastPgRustCatalogRelation {
     FastPgRustCatalogRelation {
         oid: relation.oid.0,
+        type_oid: relation.type_oid.0,
         namespace_oid: relation.namespace.0,
         owner_oid: relation.owner.0,
         name: fixed_c_name(&relation.name),
@@ -1984,6 +1990,7 @@ fn relation_summary_to_ffi(
         relkind: relation.relkind,
         has_primary_key: u8::from(relation.has_primary_key),
         has_indexes: u8::from(relation.has_indexes),
+        row_id: relation.row_id,
     }
 }
 
@@ -1993,6 +2000,7 @@ fn primary_key_index_to_ffi(
 ) -> FastPgRustCatalogRelation {
     FastPgRustCatalogRelation {
         oid: index_oid.0,
+        type_oid: 0,
         namespace_oid: relation.namespace.0,
         owner_oid: relation.owner.0,
         name: fixed_c_name(&primary_key_index_name(relation)),
@@ -2000,6 +2008,7 @@ fn primary_key_index_to_ffi(
         relkind: b'i',
         has_primary_key: 0,
         has_indexes: 0,
+        row_id: 0,
     }
 }
 
@@ -2014,6 +2023,8 @@ fn virtual_catalog_relation_to_ffi(
 ) -> FastPgRustCatalogRelation {
     FastPgRustCatalogRelation {
         oid: relation.relation_oid.0,
+        type_oid: fastpg_catalog::static_catalog_rowtype_oid(relation.relation_oid)
+            .map_or(0, |oid| oid.0),
         namespace_oid: PG_CATALOG_NAMESPACE_OID.0,
         owner_oid: 10,
         name: fixed_c_name(relation.name),
@@ -2021,6 +2032,7 @@ fn virtual_catalog_relation_to_ffi(
         relkind: b'r',
         has_primary_key: 0,
         has_indexes: 0,
+        row_id: 0,
     }
 }
 
@@ -2121,6 +2133,7 @@ fn type_to_ffi(record: &fastpg_catalog::CatalogTypeRecord) -> FastPgRustCatalogT
         typsubscript: record.typsubscript.0,
         typstorage: record.typstorage,
         _trailing_padding: [0; 3],
+        row_id: record.row_id,
     }
 }
 
@@ -3727,6 +3740,11 @@ pub extern "C" fn fastpg_rust_relation_clear(relid: u32) {
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_row_count(relid: u32) -> usize {
     with_storage(|state, session| state.visible_row_count(session, relid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_catalog_row_count(relid: u32) -> usize {
+    catalog_rows(Oid(relid)).len()
 }
 
 #[unsafe(no_mangle)]
@@ -6158,6 +6176,7 @@ mod tests {
         let mut second_row_id = 0;
         let mut index_relation = FastPgRustCatalogRelation {
             oid: 0,
+            type_oid: 0,
             namespace_oid: 0,
             owner_oid: 0,
             name: [0; NAMEDATALEN],
@@ -6165,6 +6184,7 @@ mod tests {
             relkind: 0,
             has_primary_key: 0,
             has_indexes: 0,
+            row_id: 0,
         };
         let mut index_info = FastPgRustPrimaryKeyIndexInfo {
             index_oid: 0,

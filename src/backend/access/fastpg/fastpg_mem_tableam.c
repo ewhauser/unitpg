@@ -51,6 +51,7 @@ typedef struct FastPgMemIndexFetch
 
 extern void fastpg_rust_relation_clear(uint32_t relid);
 extern size_t fastpg_rust_relation_row_count(uint32_t relid);
+extern size_t fastpg_rust_catalog_row_count(uint32_t relid);
 extern bool fastpg_rust_relation_insert(uint32_t relid,
 										const uintptr_t *values,
 										const uint8_t *isnull,
@@ -1563,10 +1564,15 @@ fastpg_mem_relation_estimate_size(Relation rel,
 								  double *tuples,
 								  double *allvisfrac)
 {
-	size_t		row_count =
-		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel)) ?
-		fastpg_storage2_relation_row_count(RelationGetRelid(rel)) :
-		fastpg_rust_relation_row_count(RelationGetRelid(rel));
+	size_t		row_count;
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+
+	if (fastpg_rust_catalog_policy_by_relation_oid(relid) != 0)
+		row_count = fastpg_rust_catalog_row_count(relid);
+	else
+		row_count = fastpg_mem_use_storage2_for_relid(relid) ?
+			fastpg_storage2_relation_row_count(relid) :
+			fastpg_rust_relation_row_count(relid);
 
 	*tuples = row_count;
 	*pages = row_count == 0 ? 0 :

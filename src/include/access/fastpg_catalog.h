@@ -61,11 +61,13 @@ typedef struct FastPgRustCatalogType
 	uint32_t	typsubscript;
 	uint8_t		typstorage;
 	uint8_t		_trailing_padding[3];
+	uint64_t	row_id;
 } FastPgRustCatalogType;
 
 typedef struct FastPgRustCatalogRelation
 {
 	uint32_t	oid;
+	uint32_t	type_oid;
 	uint32_t	namespace_oid;
 	uint32_t	owner_oid;
 	char		name[NAMEDATALEN];
@@ -73,6 +75,7 @@ typedef struct FastPgRustCatalogRelation
 	uint8_t		relkind;
 	uint8_t		has_primary_key;
 	uint8_t		has_indexes;
+	uint64_t	row_id;
 } FastPgRustCatalogRelation;
 
 typedef struct FastPgRustCatalogColumn

@@ -23,9 +23,11 @@
 #include "access/heaptoast.h"
 #include "access/htup_details.h"
 #include "access/relscan.h"
+#include "access/sysattr.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "catalog/heap.h"
 #include "catalog/pg_aggregate.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
@@ -779,13 +781,14 @@ FastPgBuildClassTuple(TupleDesc tupdesc,
 	Datum		values[Natts_pg_class] = {0};
 	bool		nulls[Natts_pg_class] = {false};
 	NameData	relname;
+	HeapTuple	tuple;
 
 	namestrcpy(&relname, relation->name);
 
 	values[Anum_pg_class_oid - 1] = ObjectIdGetDatum((Oid) relation->oid);
 	values[Anum_pg_class_relname - 1] = NameGetDatum(&relname);
 	values[Anum_pg_class_relnamespace - 1] = ObjectIdGetDatum((Oid) relation->namespace_oid);
-	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum(InvalidOid);
+	values[Anum_pg_class_reltype - 1] = ObjectIdGetDatum((Oid) relation->type_oid);
 	values[Anum_pg_class_reloftype - 1] = ObjectIdGetDatum(InvalidOid);
 	values[Anum_pg_class_relowner - 1] = ObjectIdGetDatum(BOOTSTRAP_SUPERUSERID);
 	values[Anum_pg_class_relam - 1] =
@@ -822,7 +825,14 @@ FastPgBuildClassTuple(TupleDesc tupdesc,
 	nulls[Anum_pg_class_reloptions - 1] = true;
 	nulls[Anum_pg_class_relpartbound - 1] = true;
 
-	return heap_form_tuple(tupdesc, values, nulls);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	tuple->t_tableOid = RelationRelationId;
+	if (relation->row_id != 0 &&
+		!FastPgCatalogRowIdToTid(relation->row_id, &tuple->t_self))
+		elog(ERROR,
+			 "fastpg catalog row id %llu cannot be represented as a CTID",
+			 (unsigned long long) relation->row_id);
+	return tuple;
 }
 
 static bool
@@ -966,11 +976,58 @@ FastPgBuildAttributeTuple(TupleDesc tupdesc,
 }
 
 static HeapTuple
+FastPgBuildSystemAttributeTuple(TupleDesc tupdesc,
+								Oid relation_oid,
+								const FormData_pg_attribute *attribute)
+{
+	Datum		values[Natts_pg_attribute] = {0};
+	bool		nulls[Natts_pg_attribute] = {false};
+	HeapTuple	tuple;
+
+	values[Anum_pg_attribute_attrelid - 1] = ObjectIdGetDatum(relation_oid);
+	values[Anum_pg_attribute_attname - 1] = NameGetDatum(&attribute->attname);
+	values[Anum_pg_attribute_atttypid - 1] = ObjectIdGetDatum(attribute->atttypid);
+	values[Anum_pg_attribute_attlen - 1] = Int16GetDatum(attribute->attlen);
+	values[Anum_pg_attribute_attnum - 1] = Int16GetDatum(attribute->attnum);
+	values[Anum_pg_attribute_atttypmod - 1] = Int32GetDatum(attribute->atttypmod);
+	values[Anum_pg_attribute_attndims - 1] = Int16GetDatum(attribute->attndims);
+	values[Anum_pg_attribute_attbyval - 1] = BoolGetDatum(attribute->attbyval);
+	values[Anum_pg_attribute_attalign - 1] = CharGetDatum(attribute->attalign);
+	values[Anum_pg_attribute_attstorage - 1] = CharGetDatum(attribute->attstorage);
+	values[Anum_pg_attribute_attcompression - 1] =
+		CharGetDatum(attribute->attcompression);
+	values[Anum_pg_attribute_attnotnull - 1] =
+		BoolGetDatum(attribute->attnotnull);
+	values[Anum_pg_attribute_atthasdef - 1] = BoolGetDatum(false);
+	values[Anum_pg_attribute_atthasmissing - 1] = BoolGetDatum(false);
+	values[Anum_pg_attribute_attidentity - 1] = CharGetDatum('\0');
+	values[Anum_pg_attribute_attgenerated - 1] = CharGetDatum('\0');
+	values[Anum_pg_attribute_attisdropped - 1] =
+		BoolGetDatum(attribute->attisdropped);
+	values[Anum_pg_attribute_attislocal - 1] =
+		BoolGetDatum(attribute->attislocal);
+	values[Anum_pg_attribute_attinhcount - 1] =
+		Int16GetDatum(attribute->attinhcount);
+	values[Anum_pg_attribute_attcollation - 1] =
+		ObjectIdGetDatum(attribute->attcollation);
+	values[Anum_pg_attribute_attstattarget - 1] = Int16GetDatum(-1);
+	nulls[Anum_pg_attribute_attacl - 1] = true;
+	nulls[Anum_pg_attribute_attoptions - 1] = true;
+	nulls[Anum_pg_attribute_attfdwoptions - 1] = true;
+	nulls[Anum_pg_attribute_attmissingval - 1] = true;
+
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	tuple->t_tableOid = AttributeRelationId;
+	return tuple;
+}
+
+static HeapTuple
 FastPgBuildTypeTuple(TupleDesc tupdesc, const FastPgRustCatalogType *type)
 {
 	Datum		values[Natts_pg_type] = {0};
 	bool		nulls[Natts_pg_type] = {false};
 	NameData	typname;
+	HeapTuple	tuple;
 
 	namestrcpy(&typname, type->name);
 
@@ -1007,7 +1064,14 @@ FastPgBuildTypeTuple(TupleDesc tupdesc, const FastPgRustCatalogType *type)
 	nulls[Anum_pg_type_typdefault - 1] = true;
 	nulls[Anum_pg_type_typacl - 1] = true;
 
-	return heap_form_tuple(tupdesc, values, nulls);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	tuple->t_tableOid = TypeRelationId;
+	if (type->row_id != 0 &&
+		!FastPgCatalogRowIdToTid(type->row_id, &tuple->t_self))
+		elog(ERROR,
+			 "fastpg catalog row id %llu cannot be represented as a CTID",
+			 (unsigned long long) type->row_id);
+	return tuple;
 }
 
 static HeapTuple
@@ -1241,9 +1305,6 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 static HeapTuple
 FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 {
-	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
-		return FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
-
 	if (cache->cc_reloid == RelationRelationId)
 	{
 		FastPgRustCatalogRelation relation;
@@ -1264,12 +1325,75 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 			Oid			namespace_oid = DatumGetObjectId(arguments[1]);
 
 			if (fastpg_rust_catalog_relation_by_name(relation_name,
-													 (uint32_t) namespace_oid,
-													 &relation))
+												 (uint32_t) namespace_oid,
+												 &relation))
 				return FastPgBuildClassTuple(cache->cc_tupdesc, &relation);
 		}
 	}
+	else if (cache->cc_reloid == TypeRelationId)
+	{
+		FastPgRustCatalogType type;
+
+		if (nkeys == 1 && cache->cc_keyno[0] == Anum_pg_type_oid)
+		{
+			Oid			type_oid = DatumGetObjectId(arguments[0]);
+
+			if (fastpg_rust_catalog_type_by_oid((uint32_t) type_oid, &type))
+				return FastPgBuildTypeTuple(cache->cc_tupdesc, &type);
+		}
+		else if (nkeys == 2 &&
+				 cache->cc_keyno[0] == Anum_pg_type_typname &&
+				 cache->cc_keyno[1] == Anum_pg_type_typnamespace)
+		{
+			const char *typname = DatumGetCString(arguments[0]);
+			Oid			namespace_oid = DatumGetObjectId(arguments[1]);
+
+			if (fastpg_rust_catalog_type_by_name(typname,
+												 (uint32_t) namespace_oid,
+												 &type))
+				return FastPgBuildTypeTuple(cache->cc_tupdesc, &type);
+		}
+	}
 	else if (cache->cc_reloid == AttributeRelationId)
+	{
+		FastPgRustCatalogRelation relation;
+
+		if (nkeys == 2 &&
+			cache->cc_keyno[0] == Anum_pg_attribute_attrelid &&
+			cache->cc_keyno[1] == Anum_pg_attribute_attnum)
+		{
+			Oid			relation_oid = DatumGetObjectId(arguments[0]);
+			AttrNumber	attnum = DatumGetInt16(arguments[1]);
+
+			if (attnum < 0 && attnum >= TableOidAttributeNumber &&
+				fastpg_rust_catalog_relation_by_oid((uint32_t) relation_oid,
+													&relation))
+				return FastPgBuildSystemAttributeTuple(cache->cc_tupdesc,
+													   relation_oid,
+													   SystemAttributeDefinition(attnum));
+		}
+		else if (nkeys == 2 &&
+				 cache->cc_keyno[0] == Anum_pg_attribute_attrelid &&
+				 cache->cc_keyno[1] == Anum_pg_attribute_attname)
+		{
+			Oid			relation_oid = DatumGetObjectId(arguments[0]);
+			const char *attribute_name = DatumGetCString(arguments[1]);
+			const FormData_pg_attribute *attribute =
+				SystemAttributeByName(attribute_name);
+
+			if (attribute != NULL &&
+				fastpg_rust_catalog_relation_by_oid((uint32_t) relation_oid,
+													&relation))
+				return FastPgBuildSystemAttributeTuple(cache->cc_tupdesc,
+													   relation_oid,
+													   attribute);
+		}
+	}
+
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
+		return FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
+
+	if (cache->cc_reloid == AttributeRelationId)
 	{
 		FastPgRustCatalogColumn column;
 		Oid			relation_oid;
@@ -1438,30 +1562,6 @@ FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 														  (uint32_t) target_type,
 														  &cast))
 				return FastPgBuildCastTuple(cache->cc_tupdesc, &cast);
-		}
-	}
-	else if (cache->cc_reloid == TypeRelationId)
-	{
-		FastPgRustCatalogType type;
-
-		if (nkeys == 1 && cache->cc_keyno[0] == Anum_pg_type_oid)
-		{
-			Oid			type_oid = DatumGetObjectId(arguments[0]);
-
-			if (fastpg_rust_catalog_type_by_oid((uint32_t) type_oid, &type))
-				return FastPgBuildTypeTuple(cache->cc_tupdesc, &type);
-		}
-		else if (nkeys == 2 &&
-				 cache->cc_keyno[0] == Anum_pg_type_typname &&
-				 cache->cc_keyno[1] == Anum_pg_type_typnamespace)
-		{
-			const char *typname = DatumGetCString(arguments[0]);
-			Oid			namespace_oid = DatumGetObjectId(arguments[1]);
-
-			if (fastpg_rust_catalog_type_by_name(typname,
-												 (uint32_t) namespace_oid,
-												 &type))
-				return FastPgBuildTypeTuple(cache->cc_tupdesc, &type);
 		}
 	}
 

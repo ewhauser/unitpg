@@ -45,13 +45,32 @@ if get_option('fastpg')
   fastpg_sh = find_program('sh', required: true)
   fastpg_storage_inputs = files(
     '../../Cargo.toml',
+    '../../crates/fastpg-catalog/Cargo.toml',
+    '../../crates/fastpg-catalog/src/lib.rs',
     '../../crates/fastpg-storage/Cargo.toml',
     '../../crates/fastpg-storage/src/lib.rs',
+    '../../crates/fastpg-types/Cargo.toml',
+    '../../crates/fastpg-types/src/lib.rs',
   )
   fastpg_storage2_inputs = files(
     '../../Cargo.toml',
+    '../../crates/fastpg-catalog/Cargo.toml',
+    '../../crates/fastpg-catalog/src/lib.rs',
     '../../crates/fastpg-storage2/Cargo.toml',
+    '../../crates/fastpg-storage2/src/copy.rs',
+    '../../crates/fastpg-storage2/src/error.rs',
+    '../../crates/fastpg-storage2/src/index.rs',
     '../../crates/fastpg-storage2/src/lib.rs',
+    '../../crates/fastpg-storage2/src/metrics.rs',
+    '../../crates/fastpg-storage2/src/page.rs',
+    '../../crates/fastpg-storage2/src/relation.rs',
+    '../../crates/fastpg-storage2/src/scan.rs',
+    '../../crates/fastpg-storage2/src/state.rs',
+    '../../crates/fastpg-storage2/src/tid.rs',
+    '../../crates/fastpg-storage2/src/transaction.rs',
+    '../../crates/fastpg-storage2/src/tuple.rs',
+    '../../crates/fastpg-types/Cargo.toml',
+    '../../crates/fastpg-types/src/lib.rs',
   )
   fastpg_storage_target_dir = meson.current_build_dir() / 'fastpg-cargo-target'
   fastpg_storage_static = custom_target('backend_fastpg_storage_static',
