@@ -2337,6 +2337,11 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 	int			partition;
 	bool		have_fast_path_lwlock = false;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
 	lockMethodTable = LockMethods[lockmethodid];
@@ -2605,6 +2610,11 @@ LockReleaseSession(LOCKMETHODID lockmethodid)
 	HASH_SEQ_STATUS status;
 	LOCALLOCK  *locallock;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
 		elog(ERROR, "unrecognized lock method: %d", lockmethodid);
 
@@ -2632,6 +2642,11 @@ LockReleaseSession(LOCKMETHODID lockmethodid)
 void
 LockReleaseCurrentOwner(LOCALLOCK **locallocks, int nlocks)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	if (locallocks == NULL)
 	{
 		HASH_SEQ_STATUS status;
@@ -2727,6 +2742,11 @@ ReleaseLockIfHeld(LOCALLOCK *locallock, bool sessionLock)
 void
 LockReassignCurrentOwner(LOCALLOCK **locallocks, int nlocks)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	ResourceOwner parent = ResourceOwnerGetParent(CurrentResourceOwner);
 
 	Assert(parent != NULL);
