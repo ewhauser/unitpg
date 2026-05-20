@@ -207,12 +207,7 @@ impl SessionStorage {
     }
 
     pub(crate) fn owns_inserted_tid(&self, relid: u32, tid: Tid) -> bool {
-        self.transaction_stack.iter().rev().any(|overlay| {
-            overlay
-                .inserted_tids
-                .get(&relid)
-                .is_some_and(|tids| tids.contains(&tid))
-        })
+        overlays_own_inserted_tid(&self.transaction_stack, relid, tid)
     }
 
     pub(crate) fn transaction_visible_insert_count(&self, relid: u32) -> usize {
@@ -241,6 +236,32 @@ impl SessionStorage {
             .filter(|tid| !self.owns_inserted_tid(relid, *tid))
             .count()
     }
+}
+
+pub(crate) fn overlays_own_inserted_tid(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> bool {
+    overlays.iter().rev().any(|overlay| {
+        overlay
+            .inserted_tids
+            .get(&relid)
+            .is_some_and(|tids| tids.contains(&tid))
+    })
+}
+
+pub(crate) fn overlays_invalidate_tid(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> bool {
+    overlays.iter().rev().any(|overlay| {
+        overlay
+            .invalidated_tids
+            .get(&relid)
+            .is_some_and(|tids| tids.contains(&tid))
+    })
 }
 
 pub type SessionStorageHandle = Arc<Mutex<SessionStorage>>;

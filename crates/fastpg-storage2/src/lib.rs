@@ -310,35 +310,32 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next(
     tid_out: *mut u64,
 ) -> bool {
     with_storage(|state, session| {
-        let Some(mut scan) = session.scans.remove(&scan_handle) else {
+        let overlays = &session.transaction_stack;
+        let Some(scan) = session.scans.get_mut(&scan_handle) else {
             return false;
         };
-        let cursor = if forward != 0 {
+        let is_forward = forward != 0;
+        let cursor = if is_forward {
             scan.forward_cursor
         } else {
             scan.backward_cursor
         };
         let relid = scan.relid;
-        let Some(tid) = state.next_visible_tid(
-            session,
+        let Some((tid, tuple)) = state.next_visible_tuple_slice_in_overlays(
+            overlays,
             relid,
             cursor,
             &scan.high_water_offsets,
-            forward != 0,
+            is_forward,
         ) else {
-            session.scans.insert(scan_handle, scan);
             return false;
         };
-        if forward != 0 {
+        if is_forward {
             scan.forward_cursor = ScanCursor::after(tid);
         } else {
             scan.backward_cursor = ScanCursor::before(tid);
         }
-        session.scans.insert(scan_handle, scan);
-        let Some(tuple) = state.find_visible_tuple(session, relid, tid) else {
-            return false;
-        };
-        copy_decoded_to_outputs(&tuple, values_out, is_null_out, natts, tid_out)
+        copy_tuple_to_outputs(tid, tuple, values_out, is_null_out, natts, tid_out)
     })
 }
 
@@ -357,10 +354,19 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
         return false;
     };
     with_storage(|state, session| {
-        let Some(tuple) = state.find_visible_tuple(session, relid, tid) else {
+        let Some(tuple) =
+            state.visible_tuple_slice_in_overlays(&session.transaction_stack, relid, tid)
+        else {
             return false;
         };
-        copy_decoded_to_outputs(&tuple, values_out, is_null_out, natts, std::ptr::null_mut())
+        copy_tuple_to_outputs(
+            tid,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            std::ptr::null_mut(),
+        )
     })
 }
 

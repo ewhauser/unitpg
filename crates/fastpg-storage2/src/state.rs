@@ -213,21 +213,33 @@ impl StorageState {
         relid: u32,
         tid: Tid,
     ) -> Option<DecodedTuple<'a>> {
-        for overlay in session.transaction_stack.iter().rev() {
-            if overlay
-                .invalidated_tids
-                .get(&relid)
-                .is_some_and(|tids| tids.contains(&tid))
-            {
-                return None;
-            }
-        }
+        self.find_visible_tuple_in_overlays(&session.transaction_stack, relid, tid)
+    }
 
-        let tuple = self
-            .relations
+    pub(crate) fn find_visible_tuple_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        tid: Tid,
+    ) -> Option<DecodedTuple<'a>> {
+        decode_tuple(
+            tid,
+            self.visible_tuple_slice_in_overlays(overlays, relid, tid)?,
+        )
+    }
+
+    pub(crate) fn visible_tuple_slice_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        tid: Tid,
+    ) -> Option<&'a [u8]> {
+        if overlays_invalidate_tid(overlays, relid, tid) {
+            return None;
+        }
+        self.relations
             .get(&relid)?
-            .tuple_slice(tid, session.owns_inserted_tid(relid, tid))?;
-        decode_tuple(tid, tuple)
+            .tuple_slice(tid, overlays_own_inserted_tid(overlays, relid, tid))
     }
 
     pub(crate) fn visible_tids(&self, session: &SessionStorage, relid: u32) -> Vec<Tid> {
@@ -257,14 +269,14 @@ impl StorageState {
             .saturating_sub(session.transaction_invalidated_live_count(relid))
     }
 
-    pub(crate) fn next_visible_tid(
-        &self,
-        session: &SessionStorage,
+    pub(crate) fn next_visible_tuple_slice_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
         relid: u32,
         cursor: ScanCursor,
         high_water_offsets: &[u16],
         forward: bool,
-    ) -> Option<Tid> {
+    ) -> Option<(Tid, &'a [u8])> {
         let relation = self.relations.get(&relid)?;
         if forward {
             let mut block = cursor.block;
@@ -286,8 +298,9 @@ impl StorageState {
                 };
                 while offset <= max_offset {
                     let tid = Tid { block, offset };
-                    if self.find_visible_tuple(session, relid, tid).is_some() {
-                        return Some(tid);
+                    if let Some(tuple) = self.visible_tuple_slice_in_overlays(overlays, relid, tid)
+                    {
+                        return Some((tid, tuple));
                     }
                     offset = offset.checked_add(1)?;
                 }
@@ -316,8 +329,9 @@ impl StorageState {
                 };
                 while offset > 0 {
                     let tid = Tid { block, offset };
-                    if self.find_visible_tuple(session, relid, tid).is_some() {
-                        return Some(tid);
+                    if let Some(tuple) = self.visible_tuple_slice_in_overlays(overlays, relid, tid)
+                    {
+                        return Some((tid, tuple));
                     }
                     offset -= 1;
                 }

@@ -293,19 +293,45 @@ pub(crate) fn read_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     Some(u64::from_ne_bytes(value))
 }
 
-pub(crate) fn copy_decoded_to_outputs(
-    tuple: &DecodedTuple<'_>,
+pub(crate) fn copy_tuple_to_outputs(
+    tid: Tid,
+    tuple: &[u8],
     values_out: *mut usize,
     is_null_out: *mut u8,
     natts: usize,
     tid_out: *mut u64,
 ) -> bool {
-    if tuple.values.len() != natts {
+    if tuple.len() < TUPLE_HEADER_LEN || tuple.get(0..4) != Some(TUPLE_MAGIC) {
+        return false;
+    }
+    let Some(tuple_natts) = read_u16(tuple, 4).map(usize::from) else {
+        return false;
+    };
+    if tuple_natts != natts {
         return false;
     }
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
         return false;
     }
+    let Some(null_bitmap_len) = read_u16(tuple, 6).map(usize::from) else {
+        return false;
+    };
+    let Some(attr_dir_offset) = read_u32(tuple, 8).map(|value| value as usize) else {
+        return false;
+    };
+    let Some(payload_offset) = read_u32(tuple, 12).map(|value| value as usize) else {
+        return false;
+    };
+    if attr_dir_offset != TUPLE_HEADER_LEN + null_bitmap_len {
+        return false;
+    }
+    if payload_offset < attr_dir_offset
+        || payload_offset > tuple.len()
+        || payload_offset != attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN))
+    {
+        return false;
+    }
+
     let values_out = if natts == 0 {
         &mut []
     } else {
@@ -316,25 +342,52 @@ pub(crate) fn copy_decoded_to_outputs(
     } else {
         unsafe { slice::from_raw_parts_mut(is_null_out, natts) }
     };
-    for (index, value) in tuple.values.iter().enumerate() {
-        match value {
-            DecodedDatum::Null => {
-                values_out[index] = 0;
-                is_null_out[index] = 1;
-            }
-            DecodedDatum::ByValue(value) => {
-                values_out[index] = *value;
+    for index in 0..natts {
+        let null = tuple
+            .get(TUPLE_HEADER_LEN + index / 8)
+            .is_some_and(|byte| byte & (1 << (index % 8)) != 0);
+        let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
+        let Some(tag) = tuple.get(entry).copied() else {
+            return false;
+        };
+        if null || tag == 0 {
+            values_out[index] = 0;
+            is_null_out[index] = 1;
+            continue;
+        }
+        match tag {
+            1 => {
+                let Some(value) = read_u64(tuple, entry + 8) else {
+                    return false;
+                };
+                values_out[index] = value as usize;
                 is_null_out[index] = 0;
             }
-            DecodedDatum::ByRef(bytes) => {
+            2 => {
+                let Some(offset) = read_u64(tuple, entry + 8).map(|value| value as usize) else {
+                    return false;
+                };
+                let Some(len) = read_u64(tuple, entry + 16).map(|value| value as usize) else {
+                    return false;
+                };
+                let Some(start) = payload_offset.checked_add(offset) else {
+                    return false;
+                };
+                let Some(end) = start.checked_add(len) else {
+                    return false;
+                };
+                let Some(bytes) = tuple.get(start..end) else {
+                    return false;
+                };
                 values_out[index] = bytes.as_ptr() as usize;
                 is_null_out[index] = 0;
             }
+            _ => return false,
         }
     }
     if !tid_out.is_null() {
         unsafe {
-            *tid_out = tuple.tid.pack();
+            *tid_out = tid.pack();
         }
     }
     true
