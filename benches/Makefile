@@ -13,9 +13,10 @@ PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage1
-REGRESSION_SUITE ?= core
-REGRESSION_CASES_DIR ?=
-REGRESSION_ALLOW_FAILURES ?= 0
+UPSTREAM_REGRESSION_CASES ?=
+UPSTREAM_REGRESSION_LIMIT ?=
+FASTPG_CASE_TIMEOUT ?= 60
+REGRESSION_FAIL_ON_DIFFERENCES ?= 0
 PROFILE_TRANSACTIONS ?= 50000
 PROFILE_RUNS ?= 1
 PROFILE_TOOL ?= flamegraph
@@ -31,8 +32,9 @@ CLIPPY_ARGS ?= --workspace --all-targets
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 PROFILE_HYPERFINE_FLAG := $(if $(filter 1 true yes,$(PROFILE_HYPERFINE)),--profile-hyperfine,)
 PROFILE_SERVER_MEMORY_FLAG := $(if $(filter 1 true yes,$(PROFILE_SERVER_MEMORY)),--profile-server-memory,)
-REGRESSION_CASES_ARG := $(if $(REGRESSION_CASES_DIR),--cases-dir "$(REGRESSION_CASES_DIR)",)
-REGRESSION_ALLOW_FAILURES_ARG := $(if $(filter 1 true yes,$(REGRESSION_ALLOW_FAILURES)),--allow-fastpg-failures,)
+UPSTREAM_REGRESSION_CASE_ARGS := $(foreach case,$(UPSTREAM_REGRESSION_CASES),--case "$(case)")
+UPSTREAM_REGRESSION_LIMIT_ARG := $(if $(UPSTREAM_REGRESSION_LIMIT),--limit "$(UPSTREAM_REGRESSION_LIMIT)",)
+REGRESSION_FAIL_ON_DIFFERENCES_ARG := $(if $(filter 1 true yes,$(REGRESSION_FAIL_ON_DIFFERENCES)),--fail-on-differences,)
 
 PGBENCH_COMMON_ARGS = \
 	--scale "$(SCALE)" \
@@ -126,13 +128,14 @@ profile-open-latest:
 	$(PYTHON) open_latest_profile.py
 
 regression:
-	$(PYTHON) regression_compare.py \
-		--suite "$(REGRESSION_SUITE)" \
-		$(REGRESSION_CASES_ARG) \
+	$(PYTHON) upstream_regression_inventory.py \
+		$(UPSTREAM_REGRESSION_CASE_ARGS) \
+		$(UPSTREAM_REGRESSION_LIMIT_ARG) \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--rust-build-profile "release" \
+		--rust-build-profile "$(RUST_BUILD_PROFILE)" \
 		--storage-engine "$(STORAGE_ENGINE)" \
-		$(REGRESSION_ALLOW_FAILURES_ARG)
+		--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
+		$(REGRESSION_FAIL_ON_DIFFERENCES_ARG)
 
 bench:
 	cargo bench -p fastpg-storage --bench storage_engine -- $(CRITERION_ARGS)
@@ -145,7 +148,7 @@ lint:
 	cargo clippy $(CLIPPY_ARGS) -- -D warnings
 
 validate:
-	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py regression_compare.py
+	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py upstream_regression_inventory.py
 	cargo test -p fastpg-storage
 	$(MAKE) pgbench-tpcb
 	$(MAKE) regression

@@ -146,7 +146,7 @@ Run simple-update with pgbench primary-key indexes:
 make -C benches pgbench-simple-indexed
 ```
 
-Run the curated SQL regression comparison:
+Run the upstream PostgreSQL SQL regression inventory:
 
 ```sh
 make -C benches regression

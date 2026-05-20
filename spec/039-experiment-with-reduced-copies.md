@@ -483,16 +483,16 @@ latency distribution where available
 ## Validation Commands
 
 ```sh
-python3 -m py_compile benches/pgbench_compare.py benches/open_latest_profile.py benches/regression_compare.py benches/upstream_regression_inventory.py
+python3 -m py_compile benches/pgbench_compare.py benches/open_latest_profile.py benches/upstream_regression_inventory.py
 cargo test -p fastpg-storage
-make -C benches pgbench-compare-rust-server SCALE=1 TRANSACTIONS=1 RUNS=1
-make -C benches regression-compare-rust-server
+make -C benches pgbench SCALE=1 TRANSACTIONS=1 RUNS=1
+make -C benches regression
 ```
 
 Before declaring a reduced-copy variant successful, also run:
 
 ```sh
-make -C benches validate-rust-server
+make -C benches validate
 ```
 
 ## Migration Steps
