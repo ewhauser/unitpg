@@ -1566,6 +1566,19 @@ impl StorageState {
             .extend(visible_row_ids);
     }
 
+    fn swap_relation_storage(&mut self, session: &mut SessionStorage, left: u32, right: u32) {
+        if left == right {
+            return;
+        }
+
+        swap_hashmap_entries(&mut self.relations, left, right);
+        for overlay in &mut session.transaction_stack {
+            swap_hashmap_entries(&mut overlay.relations, left, right);
+            swap_hashmap_entries(&mut overlay.deleted_row_ids, left, right);
+            swap_btreeset_members(&mut overlay.pending_primary_key_rebuilds, left, right);
+        }
+    }
+
     fn commit_top_overlay(&mut self, session: &mut SessionStorage) -> BTreeSet<u32> {
         let Some(overlay) = session.transaction_stack.pop() else {
             return BTreeSet::new();
@@ -1759,6 +1772,36 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
 
 fn remove_rows_from_segment(segment: &mut RowSegment, deleted_row_ids: &BTreeSet<u64>) {
     segment.remove_row_ids(deleted_row_ids);
+}
+
+fn swap_hashmap_entries<V>(map: &mut HashMap<u32, V>, left: u32, right: u32) {
+    if left == right {
+        return;
+    }
+
+    let left_value = map.remove(&left);
+    let right_value = map.remove(&right);
+    if let Some(value) = left_value {
+        map.insert(right, value);
+    }
+    if let Some(value) = right_value {
+        map.insert(left, value);
+    }
+}
+
+fn swap_btreeset_members(set: &mut BTreeSet<u32>, left: u32, right: u32) {
+    if left == right {
+        return;
+    }
+
+    let had_left = set.remove(&left);
+    let had_right = set.remove(&right);
+    if had_left {
+        set.insert(right);
+    }
+    if had_right {
+        set.insert(left);
+    }
 }
 
 fn find_row_in_segment(segment: &RowSegment, row_id: u64) -> Option<&Row> {
@@ -4046,6 +4089,14 @@ pub extern "C" fn fastpg_rust_subxact_abort() {
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_clear(relid: u32) {
     with_storage(|state, session| state.clear_relation(session, relid));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_swap(left_relid: u32, right_relid: u32) {
+    with_storage(|state, session| {
+        state.swap_relation_storage(session, left_relid, right_relid);
+    });
+    clear_primary_key_index_info_cache();
 }
 
 #[unsafe(no_mangle)]

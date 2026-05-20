@@ -175,6 +175,30 @@ impl StorageState {
         session.mark_scans_visibility_delta(relid);
     }
 
+    pub(crate) fn swap_relation_storage(
+        &mut self,
+        session: &mut SessionStorage,
+        left: u32,
+        right: u32,
+    ) {
+        if left == right {
+            return;
+        }
+
+        swap_hashmap_entries(&mut self.relations, left, right);
+        for overlay in &mut session.transaction_stack {
+            swap_hashmap_entries(&mut overlay.relation_checkpoints, left, right);
+            swap_hashmap_entries(&mut overlay.page_checkpoints, left, right);
+            swap_hashmap_entries(&mut overlay.new_pages, left, right);
+            swap_hashmap_entries(&mut overlay.inserted_tids, left, right);
+            swap_hashmap_entries(&mut overlay.invalidated_tids, left, right);
+            swap_hashmap_entries(&mut overlay.primary_key_inserts, left, right);
+            swap_hashmap_entries(&mut overlay.primary_key_deletes, left, right);
+        }
+        session.swap_scan_relids(left, right);
+        self.generation = self.generation.saturating_add(1);
+    }
+
     pub(crate) fn append_pending_tuple(
         &mut self,
         session: &mut SessionStorage,
@@ -564,6 +588,21 @@ pub(crate) fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStor
             let mut state = poisoned.into_inner();
             f(&mut state, &mut session)
         }
+    }
+}
+
+fn swap_hashmap_entries<V>(map: &mut HashMap<u32, V>, left: u32, right: u32) {
+    if left == right {
+        return;
+    }
+
+    let left_value = map.remove(&left);
+    let right_value = map.remove(&right);
+    if let Some(value) = left_value {
+        map.insert(right, value);
+    }
+    if let Some(value) = right_value {
+        map.insert(left, value);
     }
 }
 

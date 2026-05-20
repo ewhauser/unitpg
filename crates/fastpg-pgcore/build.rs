@@ -22,9 +22,11 @@ fn main() {
         .to_path_buf();
     for relative in [
         "src/backend/access/fastpg/fastpg_mem_tableam.c",
+        "src/backend/commands/tablecmds.c",
         "src/backend/utils/cache/catcache.c",
         "src/backend/utils/cache/relcache.c",
         "src/include/access/fastpg_catalog.h",
+        "src/include/access/fastpg_tableam.h",
     ] {
         println!(
             "cargo:rerun-if-changed={}",

@@ -123,6 +123,11 @@ pub extern "C" fn fastpg_storage2_relation_clear(relid: u32) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_swap(left_relid: u32, right_relid: u32) {
+    with_storage(|state, session| state.swap_relation_storage(session, left_relid, right_relid));
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_row_count(relid: u32) -> usize {
     with_storage(|state, session| state.visible_row_count(session, relid))
 }

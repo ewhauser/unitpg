@@ -204,6 +204,22 @@ impl SessionStorage {
         }
     }
 
+    pub(crate) fn swap_scan_relids(&mut self, left: u32, right: u32) {
+        if left == right {
+            return;
+        }
+
+        for scan in self.scans.iter_mut().filter_map(Option::as_mut) {
+            if scan.relid == left {
+                scan.relid = right;
+                scan.has_visibility_deltas = true;
+            } else if scan.relid == right {
+                scan.relid = left;
+                scan.has_visibility_deltas = true;
+            }
+        }
+    }
+
     pub(crate) fn transaction_bytes(&self) -> usize {
         self.transaction_stack
             .iter()

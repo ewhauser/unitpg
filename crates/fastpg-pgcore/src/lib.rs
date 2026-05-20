@@ -2236,6 +2236,55 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_alter_table_type_rewrite_keeps_rows_readable() {
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fastpg_pgcore_alter_type");
+        session
+            .prepare(&format!("create table {table}(f1 int)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1.2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("alter table {table} alter column f1 type numeric"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1.2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let rows = session
+            .prepare(&format!("select f1::text from {table} order by f1"))
+            .unwrap()
+            .execute()
+            .unwrap()
+            .statements[0]
+            .rows
+            .clone();
+        assert_eq!(
+            rows,
+            vec![
+                vec![PgCoreValue::Text("1".to_owned())],
+                vec![PgCoreValue::Text("1.2".to_owned())],
+            ]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_regress_compatibility_noop_utilities() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_noop_{}", std::process::id());
