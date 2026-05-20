@@ -88,6 +88,46 @@ target:
   pg_catalog rows are rendered from metadata
 ```
 
+## Performance Thesis
+
+The reason to own catalog metadata in Rust is not that Rust can out-perform
+PostgreSQL's catalog code at doing the same heap-shaped work. The reason is to
+avoid doing that work for ephemeral test-server use cases.
+
+The fast path this design is trying to unlock is:
+
+```text
+server startup:
+  load generated static catalog data
+  create empty typed maps for user schema
+  skip initdb, catalog relation files, and relcache init files
+
+schema and fixture setup:
+  publish compact typed metadata snapshots
+  keep direct relation/type/index lookups in Rust maps
+  avoid planner/executor catalog probes becoming heap/index scans
+
+test reset:
+  drop or rewind catalog/storage generations, fixtures, or epochs
+  avoid replaying setup SQL or rebuilding filesystem-backed catalog state
+```
+
+That thesis only holds if the Rust catalog is semantic. A second
+heap-shaped catalog in Rust loses the main advantage: it still has to model
+`pg_class`, `pg_attribute`, `pg_type`, `pg_index`, catalog CTIDs, cache
+invalidation, and scan behavior, just outside PostgreSQL's native machinery.
+
+The intended split is:
+
+```text
+semantic metadata:
+  source of truth for fastpg planning, execution, reset, and fixture lifecycle
+
+virtual pg_catalog rows:
+  compatibility output for SQL introspection and PostgreSQL code paths that
+  still expect catalog-shaped tuples
+```
+
 ## Target Architecture
 
 ```text
@@ -505,6 +545,24 @@ memory-backed storage:
 This spec chooses typed catalog ownership for fastpg's Rust-server path. It
 does not prevent a later memory-backed storage manager, but catalog metadata
 should not depend on filesystem-backed PostgreSQL catalog heaps.
+
+A real-PostgreSQL-catalog-on-memory-storage spike is still useful as a
+compatibility check. It should answer whether PostgreSQL's native catalog
+machinery can be kept while replacing only the physical storage layer. That
+would be a different tradeoff:
+
+```text
+possible benefit:
+  delete most bespoke catalog, catcache, and relcache compatibility shims
+
+possible cost:
+  reintroduce enough heap/index/WAL/CLOG/relmap/bootstrap semantics that
+  ephemeral startup and reset stop being cheap
+```
+
+Do not let this typed catalog design drift into the middle ground. Either the
+Rust catalog remains semantic and generationed, or a separate spike proves that
+native PostgreSQL catalog semantics over memory storage are cheaper overall.
 
 ## Migration Plan
 
