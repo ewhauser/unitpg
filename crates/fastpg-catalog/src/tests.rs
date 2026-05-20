@@ -387,6 +387,32 @@ fn static_catalog_attributes_are_visible_in_pg_attribute() {
 }
 
 #[test]
+fn static_catalog_physical_columns_resolve_from_typed_schema() {
+    let aggregate_table = static_catalog_by_name("pg_aggregate").expect("pg_aggregate catalog");
+    let column =
+        relation_physical_column_by_attnum(aggregate_table.oid, 1).expect("pg_aggregate.aggfnoid");
+
+    assert_eq!(column.name, "aggfnoid");
+    assert_eq!(column.type_oid, Oid(24));
+    assert_eq!(column.type_mod, -1);
+    assert!(!column.is_dropped);
+    assert_eq!(column.is_not_null, aggregate_table.columns[0].attnotnull);
+    assert_eq!(column.attlen, 4);
+    assert!(column.attbyval);
+    assert_eq!(column.attalign, b'i');
+    assert_eq!(column.attstorage, b'p');
+}
+
+#[test]
+fn relation_oid_exists_uses_typed_membership() {
+    let pg_class = static_catalog_by_name("pg_class").expect("pg_class catalog");
+
+    assert!(relation_oid_exists(pg_class.oid));
+    assert!(relation_oid_exists(PG_AGGREGATE_FNOID_INDEX_OID));
+    assert!(!relation_oid_exists(Oid(0xEE00_0001)));
+}
+
+#[test]
 fn information_schema_domains_mark_domain_input() {
     let pg_namespace = static_catalog_by_name("pg_namespace").expect("pg_namespace catalog");
     let namespace_rows = catalog_rows(pg_namespace.oid);

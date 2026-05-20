@@ -3213,16 +3213,14 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
     if out.is_null() {
         return false;
     }
-    if relation_by_oid(Oid(relation_oid)).is_some() {
-        let Some(attnum) = column_index
-            .checked_add(1)
-            .and_then(|attnum| i16::try_from(attnum).ok())
-        else {
-            return false;
-        };
-        let Some(column) = relation_physical_column_by_attnum(Oid(relation_oid), attnum) else {
-            return false;
-        };
+    let Some(attnum) = column_index
+        .checked_add(1)
+        .and_then(|attnum| i16::try_from(attnum).ok())
+    else {
+        return false;
+    };
+
+    if let Some(column) = relation_physical_column_by_attnum(Oid(relation_oid), attnum) {
         unsafe {
             *out = physical_column_to_ffi(&column);
         }

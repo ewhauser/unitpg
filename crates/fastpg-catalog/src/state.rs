@@ -736,6 +736,7 @@ impl Default for PrimaryKeyIndexOidCache {
 pub(crate) struct CatalogLookupCache {
     pub(crate) generation: u64,
     pub(crate) relation_columns: BTreeMap<(u32, i16), Option<ColumnRecord>>,
+    pub(crate) relation_physical_columns: BTreeMap<(u32, i16), Option<PhysicalColumnRecord>>,
     pub(crate) index_records_by_oid: BTreeMap<u32, Option<IndexRecord>>,
     pub(crate) index_records_by_relation: BTreeMap<u32, Vec<IndexRecord>>,
     pub(crate) unique_index_records_by_relation: BTreeMap<u32, Vec<IndexRecord>>,
@@ -746,6 +747,7 @@ impl Default for CatalogLookupCache {
         Self {
             generation: current_generation(),
             relation_columns: BTreeMap::new(),
+            relation_physical_columns: BTreeMap::new(),
             index_records_by_oid: BTreeMap::new(),
             index_records_by_relation: BTreeMap::new(),
             unique_index_records_by_relation: BTreeMap::new(),

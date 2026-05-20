@@ -270,6 +270,7 @@ class UpstreamRegressionInventory:
         }
         self.write_results()
 
+        case_results: list[dict[str, Any]] = []
         try:
             server = self.helper.start_rust_server(
                 "fastpg",
@@ -292,6 +293,8 @@ class UpstreamRegressionInventory:
                 env,
                 run_dir,
                 timeout=self.args.fastpg_case_timeout,
+                server_process=server["process"],
+                stop_on_server_exit=True,
             )
             self.results["variants"]["fastpg"]["cases"] = case_results
             self.results["variants"]["fastpg"]["status"] = "ok"
@@ -302,7 +305,10 @@ class UpstreamRegressionInventory:
             if server is not None:
                 stopped = self.helper.stop_rust_server(server, run_dir)
                 run_record["commands"]["stop"] = stopped.as_json()
-                if stopped.returncode != 0 and not active_failure:
+                server_crash_recorded = any(
+                    case.get("status") == "server-crash" for case in case_results
+                )
+                if stopped.returncode != 0 and not active_failure and not server_crash_recorded:
                     raise BenchmarkFailure("fastpg", "stop", stopped, run_dir)
             if socket_dir is not None:
                 shutil.rmtree(socket_dir, ignore_errors=True)
@@ -595,6 +601,8 @@ class UpstreamRegressionInventory:
         env: dict[str, str],
         run_dir: Path,
         timeout: float | None = None,
+        server_process: Any | None = None,
+        stop_on_server_exit: bool = False,
     ) -> list[dict[str, Any]]:
         case_results: list[dict[str, Any]] = []
         for index, case in enumerate(self.cases, start=1):
@@ -624,11 +632,23 @@ class UpstreamRegressionInventory:
                 "command": result.command,
                 "tail": tail(read_text(transcript)),
             }
+            server_exited = (
+                stop_on_server_exit
+                and server_process is not None
+                and server_process.poll() is not None
+            )
             if timed_out:
                 case_result["difference"] = {
                     "kind": "timeout",
                     "seconds": result.seconds,
                     "timeout": timeout,
+                }
+            if server_exited:
+                case_result["status"] = "server-crash"
+                case_result["difference"] = {
+                    "kind": "server-crash",
+                    "psql_returncode": result.returncode,
+                    "server_returncode": server_process.returncode,
                 }
             case_results.append(case_result)
             self.results["variants"][variant]["cases"] = case_results
@@ -638,6 +658,8 @@ class UpstreamRegressionInventory:
                 f"{case_result['status']} ({case_result['seconds']:.3f}s)",
                 flush=True,
             )
+            if server_exited:
+                break
         return case_results
 
     def write_results(self) -> None:
