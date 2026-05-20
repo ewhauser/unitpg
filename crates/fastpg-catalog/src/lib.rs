@@ -906,6 +906,7 @@ fn type_meta_from_row(
     let oid = catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?;
     let name = catalog_row_value(table, row, "typname").and_then(catalog_value_string)?;
     let record = CatalogTypeRecord {
+        row_id,
         oid,
         name: canonical_catalog_type_name(&name),
         namespace: catalog_row_value(table, row, "typnamespace")
@@ -3259,6 +3260,7 @@ pub struct PgTypeRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CatalogTypeRecord {
+    pub row_id: u64,
     pub oid: Oid,
     pub name: String,
     pub namespace: Oid,
@@ -3290,6 +3292,7 @@ pub struct CatalogTypeRecord {
 impl From<PgTypeRecord> for CatalogTypeRecord {
     fn from(record: PgTypeRecord) -> Self {
         Self {
+            row_id: 0,
             oid: record.oid,
             name: record.name.to_owned(),
             namespace: record.namespace,
@@ -3325,6 +3328,7 @@ fn catalog_type_from_row(
     row: &CatalogRow,
 ) -> Option<CatalogTypeRecord> {
     Some(CatalogTypeRecord {
+        row_id: row.row_id,
         oid: catalog_row_value(table, row, "oid").and_then(catalog_value_oid)?,
         name: catalog_row_value(table, row, "typname").and_then(catalog_value_string)?,
         namespace: catalog_row_value(table, row, "typnamespace").and_then(catalog_value_oid)?,
@@ -3358,6 +3362,7 @@ fn catalog_type_from_row(
 fn synthetic_catalog_rowtype_for_table(table: &StaticCatalogTable) -> Option<CatalogTypeRecord> {
     let template: CatalogTypeRecord = lookup_builtin_type(Oid(83))?.into();
     Some(CatalogTypeRecord {
+        row_id: 0,
         oid: static_catalog_table_rowtype_oid(table),
         name: table.name.to_owned(),
         namespace: PG_CATALOG_NAMESPACE_OID,

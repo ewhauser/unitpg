@@ -72,6 +72,7 @@ pub struct FastPgRustCatalogType {
     pub typsubscript: u32,
     pub typstorage: u8,
     pub _trailing_padding: [u8; 3],
+    pub row_id: u64,
 }
 
 #[repr(C)]
@@ -2132,6 +2133,7 @@ fn type_to_ffi(record: &fastpg_catalog::CatalogTypeRecord) -> FastPgRustCatalogT
         typsubscript: record.typsubscript.0,
         typstorage: record.typstorage,
         _trailing_padding: [0; 3],
+        row_id: record.row_id,
     }
 }
 

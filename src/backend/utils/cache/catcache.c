@@ -1027,6 +1027,7 @@ FastPgBuildTypeTuple(TupleDesc tupdesc, const FastPgRustCatalogType *type)
 	Datum		values[Natts_pg_type] = {0};
 	bool		nulls[Natts_pg_type] = {false};
 	NameData	typname;
+	HeapTuple	tuple;
 
 	namestrcpy(&typname, type->name);
 
@@ -1063,7 +1064,14 @@ FastPgBuildTypeTuple(TupleDesc tupdesc, const FastPgRustCatalogType *type)
 	nulls[Anum_pg_type_typdefault - 1] = true;
 	nulls[Anum_pg_type_typacl - 1] = true;
 
-	return heap_form_tuple(tupdesc, values, nulls);
+	tuple = heap_form_tuple(tupdesc, values, nulls);
+	tuple->t_tableOid = TypeRelationId;
+	if (type->row_id != 0 &&
+		!FastPgCatalogRowIdToTid(type->row_id, &tuple->t_self))
+		elog(ERROR,
+			 "fastpg catalog row id %llu cannot be represented as a CTID",
+			 (unsigned long long) type->row_id);
+	return tuple;
 }
 
 static HeapTuple

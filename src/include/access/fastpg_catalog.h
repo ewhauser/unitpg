@@ -61,6 +61,7 @@ typedef struct FastPgRustCatalogType
 	uint32_t	typsubscript;
 	uint8_t		typstorage;
 	uint8_t		_trailing_padding[3];
+	uint64_t	row_id;
 } FastPgRustCatalogType;
 
 typedef struct FastPgRustCatalogRelation
