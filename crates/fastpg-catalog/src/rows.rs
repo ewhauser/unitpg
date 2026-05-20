@@ -1332,6 +1332,34 @@ fn synthetic_operator_proc_description_row(
     Some(row)
 }
 
+fn synthetic_pg_catalog_init_privs_row(table: &StaticCatalogTable) -> CatalogRow {
+    let mut row = empty_catalog_row(
+        table,
+        SYNTHETIC_INIT_PRIVS_ROW_ID_BASE | u64::from(PG_CATALOG_NAMESPACE_OID.0),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "objoid",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "classoid",
+        CatalogValue::Oid(PG_NAMESPACE_RELATION_OID),
+    );
+    set_catalog_row_value(table, &mut row, "objsubid", CatalogValue::Int32(0));
+    set_catalog_row_value(table, &mut row, "privtype", CatalogValue::Char(b'i'));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "initprivs",
+        CatalogValue::Raw("{=U/postgres,postgres=UC/postgres}".to_owned()),
+    );
+    row
+}
+
 pub(crate) fn static_row_column_value(
     table: &StaticCatalogTable,
     row: &StaticCatalogRow,
@@ -1553,6 +1581,10 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                         rows.entry(row.row_id).or_insert(row);
                     }
                 }
+            }
+            PG_INIT_PRIVS_RELATION_OID => {
+                let row = synthetic_pg_catalog_init_privs_row(table);
+                rows.entry(row.row_id).or_insert(row);
             }
             _ => {}
         }

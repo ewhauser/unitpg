@@ -143,6 +143,33 @@ fn generated_static_catalog_has_core_rows() {
 }
 
 #[test]
+fn pg_init_privs_exposes_bootstrap_schema_privileges() {
+    let table = static_catalog_by_name("pg_init_privs").expect("pg_init_privs");
+    let rows = catalog_rows(table.oid);
+    let row = rows
+        .iter()
+        .find(|row| {
+            catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)
+                == Some(PG_CATALOG_NAMESPACE_OID)
+        })
+        .expect("pg_catalog init privs row");
+
+    assert_eq!(
+        catalog_row_value(table, row, "classoid").and_then(catalog_value_oid),
+        Some(PG_NAMESPACE_RELATION_OID)
+    );
+    assert_eq!(
+        catalog_row_value(table, row, "privtype").and_then(catalog_value_u8),
+        Some(b'i')
+    );
+    assert!(
+        catalog_row_value(table, row, "initprivs")
+            .and_then(catalog_value_string)
+            .is_some_and(|initprivs| initprivs.contains("=U/postgres"))
+    );
+}
+
+#[test]
 fn pg_proc_bootstrap_defaults_are_normalized() {
     let table = static_catalog_by_name("pg_proc").expect("pg_proc");
     let row = catalog_rows(PG_PROC_RELATION_OID)

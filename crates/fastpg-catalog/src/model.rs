@@ -54,6 +54,7 @@ pub(crate) const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 pub(crate) const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 pub(crate) const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 pub(crate) const PG_DESCRIPTION_RELATION_OID: Oid = Oid(2609);
+pub(crate) const PG_INIT_PRIVS_RELATION_OID: Oid = Oid(3394);
 pub(crate) const PG_ENUM_RELATION_OID: Oid = Oid(3501);
 pub(crate) const BTREE_INDEX_AM_OID: Oid = Oid(403);
 pub(crate) const PG_AGGREGATE_FNOID_INDEX_OID: Oid = Oid(2650);
@@ -64,6 +65,7 @@ pub(crate) const POSTGRES_DATABASE_OID: Oid = Oid(5);
 pub(crate) const SYNTHETIC_DATABASE_OID_BASE: u32 = 0xE100_0000;
 pub(crate) const SYNTHETIC_CATALOG_ROWTYPE_OID_BASE: u32 = 0xF000_0000;
 pub(crate) const SYNTHETIC_DESCRIPTION_ROW_ID_BASE: u64 = 0xD200_0000;
+pub(crate) const SYNTHETIC_INIT_PRIVS_ROW_ID_BASE: u64 = 0xD400_0000;
 pub(crate) const SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG: u64 = 0x8000;
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
