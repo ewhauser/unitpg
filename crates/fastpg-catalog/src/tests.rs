@@ -6,8 +6,7 @@ use fastpg_types::Oid;
 
 use crate::lookups::catalog_value_int2_vector;
 use crate::rows::{
-    catalog_value_i16, catalog_value_i32, catalog_value_oid, catalog_value_string,
-    catalog_value_u8,
+    catalog_value_i16, catalog_value_i32, catalog_value_oid, catalog_value_string, catalog_value_u8,
 };
 
 static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());

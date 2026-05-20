@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use fastpg_types::Oid;
 
@@ -1247,32 +1247,20 @@ fn synthetic_system_attribute_row(
     Some(row)
 }
 
-fn catalog_rows_have_attribute(
-    table: &StaticCatalogTable,
-    rows: &BTreeMap<u64, CatalogRow>,
-    relation_oid: Oid,
-    attnum: i16,
-) -> bool {
-    rows.values().any(|row| {
-        catalog_row_value(table, row, "attrelid").and_then(catalog_value_oid) == Some(relation_oid)
-            && catalog_row_value(table, row, "attnum").and_then(catalog_value_i16) == Some(attnum)
-    })
+fn catalog_row_attribute_key(table: &StaticCatalogTable, row: &CatalogRow) -> Option<(Oid, i16)> {
+    let relation_oid = catalog_row_value(table, row, "attrelid").and_then(catalog_value_oid)?;
+    let attnum = catalog_row_value(table, row, "attnum").and_then(catalog_value_i16)?;
+    Some((relation_oid, attnum))
 }
 
-fn catalog_rows_have_description(
+fn catalog_row_description_key(
     table: &StaticCatalogTable,
-    rows: &BTreeMap<u64, CatalogRow>,
-    class_oid: Oid,
-    object_oid: Oid,
-    object_subid: i32,
-) -> bool {
-    rows.values().any(|row| {
-        catalog_row_value(table, row, "classoid").and_then(catalog_value_oid) == Some(class_oid)
-            && catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)
-                == Some(object_oid)
-            && catalog_row_value(table, row, "objsubid").and_then(catalog_value_i32)
-                == Some(object_subid)
-    })
+    row: &CatalogRow,
+) -> Option<(Oid, Oid, i32)> {
+    let class_oid = catalog_row_value(table, row, "classoid").and_then(catalog_value_oid)?;
+    let object_oid = catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)?;
+    let object_subid = catalog_row_value(table, row, "objsubid").and_then(catalog_value_i32)?;
+    Some((class_oid, object_oid, object_subid))
 }
 
 fn catalog_description_text(
@@ -1362,7 +1350,12 @@ fn synthetic_pg_catalog_init_privs_row(table: &StaticCatalogTable) -> CatalogRow
 
 fn synthetic_english_ts_dict_row(table: &StaticCatalogTable) -> CatalogRow {
     let mut row = empty_catalog_row(table, u64::from(ENGLISH_TS_DICT_OID.0));
-    set_catalog_row_value(table, &mut row, "oid", CatalogValue::Oid(ENGLISH_TS_DICT_OID));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "oid",
+        CatalogValue::Oid(ENGLISH_TS_DICT_OID),
+    );
     set_catalog_row_value(
         table,
         &mut row,
@@ -1589,33 +1582,34 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                 for column in snapshot.columns.values() {
                     rows.insert(column.row_id, column.row.clone());
                 }
+                let mut existing_attributes: HashSet<(Oid, i16)> = rows
+                    .values()
+                    .filter_map(|row| catalog_row_attribute_key(table, row))
+                    .collect();
                 for relation_table in static_catalogs() {
                     for (index, column) in relation_table.columns.iter().enumerate() {
                         let attnum = i16::try_from(index + 1).ok();
                         let Some(attnum) = attnum else {
                             continue;
                         };
-                        if catalog_rows_have_attribute(table, &rows, relation_table.oid, attnum) {
+                        if existing_attributes.contains(&(relation_table.oid, attnum)) {
                             continue;
                         }
                         if let Some(row) =
                             synthetic_static_attribute_row(table, relation_table, column, attnum)
                         {
+                            existing_attributes.insert((relation_table.oid, attnum));
                             rows.insert(row.row_id, row);
                         }
                     }
                     for spec in SYSTEM_ATTRIBUTE_SPECS {
-                        if catalog_rows_have_attribute(
-                            table,
-                            &rows,
-                            relation_table.oid,
-                            spec.attnum,
-                        ) {
+                        if existing_attributes.contains(&(relation_table.oid, spec.attnum)) {
                             continue;
                         }
                         if let Some(row) =
                             synthetic_system_attribute_row(table, relation_table, *spec)
                         {
+                            existing_attributes.insert((relation_table.oid, spec.attnum));
                             rows.insert(row.row_id, row);
                         }
                     }
@@ -1672,20 +1666,19 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                         .entry(operator.code.0)
                         .or_insert_with(|| format!("implementation of {} operator", operator.name));
                 }
+                let mut existing_descriptions: HashSet<(Oid, Oid, i32)> = rows
+                    .values()
+                    .filter_map(|row| catalog_row_description_key(table, row))
+                    .collect();
                 for (proc_oid, description) in proc_descriptions {
                     let proc_oid = Oid(proc_oid);
-                    if catalog_rows_have_description(
-                        table,
-                        &rows,
-                        PG_PROC_RELATION_OID,
-                        proc_oid,
-                        0,
-                    ) {
+                    if existing_descriptions.contains(&(PG_PROC_RELATION_OID, proc_oid, 0)) {
                         continue;
                     }
                     if let Some(row) =
                         synthetic_operator_proc_description_row(table, proc_oid, description)
                     {
+                        existing_descriptions.insert((PG_PROC_RELATION_OID, proc_oid, 0));
                         rows.entry(row.row_id).or_insert(row);
                     }
                 }
