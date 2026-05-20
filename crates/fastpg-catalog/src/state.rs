@@ -759,9 +759,21 @@ impl Default for CatalogLookupCache {
 pub struct CatalogSession {
     pub(crate) transaction_stack: Vec<CatalogDraft>,
     pub(crate) explicit_transaction: bool,
+    pub(crate) visible_snapshot_revision: u64,
+    pub(crate) visible_snapshot_cache: Option<CachedVisibleCatalogSnapshot>,
 }
 
 pub type CatalogSessionHandle = Arc<Mutex<CatalogSession>>;
+
+#[derive(Debug)]
+pub(crate) struct CachedVisibleCatalogSnapshot {
+    base_generation: u64,
+    revision: u64,
+    snapshot: Arc<CatalogSnapshot>,
+}
+
+#[cfg(test)]
+pub(crate) static VISIBLE_CATALOG_SNAPSHOT_MATERIALIZATIONS: AtomicU64 = AtomicU64::new(0);
 
 pub fn new_catalog_session() -> CatalogSessionHandle {
     Arc::new(Mutex::new(CatalogSession::default()))
@@ -838,38 +850,82 @@ pub(crate) fn with_catalog_session<R>(f: impl FnOnce(&mut CatalogSession) -> R) 
     }
 }
 
-fn visible_session_drafts() -> Vec<CatalogDraft> {
-    let session = current_catalog_session();
-    match session.lock() {
-        Ok(session) => session
-            .transaction_stack
-            .iter()
-            .filter(|draft| !draft.is_empty())
-            .cloned()
-            .collect(),
-        Err(poisoned) => poisoned
-            .into_inner()
-            .transaction_stack
-            .iter()
-            .filter(|draft| !draft.is_empty())
-            .cloned()
-            .collect(),
-    }
+pub(crate) fn invalidate_visible_catalog_snapshot(session: &mut CatalogSession) {
+    let next_revision = session.visible_snapshot_revision.wrapping_add(1);
+    session.visible_snapshot_revision = next_revision.max(1);
+    session.visible_snapshot_cache = None;
+}
+
+fn session_has_visible_drafts(session: &CatalogSession) -> bool {
+    session
+        .transaction_stack
+        .iter()
+        .any(|draft| !draft.is_empty())
 }
 
 pub(crate) fn with_visible_catalog_snapshot<R>(f: impl FnOnce(&CatalogSnapshot) -> R) -> R {
-    let session_drafts = visible_session_drafts();
-    if session_drafts.is_empty() {
+    let session = current_catalog_session();
+    let visible_snapshot = {
+        let mut session = match session.lock() {
+            Ok(session) => session,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+
+        if !session_has_visible_drafts(&session) {
+            None
+        } else {
+            let base_generation = current_generation();
+            if let Some(cache) = &session.visible_snapshot_cache {
+                if cache.base_generation == base_generation
+                    && cache.revision == session.visible_snapshot_revision
+                {
+                    Some(Arc::clone(&cache.snapshot))
+                } else {
+                    let revision = session.visible_snapshot_revision;
+                    let (base_generation, snapshot) =
+                        materialize_visible_catalog_snapshot(&session);
+                    session.visible_snapshot_cache = Some(CachedVisibleCatalogSnapshot {
+                        base_generation,
+                        revision,
+                        snapshot: Arc::clone(&snapshot),
+                    });
+                    Some(snapshot)
+                }
+            } else {
+                let revision = session.visible_snapshot_revision;
+                let (base_generation, snapshot) = materialize_visible_catalog_snapshot(&session);
+                session.visible_snapshot_cache = Some(CachedVisibleCatalogSnapshot {
+                    base_generation,
+                    revision,
+                    snapshot: Arc::clone(&snapshot),
+                });
+                Some(snapshot)
+            }
+        }
+    };
+
+    if let Some(snapshot) = visible_snapshot {
+        f(&snapshot)
+    } else {
         return with_catalog_read(|state| f(&state.snapshot));
     }
+}
 
-    with_catalog_read(|state| {
+fn materialize_visible_catalog_snapshot(session: &CatalogSession) -> (u64, Arc<CatalogSnapshot>) {
+    let snapshot = with_catalog_read(|state| {
         let mut visible_snapshot = state.snapshot.clone();
-        for draft in session_drafts {
+        for draft in session
+            .transaction_stack
+            .iter()
+            .filter(|draft| !draft.is_empty())
+        {
             draft.apply_to_snapshot(&mut visible_snapshot);
         }
-        f(&visible_snapshot)
-    })
+        (state.snapshot.generation, Arc::new(visible_snapshot))
+    });
+    #[cfg(test)]
+    VISIBLE_CATALOG_SNAPSHOT_MATERIALIZATIONS.fetch_add(1, Ordering::Relaxed);
+    snapshot
 }
 
 pub fn has_uncommitted_catalog_changes() -> bool {
@@ -890,6 +946,7 @@ pub fn has_uncommitted_catalog_changes() -> bool {
 pub(crate) fn ensure_catalog_transaction(session: &mut CatalogSession) {
     if session.transaction_stack.is_empty() {
         session.transaction_stack.push(CatalogDraft::default());
+        invalidate_visible_catalog_snapshot(session);
     }
 }
 
@@ -912,6 +969,7 @@ fn commit_top_catalog_draft(session: &mut CatalogSession) {
     } else {
         commit_catalog_draft(draft);
     }
+    invalidate_visible_catalog_snapshot(session);
 }
 
 pub(crate) fn bump_generation(state: &mut CatalogState) {
@@ -952,6 +1010,7 @@ pub fn abort_explicit_transaction() {
     with_catalog_session(|session| {
         session.transaction_stack.clear();
         session.explicit_transaction = false;
+        invalidate_visible_catalog_snapshot(session);
     });
 }
 
@@ -970,6 +1029,7 @@ pub fn abort_implicit_transaction() {
     with_catalog_session(|session| {
         if !session.explicit_transaction {
             session.transaction_stack.clear();
+            invalidate_visible_catalog_snapshot(session);
         }
     });
 }
@@ -978,6 +1038,7 @@ pub fn begin_subtransaction() {
     with_catalog_session(|session| {
         ensure_catalog_transaction(session);
         session.transaction_stack.push(CatalogDraft::default());
+        invalidate_visible_catalog_snapshot(session);
     });
 }
 
@@ -993,6 +1054,26 @@ pub fn abort_subtransaction() {
     with_catalog_session(|session| {
         if session.transaction_stack.len() > 1 {
             session.transaction_stack.pop();
+            invalidate_visible_catalog_snapshot(session);
         }
     });
+}
+
+#[cfg(test)]
+pub(crate) fn clear_current_catalog_session_for_tests() {
+    with_catalog_session(|session| {
+        session.transaction_stack.clear();
+        session.explicit_transaction = false;
+        invalidate_visible_catalog_snapshot(session);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn reset_visible_catalog_snapshot_materializations_for_tests() {
+    VISIBLE_CATALOG_SNAPSHOT_MATERIALIZATIONS.store(0, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn visible_catalog_snapshot_materializations_for_tests() -> u64 {
+    VISIBLE_CATALOG_SNAPSHOT_MATERIALIZATIONS.load(Ordering::Relaxed)
 }

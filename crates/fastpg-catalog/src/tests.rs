@@ -524,6 +524,67 @@ fn operator_implementation_proc_descriptions_are_synthesized() {
 }
 
 #[test]
+fn visible_catalog_snapshot_is_cached_until_overlay_changes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+    let relation_oid = Oid(50_010);
+
+    upsert_named_catalog_row(
+        "pg_class",
+        relation_oid.0 as u64,
+        &[
+            ("oid", "50010"),
+            ("relname", "cached_snapshot_before_change"),
+            ("relnamespace", "2200"),
+            ("reltype", "50011"),
+            ("relowner", "10"),
+            ("relam", "2"),
+            ("relfilenode", "50010"),
+            ("relhasindex", "f"),
+            ("relpersistence", "p"),
+            ("relkind", "r"),
+            ("relnatts", "0"),
+        ],
+    );
+
+    crate::state::reset_visible_catalog_snapshot_materializations_for_tests();
+    assert!(relation_oid_exists(relation_oid));
+    assert!(relation_oid_exists(relation_oid));
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    upsert_named_catalog_row(
+        "pg_class",
+        relation_oid.0 as u64,
+        &[
+            ("oid", "50010"),
+            ("relname", "cached_snapshot_after_change"),
+            ("relnamespace", "2200"),
+            ("reltype", "50011"),
+            ("relowner", "10"),
+            ("relam", "2"),
+            ("relfilenode", "50010"),
+            ("relhasindex", "f"),
+            ("relpersistence", "p"),
+            ("relkind", "r"),
+            ("relnatts", "0"),
+        ],
+    );
+    assert!(relation_by_name("cached_snapshot_after_change").is_some());
+    assert!(relation_oid_exists(relation_oid));
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        2
+    );
+
+    abort_implicit_transaction();
+    assert!(!relation_oid_exists(relation_oid));
+}
+
+#[test]
 fn generic_overlay_rows_drive_relation_views() {
     let _guard = catalog_test_lock();
     clear_for_tests();

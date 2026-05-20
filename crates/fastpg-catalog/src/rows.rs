@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use fastpg_types::Oid;
 
@@ -6,8 +6,9 @@ use crate::generated_catalog;
 use crate::lookups::{lookup_builtin_type, relation_by_oid};
 use crate::model::*;
 use crate::state::{
-    CatalogDraft, CatalogState, commit_catalog_draft, ensure_catalog_transaction, with_catalog,
-    with_catalog_session, with_visible_catalog_snapshot,
+    CatalogDraft, CatalogState, commit_catalog_draft, ensure_catalog_transaction,
+    invalidate_visible_catalog_snapshot, with_catalog, with_catalog_session,
+    with_visible_catalog_snapshot,
 };
 
 pub fn static_catalogs() -> &'static [StaticCatalogTable] {
@@ -1263,23 +1264,27 @@ fn catalog_row_description_key(
     Some((class_oid, object_oid, object_subid))
 }
 
-fn catalog_description_text(
-    table: &StaticCatalogTable,
-    rows: &BTreeMap<u64, CatalogRow>,
-    class_oid: Oid,
-    object_oid: Oid,
-    object_subid: i32,
-) -> Option<String> {
-    rows.values().find_map(|row| {
-        let matches = catalog_row_value(table, row, "classoid").and_then(catalog_value_oid)
-            == Some(class_oid)
-            && catalog_row_value(table, row, "objoid").and_then(catalog_value_oid)
-                == Some(object_oid)
-            && catalog_row_value(table, row, "objsubid").and_then(catalog_value_i32)
-                == Some(object_subid);
-        matches
-            .then(|| catalog_row_value(table, row, "description").and_then(catalog_value_string))?
-    })
+fn catalog_value_str(value: &CatalogValue) -> Option<&str> {
+    match value {
+        CatalogValue::Name(value) | CatalogValue::Text(value) | CatalogValue::Raw(value) => {
+            Some(value)
+        }
+        _ => None,
+    }
+}
+
+fn catalog_description_text_index<'a>(
+    table: &'a StaticCatalogTable,
+    rows: &'a BTreeMap<u64, CatalogRow>,
+) -> HashMap<(Oid, Oid, i32), &'a str> {
+    rows.values()
+        .filter_map(|row| {
+            let key = catalog_row_description_key(table, row)?;
+            let description =
+                catalog_row_value(table, row, "description").and_then(catalog_value_str)?;
+            Some((key, description))
+        })
+        .collect()
 }
 
 fn synthetic_operator_proc_description_row(
@@ -1644,20 +1649,14 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                 }
             }
             PG_DESCRIPTION_RELATION_OID => {
+                let description_texts = catalog_description_text_index(table, &rows);
                 let mut proc_descriptions = BTreeMap::<u32, String>::new();
                 for operator in generated_catalog::STATIC_OPERATORS {
                     if operator.code == INVALID_OID {
                         continue;
                     }
-                    let operator_description = catalog_description_text(
-                        table,
-                        &rows,
-                        PG_OPERATOR_RELATION_OID,
-                        operator.oid,
-                        0,
-                    );
-                    if operator_description
-                        .as_deref()
+                    if description_texts
+                        .get(&(PG_OPERATOR_RELATION_OID, operator.oid, 0))
                         .is_some_and(|description| description.starts_with("deprecated"))
                     {
                         continue;
@@ -1666,10 +1665,8 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                         .entry(operator.code.0)
                         .or_insert_with(|| format!("implementation of {} operator", operator.name));
                 }
-                let mut existing_descriptions: HashSet<(Oid, Oid, i32)> = rows
-                    .values()
-                    .filter_map(|row| catalog_row_description_key(table, row))
-                    .collect();
+                let mut existing_descriptions: HashSet<(Oid, Oid, i32)> =
+                    description_texts.keys().copied().collect();
                 for (proc_oid, description) in proc_descriptions {
                     let proc_oid = Oid(proc_oid);
                     if existing_descriptions.contains(&(PG_PROC_RELATION_OID, proc_oid, 0)) {
@@ -1966,6 +1963,7 @@ pub fn upsert_catalog_row(
             .last_mut()
             .expect("catalog transaction was just ensured")
             .upsert_catalog_row(table, row);
+        invalidate_visible_catalog_snapshot(session);
     });
     Ok(row_id)
 }
@@ -1987,6 +1985,7 @@ pub fn delete_catalog_row(relation_oid: Oid, row_id: u64) -> Result<(), CatalogE
             .last_mut()
             .expect("catalog transaction was just ensured")
             .delete_catalog_row(relation_oid, row_id);
+        invalidate_visible_catalog_snapshot(session);
     });
     Ok(())
 }

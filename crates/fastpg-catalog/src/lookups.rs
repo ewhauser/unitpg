@@ -15,7 +15,9 @@ use crate::rows::{
     static_row_column_identifier_matches, static_row_column_oid, static_row_to_catalog_row,
 };
 #[cfg(test)]
-use crate::state::{CATALOG_GENERATION, CatalogState, with_catalog};
+use crate::state::{
+    CATALOG_GENERATION, CatalogState, clear_current_catalog_session_for_tests, with_catalog,
+};
 use crate::state::{
     CATALOG_LOOKUP_CACHE, CatalogLookupCache, CatalogSnapshot, PRIMARY_KEY_INDEX_OID_CACHE,
     PrimaryKeyIndexOidCache, RelationMeta, current_generation, has_uncommitted_catalog_changes,
@@ -1463,6 +1465,7 @@ pub fn clear_for_tests() {
         CATALOG_GENERATION.store(state.snapshot.generation, Ordering::Relaxed);
     });
     clear_catalog_lookup_caches();
+    clear_current_catalog_session_for_tests();
 }
 
 fn catalog_type_from_row(
