@@ -9,8 +9,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    ACLITEM_ARRAY_OID, ANYARRAY_OID, BPCHAR_OID, CHAR_ARRAY_OID, CID_OID, CatalogError,
-    CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
+    ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BPCHAR_OID, CHAR_ARRAY_OID, CID_OID,
+    CatalogError, CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
     INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
     PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, TEXT_ARRAY_OID, TEXT_OID,
     TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
@@ -4702,6 +4702,10 @@ fn push_u32_ne(bytes: &mut Vec<u8>, value: u32) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
 
+fn push_u64_ne(bytes: &mut Vec<u8>, value: u64) {
+    bytes.extend_from_slice(&value.to_ne_bytes());
+}
+
 fn push_i16_ne(bytes: &mut Vec<u8>, value: i16) {
     bytes.extend_from_slice(&value.to_ne_bytes());
 }
@@ -4873,6 +4877,95 @@ fn textarray_datum(values: &[String], region: &mut StorageRegion) -> Cell {
     byref_datum(&bytes, region)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AclItemDatum {
+    grantee: Oid,
+    grantor: Oid,
+    rights: u64,
+}
+
+fn acl_privilege_bit(ch: char) -> Option<u64> {
+    match ch {
+        'a' => Some(1 << 0),
+        'r' => Some(1 << 1),
+        'w' => Some(1 << 2),
+        'd' => Some(1 << 3),
+        'D' => Some(1 << 4),
+        'x' => Some(1 << 5),
+        't' => Some(1 << 6),
+        'X' => Some(1 << 7),
+        'U' => Some(1 << 8),
+        'C' => Some(1 << 9),
+        'T' => Some(1 << 10),
+        'c' => Some(1 << 11),
+        's' => Some(1 << 12),
+        'A' => Some(1 << 13),
+        'm' => Some(1 << 14),
+        _ => None,
+    }
+}
+
+fn acl_role_oid(name: &str) -> Option<Oid> {
+    if name.is_empty() {
+        return Some(Oid(0));
+    }
+    if let Ok(oid) = name.parse::<u32>() {
+        return Some(Oid(oid));
+    }
+
+    let table = static_catalog_by_name("pg_authid")?;
+    catalog_rows(table.oid)
+        .into_iter()
+        .find(|row| {
+            catalog_row_value(table, row, "rolname")
+                .and_then(catalog_value_name)
+                .is_some_and(|rolname| rolname == name)
+        })
+        .and_then(|row| catalog_row_value(table, &row, "oid").and_then(catalog_value_oid))
+}
+
+fn parse_aclitem(value: &str) -> Option<AclItemDatum> {
+    let (grantee, rest) = value.split_once('=')?;
+    let (privileges, grantor) = rest.split_once('/').unwrap_or((rest, "10"));
+    let grantee = acl_role_oid(grantee)?;
+    let grantor = acl_role_oid(grantor)?;
+    let mut privs = 0u64;
+    let mut goptions = 0u64;
+    let mut last_privilege = 0u64;
+
+    for ch in privileges.chars() {
+        if ch == '*' {
+            if last_privilege == 0 {
+                return None;
+            }
+            goptions |= last_privilege;
+            continue;
+        }
+        let bit = acl_privilege_bit(ch)?;
+        privs |= bit;
+        last_privilege = bit;
+    }
+
+    Some(AclItemDatum {
+        grantee,
+        grantor,
+        rights: privs | (goptions << 32),
+    })
+}
+
+fn aclitem_array_datum(value: &str, region: &mut StorageRegion) -> Option<Cell> {
+    let values = parse_pg_array_values(value, parse_aclitem)?;
+    let total_len = 24 + values.len() * 16;
+    let mut bytes = Vec::with_capacity(total_len);
+    push_1d_array_header(&mut bytes, total_len, ACLITEM_OID, values.len(), 1);
+    for value in values {
+        push_u32_ne(&mut bytes, value.grantee.0);
+        push_u32_ne(&mut bytes, value.grantor.0);
+        push_u64_ne(&mut bytes, value.rights);
+    }
+    Some(byref_datum(&bytes, region))
+}
+
 fn parse_lsn(value: &str) -> Option<u64> {
     let (high, low) = value.split_once('/')?;
     let high = u64::from_str_radix(high, 16).ok()?;
@@ -4965,7 +5058,8 @@ fn catalog_value_to_cell(
             TEXT_ARRAY_OID => parse_pg_array_values(value, |part| Some(part.to_owned()))
                 .map(|values| textarray_datum(&values, region))
                 .unwrap_or_else(null_datum),
-            ACLITEM_ARRAY_OID | ANYARRAY_OID => null_datum(),
+            ACLITEM_ARRAY_OID => aclitem_array_datum(value, region).unwrap_or_else(null_datum),
+            ANYARRAY_OID => null_datum(),
             _ => null_datum(),
         },
     }
@@ -5196,6 +5290,10 @@ mod tests {
         u32::from_ne_bytes(bytes[offset..offset + 4].try_into().expect("u32 bytes"))
     }
 
+    fn u64_from_bytes(bytes: &[u8], offset: usize) -> u64 {
+        u64::from_ne_bytes(bytes[offset..offset + 8].try_into().expect("u64 bytes"))
+    }
+
     #[test]
     fn catalog_arrays_use_sql_array_bounds_not_vector_bounds() {
         let mut region = StorageRegion::new(StorageRegionKind::Scan);
@@ -5212,6 +5310,33 @@ mod tests {
         let oid_vector = oidvector_datum(&[23, 26], &mut region);
         let oid_vector_bytes = oid_vector.byref_bytes().expect("oidvector bytes");
         assert_eq!(i32_from_bytes(oid_vector_bytes, 20), 0);
+    }
+
+    #[test]
+    fn aclitem_arrays_render_as_postgres_acl_datums() {
+        let _guard = test_guard();
+        upsert_named_catalog_row(
+            "pg_authid",
+            60_001,
+            &[("oid", "60001"), ("rolname", "regress_acl_user")],
+        );
+
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+        let cell = aclitem_array_datum(
+            "{regress_acl_user=a*r/regress_acl_user,=r/regress_acl_user}",
+            &mut region,
+        )
+        .expect("aclitem array");
+        let bytes = cell.byref_bytes().expect("aclitem array bytes");
+        assert_eq!(u32_from_bytes(bytes, 12), ACLITEM_OID.0);
+        assert_eq!(i32_from_bytes(bytes, 16), 2);
+        assert_eq!(i32_from_bytes(bytes, 20), 1);
+        assert_eq!(u32_from_bytes(bytes, 24), 60_001);
+        assert_eq!(u32_from_bytes(bytes, 28), 60_001);
+        assert_eq!(u64_from_bytes(bytes, 32), (1 | 2) | (1u64 << 32));
+        assert_eq!(u32_from_bytes(bytes, 40), 0);
+        assert_eq!(u32_from_bytes(bytes, 44), 60_001);
+        assert_eq!(u64_from_bytes(bytes, 48), 2);
     }
 
     fn upsert_named_catalog_row(table_name: &str, row_id: u64, values: &[(&str, &str)]) -> u64 {

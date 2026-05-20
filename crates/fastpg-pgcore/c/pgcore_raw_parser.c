@@ -893,7 +893,6 @@ fastpg_pgcore_should_noop_utility(Node *utility_stmt)
 	{
 		case T_GrantStmt:
 		case T_GrantRoleStmt:
-		case T_AlterDefaultPrivilegesStmt:
 		case T_CreateTableSpaceStmt:
 		case T_DropTableSpaceStmt:
 		case T_AlterTableSpaceOptionsStmt:

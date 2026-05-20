@@ -1383,6 +1383,7 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 			for (size_t index = 0; index < natts; index++)
 				nulls[index] = isnull[index] != 0;
 			tuple = heap_form_tuple(cache->cc_tupdesc, values, nulls);
+			tuple->t_tableOid = cache->cc_reloid;
 			if (!FastPgCatalogRowIdToTid(row_id, &tuple->t_self))
 				elog(ERROR,
 					 "fastpg catalog row id %llu cannot be represented as a CTID",
@@ -1400,6 +1401,16 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 static HeapTuple
 FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 {
+	if (cache->cc_reloid == RelationRelationId &&
+		fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
+	{
+		HeapTuple	tuple;
+
+		tuple = FastPgCatalogCacheLookupGeneric(cache, nkeys, arguments);
+		if (tuple != NULL)
+			return tuple;
+	}
+
 	if (cache->cc_reloid == RelationRelationId)
 	{
 		FastPgRustCatalogRelation relation;
