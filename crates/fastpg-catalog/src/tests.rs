@@ -5,7 +5,10 @@ use std::sync::{Mutex, MutexGuard};
 use fastpg_types::Oid;
 
 use crate::lookups::catalog_value_int2_vector;
-use crate::rows::{catalog_value_i16, catalog_value_oid, catalog_value_string, catalog_value_u8};
+use crate::rows::{
+    catalog_value_i16, catalog_value_i32, catalog_value_oid, catalog_value_string,
+    catalog_value_u8,
+};
 
 static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
 
@@ -167,6 +170,48 @@ fn pg_init_privs_exposes_bootstrap_schema_privileges() {
             .and_then(catalog_value_string)
             .is_some_and(|initprivs| initprivs.contains("=U/postgres"))
     );
+}
+
+#[test]
+fn text_search_catalog_exposes_initdb_english_config() {
+    let config_table = static_catalog_by_name("pg_ts_config").expect("pg_ts_config");
+    let config_row = catalog_rows(PG_TS_CONFIG_RELATION_OID)
+        .into_iter()
+        .find(|row| {
+            catalog_row_value(config_table, row, "cfgname").and_then(catalog_value_string)
+                == Some("english".to_owned())
+        })
+        .expect("english text search config");
+
+    assert_eq!(
+        catalog_row_value(config_table, &config_row, "oid").and_then(catalog_value_oid),
+        Some(ENGLISH_TS_CONFIG_OID)
+    );
+    assert_eq!(
+        catalog_row_value(config_table, &config_row, "cfgparser").and_then(catalog_value_oid),
+        Some(DEFAULT_TS_PARSER_OID)
+    );
+
+    let map_table = static_catalog_by_name("pg_ts_config_map").expect("pg_ts_config_map");
+    let english_map_rows = catalog_rows(PG_TS_CONFIG_MAP_RELATION_OID)
+        .into_iter()
+        .filter(|row| {
+            catalog_row_value(map_table, row, "mapcfg").and_then(catalog_value_oid)
+                == Some(ENGLISH_TS_CONFIG_OID)
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(english_map_rows.len(), 19);
+    assert!(english_map_rows.iter().any(|row| {
+        catalog_row_value(map_table, row, "maptokentype").and_then(catalog_value_i32) == Some(1)
+            && catalog_row_value(map_table, row, "mapdict").and_then(catalog_value_oid)
+                == Some(ENGLISH_TS_DICT_OID)
+    }));
+    assert!(english_map_rows.iter().any(|row| {
+        catalog_row_value(map_table, row, "maptokentype").and_then(catalog_value_i32) == Some(3)
+            && catalog_row_value(map_table, row, "mapdict").and_then(catalog_value_oid)
+                == Some(SIMPLE_TS_DICT_OID)
+    }));
 }
 
 #[test]

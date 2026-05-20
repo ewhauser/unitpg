@@ -1360,6 +1360,114 @@ fn synthetic_pg_catalog_init_privs_row(table: &StaticCatalogTable) -> CatalogRow
     row
 }
 
+fn synthetic_english_ts_dict_row(table: &StaticCatalogTable) -> CatalogRow {
+    let mut row = empty_catalog_row(table, u64::from(ENGLISH_TS_DICT_OID.0));
+    set_catalog_row_value(table, &mut row, "oid", CatalogValue::Oid(ENGLISH_TS_DICT_OID));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "dictname",
+        CatalogValue::Name("english_stem".to_owned()),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "dictnamespace",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "dictowner",
+        CatalogValue::Oid(POSTGRES_ROLE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "dicttemplate",
+        CatalogValue::Oid(SNOWBALL_TS_TEMPLATE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "dictinitoption",
+        CatalogValue::Text("language = 'english', stopwords = 'english'".to_owned()),
+    );
+    row
+}
+
+fn synthetic_english_ts_config_row(table: &StaticCatalogTable) -> CatalogRow {
+    let mut row = empty_catalog_row(table, u64::from(ENGLISH_TS_CONFIG_OID.0));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "oid",
+        CatalogValue::Oid(ENGLISH_TS_CONFIG_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "cfgname",
+        CatalogValue::Name("english".to_owned()),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "cfgnamespace",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "cfgowner",
+        CatalogValue::Oid(POSTGRES_ROLE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "cfgparser",
+        CatalogValue::Oid(DEFAULT_TS_PARSER_OID),
+    );
+    row
+}
+
+fn synthetic_english_ts_config_map_rows(table: &StaticCatalogTable) -> Vec<CatalogRow> {
+    const SIMPLE_TOKEN_TYPES: &[i32] = &[3, 4, 5, 6, 7, 8, 9, 15, 18, 19, 20, 21, 22];
+    const ENGLISH_TOKEN_TYPES: &[i32] = &[1, 2, 10, 11, 16, 17];
+
+    SIMPLE_TOKEN_TYPES
+        .iter()
+        .map(|token_type| (*token_type, SIMPLE_TS_DICT_OID))
+        .chain(
+            ENGLISH_TOKEN_TYPES
+                .iter()
+                .map(|token_type| (*token_type, ENGLISH_TS_DICT_OID)),
+        )
+        .enumerate()
+        .map(|(index, (token_type, dict_oid))| {
+            let mut row = empty_catalog_row(
+                table,
+                SYNTHETIC_TS_CONFIG_MAP_ROW_ID_BASE | u64::try_from(index).unwrap_or(0),
+            );
+            set_catalog_row_value(
+                table,
+                &mut row,
+                "mapcfg",
+                CatalogValue::Oid(ENGLISH_TS_CONFIG_OID),
+            );
+            set_catalog_row_value(
+                table,
+                &mut row,
+                "maptokentype",
+                CatalogValue::Int32(token_type),
+            );
+            set_catalog_row_value(table, &mut row, "mapseqno", CatalogValue::Int32(1));
+            set_catalog_row_value(table, &mut row, "mapdict", CatalogValue::Oid(dict_oid));
+            row
+        })
+        .collect()
+}
+
 pub(crate) fn static_row_column_value(
     table: &StaticCatalogTable,
     row: &StaticCatalogRow,
@@ -1585,6 +1693,19 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
             PG_INIT_PRIVS_RELATION_OID => {
                 let row = synthetic_pg_catalog_init_privs_row(table);
                 rows.entry(row.row_id).or_insert(row);
+            }
+            PG_TS_DICT_RELATION_OID => {
+                let row = synthetic_english_ts_dict_row(table);
+                rows.entry(row.row_id).or_insert(row);
+            }
+            PG_TS_CONFIG_RELATION_OID => {
+                let row = synthetic_english_ts_config_row(table);
+                rows.entry(row.row_id).or_insert(row);
+            }
+            PG_TS_CONFIG_MAP_RELATION_OID => {
+                for row in synthetic_english_ts_config_map_rows(table) {
+                    rows.entry(row.row_id).or_insert(row);
+                }
             }
             _ => {}
         }
