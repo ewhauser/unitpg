@@ -43,6 +43,12 @@ jobs:
             pkg-config \
             python3
 
+      - name: Install Rust toolchain
+        run: |
+          cargo --version
+          cargo clippy --version
+          rustfmt --version
+
       - name: Build fastpg PostgreSQL core
         run: |
           set -euo pipefail
@@ -106,6 +112,12 @@ jobs:
             echo "$(brew --prefix bison)/bin"
             echo "$(brew --prefix flex)/bin"
           } >> "$GITHUB_PATH"
+
+      - name: Install Rust toolchain
+        run: |
+          cargo --version
+          cargo clippy --version
+          rustfmt --version
 
       - name: Build fastpg PostgreSQL core
         run: |

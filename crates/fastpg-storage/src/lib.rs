@@ -12,20 +12,21 @@ use fastpg_catalog::{
     ACLITEM_ARRAY_OID, ANYARRAY_OID, BPCHAR_OID, CHAR_ARRAY_OID, CID_OID, CatalogError,
     CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
     INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
-    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, TEXT_ARRAY_OID, TEXT_OID, TID_OID, TIMESTAMP_OID,
-    VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
-    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
-    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_value, catalog_rows, current_generation,
-    delete_catalog_row, has_uncommitted_catalog_changes, index_record_by_index_oid,
+    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, TEXT_ARRAY_OID, TEXT_OID,
+    TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
+    btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
+    builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
+    builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
+    catalog_row_value, catalog_rows, current_generation, delete_catalog_row,
+    enum_oids_by_sort_order, has_uncommitted_catalog_changes, index_record_by_index_oid,
     index_records_for_relation_oid, lookup_type, primary_key_index_oid_for_relation_oid,
     primary_key_relation_oid_for_index_oid, relation_by_name, relation_by_name_in_namespace,
     relation_by_oid, relation_column_by_attnum, relation_column_count,
     relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
-    relation_summary_by_name_in_namespace, relation_summary_by_oid, static_catalog_by_name,
-    static_catalog_by_relation_oid, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, upsert_catalog_row, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid,
+    relation_physical_column_by_attnum, relation_summary_by_name_in_namespace,
+    relation_summary_by_oid, static_catalog_by_name, static_catalog_by_relation_oid, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid, upsert_catalog_row,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid,
 };
 use fastpg_types::Oid;
 
@@ -92,9 +93,15 @@ pub struct FastPgRustCatalogColumn {
     pub name: [c_char; NAMEDATALEN],
     pub type_oid: u32,
     pub type_mod: i32,
+    pub attcollation: u32,
+    pub attlen: i16,
     pub is_not_null: u8,
     pub has_default: u8,
     pub generated: u8,
+    pub is_dropped: u8,
+    pub attbyval: u8,
+    pub attalign: u8,
+    pub attstorage: u8,
     pub _padding: u8,
 }
 
@@ -2018,13 +2025,40 @@ fn virtual_catalog_relation_to_ffi(
 }
 
 fn column_to_ffi(column: &ColumnRecord) -> FastPgRustCatalogColumn {
+    let pg_type = lookup_type(column.type_oid);
     FastPgRustCatalogColumn {
         name: fixed_c_name(&column.name),
         type_oid: column.type_oid.0,
         type_mod: column.type_mod,
+        attcollation: pg_type.as_ref().map_or(0, |pg_type| pg_type.typcollation.0),
+        attlen: pg_type.as_ref().map_or(0, |pg_type| pg_type.typlen),
         is_not_null: u8::from(column.is_not_null),
         has_default: u8::from(column.has_default),
         generated: column.generated,
+        is_dropped: 0,
+        attbyval: pg_type
+            .as_ref()
+            .map_or(0, |pg_type| u8::from(pg_type.typbyval)),
+        attalign: pg_type.as_ref().map_or(b'i', |pg_type| pg_type.typalign),
+        attstorage: pg_type.as_ref().map_or(b'p', |pg_type| pg_type.typstorage),
+        _padding: 0,
+    }
+}
+
+fn physical_column_to_ffi(column: &PhysicalColumnRecord) -> FastPgRustCatalogColumn {
+    FastPgRustCatalogColumn {
+        name: fixed_c_name(&column.name),
+        type_oid: column.type_oid.0,
+        type_mod: column.type_mod,
+        attcollation: column.attcollation.0,
+        attlen: column.attlen,
+        is_not_null: u8::from(column.is_not_null),
+        has_default: u8::from(column.has_default),
+        generated: column.generated,
+        is_dropped: u8::from(column.is_dropped),
+        attbyval: u8::from(column.attbyval),
+        attalign: column.attalign,
+        attstorage: column.attstorage,
         _padding: 0,
     }
 }
@@ -2036,9 +2070,15 @@ fn static_catalog_column_to_ffi(
         name: fixed_c_name(column.name),
         type_oid: column.type_oid.0,
         type_mod: -1,
+        attcollation: column.attcollation.0,
+        attlen: column.attlen,
         is_not_null: u8::from(column.attnotnull),
         has_default: 0,
         generated: 0,
+        is_dropped: 0,
+        attbyval: u8::from(column.attbyval),
+        attalign: column.attalign,
+        attstorage: column.attstorage,
         _padding: 0,
     }
 }
@@ -2996,8 +3036,20 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
     if out.is_null() {
         return false;
     }
-    let relation = if let Some(relation) = relation_by_oid(Oid(relation_oid)) {
-        relation
+    if relation_by_oid(Oid(relation_oid)).is_some() {
+        let Some(attnum) = column_index
+            .checked_add(1)
+            .and_then(|attnum| i16::try_from(attnum).ok())
+        else {
+            return false;
+        };
+        let Some(column) = relation_physical_column_by_attnum(Oid(relation_oid), attnum) else {
+            return false;
+        };
+        unsafe {
+            *out = physical_column_to_ffi(&column);
+        }
+        true
     } else if let Some(relation) = primary_key_index_relation(Oid(relation_oid)) {
         let Some(column) = primary_key_column(&relation, column_index) else {
             return false;
@@ -3005,7 +3057,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
         unsafe {
             *out = column_to_ffi(column);
         }
-        return true;
+        true
     } else if let Some(table) = static_catalog_by_relation_oid(Oid(relation_oid)) {
         let Some(column) = table.columns.get(column_index) else {
             return false;
@@ -3013,18 +3065,10 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
         unsafe {
             *out = static_catalog_column_to_ffi(column);
         }
-        return true;
+        true
     } else {
-        return false;
-    };
-    let Some(column) = relation.columns.get(column_index) else {
-        return false;
-    };
-
-    unsafe {
-        *out = column_to_ffi(column);
+        false
     }
-    true
 }
 
 #[unsafe(no_mangle)]
@@ -3090,6 +3134,65 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_unique_index_oid(
     };
     unsafe {
         *oid_out = index_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer for `oid_out`.
+pub unsafe extern "C" fn fastpg_rust_catalog_enum_endpoint(
+    enum_type_oid: u32,
+    forward: u8,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let mut oids = enum_oids_by_sort_order(Oid(enum_type_oid));
+    if oids.is_empty() {
+        return false;
+    }
+    let oid = if forward != 0 {
+        oids.remove(0)
+    } else {
+        oids.pop().expect("non-empty enum oid list")
+    };
+    unsafe {
+        *oid_out = oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// If `oids_out` is non-null, it must point to `capacity` writable `uint32_t`
+/// slots. `count_out`, when non-null, receives the full number of matching
+/// enum labels even when `capacity` is smaller.
+pub unsafe extern "C" fn fastpg_rust_catalog_enum_oids_by_sort_order(
+    enum_type_oid: u32,
+    oids_out: *mut u32,
+    capacity: usize,
+    count_out: *mut usize,
+) -> bool {
+    let oids = enum_oids_by_sort_order(Oid(enum_type_oid));
+    if !count_out.is_null() {
+        unsafe {
+            *count_out = oids.len();
+        }
+    }
+    if oids_out.is_null() {
+        return true;
+    }
+    if capacity < oids.len() {
+        return false;
+    }
+    for (index, oid) in oids.into_iter().enumerate() {
+        unsafe {
+            *oids_out.add(index) = oid.0;
+        }
     }
     true
 }

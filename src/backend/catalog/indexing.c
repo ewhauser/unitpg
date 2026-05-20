@@ -26,6 +26,7 @@
 #include "catalog/indexing.h"
 #include "executor/executor.h"
 #include "fmgr.h"
+#include "utils/catcache.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
@@ -69,6 +70,12 @@ static bool
 FastPgIsVirtualCatalog(Relation heapRel)
 {
 	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRel)) != 0;
+}
+
+static void
+FastPgInvalidateVirtualCatalog(Relation heapRel)
+{
+	CatalogCacheFlushCatalog(RelationGetRelid(heapRel));
 }
 
 static void
@@ -133,6 +140,7 @@ FastPgCatalogUpsertTuple(Relation heapRel, HeapTuple tup, uint64_t row_id)
 	if (!FastPgCatalogRowIdToTid(stored_row_id, &tup->t_self))
 		elog(ERROR, "fastpg catalog row id %llu cannot be represented as a CTID",
 			 (unsigned long long) stored_row_id);
+	FastPgInvalidateVirtualCatalog(heapRel);
 }
 
 static void
@@ -150,6 +158,7 @@ FastPgCatalogDeleteTuple(Relation heapRel, const ItemPointerData *tid)
 		elog(ERROR, "fastpg failed to delete catalog row %llu for relation %u",
 			 (unsigned long long) row_id,
 			 RelationGetRelid(heapRel));
+	FastPgInvalidateVirtualCatalog(heapRel);
 }
 #endif
 

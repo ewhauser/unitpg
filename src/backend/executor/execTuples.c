@@ -58,6 +58,7 @@
 #include "postgres.h"
 
 #include "access/heaptoast.h"
+#include "access/sysattr.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
 #include "access/xact.h"
@@ -141,6 +142,27 @@ static Datum
 tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
 	Assert(!TTS_EMPTY(slot));
+
+#ifdef USE_FASTPG
+	if (OidIsValid(slot->tts_tableOid))
+	{
+		switch (attnum)
+		{
+			case MinTransactionIdAttributeNumber:
+				*isnull = false;
+				return TransactionIdGetDatum(GetCurrentTransactionId());
+			case MaxTransactionIdAttributeNumber:
+				*isnull = false;
+				return TransactionIdGetDatum(InvalidTransactionId);
+			case MinCommandIdAttributeNumber:
+			case MaxCommandIdAttributeNumber:
+				*isnull = false;
+				return CommandIdGetDatum(FirstCommandId);
+			default:
+				break;
+		}
+	}
+#endif
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

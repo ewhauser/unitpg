@@ -447,6 +447,9 @@ extern void SetUserIdAndContext(Oid userid, bool sec_def_context);
 extern void InitializeSessionUserId(const char *rolename, Oid roleid,
 									bool bypass_login_check);
 extern void InitializeSessionUserIdStandalone(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureStandaloneUserId(void);
+#endif
 extern void SetSessionAuthorization(Oid userid, bool is_superuser);
 extern Oid	GetCurrentRoleId(void);
 extern void SetCurrentRoleId(Oid roleid, bool is_superuser);

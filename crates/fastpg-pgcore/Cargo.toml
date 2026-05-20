@@ -12,6 +12,7 @@ postgres-execution = []
 [dependencies]
 fastpg-catalog.workspace = true
 fastpg-storage.workspace = true
+fastpg-storage2.workspace = true
 
 [build-dependencies]
 cc.workspace = true

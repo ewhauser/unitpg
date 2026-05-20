@@ -13,11 +13,15 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/table.h"
 #include "catalog/pg_enum.h"
 #include "libpq/pqformat.h"
+#include "miscadmin.h"
 #include "storage/procarray.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
@@ -28,6 +32,10 @@
 
 static Oid	enum_endpoint(Oid enumtypoid, ScanDirection direction);
 static ArrayType *enum_range_internal(Oid enumtypoid, Oid lower, Oid upper);
+#ifdef USE_FASTPG
+static ArrayType *fastpg_enum_range_internal(Oid enumtypoid, Oid lower,
+											 Oid upper);
+#endif
 
 
 /*
@@ -64,6 +72,11 @@ check_safe_enum_use(HeapTuple enumval_tup)
 {
 	TransactionId xmin;
 	Form_pg_enum en = (Form_pg_enum) GETSTRUCT(enumval_tup);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return;
+#endif
 
 	/*
 	 * If the row is hinted as committed, it's surely safe.  This provides a
@@ -398,6 +411,19 @@ enum_endpoint(Oid enumtypoid, ScanDirection direction)
 	ScanKeyData skey;
 	Oid			minmax;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		uint32_t	fastpg_enum_oid = InvalidOid;
+
+		if (fastpg_rust_catalog_enum_endpoint((uint32_t) enumtypoid,
+											  ScanDirectionIsForward(direction) ? 1 : 0,
+											  &fastpg_enum_oid))
+			return (Oid) fastpg_enum_oid;
+		return InvalidOid;
+	}
+#endif
+
 	/*
 	 * Find the first/last enum member using pg_enum_typid_sortorder_index.
 	 * Note we must not use the syscache.  See comments for RenumberEnumType
@@ -557,6 +583,11 @@ enum_range_internal(Oid enumtypoid, Oid lower, Oid upper)
 				cnt;
 	bool		left_found;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		return fastpg_enum_range_internal(enumtypoid, lower, upper);
+#endif
+
 	/*
 	 * Scan the enum members in order using pg_enum_typid_sortorder_index.
 	 * Note we must not use the syscache.  See comments for RenumberEnumType
@@ -614,3 +645,52 @@ enum_range_internal(Oid enumtypoid, Oid lower, Oid upper)
 
 	return result;
 }
+
+#ifdef USE_FASTPG
+static ArrayType *
+fastpg_enum_range_internal(Oid enumtypoid, Oid lower, Oid upper)
+{
+	ArrayType  *result;
+	uint32_t   *oids = NULL;
+	Datum	   *elems;
+	size_t		count = 0;
+	int			cnt = 0;
+	bool		left_found = !OidIsValid(lower);
+
+	if (!fastpg_rust_catalog_enum_oids_by_sort_order((uint32_t) enumtypoid,
+													 NULL,
+													 0,
+													 &count))
+		count = 0;
+	if (count > 0)
+	{
+		oids = (uint32_t *) palloc(sizeof(uint32_t) * count);
+		if (!fastpg_rust_catalog_enum_oids_by_sort_order((uint32_t) enumtypoid,
+														 oids,
+														 count,
+														 &count))
+			elog(ERROR, "fastpg failed to read enum labels for type %u",
+				 enumtypoid);
+	}
+
+	elems = (Datum *) palloc(sizeof(Datum) * (count > 0 ? count : 1));
+	for (size_t index = 0; index < count; index++)
+	{
+		Oid			enum_oid = (Oid) oids[index];
+
+		if (!left_found && lower == enum_oid)
+			left_found = true;
+		if (left_found)
+			elems[cnt++] = ObjectIdGetDatum(enum_oid);
+		if (OidIsValid(upper) && upper == enum_oid)
+			break;
+	}
+
+	result = construct_array(elems, cnt, enumtypoid,
+							 sizeof(Oid), true, TYPALIGN_INT);
+	if (oids != NULL)
+		pfree(oids);
+	pfree(elems);
+	return result;
+}
+#endif

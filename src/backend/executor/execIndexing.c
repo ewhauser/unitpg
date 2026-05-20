@@ -107,6 +107,9 @@
 #include "postgres.h"
 
 #include "access/genam.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
@@ -784,6 +787,22 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 				return true;
 		}
 	}
+
+#ifdef USE_FASTPG
+	if (indexInfo->ii_ExclusionOps == NULL && violationOK)
+	{
+		bool		fastpg_satisfies;
+
+		if (FastPgMemIndexCheckUniqueConflict(heap,
+											  index,
+											  values,
+											  isnull,
+											  tupleid,
+											  &fastpg_satisfies,
+											  conflictTid))
+			return fastpg_satisfies;
+	}
+#endif
 
 	/*
 	 * Search the tuples that are in the index for any violations, including

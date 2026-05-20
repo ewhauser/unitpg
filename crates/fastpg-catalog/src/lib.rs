@@ -40,6 +40,7 @@ pub const ANY_OID: Oid = Oid(2276);
 pub const ANYARRAY_OID: Oid = Oid(2277);
 pub const INTERNAL_OID: Oid = Oid(2281);
 pub const LSN_OID: Oid = Oid(3220);
+pub const ANYENUM_OID: Oid = Oid(3500);
 
 pub const DEFAULT_COLLATION_OID: Oid = Oid(100);
 pub const C_COLLATION_OID: Oid = Oid(950);
@@ -55,6 +56,7 @@ const PG_PROC_RELATION_OID: Oid = Oid(1255);
 const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 const PG_INDEX_RELATION_OID: Oid = Oid(2610);
 const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
+const PG_ENUM_RELATION_OID: Oid = Oid(3501);
 const BTREE_INDEX_AM_OID: Oid = Oid(403);
 
 pub const VIRTUAL_CATALOG_STATIC: u8 = 1;
@@ -283,6 +285,22 @@ impl ColumnRecord {
             generated: 0,
         }
     }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PhysicalColumnRecord {
+    pub name: String,
+    pub type_oid: Oid,
+    pub type_mod: i32,
+    pub is_not_null: bool,
+    pub has_default: bool,
+    pub generated: u8,
+    pub is_dropped: bool,
+    pub attlen: i16,
+    pub attbyval: bool,
+    pub attalign: u8,
+    pub attstorage: u8,
+    pub attcollation: Oid,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -604,30 +622,8 @@ impl CatalogSnapshot {
             .collect()
     }
 
-    fn remove_relation_cascade(&mut self, row_id: u64) {
-        let Some(relation) = self.relations.remove(&row_id) else {
-            return;
-        };
-        let relation_oid = relation.oid;
-        let relation_oid_raw = relation_oid.0;
-
-        self.columns
-            .retain(|_, column| column.relation_oid != relation_oid);
-        self.types
-            .retain(|_, pg_type| pg_type.record.typrelid != relation_oid);
-        self.indexes.retain(|_, index| {
-            index.record.relation_oid != relation_oid && index.record.index_oid != relation_oid
-        });
-        self.constraints.retain(|_, constraint| {
-            constraint.relation_oid != relation_oid && constraint.index_oid != relation_oid
-        });
-
-        if relation.relkind == b'r' {
-            self.indexes
-                .retain(|_, index| index.record.relation_oid.0 != relation_oid_raw);
-            self.constraints
-                .retain(|_, constraint| constraint.relation_oid.0 != relation_oid_raw);
-        }
+    fn remove_relation(&mut self, row_id: u64) {
+        self.relations.remove(&row_id);
     }
 }
 
@@ -714,7 +710,7 @@ impl CatalogDraft {
                     snapshot.relations.insert(*row_id, relation.clone());
                 }
                 None => {
-                    snapshot.remove_relation_cascade(*row_id);
+                    snapshot.remove_relation(*row_id);
                 }
             }
         }
@@ -1055,6 +1051,7 @@ impl Default for CatalogState {
 static CATALOG: OnceLock<RwLock<CatalogState>> = OnceLock::new();
 static CATALOG_GENERATION: AtomicU64 = AtomicU64::new(1);
 static PRIMARY_KEY_INDEX_OID_CACHE: OnceLock<Mutex<PrimaryKeyIndexOidCache>> = OnceLock::new();
+static CATALOG_LOOKUP_CACHE: OnceLock<Mutex<CatalogLookupCache>> = OnceLock::new();
 
 #[derive(Debug)]
 struct PrimaryKeyIndexOidCache {
@@ -1067,6 +1064,27 @@ impl Default for PrimaryKeyIndexOidCache {
         Self {
             generation: current_generation(),
             entries: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CatalogLookupCache {
+    generation: u64,
+    relation_columns: BTreeMap<(u32, i16), Option<ColumnRecord>>,
+    index_records_by_oid: BTreeMap<u32, Option<IndexRecord>>,
+    index_records_by_relation: BTreeMap<u32, Vec<IndexRecord>>,
+    unique_index_records_by_relation: BTreeMap<u32, Vec<IndexRecord>>,
+}
+
+impl Default for CatalogLookupCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            relation_columns: BTreeMap::new(),
+            index_records_by_oid: BTreeMap::new(),
+            index_records_by_relation: BTreeMap::new(),
+            unique_index_records_by_relation: BTreeMap::new(),
         }
     }
 }
@@ -1973,6 +1991,14 @@ fn catalog_value_i32(value: &CatalogValue) -> Option<i32> {
     }
 }
 
+fn catalog_value_f32(value: &CatalogValue) -> Option<f32> {
+    match value {
+        CatalogValue::Float32(value) => Some(*value),
+        CatalogValue::Raw(value) => value.parse::<f32>().ok(),
+        _ => None,
+    }
+}
+
 fn catalog_value_u8(value: &CatalogValue) -> Option<u8> {
     match value {
         CatalogValue::Char(value) => Some(*value),
@@ -1999,7 +2025,10 @@ fn catalog_value_identifier_matches(value: &CatalogValue, normalized: &str) -> b
 }
 
 pub fn btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
-    static_btree_opclass_for_type(type_oid)
+    static_btree_opclass_for_type(type_oid).or_else(|| {
+        let record = lookup_type(type_oid)?;
+        (record.typtype == b'e').then(|| static_btree_opclass_for_type(ANYENUM_OID))?
+    })
 }
 
 fn static_btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
@@ -2056,6 +2085,129 @@ fn primary_key_index_oid_cache_store(relation_oid: Oid, index_oid: Option<Oid>) 
         cache.entries.clear();
     }
     cache.entries.insert(relation_oid.0, index_oid);
+}
+
+fn catalog_lookup_cache() -> &'static Mutex<CatalogLookupCache> {
+    CATALOG_LOOKUP_CACHE.get_or_init(|| Mutex::new(CatalogLookupCache::default()))
+}
+
+fn with_catalog_lookup_cache<R>(f: impl FnOnce(&mut CatalogLookupCache) -> R) -> R {
+    let generation = current_generation();
+    let mut cache = catalog_lookup_cache()
+        .lock()
+        .expect("catalog lookup cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.relation_columns.clear();
+        cache.index_records_by_oid.clear();
+        cache.index_records_by_relation.clear();
+        cache.unique_index_records_by_relation.clear();
+    }
+    f(&mut cache)
+}
+
+fn relation_column_cache_lookup(relation_oid: Oid, attnum: i16) -> Option<Option<ColumnRecord>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .relation_columns
+            .get(&(relation_oid.0, attnum))
+            .cloned()
+    })
+}
+
+fn relation_column_cache_store(relation_oid: Oid, attnum: i16, column: Option<ColumnRecord>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .relation_columns
+            .insert((relation_oid.0, attnum), column);
+    });
+}
+
+fn index_record_by_oid_cache_lookup(index_oid: Oid) -> Option<Option<IndexRecord>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    with_catalog_lookup_cache(|cache| cache.index_records_by_oid.get(&index_oid.0).cloned())
+}
+
+fn index_record_by_oid_cache_store(index_oid: Oid, record: Option<IndexRecord>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache.index_records_by_oid.insert(index_oid.0, record);
+    });
+}
+
+fn index_records_by_relation_cache_lookup(relation_oid: Oid) -> Option<Vec<IndexRecord>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .index_records_by_relation
+            .get(&relation_oid.0)
+            .cloned()
+    })
+}
+
+fn index_records_by_relation_cache_store(relation_oid: Oid, records: Vec<IndexRecord>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .index_records_by_relation
+            .insert(relation_oid.0, records);
+    });
+}
+
+fn unique_index_records_by_relation_cache_lookup(relation_oid: Oid) -> Option<Vec<IndexRecord>> {
+    if has_uncommitted_catalog_changes() {
+        return None;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .unique_index_records_by_relation
+            .get(&relation_oid.0)
+            .cloned()
+    })
+}
+
+fn unique_index_records_by_relation_cache_store(relation_oid: Oid, records: Vec<IndexRecord>) {
+    if has_uncommitted_catalog_changes() {
+        return;
+    }
+    with_catalog_lookup_cache(|cache| {
+        cache
+            .unique_index_records_by_relation
+            .insert(relation_oid.0, records);
+    });
+}
+
+#[cfg(test)]
+fn clear_catalog_lookup_caches() {
+    if let Some(cache) = PRIMARY_KEY_INDEX_OID_CACHE.get() {
+        let mut cache = cache
+            .lock()
+            .expect("primary key index OID cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+    }
+    if let Some(cache) = CATALOG_LOOKUP_CACHE.get() {
+        let mut cache = cache.lock().expect("catalog lookup cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.relation_columns.clear();
+        cache.index_records_by_oid.clear();
+        cache.index_records_by_relation.clear();
+        cache.unique_index_records_by_relation.clear();
+    }
 }
 
 fn relation_pg_class_row_by_oid(oid: Oid) -> Option<CatalogRow> {
@@ -2168,7 +2320,89 @@ fn column_record_from_pg_attribute_row(
     ))
 }
 
+fn physical_column_record_from_pg_attribute_row(
+    table: &StaticCatalogTable,
+    row: &CatalogRow,
+    relation_oid: Oid,
+) -> Option<(i16, PhysicalColumnRecord)> {
+    let attrelid = catalog_row_value(table, row, "attrelid").and_then(catalog_value_oid)?;
+    if attrelid != relation_oid {
+        return None;
+    }
+    let attnum = catalog_row_value(table, row, "attnum").and_then(catalog_value_i16)?;
+    if attnum <= 0 {
+        return None;
+    }
+    let is_dropped = catalog_row_value(table, row, "attisdropped")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    let name = catalog_row_value(table, row, "attname").and_then(catalog_value_string)?;
+    let type_oid = catalog_row_value(table, row, "atttypid")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
+    let type_mod = catalog_row_value(table, row, "atttypmod")
+        .and_then(catalog_value_i32)
+        .unwrap_or(-1);
+    let is_not_null = !is_dropped
+        && catalog_row_value(table, row, "attnotnull")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+    let has_default = !is_dropped
+        && catalog_row_value(table, row, "atthasdef")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false);
+    let generated = if is_dropped {
+        0
+    } else {
+        catalog_row_value(table, row, "attgenerated")
+            .and_then(catalog_value_u8)
+            .unwrap_or(0)
+    };
+    let attlen = catalog_row_value(table, row, "attlen")
+        .and_then(catalog_value_i16)
+        .unwrap_or(0);
+    let attbyval = catalog_row_value(table, row, "attbyval")
+        .and_then(catalog_value_bool)
+        .unwrap_or(false);
+    let attalign = catalog_row_value(table, row, "attalign")
+        .and_then(catalog_value_u8)
+        .unwrap_or(b'i');
+    let attstorage = catalog_row_value(table, row, "attstorage")
+        .and_then(catalog_value_u8)
+        .unwrap_or(b'p');
+    let attcollation = catalog_row_value(table, row, "attcollation")
+        .and_then(catalog_value_oid)
+        .unwrap_or(INVALID_OID);
+
+    Some((
+        attnum,
+        PhysicalColumnRecord {
+            name: normalize_identifier(&name),
+            type_oid,
+            type_mod,
+            is_not_null,
+            has_default,
+            generated,
+            is_dropped,
+            attlen,
+            attbyval,
+            attalign,
+            attstorage,
+            attcollation,
+        },
+    ))
+}
+
 pub fn relation_column_by_attnum(relation_oid: Oid, attnum: i16) -> Option<ColumnRecord> {
+    if let Some(cached) = relation_column_cache_lookup(relation_oid, attnum) {
+        return cached;
+    }
+    let result = relation_column_by_attnum_uncached(relation_oid, attnum);
+    relation_column_cache_store(relation_oid, attnum, result.clone());
+    result
+}
+
+fn relation_column_by_attnum_uncached(relation_oid: Oid, attnum: i16) -> Option<ColumnRecord> {
     if attnum <= 0 {
         return None;
     }
@@ -2199,6 +2433,40 @@ pub fn relation_column_by_attnum(relation_oid: Oid, attnum: i16) -> Option<Colum
     .into_iter()
     .find_map(|row| {
         let (row_attnum, column) = column_record_from_pg_attribute_row(table, &row, relation_oid)?;
+        (row_attnum == attnum).then_some(column)
+    })
+}
+
+pub fn relation_physical_column_by_attnum(
+    relation_oid: Oid,
+    attnum: i16,
+) -> Option<PhysicalColumnRecord> {
+    if attnum <= 0 {
+        return None;
+    }
+    let table = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)?;
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "attrelid")
+                .is_some_and(|attrelid| attrelid == relation_oid)
+                && static_row_column_i16(table, row, "attnum")
+                    .is_some_and(|row_attnum| row_attnum == attnum)
+        },
+        |row| {
+            let relation_matches = catalog_row_value(table, row, "attrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|attrelid| attrelid == relation_oid);
+            let attnum_matches = catalog_row_value(table, row, "attnum")
+                .and_then(catalog_value_i16)
+                .is_some_and(|row_attnum| row_attnum == attnum);
+            relation_matches && attnum_matches
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
+        let (row_attnum, column) =
+            physical_column_record_from_pg_attribute_row(table, &row, relation_oid)?;
         (row_attnum == attnum).then_some(column)
     })
 }
@@ -2254,6 +2522,15 @@ pub fn index_record_by_index_oid(index_oid: Oid) -> Option<IndexRecord> {
     }) {
         return Some(index);
     }
+    if let Some(cached) = index_record_by_oid_cache_lookup(index_oid) {
+        return cached;
+    }
+    let result = index_record_by_index_oid_uncached(index_oid);
+    index_record_by_oid_cache_store(index_oid, result.clone());
+    result
+}
+
+fn index_record_by_index_oid_uncached(index_oid: Oid) -> Option<IndexRecord> {
     let table = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)?;
     catalog_rows_matching_static(
         table.oid,
@@ -2285,6 +2562,15 @@ pub fn index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
     if !typed_indexes.is_empty() {
         return typed_indexes;
     }
+    if let Some(cached) = index_records_by_relation_cache_lookup(relation_oid) {
+        return cached;
+    }
+    let result = index_records_for_relation_oid_uncached(relation_oid);
+    index_records_by_relation_cache_store(relation_oid, result.clone());
+    result
+}
+
+fn index_records_for_relation_oid_uncached(relation_oid: Oid) -> Vec<IndexRecord> {
     let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
         return Vec::new();
     };
@@ -2309,10 +2595,15 @@ pub fn index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
 }
 
 pub fn unique_index_records_for_relation_oid(relation_oid: Oid) -> Vec<IndexRecord> {
-    index_records_for_relation_oid(relation_oid)
+    if let Some(cached) = unique_index_records_by_relation_cache_lookup(relation_oid) {
+        return cached;
+    }
+    let result: Vec<_> = index_records_for_relation_oid(relation_oid)
         .into_iter()
         .filter(|record| record.is_unique && record.is_valid && record.is_ready && record.is_live)
-        .collect()
+        .collect();
+    unique_index_records_by_relation_cache_store(relation_oid, result.clone());
+    result
 }
 
 pub fn unique_index_oids_for_relation_oid(relation_oid: Oid) -> Vec<Oid> {
@@ -2471,7 +2762,7 @@ fn primary_key_constraint_oid_for_relation(
 
 fn relation_primary_key_from_pg_index(
     relation_oid: Oid,
-    columns: &[ColumnRecord],
+    _columns: &[ColumnRecord],
 ) -> (Vec<String>, Option<Oid>) {
     let Some(table) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID) else {
         return (Vec::new(), None);
@@ -2489,12 +2780,7 @@ fn relation_primary_key_from_pg_index(
     let primary_key = indkey
         .into_iter()
         .filter_map(|attnum| {
-            if attnum <= 0 {
-                return None;
-            }
-            columns
-                .get(usize::try_from(attnum - 1).ok()?)
-                .map(|column| column.name.clone())
+            relation_column_by_attnum(relation_oid, attnum).map(|column| column.name)
         })
         .collect::<Vec<_>>();
     let constraint_oid = primary_key_constraint_oid_for_relation(relation_oid, index_oid);
@@ -2903,6 +3189,7 @@ pub fn clear_for_tests() {
         *state = CatalogState::default();
         CATALOG_GENERATION.store(state.snapshot.generation, Ordering::Relaxed);
     });
+    clear_catalog_lookup_caches();
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -3112,6 +3399,32 @@ pub fn builtin_type_by_name(name: &str, namespace: Oid) -> Option<PgTypeRecord> 
         .find(|record| record.name == canonical_name.as_str())
 }
 
+pub fn enum_oids_by_sort_order(enum_type_oid: Oid) -> Vec<Oid> {
+    let Some(table) = static_catalog_by_relation_oid(PG_ENUM_RELATION_OID) else {
+        return Vec::new();
+    };
+    let mut rows = catalog_rows(PG_ENUM_RELATION_OID)
+        .into_iter()
+        .filter_map(|row| {
+            let oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
+            let row_type =
+                catalog_row_value(table, &row, "enumtypid").and_then(catalog_value_oid)?;
+            if row_type != enum_type_oid {
+                return None;
+            }
+            let sort_order =
+                catalog_row_value(table, &row, "enumsortorder").and_then(catalog_value_f32)?;
+            Some((sort_order, oid))
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.0
+            .total_cmp(&right.0)
+            .then_with(|| left.1.0.cmp(&right.1.0))
+    });
+    rows.into_iter().map(|(_, oid)| oid).collect()
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgProcRecord {
     pub oid: Oid,
@@ -3189,6 +3502,15 @@ mod generated_catalog {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::sync::{Mutex, MutexGuard};
+
+    static CATALOG_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn catalog_test_lock() -> MutexGuard<'static, ()> {
+        CATALOG_TEST_LOCK
+            .lock()
+            .expect("catalog test mutex poisoned")
+    }
 
     #[test]
     fn has_pgbench_scalar_types() {
@@ -3371,6 +3693,7 @@ mod tests {
 
     #[test]
     fn generic_overlay_rows_drive_relation_views() {
+        let _guard = catalog_test_lock();
         clear_for_tests();
         abort_implicit_transaction();
         let relation_oid = Oid(50_000);
@@ -3621,5 +3944,119 @@ mod tests {
         assert!(!catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
             value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")
         }));
+    }
+
+    #[test]
+    fn physical_columns_preserve_dropped_attnum_holes() {
+        let _guard = catalog_test_lock();
+        clear_for_tests();
+        abort_implicit_transaction();
+        let relation_oid = Oid(50_100);
+
+        upsert_named_catalog_row(
+            "pg_class",
+            relation_oid.0 as u64,
+            &[
+                ("oid", "50100"),
+                ("relname", "dropped_columns"),
+                ("relnamespace", "2200"),
+                ("reltype", "50101"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", "50100"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "3"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50100"),
+                ("attname", "........pg.dropped.1........"),
+                ("atttypid", "0"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "f"),
+                ("attisdropped", "t"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50100"),
+                ("attname", "live_b"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "2"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attnotnull", "f"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50100"),
+                ("attname", "live_c"),
+                ("atttypid", "25"),
+                ("attlen", "-1"),
+                ("attnum", "3"),
+                ("atttypmod", "-1"),
+                ("attbyval", "f"),
+                ("attalign", "i"),
+                ("attstorage", "x"),
+                ("attnotnull", "f"),
+                ("attisdropped", "f"),
+                ("attcollation", "100"),
+            ],
+        );
+        commit_implicit_transaction();
+
+        let relation = relation_by_oid(relation_oid).expect("relation");
+        assert_eq!(
+            relation
+                .columns
+                .iter()
+                .map(|column| column.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["live_b", "live_c"]
+        );
+        assert_eq!(
+            relation_summary_by_oid(relation_oid)
+                .expect("relation summary")
+                .column_count,
+            3
+        );
+        assert!(relation_column_by_attnum(relation_oid, 1).is_none());
+        assert_eq!(
+            relation_column_by_attnum(relation_oid, 2)
+                .expect("attnum 2")
+                .name,
+            "live_b"
+        );
+
+        let dropped =
+            relation_physical_column_by_attnum(relation_oid, 1).expect("physical attnum 1");
+        assert!(dropped.is_dropped);
+        assert_eq!(dropped.type_oid, INVALID_OID);
+        assert_eq!(dropped.attlen, 4);
+
+        let live = relation_physical_column_by_attnum(relation_oid, 3).expect("physical attnum 3");
+        assert!(!live.is_dropped);
+        assert_eq!(live.name, "live_c");
+        assert_eq!(live.type_oid, TEXT_OID);
+        assert_eq!(live.attcollation, DEFAULT_COLLATION_OID);
     }
 }

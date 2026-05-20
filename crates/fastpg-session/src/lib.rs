@@ -261,7 +261,7 @@ impl SessionCopyState {
     }
 
     fn process_line(&mut self, executor: &QueryExecutor, line: &str) -> Result<(), String> {
-        if executor.copy_text_line(&self.target.table, line)? {
+        if executor.copy_target_text_line(&self.target, line)? {
             self.rows += 1;
         }
         Ok(())

@@ -64,6 +64,12 @@ jobs:
             echo "$(brew --prefix flex)/bin"
           } >> "$GITHUB_PATH"
 
+      - name: Install Rust toolchain
+        run: |
+          cargo --version
+          cargo clippy --version
+          rustfmt --version
+
       - name: Build fastpg PostgreSQL core
         run: |
           set -euo pipefail

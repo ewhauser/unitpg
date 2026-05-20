@@ -8,6 +8,7 @@
  */
 #include "postgres.h"
 
+#include <stdint.h>
 #include <unistd.h>
 
 #include "access/session.h"
@@ -17,9 +18,11 @@
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_language.h"
 #include "catalog/pg_namespace.h"
+#include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
 #include "commands/defrem.h"
 #include "executor/execdesc.h"
@@ -62,6 +65,14 @@
 extern void fastpg_xid_begin(void);
 extern void fastpg_xid_commit(void);
 extern void fastpg_xid_rollback(void);
+extern void fastpg_storage2_xact_begin(void);
+extern void fastpg_storage2_xact_commit(void);
+extern void fastpg_storage2_xact_abort(void);
+extern void fastpg_storage2_xact_commit_if_implicit(void);
+extern void fastpg_storage2_xact_abort_if_implicit(void);
+extern void fastpg_storage2_subxact_begin(void);
+extern void fastpg_storage2_subxact_commit(void);
+extern void fastpg_storage2_subxact_abort(void);
 #endif
 
 typedef struct FastPgPgCoreParseResult
@@ -79,6 +90,7 @@ typedef struct FastPgPgCoreField
 {
 	char	   *name;
 	Oid			type_oid;
+	int32		type_modifier;
 	Oid			output_oid;
 } FastPgPgCoreField;
 
@@ -120,6 +132,7 @@ typedef struct FastPgPgCoreExecuteStatement
 	bool		copy_in;
 	char	   *copy_table;
 	int			copy_column_count;
+	char	  **copy_column_names;
 	bool		has_plan_tree;
 	NodeTag		plan_tree_tag;
 	int			column_count;
@@ -141,6 +154,21 @@ typedef struct FastPgPgCoreExecuteResult
 	FastPgPgCoreExecuteStatement *statements;
 } FastPgPgCoreExecuteResult;
 
+typedef struct FastPgPgCoreInputDatumResult
+{
+	bool		ok;
+	char		sqlstate[6];
+	char	   *message;
+	char	   *detail;
+	char	   *hint;
+	int			cursorpos;
+	Datum		value;
+	bool		typbyval;
+	int16		typlen;
+	size_t		value_len;
+	unsigned char *payload;
+} FastPgPgCoreInputDatumResult;
+
 typedef struct FastPgPgCoreCaptureDestReceiver
 {
 	DestReceiver pub;
@@ -152,6 +180,24 @@ static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteSt
 														   MemoryContext context);
 
 static bool fastpg_pgcore_initialized = false;
+
+static void
+fastpg_pgcore_configure_library_paths(void)
+{
+	const char *libdir;
+
+	libdir = getenv("FASTPG_PGLIBDIR");
+	if (libdir == NULL || libdir[0] == '\0')
+		libdir = getenv("PG_LIBDIR");
+	if (libdir == NULL || libdir[0] == '\0')
+		return;
+	if (!is_absolute_path(libdir))
+		return;
+
+	strlcpy(pkglib_path, libdir, MAXPGPATH);
+	SetConfigOption("dynamic_library_path", "$libdir",
+					PGC_SUSET, PGC_S_OVERRIDE);
+}
 
 /*
  * We link selected backend objects without backend/main/main.c because that file
@@ -184,7 +230,11 @@ fastpg_pgcore_init_once(void)
 
 	MyProcPid = getpid();
 	MemoryContextInit();
+	MyDatabaseId = PostgresDbOid;
+	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
+	DatabasePath = pstrdup("base/5");
 	InitializeGUCOptions();
+	fastpg_pgcore_configure_library_paths();
 	pg_timezone_initialize();
 	RelationCacheInitialize();
 	InitCatalogCache();
@@ -213,6 +263,13 @@ fastpg_pgcore_invalidate_system_caches(void)
 static void
 fastpg_pgcore_ensure_execution_owner(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		FastPgEnsureStandaloneTransactionState();
+		return;
+	}
+#endif
 	if (TopTransactionContext == NULL)
 		TopTransactionContext =
 			AllocSetContextCreate(TopMemoryContext,
@@ -233,6 +290,15 @@ fastpg_pgcore_release_error_resources(void)
 	if (owner == NULL)
 		return;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (!fastpg_rust_xact_is_explicit())
+			FastPgReleaseStandaloneStatementResources(false);
+		fastpg_pgcore_ensure_execution_owner();
+		return;
+	}
+#endif
 	ResourceOwnerRelease(owner, RESOURCE_RELEASE_BEFORE_LOCKS, false, true);
 	ResourceOwnerRelease(owner, RESOURCE_RELEASE_LOCKS, false, true);
 	ResourceOwnerRelease(owner, RESOURCE_RELEASE_AFTER_LOCKS, false, true);
@@ -247,7 +313,12 @@ fastpg_pgcore_start_statement_timestamp(void)
 	SetCurrentStatementStartTimestamp();
 #ifdef USE_FASTPG
 	if (!fastpg_rust_xact_is_explicit())
+	{
+		FastPgStartStandaloneStatement();
 		FastPgSetCurrentTransactionStartTimestampToStatement();
+	}
+	else
+		FastPgEnsureStandaloneTransactionState();
 #endif
 }
 
@@ -460,7 +531,17 @@ fastpg_pgcore_execute_copy_stmt(const CopyStmt *stmt,
 	summary->copy_in = true;
 	summary->copy_table = pstrdup(relation_name);
 	if (stmt->attlist != NIL)
+	{
+		ListCell   *lc;
+		int			column_index = 0;
+
 		summary->copy_column_count = list_length(stmt->attlist);
+		summary->copy_column_names =
+			palloc0_array(char *, summary->copy_column_count);
+		foreach(lc, stmt->attlist)
+			summary->copy_column_names[column_index++] =
+				pstrdup(strVal(lfirst(lc)));
+	}
 	else
 		summary->copy_column_count =
 			(int) fastpg_pgcore_call_relation_column_count(relation_name);
@@ -478,6 +559,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 #ifdef USE_FASTPG
 			fastpg_xid_begin();
 			fastpg_rust_xact_begin();
+			fastpg_storage2_xact_begin();
 #endif
 			summary->command_tag = "BEGIN";
 			break;
@@ -485,6 +567,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 #ifdef USE_FASTPG
 			fastpg_xid_commit();
 			fastpg_rust_xact_commit();
+			fastpg_storage2_xact_commit();
 #endif
 			summary->command_tag = "COMMIT";
 			break;
@@ -492,18 +575,21 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 #ifdef USE_FASTPG
 			fastpg_xid_rollback();
 			fastpg_rust_xact_abort();
+			fastpg_storage2_xact_abort();
 #endif
 			summary->command_tag = "ROLLBACK";
 			break;
 		case TRANS_STMT_SAVEPOINT:
 #ifdef USE_FASTPG
 			fastpg_rust_subxact_begin();
+			fastpg_storage2_subxact_begin();
 #endif
 			summary->command_tag = "SAVEPOINT";
 			break;
 		case TRANS_STMT_RELEASE:
 #ifdef USE_FASTPG
 			fastpg_rust_subxact_commit();
+			fastpg_storage2_subxact_commit();
 #endif
 			summary->command_tag = "RELEASE";
 			break;
@@ -511,6 +597,8 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 #ifdef USE_FASTPG
 			fastpg_rust_subxact_abort();
 			fastpg_rust_subxact_begin();
+			fastpg_storage2_subxact_abort();
+			fastpg_storage2_subxact_begin();
 #endif
 			summary->command_tag = "ROLLBACK";
 			break;
@@ -702,6 +790,8 @@ fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
 			pstrdup(target->resname != NULL ? target->resname : "");
 		result->fields[field_index].type_oid =
 			target->expr != NULL ? exprType((const Node *) target->expr) : InvalidOid;
+		result->fields[field_index].type_modifier =
+			target->expr != NULL ? exprTypmod((const Node *) target->expr) : -1;
 		field_index++;
 	}
 }
@@ -726,6 +816,7 @@ fastpg_pgcore_capture_startup(DestReceiver *self, int operation, TupleDesc typei
 
 		statement->columns[index].name = pstrdup(NameStr(attr->attname));
 		statement->columns[index].type_oid = attr->atttypid;
+		statement->columns[index].type_modifier = attr->atttypmod;
 		getTypeOutputInfo(attr->atttypid,
 						  &statement->columns[index].output_oid,
 						  &type_is_varlena);
@@ -1110,6 +1201,17 @@ fastpg_pgcore_prepared_field_type_oid(const FastPgPgCorePrepared *prepared,
 	return prepared->fields[index].type_oid;
 }
 
+int
+fastpg_pgcore_prepared_field_type_modifier(const FastPgPgCorePrepared *prepared,
+										   int index)
+{
+	if (!fastpg_pgcore_prepared_ok(prepared) ||
+		index < 0 ||
+		index >= prepared->field_count)
+		return -1;
+	return prepared->fields[index].type_modifier;
+}
+
 static ParamListInfo
 fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 						   const char *const *parameter_values,
@@ -1266,6 +1368,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 				{
 					fastpg_xid_commit();
 					fastpg_rust_xact_commit_if_implicit();
+					fastpg_storage2_xact_commit_if_implicit();
 				}
 #endif
 				continue;
@@ -1312,6 +1415,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 			{
 				fastpg_xid_commit();
 				fastpg_rust_xact_commit_if_implicit();
+				fastpg_storage2_xact_commit_if_implicit();
 			}
 #endif
 
@@ -1338,6 +1442,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		{
 			fastpg_xid_rollback();
 			fastpg_rust_xact_abort_if_implicit();
+			fastpg_storage2_xact_abort_if_implicit();
 		}
 #endif
 		if (query_desc != NULL)
@@ -1379,6 +1484,212 @@ fastpg_pgcore_execute_result_free(FastPgPgCoreExecuteResult *result)
 	free(result->detail);
 	free(result->hint);
 	free(result);
+}
+
+static size_t
+fastpg_pgcore_byref_datum_len(Datum value, int16 typlen)
+{
+	Pointer		pointer = DatumGetPointer(value);
+
+	if (pointer == NULL)
+		ereport(ERROR,
+				(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+				 errmsg("PostgreSQL type input returned a null pointer for a non-null value")));
+
+	if (typlen > 0)
+		return (size_t) typlen;
+	if (typlen == -1)
+		return (size_t) VARSIZE_ANY(pointer);
+	if (typlen == -2)
+		return strlen((const char *) pointer) + 1;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("fastpg cannot copy by-reference Datum with typlen %d",
+					(int) typlen)));
+	return 0;
+}
+
+FastPgPgCoreInputDatumResult *
+fastpg_pgcore_input_text_datum(Oid type_oid, int32 typmod, const char *value_text)
+{
+	FastPgPgCoreInputDatumResult *result;
+	MemoryContext oldcontext;
+	MemoryContext input_context = NULL;
+
+	result = (FastPgPgCoreInputDatumResult *) calloc(1, sizeof(FastPgPgCoreInputDatumResult));
+	if (result == NULL)
+		return NULL;
+
+	fastpg_pgcore_enter();
+	fastpg_pgcore_ensure_execution_owner();
+	oldcontext = CurrentMemoryContext;
+
+	PG_TRY();
+	{
+		Oid			typinput;
+		Oid			typioparam;
+
+		if (!OidIsValid(type_oid))
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("fastpg cannot input text for invalid type OID")));
+		if (value_text == NULL)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("fastpg cannot input a null text pointer as a Datum")));
+
+		input_context = AllocSetContextCreate(TopMemoryContext,
+											  "fastpg pgcore datum input",
+											  ALLOCSET_DEFAULT_SIZES);
+		MemoryContextSwitchTo(input_context);
+
+		getTypeInputInfo(type_oid, &typinput, &typioparam);
+		get_typlenbyval(type_oid, &result->typlen, &result->typbyval);
+		result->value = OidInputFunctionCall(typinput,
+											 (char *) value_text,
+											 typioparam,
+											 typmod);
+
+		if (!result->typbyval)
+		{
+			size_t		len = fastpg_pgcore_byref_datum_len(result->value,
+															 result->typlen);
+			Pointer		pointer = DatumGetPointer(result->value);
+
+			result->payload = (unsigned char *) malloc(len);
+			if (result->payload == NULL && len > 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_OUT_OF_MEMORY),
+						 errmsg("out of memory copying PostgreSQL Datum payload")));
+			if (len > 0)
+				memcpy(result->payload, pointer, len);
+			result->value = PointerGetDatum(result->payload);
+			result->value_len = len;
+		}
+
+		result->ok = true;
+		MemoryContextSwitchTo(oldcontext);
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(oldcontext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		fastpg_pgcore_copy_error(result->sqlstate,
+								 &result->message,
+								 &result->detail,
+								 &result->hint,
+								 &result->cursorpos,
+								 edata);
+		FreeErrorData(edata);
+		fastpg_pgcore_release_error_resources();
+	}
+	PG_END_TRY();
+
+	MemoryContextSwitchTo(oldcontext);
+	if (input_context != NULL)
+		MemoryContextDelete(input_context);
+	return result;
+}
+
+void
+fastpg_pgcore_input_datum_result_free(FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return;
+
+	free(result->message);
+	free(result->detail);
+	free(result->hint);
+	free(result->payload);
+	free(result);
+}
+
+bool
+fastpg_pgcore_input_datum_result_ok(const FastPgPgCoreInputDatumResult *result)
+{
+	return result != NULL && result->ok;
+}
+
+const char *
+fastpg_pgcore_input_datum_result_sqlstate(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return "";
+	return result->sqlstate;
+}
+
+const char *
+fastpg_pgcore_input_datum_result_message(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL || result->message == NULL)
+		return "";
+	return result->message;
+}
+
+const char *
+fastpg_pgcore_input_datum_result_detail(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL || result->detail == NULL)
+		return "";
+	return result->detail;
+}
+
+const char *
+fastpg_pgcore_input_datum_result_hint(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL || result->hint == NULL)
+		return "";
+	return result->hint;
+}
+
+int
+fastpg_pgcore_input_datum_result_cursorpos(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return 0;
+	return result->cursorpos;
+}
+
+uintptr_t
+fastpg_pgcore_input_datum_result_value(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return 0;
+	return (uintptr_t) result->value;
+}
+
+bool
+fastpg_pgcore_input_datum_result_typbyval(const FastPgPgCoreInputDatumResult *result)
+{
+	return result != NULL && result->typbyval;
+}
+
+int16
+fastpg_pgcore_input_datum_result_typlen(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return 0;
+	return result->typlen;
+}
+
+size_t
+fastpg_pgcore_input_datum_result_value_len(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return 0;
+	return result->value_len;
+}
+
+const unsigned char *
+fastpg_pgcore_input_datum_result_payload(const FastPgPgCoreInputDatumResult *result)
+{
+	if (result == NULL)
+		return NULL;
+	return result->payload;
 }
 
 bool
@@ -1498,6 +1809,23 @@ fastpg_pgcore_execute_statement_copy_column_count(const FastPgPgCoreExecuteResul
 }
 
 const char *
+fastpg_pgcore_execute_statement_copy_column_name(const FastPgPgCoreExecuteResult *result,
+												 int statement_index,
+												 int column_index)
+{
+	FastPgPgCoreExecuteStatement *statement;
+
+	if (!fastpg_pgcore_execute_statement_is_copy_in(result, statement_index))
+		return NULL;
+	statement = &result->statements[statement_index];
+	if (statement->copy_column_names == NULL ||
+		column_index < 0 ||
+		column_index >= statement->copy_column_count)
+		return NULL;
+	return statement->copy_column_names[column_index];
+}
+
+const char *
 fastpg_pgcore_execute_column_name(const FastPgPgCoreExecuteResult *result,
 								  int statement_index,
 								  int column_index)
@@ -1529,6 +1857,23 @@ fastpg_pgcore_execute_column_type_oid(const FastPgPgCoreExecuteResult *result,
 	if (column_index < 0 || column_index >= statement->column_count)
 		return InvalidOid;
 	return statement->columns[column_index].type_oid;
+}
+
+int
+fastpg_pgcore_execute_column_type_modifier(const FastPgPgCoreExecuteResult *result,
+										   int statement_index,
+										   int column_index)
+{
+	FastPgPgCoreExecuteStatement *statement;
+
+	if (!fastpg_pgcore_execute_result_ok(result) ||
+		statement_index < 0 ||
+		statement_index >= result->statement_count)
+		return -1;
+	statement = &result->statements[statement_index];
+	if (column_index < 0 || column_index >= statement->column_count)
+		return -1;
+	return statement->columns[column_index].type_modifier;
 }
 
 bool

@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::env;
 use std::ffi::OsStr;
 use std::fs;
@@ -34,8 +35,7 @@ fn main() {
     let archive = out_dir.join("libfastpg_pgcore_backend.a");
     build_backend_archive(&build_dir, &out_dir, &archive);
 
-    println!("cargo:rustc-link-search=native={}", out_dir.display());
-    println!("cargo:rustc-link-lib=static=fastpg_pgcore_backend");
+    link_backend_archive(&archive);
 }
 
 fn compile_shim(source_root: &Path, build_dir: &Path) {
@@ -82,24 +82,31 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
         &object_dir.join("parser"),
         &mut objects,
     );
+    let pgcommon_srv = build_dir.join("src/common/libpgcommon_srv.a");
     extract_archive_objects(
         build_dir,
-        &build_dir.join("src/common/libpgcommon_srv.a"),
+        &pgcommon_srv,
         &object_dir.join("pgcommon_srv"),
         &mut objects,
     );
-    extract_archive_objects(
-        build_dir,
-        &build_dir.join("src/common/libpgcommon_srv_config_info.a"),
-        &object_dir.join("pgcommon_srv_config_info"),
-        &mut objects,
-    );
-    extract_archive_objects(
-        build_dir,
-        &build_dir.join("src/common/libpgcommon_srv_ryu.a"),
-        &object_dir.join("pgcommon_srv_ryu"),
-        &mut objects,
-    );
+    if !archive_has_member(&pgcommon_srv, "config_info.c.o") {
+        extract_archive_objects(
+            build_dir,
+            &build_dir.join("src/common/libpgcommon_srv_config_info.a"),
+            &object_dir.join("pgcommon_srv_config_info"),
+            &mut objects,
+        );
+    }
+    if !archive_has_member(&pgcommon_srv, "d2s.c.o")
+        || !archive_has_member(&pgcommon_srv, "f2s.c.o")
+    {
+        extract_archive_objects(
+            build_dir,
+            &build_dir.join("src/common/libpgcommon_srv_ryu.a"),
+            &object_dir.join("pgcommon_srv_ryu"),
+            &mut objects,
+        );
+    }
     extract_archive_objects(
         build_dir,
         &build_dir.join("src/port/libpgport_srv.a"),
@@ -113,6 +120,7 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
             build_dir.display()
         );
     }
+    dedupe_objects(&mut objects);
 
     run_command(
         Command::new(ar_program())
@@ -121,6 +129,14 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
             .args(&objects),
         "build Postgres backend archive",
     );
+}
+
+fn link_backend_archive(archive: &Path) {
+    let out_dir = archive
+        .parent()
+        .expect("backend archive should have an output directory");
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!("cargo:rustc-link-lib=static:+whole-archive=fastpg_pgcore_backend");
 }
 
 fn collect_backend_objects(build_dir: &Path, objects: &mut Vec<PathBuf>) {
@@ -244,6 +260,12 @@ fn archive_members(archive: &Path) -> Vec<String> {
         .collect()
 }
 
+fn archive_has_member(archive: &Path, member: &str) -> bool {
+    archive_members(archive).iter().any(|candidate| {
+        candidate == member || Path::new(candidate).file_name() == Some(OsStr::new(member))
+    })
+}
+
 fn resolve_thin_archive_member(build_dir: &Path, archive: &Path, member: &str) -> PathBuf {
     let member_path = Path::new(member);
     if member_path.is_absolute() {
@@ -263,6 +285,15 @@ fn resolve_thin_archive_member(build_dir: &Path, archive: &Path, member: &str) -
         archive_dir.display(),
         build_dir.display()
     );
+}
+
+fn dedupe_objects(objects: &mut Vec<PathBuf>) {
+    let mut seen = HashSet::new();
+    objects.retain(|path| seen.insert(object_identity(path)));
+}
+
+fn object_identity(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn ar_program() -> String {

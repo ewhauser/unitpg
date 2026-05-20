@@ -35,6 +35,8 @@ from pgbench_compare import (
     rust_server_pgbench_env,
 )
 
+TIMEOUT_RETURN_CODE = 124
+
 
 @dataclass(frozen=True)
 class UpstreamCase:
@@ -79,6 +81,9 @@ class UpstreamRegressionInventory:
                 "database": args.database,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
+                "storage_engine": args.storage_engine,
+                "fastpg_isolation": args.fastpg_isolation,
+                "fastpg_case_timeout": args.fastpg_case_timeout,
             },
             "cases": [
                 {"name": case.name, "path": str(case.path), "group": case.group}
@@ -220,6 +225,9 @@ class UpstreamRegressionInventory:
             self.write_results()
 
     def run_rust_server_suite(self, paths: dict[str, Path]) -> list[dict[str, Any]]:
+        if self.args.fastpg_isolation == "case":
+            return self.run_rust_server_cases_isolated(paths)
+
         variant_dir = self.result_root / "fastpg"
         run_dir = variant_dir / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -271,11 +279,20 @@ class UpstreamRegressionInventory:
                 host=host,
                 port=port,
                 socket_path=socket_path,
+                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
             )
             run_record["commands"]["start"] = server["result"].as_json()
             prelude = self.install_regression_prelude("fastpg", paths["client_bindir"], host, port, env, run_dir)
             run_record["commands"]["prelude"] = prelude.as_json()
-            case_results = self.run_cases("fastpg", paths["client_bindir"], host, port, env, run_dir)
+            case_results = self.run_cases(
+                "fastpg",
+                paths["client_bindir"],
+                host,
+                port,
+                env,
+                run_dir,
+                timeout=self.args.fastpg_case_timeout,
+            )
             self.results["variants"]["fastpg"]["cases"] = case_results
             self.results["variants"]["fastpg"]["status"] = "ok"
             self.write_results()
@@ -290,6 +307,202 @@ class UpstreamRegressionInventory:
             if socket_dir is not None:
                 shutil.rmtree(socket_dir, ignore_errors=True)
             self.write_results()
+
+    def run_rust_server_cases_isolated(self, paths: dict[str, Path]) -> list[dict[str, Any]]:
+        variant_dir = self.result_root / "fastpg"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pgcore_build_dir = paths.get("pgcore_build_dir")
+        if pgcore_build_dir is None and self.helper.pgbench_client_paths is not None:
+            pgcore_build_dir = self.helper.pgbench_client_paths["build_dir"]
+        regress_lib_dir = Path(pgcore_build_dir) / "src/test/regress" if pgcore_build_dir else self.input_dir
+        env = regress_env(
+            rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"]),
+            self.input_dir,
+            regress_lib_dir,
+        )
+        setup_case = next((case for case in self.cases if case.name == "test_setup"), None)
+        case_results: list[dict[str, Any]] = []
+        runs: list[dict[str, Any]] = []
+        self.results["variants"]["fastpg"] = {
+            "engine": "rust-server",
+            "status": "running",
+            "server_binary": str(paths["server_binary"]),
+            "isolation": "case",
+            "runs": runs,
+            "cases": [],
+        }
+        self.write_results()
+
+        for index, case in enumerate(self.cases, start=1):
+            print(f"[fastpg] upstream regression isolated case {index}/{len(self.cases)} {case.name} start", flush=True)
+            run_dir = variant_dir / f"run-{index:03d}-{case.name}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            port = free_port()
+            socket_dir: Path | None = None
+            socket_path: Path | None = None
+            if os.name == "nt":
+                host = "127.0.0.1"
+                listen_address = f"{host}:{port}"
+            else:
+                socket_dir = short_temp_dir("fpru-fastpg-")
+                socket_path = socket_dir / f".s.PGSQL.{port}"
+                host = str(socket_dir)
+                listen_address = f"unix:{socket_path}"
+
+            run_record: dict[str, Any] = {
+                "case": case.name,
+                "host": host,
+                "port": port,
+                "commands": {},
+            }
+            if socket_dir is not None:
+                run_record["socket_dir"] = str(socket_dir)
+            runs.append(run_record)
+            self.write_results()
+
+            server: dict[str, Any] | None = None
+            stop_result: CommandResult | None = None
+            setup_result: CommandResult | None = None
+            try:
+                server = self.helper.start_rust_server(
+                    "fastpg",
+                    paths["server_binary"],
+                    listen_address,
+                    run_dir,
+                    host=host,
+                    port=port,
+                    socket_path=socket_path,
+                    server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
+                )
+                run_record["commands"]["start"] = server["result"].as_json()
+                prelude = self.install_regression_prelude(
+                    "fastpg",
+                    paths["client_bindir"],
+                    host,
+                    port,
+                    env,
+                    run_dir,
+                )
+                run_record["commands"]["prelude"] = prelude.as_json()
+                if case.name != "test_setup" and setup_case is not None:
+                    setup_result, setup_transcript = run_psql_transcript(
+                        paths["client_bindir"],
+                        host,
+                        port,
+                        self.args.database,
+                        setup_case,
+                        run_dir / "setup-case",
+                        env,
+                        self.source_root,
+                        timeout=self.args.fastpg_case_timeout,
+                    )
+                    run_record["commands"]["test_setup"] = setup_result.as_json()
+                    if setup_result.returncode != 0:
+                        timed_out = setup_result.returncode == TIMEOUT_RETURN_CODE
+                        case_result = {
+                            "case": case.name,
+                            "group": case.group,
+                            "path": str(case.path),
+                            "output_dir": str(run_dir / "setup-case"),
+                            "transcript": str(setup_transcript),
+                            "status": "timeout" if timed_out else "failed",
+                            "returncode": setup_result.returncode,
+                            "seconds": setup_result.seconds,
+                            "command": setup_result.command,
+                            "tail": tail(read_text(setup_transcript)),
+                            "difference": {
+                                "kind": "setup-timeout" if timed_out else "setup-returncode",
+                                "fastpg": setup_result.returncode,
+                            },
+                        }
+                        case_results.append(case_result)
+                        self.results["variants"]["fastpg"]["cases"] = case_results
+                        self.write_results()
+                        continue
+
+                output_dir = run_dir / "cases" / case.name
+                result, transcript = run_psql_transcript(
+                    paths["client_bindir"],
+                    host,
+                    port,
+                    self.args.database,
+                    case,
+                    output_dir,
+                    env,
+                    self.source_root,
+                    timeout=self.args.fastpg_case_timeout,
+                )
+                timed_out = result.returncode == TIMEOUT_RETURN_CODE
+                case_result = {
+                    "case": case.name,
+                    "group": case.group,
+                    "path": str(case.path),
+                    "output_dir": str(output_dir),
+                    "transcript": str(transcript),
+                    "status": "ok" if result.returncode == 0 else ("timeout" if timed_out else "failed"),
+                    "returncode": result.returncode,
+                    "seconds": result.seconds + (setup_result.seconds if setup_result else 0.0),
+                    "command": result.command,
+                    "tail": tail(read_text(transcript)),
+                }
+                if timed_out:
+                    case_result["difference"] = {
+                        "kind": "timeout",
+                        "seconds": result.seconds,
+                        "timeout": self.args.fastpg_case_timeout,
+                    }
+                case_results.append(case_result)
+                self.results["variants"]["fastpg"]["cases"] = case_results
+                self.write_results()
+            except BenchmarkFailure as failure:
+                case_result = {
+                    "case": case.name,
+                    "group": case.group,
+                    "path": str(case.path),
+                    "output_dir": str(failure.output_dir),
+                    "transcript": "",
+                    "status": "harness-failure",
+                    "returncode": failure.result.returncode,
+                    "seconds": failure.result.seconds,
+                    "command": failure.result.command,
+                    "tail": tail(failure.result.stdout + "\n" + failure.result.stderr),
+                    "difference": failure_as_json(failure),
+                }
+                case_results.append(case_result)
+                self.results["variants"]["fastpg"]["cases"] = case_results
+                self.write_results()
+            finally:
+                if server is not None:
+                    stop_result = self.helper.stop_rust_server(server, run_dir)
+                    run_record["commands"]["stop"] = stop_result.as_json()
+                    if (
+                        case_results
+                        and case_results[-1]["case"] == case.name
+                        and case_results[-1]["returncode"] != 0
+                        and stop_result.returncode != 0
+                        and case_results[-1]["status"] == "failed"
+                    ):
+                        case_results[-1]["status"] = "server-crash"
+                        case_results[-1]["difference"] = {
+                            "kind": "server-crash",
+                            "psql_returncode": case_results[-1]["returncode"],
+                            "server_returncode": stop_result.returncode,
+                        }
+                if socket_dir is not None:
+                    shutil.rmtree(socket_dir, ignore_errors=True)
+                self.results["variants"]["fastpg"]["cases"] = case_results
+                self.write_results()
+                if case_results and case_results[-1]["case"] == case.name:
+                    case_result = case_results[-1]
+                    print(
+                        f"[fastpg] upstream regression isolated case {index}/{len(self.cases)} {case.name} "
+                        f"{case_result['status']} ({case_result['seconds']:.3f}s)",
+                        flush=True,
+                    )
+
+        self.results["variants"]["fastpg"]["status"] = "ok"
+        self.write_results()
+        return case_results
 
     def create_regression_database(
         self,
@@ -381,10 +594,11 @@ class UpstreamRegressionInventory:
         port: int,
         env: dict[str, str],
         run_dir: Path,
+        timeout: float | None = None,
     ) -> list[dict[str, Any]]:
         case_results: list[dict[str, Any]] = []
         for index, case in enumerate(self.cases, start=1):
-            print(f"[{variant}] upstream regression case {index}/{len(self.cases)} {case.name}")
+            print(f"[{variant}] upstream regression case {index}/{len(self.cases)} {case.name} start", flush=True)
             output_dir = run_dir / "cases" / case.name
             result, transcript = run_psql_transcript(
                 bindir,
@@ -395,22 +609,35 @@ class UpstreamRegressionInventory:
                 output_dir,
                 env,
                 self.source_root,
+                timeout=timeout,
             )
+            timed_out = result.returncode == TIMEOUT_RETURN_CODE
             case_result = {
                 "case": case.name,
                 "group": case.group,
                 "path": str(case.path),
                 "output_dir": str(output_dir),
                 "transcript": str(transcript),
-                "status": "ok" if result.returncode == 0 else "failed",
+                "status": "ok" if result.returncode == 0 else ("timeout" if timed_out else "failed"),
                 "returncode": result.returncode,
                 "seconds": result.seconds,
                 "command": result.command,
                 "tail": tail(read_text(transcript)),
             }
+            if timed_out:
+                case_result["difference"] = {
+                    "kind": "timeout",
+                    "seconds": result.seconds,
+                    "timeout": timeout,
+                }
             case_results.append(case_result)
             self.results["variants"][variant]["cases"] = case_results
             self.write_results()
+            print(
+                f"[{variant}] upstream regression case {index}/{len(self.cases)} {case.name} "
+                f"{case_result['status']} ({case_result['seconds']:.3f}s)",
+                flush=True,
+            )
         return case_results
 
     def write_results(self) -> None:
@@ -425,6 +652,9 @@ class UpstreamRegressionInventory:
         print(f"fastpg ok: {totals_data['fastpg_ok']}")
         print(f"fastpg failed: {totals_data['fastpg_failed']}")
         print(f"fastpg mismatched: {totals_data['fastpg_mismatch']}")
+        print(f"fastpg timeouts: {totals_data['fastpg_timeout']}")
+        print(f"fastpg server crashes: {totals_data['fastpg_server_crash']}")
+        print(f"fastpg harness failures: {totals_data['fastpg_harness_failure']}")
         print(f"summary: {self.result_root / 'summary.md'}")
 
 
@@ -437,6 +667,7 @@ def run_psql_transcript(
     output_dir: Path,
     env: dict[str, str],
     cwd: Path,
+    timeout: float | None = None,
 ) -> tuple[CommandResult, Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     transcript = output_dir / f"{case.name}.out"
@@ -459,25 +690,38 @@ def run_psql_transcript(
         "HIDE_TOAST_COMPRESSION=on",
     ]
     started = time.monotonic()
+    timed_out = False
     with case.path.open("r") as input_file, transcript.open("w") as output_file:
-        completed = subprocess.run(
-            command,
-            cwd=cwd,
-            env=env,
-            text=True,
-            stdin=input_file,
-            stdout=output_file,
-            stderr=subprocess.STDOUT,
-            check=False,
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                cwd=cwd,
+                env=env,
+                text=True,
+                stdin=input_file,
+                stdout=output_file,
+                stderr=subprocess.STDOUT,
+                check=False,
+                timeout=timeout,
+            )
+            returncode = completed.returncode
+            stderr = ""
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            returncode = TIMEOUT_RETURN_CODE
+            stderr = f"psql timed out after {timeout:.1f}s" if timeout is not None else "psql timed out"
     result = CommandResult(
         command=command + ["<", str(case.path), ">", str(transcript)],
         cwd=str(cwd),
-        returncode=completed.returncode,
+        returncode=returncode,
         stdout=read_text(transcript),
-        stderr="",
+        stderr=stderr,
         seconds=time.monotonic() - started,
     )
+    if timed_out:
+        with transcript.open("a") as output_file:
+            output_file.write(f"\nERROR:  fastpg upstream inventory timed out after {timeout:.1f}s\n")
+        result.stdout = read_text(transcript)
     (output_dir / "psql.command.json").write_text(json.dumps(result.as_json(), indent=2) + "\n")
     return result, transcript
 
@@ -489,6 +733,8 @@ def compare_fastpg_cases(
     normal_by_case = {case["case"]: case for case in normal_cases}
     for fastpg_case in fastpg_cases:
         normal_case = normal_by_case[fastpg_case["case"]]
+        if fastpg_case.get("status") in {"server-crash", "harness-failure", "timeout"}:
+            continue
         if normal_case["returncode"] != 0:
             fastpg_case["status"] = "normal-failed"
             fastpg_case["difference"] = {
@@ -529,6 +775,9 @@ def totals(
         "fastpg_ok": sum(1 for case in fastpg_cases if case["status"] == "ok"),
         "fastpg_failed": sum(1 for case in fastpg_cases if case["status"] == "failed"),
         "fastpg_mismatch": sum(1 for case in fastpg_cases if case["status"] == "mismatch"),
+        "fastpg_timeout": sum(1 for case in fastpg_cases if case["status"] == "timeout"),
+        "fastpg_server_crash": sum(1 for case in fastpg_cases if case["status"] == "server-crash"),
+        "fastpg_harness_failure": sum(1 for case in fastpg_cases if case["status"] == "harness-failure"),
         "fastpg_normal_failed": sum(1 for case in fastpg_cases if case["status"] == "normal-failed"),
     }
 
@@ -583,12 +832,17 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         protocol="simple",
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
+        storage_engine=args.storage_engine,
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
         profile_phase="run",
         profile_open=False,
         profile_warmup_seconds=0.0,
+        profile_hyperfine=False,
+        profile_hyperfine_runs=1,
+        profile_hyperfine_warmup=0,
+        profile_server_memory=False,
     )
 
 
@@ -664,6 +918,9 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
                 f"- fastpg ok: `{totals_data['fastpg_ok']}`",
                 f"- fastpg failed: `{totals_data['fastpg_failed']}`",
                 f"- fastpg mismatched: `{totals_data['fastpg_mismatch']}`",
+                f"- fastpg timeouts: `{totals_data['fastpg_timeout']}`",
+                f"- fastpg server crashes: `{totals_data['fastpg_server_crash']}`",
+                f"- fastpg harness failures: `{totals_data['fastpg_harness_failure']}`",
                 f"- skipped by normal failure: `{totals_data['fastpg_normal_failed']}`",
             ]
         )
@@ -744,6 +1001,23 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default="release",
     )
     parser.add_argument(
+        "--storage-engine",
+        choices=["storage1", "storage2"],
+        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
+    )
+    parser.add_argument(
+        "--fastpg-isolation",
+        choices=["suite", "case"],
+        default="suite",
+        help="run fastpg cases in one server or restart fastpg for each selected case",
+    )
+    parser.add_argument(
+        "--fastpg-case-timeout",
+        type=float,
+        default=60.0,
+        help="seconds before a fastpg SQL case is marked as a timeout",
+    )
+    parser.add_argument(
         "--fail-on-differences",
         action="store_true",
         help="return non-zero when fastpg differs from normal Postgres",
@@ -751,6 +1025,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.limit is not None and args.limit < 1:
         parser.error("--limit must be at least 1")
+    if args.fastpg_case_timeout is not None and args.fastpg_case_timeout <= 0:
+        parser.error("--fastpg-case-timeout must be positive")
     return args
 
 

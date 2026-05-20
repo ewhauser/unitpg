@@ -6,6 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use bytes::{BufMut, BytesMut};
 use fastpg_session::{
     Column, PgType, QueryDescription, QueryExecution, QueryResult, ServerState, SessionState,
     StartupParameters, Value,
@@ -26,6 +27,7 @@ use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::DataRow;
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+use postgres_types::Kind;
 use tokio::sync::Semaphore;
 
 #[derive(Debug)]
@@ -456,10 +458,11 @@ fn missing_session_error() -> PgWireError {
 
 fn parameter_types(description: &QueryDescription) -> Vec<Type> {
     description
-        .parameter_types
+        .parameter_type_oids
         .iter()
         .copied()
-        .map(to_pgwire_type)
+        .zip(description.parameter_types.iter().copied())
+        .map(|(type_oid, fallback)| pgwire_type_for_oid(type_oid, fallback))
         .collect()
 }
 
@@ -483,12 +486,27 @@ fn field_info(field: &Column, format: FieldFormat) -> FieldInfo {
         field.name.clone(),
         None,
         None,
-        to_pgwire_type(field.data_type),
+        pgwire_type_for_oid(field.type_oid, field.data_type),
         format,
     )
 }
 
-fn to_pgwire_type(data_type: PgType) -> Type {
+fn pgwire_type_for_oid(type_oid: u32, fallback: PgType) -> Type {
+    Type::from_oid(type_oid).unwrap_or_else(|| {
+        if type_oid == 0 {
+            pgwire_type_for_pg_type(fallback)
+        } else {
+            Type::new(
+                format!("fastpg_type_{type_oid}"),
+                type_oid,
+                Kind::Simple,
+                "pg_catalog".to_owned(),
+            )
+        }
+    })
+}
+
+fn pgwire_type_for_pg_type(data_type: PgType) -> Type {
     match data_type {
         PgType::Int2 => Type::INT2,
         PgType::Int4 => Type::INT4,
@@ -564,11 +582,37 @@ fn encode_row(
     fields: &[Column],
     values: &[Value],
 ) -> PgWireResult<DataRow> {
+    if schema
+        .iter()
+        .all(|field| field.format() == FieldFormat::Text)
+    {
+        let mut row = BytesMut::with_capacity(128);
+        for value in values {
+            encode_text_field(&mut row, value);
+        }
+        return Ok(DataRow::new(row, values.len() as i16));
+    }
+
     let mut encoder = DataRowEncoder::new(schema);
     for (field, value) in fields.iter().zip(values) {
         encode_value(&mut encoder, field.data_type, value)?;
     }
     Ok(encoder.take_row())
+}
+
+fn encode_text_field(row: &mut BytesMut, value: &Value) {
+    match value {
+        Value::Null => row.put_i32(-1),
+        Value::Int2(value) => encode_text_bytes(row, value.to_string().as_bytes()),
+        Value::Int4(value) => encode_text_bytes(row, value.to_string().as_bytes()),
+        Value::Int8(value) => encode_text_bytes(row, value.to_string().as_bytes()),
+        Value::Text(value) => encode_text_bytes(row, value.as_bytes()),
+    }
+}
+
+fn encode_text_bytes(row: &mut BytesMut, bytes: &[u8]) {
+    row.put_i32(bytes.len() as i32);
+    row.put_slice(bytes);
 }
 
 fn encode_value(

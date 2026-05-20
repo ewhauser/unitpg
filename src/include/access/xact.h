@@ -459,6 +459,9 @@ extern TimestampTz GetCurrentTransactionStopTimestamp(void);
 extern void SetCurrentStatementStartTimestamp(void);
 #ifdef USE_FASTPG
 extern void FastPgSetCurrentTransactionStartTimestampToStatement(void);
+extern void FastPgStartStandaloneStatement(void);
+extern void FastPgEnsureStandaloneTransactionState(void);
+extern void FastPgReleaseStandaloneStatementResources(bool isCommit);
 #endif
 extern int	GetCurrentTransactionNestLevel(void);
 extern bool TransactionIdIsCurrentTransactionId(TransactionId xid);

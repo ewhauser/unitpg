@@ -34,6 +34,7 @@
 #include "access/xlogwait.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_enum.h"
 #include "catalog/storage.h"
 #include "commands/async.h"
@@ -252,6 +253,94 @@ static TransactionStateData TopTransactionStateData = {
 	.topXidLogged = false,
 };
 
+#ifdef USE_FASTPG
+static PGPROC FastPgStandaloneProc;
+static LocalTransactionId FastPgStandaloneNextLocalTransactionId = 1;
+static TransactionId FastPgStandaloneNextTransactionId = FirstNormalTransactionId;
+static bool FastPgStandaloneProcInitialized = false;
+
+static void FastPgEnsureStandaloneProc(void);
+
+static LocalTransactionId
+FastPgNextStandaloneLocalTransactionId(void)
+{
+	LocalTransactionId lxid = FastPgStandaloneNextLocalTransactionId++;
+
+	if (!LocalTransactionIdIsValid(FastPgStandaloneNextLocalTransactionId))
+		FastPgStandaloneNextLocalTransactionId = 1;
+	return lxid;
+}
+
+static FullTransactionId
+FastPgNextStandaloneFullTransactionId(void)
+{
+	TransactionId xid = FastPgStandaloneNextTransactionId++;
+
+	if (!TransactionIdIsNormal(FastPgStandaloneNextTransactionId))
+		FastPgStandaloneNextTransactionId = FirstNormalTransactionId;
+	return FullTransactionIdFromEpochAndXid(0, xid);
+}
+
+static void
+FastPgAssignStandaloneTransactionId(TransactionState s)
+{
+	if (FullTransactionIdIsValid(s->fullTransactionId))
+		return;
+
+	if (s->parent != NULL &&
+		!FullTransactionIdIsValid(s->parent->fullTransactionId))
+		FastPgAssignStandaloneTransactionId(s->parent);
+
+	s->fullTransactionId = FastPgNextStandaloneFullTransactionId();
+	if (s->parent == NULL)
+		XactTopFullTransactionId = s->fullTransactionId;
+	else if (!FullTransactionIdIsValid(XactTopFullTransactionId))
+		XactTopFullTransactionId = s->parent->fullTransactionId;
+
+	FastPgEnsureStandaloneProc();
+	MyProc->xid = XidFromFullTransactionId(s->fullTransactionId);
+}
+
+static void
+FastPgEnsureStandaloneProc(void)
+{
+	if (IsUnderPostmaster)
+		return;
+
+	if (!FastPgStandaloneProcInitialized)
+	{
+		memset(&FastPgStandaloneProc, 0, sizeof(FastPgStandaloneProc));
+		FastPgStandaloneProc.pid = MyProcPid != 0 ? MyProcPid : getpid();
+		FastPgStandaloneProc.backendType = B_STANDALONE_BACKEND;
+		FastPgStandaloneProc.databaseId = MyDatabaseId;
+		FastPgStandaloneProc.roleId = BOOTSTRAP_SUPERUSERID;
+		FastPgStandaloneProc.pgxactoff = -1;
+		FastPgStandaloneProc.vxid.procNumber = 0;
+		FastPgStandaloneProc.vxid.lxid = InvalidLocalTransactionId;
+		FastPgStandaloneProc.xid = InvalidTransactionId;
+		FastPgStandaloneProc.xmin = InvalidTransactionId;
+		FastPgStandaloneProc.fpLocalTransactionId = InvalidLocalTransactionId;
+		FastPgStandaloneProcInitialized = true;
+	}
+
+	MyProc = &FastPgStandaloneProc;
+	MyProcNumber = FastPgStandaloneProc.vxid.procNumber;
+	MyProc->pid = MyProcPid != 0 ? MyProcPid : getpid();
+	MyProc->databaseId = MyDatabaseId;
+	MyProc->backendType = B_STANDALONE_BACKEND;
+	FastPgEnsureStandaloneUserId();
+}
+
+static void
+FastPgEnsureStandaloneLocalTransactionId(void)
+{
+	FastPgEnsureStandaloneProc();
+	if (!IsUnderPostmaster &&
+		!LocalTransactionIdIsValid(MyProc->vxid.lxid))
+		MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
+}
+#endif
+
 /*
  * unreportedXids holds XIDs of all subtransactions that have not yet been
  * reported in an XLOG_XACT_ASSIGNMENT record.
@@ -427,6 +516,15 @@ IsAbortedTransactionBlockState(void)
 TransactionId
 GetTopTransactionId(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		FastPgEnsureStandaloneTransactionState();
+		if (!FullTransactionIdIsValid(XactTopFullTransactionId))
+			FastPgAssignStandaloneTransactionId(&TopTransactionStateData);
+		return XidFromFullTransactionId(XactTopFullTransactionId);
+	}
+#endif
 	if (!FullTransactionIdIsValid(XactTopFullTransactionId))
 		AssignTransactionId(&TopTransactionStateData);
 	return XidFromFullTransactionId(XactTopFullTransactionId);
@@ -457,6 +555,16 @@ GetCurrentTransactionId(void)
 {
 	TransactionState s = CurrentTransactionState;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		FastPgEnsureStandaloneTransactionState();
+		s = CurrentTransactionState;
+		if (!FullTransactionIdIsValid(s->fullTransactionId))
+			FastPgAssignStandaloneTransactionId(s);
+		return XidFromFullTransactionId(s->fullTransactionId);
+	}
+#endif
 	if (!FullTransactionIdIsValid(s->fullTransactionId))
 		AssignTransactionId(s);
 	return XidFromFullTransactionId(s->fullTransactionId);
@@ -484,6 +592,15 @@ GetCurrentTransactionIdIfAny(void)
 FullTransactionId
 GetTopFullTransactionId(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		FastPgEnsureStandaloneTransactionState();
+		if (!FullTransactionIdIsValid(XactTopFullTransactionId))
+			FastPgAssignStandaloneTransactionId(&TopTransactionStateData);
+		return XactTopFullTransactionId;
+	}
+#endif
 	if (!FullTransactionIdIsValid(XactTopFullTransactionId))
 		AssignTransactionId(&TopTransactionStateData);
 	return XactTopFullTransactionId;
@@ -515,6 +632,16 @@ GetCurrentFullTransactionId(void)
 {
 	TransactionState s = CurrentTransactionState;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		FastPgEnsureStandaloneTransactionState();
+		s = CurrentTransactionState;
+		if (!FullTransactionIdIsValid(s->fullTransactionId))
+			FastPgAssignStandaloneTransactionId(s);
+		return s->fullTransactionId;
+	}
+#endif
 	if (!FullTransactionIdIsValid(s->fullTransactionId))
 		AssignTransactionId(s);
 	return s->fullTransactionId;
@@ -933,6 +1060,16 @@ FastPgSetCurrentTransactionStartTimestampToStatement(void)
 	pgstat_report_xact_timestamp(xactStartTimestamp);
 	xactStopTimestamp = 0;
 }
+
+void
+FastPgStartStandaloneStatement(void)
+{
+	if (IsUnderPostmaster)
+		return;
+
+	FastPgEnsureStandaloneProc();
+	MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
+}
 #endif
 
 /*
@@ -1285,6 +1422,86 @@ AtStart_ResourceOwner(void)
 	CurTransactionResourceOwner = s->curTransactionOwner;
 	CurrentResourceOwner = s->curTransactionOwner;
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureStandaloneTransactionState(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (IsUnderPostmaster)
+		return;
+	FastPgEnsureStandaloneLocalTransactionId();
+	if (s->blockState != TBLOCK_DEFAULT || s->state != TRANS_DEFAULT)
+		return;
+
+	s->state = TRANS_START;
+	s->fullTransactionId = InvalidFullTransactionId;
+	s->nestingLevel = 1;
+	s->gucNestLevel = 1;
+	s->childXids = NULL;
+	s->nChildXids = 0;
+	s->maxChildXids = 0;
+	GetUserIdAndSecContext(&s->prevUser, &s->prevSecContext);
+	s->startedInRecovery = false;
+	XactReadOnly = DefaultXactReadOnly;
+	XactDeferrable = DefaultXactDeferrable;
+	XactIsoLevel = DefaultXactIsoLevel;
+	forceSyncCommit = false;
+	MyXactFlags = 0;
+	s->subTransactionId = TopSubTransactionId;
+	currentSubTransactionId = TopSubTransactionId;
+	currentCommandId = FirstCommandId;
+	currentCommandIdUsed = false;
+	nUnreportedXids = 0;
+	s->didLogXid = false;
+
+	AtStart_Memory();
+	AtStart_ResourceOwner();
+	xactStartTimestamp = stmtStartTimestamp != 0 ? stmtStartTimestamp : GetCurrentTimestamp();
+	pgstat_report_xact_timestamp(xactStartTimestamp);
+	xactStopTimestamp = 0;
+
+	s->state = TRANS_INPROGRESS;
+	s->blockState = TBLOCK_STARTED;
+}
+
+void
+FastPgReleaseStandaloneStatementResources(bool isCommit)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (IsUnderPostmaster)
+		return;
+
+	FastPgEnsureStandaloneTransactionState();
+	s = CurrentTransactionState;
+
+	if (TopTransactionResourceOwner != NULL)
+	{
+		CurrentResourceOwner = TopTransactionResourceOwner;
+		ResourceOwnerRelease(TopTransactionResourceOwner,
+							 RESOURCE_RELEASE_BEFORE_LOCKS,
+							 isCommit,
+							 true);
+		ResourceOwnerRelease(TopTransactionResourceOwner,
+							 RESOURCE_RELEASE_LOCKS,
+							 isCommit,
+							 true);
+		ResourceOwnerRelease(TopTransactionResourceOwner,
+							 RESOURCE_RELEASE_AFTER_LOCKS,
+							 isCommit,
+							 true);
+		ResourceOwnerDelete(TopTransactionResourceOwner);
+	}
+
+	TopTransactionResourceOwner = NULL;
+	CurTransactionResourceOwner = NULL;
+	CurrentResourceOwner = NULL;
+	s->curTransactionOwner = NULL;
+	AtStart_ResourceOwner();
+}
+#endif
 
 /* ----------------------------------------------------------------
  *						StartSubTransaction stuff
@@ -4775,6 +4992,10 @@ BeginInternalSubTransaction(const char *name)
 	 * new XIDs or command IDs are assigned.  Enforcement of that occurs in
 	 * AssignTransactionId() and CommandCounterIncrement().
 	 */
+#ifdef USE_FASTPG
+	FastPgEnsureStandaloneTransactionState();
+	s = CurrentTransactionState;
+#endif
 
 	switch (s->blockState)
 	{

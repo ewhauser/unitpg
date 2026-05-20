@@ -46,6 +46,9 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 
+#ifdef USE_FASTPG
+extern void FastPgEnsureRelationRules(Relation relation);
+#endif
 
 /* We use a list of these to detect recursion in RewriteQuery */
 typedef struct rewrite_event
@@ -2577,6 +2580,13 @@ get_view_query(Relation view)
 	int			i;
 
 	Assert(view->rd_rel->relkind == RELKIND_VIEW);
+
+#ifdef USE_FASTPG
+	FastPgEnsureRelationRules(view);
+#endif
+	if (view->rd_rules == NULL)
+		elog(ERROR, "failed to load _RETURN rule for view \"%s\"",
+			 RelationGetRelationName(view));
 
 	for (i = 0; i < view->rd_rules->numLocks; i++)
 	{
