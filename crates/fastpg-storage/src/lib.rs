@@ -3049,7 +3049,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
         unsafe {
             *out = physical_column_to_ffi(&column);
         }
-        return true;
+        true
     } else if let Some(relation) = primary_key_index_relation(Oid(relation_oid)) {
         let Some(column) = primary_key_column(&relation, column_index) else {
             return false;
@@ -3057,7 +3057,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
         unsafe {
             *out = column_to_ffi(column);
         }
-        return true;
+        true
     } else if let Some(table) = static_catalog_by_relation_oid(Oid(relation_oid)) {
         let Some(column) = table.columns.get(column_index) else {
             return false;
@@ -3065,9 +3065,9 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
         unsafe {
             *out = static_catalog_column_to_ffi(column);
         }
-        return true;
+        true
     } else {
-        return false;
+        false
     }
 }
 

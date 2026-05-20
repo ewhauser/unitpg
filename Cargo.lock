@@ -404,6 +404,7 @@ dependencies = [
 name = "fastpg-exec"
 version = "0.1.0"
 dependencies = [
+ "fastpg-catalog",
  "fastpg-pgcore",
  "fastpg-storage",
  "fastpg-storage2",
