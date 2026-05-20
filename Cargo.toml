@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/fastpg-backend",
     "crates/fastpg-catalog",
     "crates/fastpg-compat",
     "crates/fastpg-exec",
@@ -26,6 +27,7 @@ rust-version = "1.94"
 [workspace.dependencies]
 async-trait = "0.1"
 fastpg-catalog = { path = "crates/fastpg-catalog" }
+fastpg-backend = { path = "crates/fastpg-backend" }
 fastpg-compat = { path = "crates/fastpg-compat" }
 fastpg-exec = { path = "crates/fastpg-exec" }
 fastpg-index = { path = "crates/fastpg-index" }

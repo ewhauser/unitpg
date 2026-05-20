@@ -99,7 +99,8 @@ pub struct SessionState {
 impl SessionState {
     pub fn new(server: Arc<ServerState>, startup: StartupParameters) -> Self {
         let id = server.allocate_session_id();
-        let executor = QueryExecutor::with_shared(server.executor.clone());
+        let executor =
+            QueryExecutor::with_shared_for_database(server.executor.clone(), startup.database());
         Self {
             id,
             server,
