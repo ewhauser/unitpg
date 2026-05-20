@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::OnceLock;
 
 use fastpg_types::Oid;
 
@@ -19,6 +20,43 @@ pub fn static_catalog_by_relation_oid(relation_oid: Oid) -> Option<&'static Stat
     generated_catalog::STATIC_CATALOG_TABLES
         .iter()
         .find(|table| table.oid == relation_oid)
+}
+
+struct CachedStaticCatalogRows {
+    rows: Vec<CatalogRow>,
+    row_indexes: HashMap<u64, usize>,
+}
+
+fn static_catalog_row_cache() -> &'static HashMap<u32, CachedStaticCatalogRows> {
+    static STATIC_CATALOG_ROW_CACHE: OnceLock<HashMap<u32, CachedStaticCatalogRows>> =
+        OnceLock::new();
+    STATIC_CATALOG_ROW_CACHE.get_or_init(|| {
+        static_catalogs()
+            .iter()
+            .map(|table| {
+                let rows = table
+                    .rows
+                    .iter()
+                    .map(|row| static_row_to_catalog_row_uncached(table, row))
+                    .collect::<Vec<_>>();
+                let row_indexes = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(index, row)| (row.row_id, index))
+                    .collect();
+                (table.oid.0, CachedStaticCatalogRows { rows, row_indexes })
+            })
+            .collect()
+    })
+}
+
+fn static_catalog_cached_row(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+) -> Option<&'static CatalogRow> {
+    let cached = static_catalog_row_cache().get(&table.oid.0)?;
+    let index = cached.row_indexes.get(&row.row_id)?;
+    cached.rows.get(*index)
 }
 
 pub fn static_catalog_by_name(name: &str) -> Option<&'static StaticCatalogTable> {
@@ -320,7 +358,7 @@ fn normalize_pg_proc_bootstrap_defaults(table: &StaticCatalogTable, values: &mut
     values[proargdefaults_index] = CatalogValue::Text(format!("({})", nodes.join(" ")));
 }
 
-pub(crate) fn static_row_to_catalog_row(
+fn static_row_to_catalog_row_uncached(
     table: &StaticCatalogTable,
     row: &StaticCatalogRow,
 ) -> CatalogRow {
@@ -337,6 +375,15 @@ pub(crate) fn static_row_to_catalog_row(
         row_id: row.row_id,
         values,
     }
+}
+
+pub(crate) fn static_row_to_catalog_row(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+) -> CatalogRow {
+    static_catalog_cached_row(table, row)
+        .cloned()
+        .unwrap_or_else(|| static_row_to_catalog_row_uncached(table, row))
 }
 
 fn synthetic_static_relation_rowtype_row(
@@ -1542,50 +1589,47 @@ pub(crate) fn catalog_row_identifier_matches(
 
 pub(crate) fn catalog_rows_matching_static<StaticMatches, RowMatches>(
     relation_oid: Oid,
-    _static_matches: StaticMatches,
+    static_matches: StaticMatches,
     row_matches: RowMatches,
 ) -> Vec<CatalogRow>
 where
     StaticMatches: Fn(&StaticCatalogTable, &StaticCatalogRow) -> bool,
     RowMatches: Fn(&CatalogRow) -> bool,
 {
-    if static_catalog_by_relation_oid(relation_oid).is_none() {
-        return Vec::new();
-    }
-    catalog_rows(relation_oid)
-        .into_iter()
-        .filter(row_matches)
-        .collect()
-}
-
-pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
     let Some(table) = static_catalog_by_relation_oid(relation_oid) else {
         return Vec::new();
     };
     with_visible_catalog_snapshot(|snapshot| {
         let mut rows = BTreeMap::<u64, CatalogRow>::new();
-        for row in table.rows {
-            rows.insert(row.row_id, static_row_to_catalog_row(table, row));
+        for static_row in table.rows.iter().filter(|row| static_matches(table, row)) {
+            if let Some(row) = static_catalog_cached_row(table, static_row) {
+                rows.insert(row.row_id, row.clone());
+            }
         }
         match relation_oid {
             PG_NAMESPACE_RELATION_OID => {
-                if let Some(row) = synthetic_information_schema_namespace_row(table) {
-                    rows.entry(row.row_id).or_insert(row);
-                }
+                insert_matching_row(
+                    &mut rows,
+                    synthetic_information_schema_namespace_row(table),
+                    &row_matches,
+                );
                 for namespace in snapshot.namespaces.values() {
-                    rows.insert(namespace.row_id, namespace.row.clone());
+                    insert_matching_row(&mut rows, Some(namespace.row.clone()), &row_matches);
                 }
             }
             PG_CLASS_RELATION_OID => {
-                let row = synthetic_pg_aggregate_fnoid_index_class_row(table);
-                rows.entry(row.row_id).or_insert(row);
+                insert_matching_row(
+                    &mut rows,
+                    Some(synthetic_pg_aggregate_fnoid_index_class_row(table)),
+                    &row_matches,
+                );
                 for relation in snapshot.relations.values() {
-                    rows.insert(relation.row_id, relation.row.clone());
+                    insert_matching_row(&mut rows, Some(relation.row.clone()), &row_matches);
                 }
             }
             PG_ATTRIBUTE_RELATION_OID => {
                 for column in snapshot.columns.values() {
-                    rows.insert(column.row_id, column.row.clone());
+                    insert_matching_row(&mut rows, Some(column.row.clone()), &row_matches);
                 }
                 let mut existing_attributes: HashSet<(Oid, i16)> = rows
                     .values()
@@ -1604,7 +1648,7 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                             synthetic_static_attribute_row(table, relation_table, column, attnum)
                         {
                             existing_attributes.insert((relation_table.oid, attnum));
-                            rows.insert(row.row_id, row);
+                            insert_matching_row(&mut rows, Some(row), &row_matches);
                         }
                     }
                     for spec in SYSTEM_ATTRIBUTE_SPECS {
@@ -1615,37 +1659,43 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                             synthetic_system_attribute_row(table, relation_table, *spec)
                         {
                             existing_attributes.insert((relation_table.oid, spec.attnum));
-                            rows.insert(row.row_id, row);
+                            insert_matching_row(&mut rows, Some(row), &row_matches);
                         }
                     }
                 }
             }
             PG_TYPE_RELATION_OID => {
                 for pg_type in snapshot.types.values() {
-                    rows.insert(pg_type.row_id, pg_type.row.clone());
+                    insert_matching_row(&mut rows, Some(pg_type.row.clone()), &row_matches);
                 }
                 for spec in INFORMATION_SCHEMA_DOMAIN_SPECS {
-                    if let Some(row) = synthetic_information_schema_domain_row(table, *spec) {
-                        rows.entry(row.row_id).or_insert(row);
-                    }
+                    insert_matching_row(
+                        &mut rows,
+                        synthetic_information_schema_domain_row(table, *spec),
+                        &row_matches,
+                    );
                 }
                 for relation_table in static_catalogs() {
-                    if let Some(row) = synthetic_static_relation_rowtype_row(table, relation_table)
-                    {
-                        rows.entry(row.row_id).or_insert(row);
-                    }
+                    insert_matching_row(
+                        &mut rows,
+                        synthetic_static_relation_rowtype_row(table, relation_table),
+                        &row_matches,
+                    );
                 }
             }
             PG_INDEX_RELATION_OID => {
-                let row = synthetic_pg_aggregate_fnoid_index_row(table);
-                rows.entry(row.row_id).or_insert(row);
+                insert_matching_row(
+                    &mut rows,
+                    Some(synthetic_pg_aggregate_fnoid_index_row(table)),
+                    &row_matches,
+                );
                 for index in snapshot.indexes.values() {
-                    rows.insert(index.row_id, index.row.clone());
+                    insert_matching_row(&mut rows, Some(index.row.clone()), &row_matches);
                 }
             }
             PG_CONSTRAINT_RELATION_OID => {
                 for constraint in snapshot.constraints.values() {
-                    rows.insert(constraint.row_id, constraint.row.clone());
+                    insert_matching_row(&mut rows, Some(constraint.row.clone()), &row_matches);
                 }
             }
             PG_DESCRIPTION_RELATION_OID => {
@@ -1676,32 +1726,57 @@ pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
                         synthetic_operator_proc_description_row(table, proc_oid, description)
                     {
                         existing_descriptions.insert((PG_PROC_RELATION_OID, proc_oid, 0));
-                        rows.entry(row.row_id).or_insert(row);
+                        insert_matching_row(&mut rows, Some(row), &row_matches);
                     }
                 }
             }
             PG_INIT_PRIVS_RELATION_OID => {
-                let row = synthetic_pg_catalog_init_privs_row(table);
-                rows.entry(row.row_id).or_insert(row);
+                insert_matching_row(
+                    &mut rows,
+                    Some(synthetic_pg_catalog_init_privs_row(table)),
+                    &row_matches,
+                );
             }
             PG_TS_DICT_RELATION_OID => {
-                let row = synthetic_english_ts_dict_row(table);
-                rows.entry(row.row_id).or_insert(row);
+                insert_matching_row(
+                    &mut rows,
+                    Some(synthetic_english_ts_dict_row(table)),
+                    &row_matches,
+                );
             }
             PG_TS_CONFIG_RELATION_OID => {
-                let row = synthetic_english_ts_config_row(table);
-                rows.entry(row.row_id).or_insert(row);
+                insert_matching_row(
+                    &mut rows,
+                    Some(synthetic_english_ts_config_row(table)),
+                    &row_matches,
+                );
             }
             PG_TS_CONFIG_MAP_RELATION_OID => {
                 for row in synthetic_english_ts_config_map_rows(table) {
-                    rows.entry(row.row_id).or_insert(row);
+                    insert_matching_row(&mut rows, Some(row), &row_matches);
                 }
             }
             _ => {}
         }
         snapshot.compat_rows.apply_to_rows(relation_oid, &mut rows);
-        rows.into_values().collect()
+        rows.into_values().filter(|row| row_matches(row)).collect()
     })
+}
+
+fn insert_matching_row(
+    rows: &mut BTreeMap<u64, CatalogRow>,
+    row: Option<CatalogRow>,
+    row_matches: &impl Fn(&CatalogRow) -> bool,
+) {
+    if let Some(row) = row
+        && row_matches(&row)
+    {
+        rows.insert(row.row_id, row);
+    }
+}
+
+pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
+    catalog_rows_matching_static(relation_oid, |_, _| true, |_| true)
 }
 
 pub fn relation_rowtype_oid_by_oid(relation_oid: Oid) -> Option<Oid> {

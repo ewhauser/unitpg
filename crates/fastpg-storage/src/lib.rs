@@ -927,6 +927,7 @@ impl Default for TransactionOverlay {
 struct ScanState {
     rows: Vec<Row>,
     region: StorageRegion,
+    shared_region: Option<Arc<StorageRegion>>,
     next_index: usize,
 }
 
@@ -944,12 +945,73 @@ impl ScanState {
         Ok(Self {
             rows,
             region,
+            shared_region: None,
             next_index: 0,
         })
     }
 
     fn bytes(&self) -> usize {
-        self.region.bytes()
+        self.region.bytes().saturating_add(
+            self.shared_region
+                .as_ref()
+                .map_or(0, |region| region.bytes()),
+        )
+    }
+}
+
+#[derive(Debug)]
+struct CachedCatalogScan {
+    rows: Vec<Row>,
+    region: Arc<StorageRegion>,
+}
+
+#[derive(Debug)]
+struct CatalogScanCache {
+    generation: u64,
+    entries: HashMap<u32, Arc<CachedCatalogScan>>,
+}
+
+impl Default for CatalogScanCache {
+    fn default() -> Self {
+        Self {
+            generation: current_generation(),
+            entries: HashMap::new(),
+        }
+    }
+}
+
+static CATALOG_SCAN_CACHE: OnceLock<Mutex<CatalogScanCache>> = OnceLock::new();
+
+fn catalog_scan_cache() -> &'static Mutex<CatalogScanCache> {
+    CATALOG_SCAN_CACHE.get_or_init(|| Mutex::new(CatalogScanCache::default()))
+}
+
+fn with_catalog_scan_cache<R>(f: impl FnOnce(&mut CatalogScanCache) -> R) -> R {
+    let generation = current_generation();
+    let mut cache = catalog_scan_cache()
+        .lock()
+        .expect("catalog scan cache mutex poisoned");
+    if cache.generation != generation {
+        cache.generation = generation;
+        cache.entries.clear();
+    }
+    f(&mut cache)
+}
+
+fn clear_catalog_scan_cache() {
+    if let Some(cache) = CATALOG_SCAN_CACHE.get() {
+        let mut cache = cache.lock().expect("catalog scan cache mutex poisoned");
+        cache.generation = current_generation();
+        cache.entries.clear();
+    }
+}
+
+fn scan_state_from_cached_catalog_scan(cache: Arc<CachedCatalogScan>) -> ScanState {
+    ScanState {
+        rows: cache.rows.clone(),
+        region: StorageRegion::new(StorageRegionKind::Scan),
+        shared_region: Some(Arc::clone(&cache.region)),
+        next_index: 0,
     }
 }
 
@@ -4042,6 +4104,7 @@ pub extern "C" fn fastpg_rust_storage_set_limits(
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_storage_reset_limits() {
     with_storage(|state, _session| state.reset_limits());
+    clear_catalog_scan_cache();
     clear_last_storage_error();
 }
 
@@ -5063,7 +5126,7 @@ fn catalog_value_to_cell(
     }
 }
 
-fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
+fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
     let table = static_catalog_by_relation_oid(relation_oid)?;
     let mut region = StorageRegion::new(StorageRegionKind::Scan);
     let mut rows = Vec::new();
@@ -5086,8 +5149,29 @@ fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
     Some(ScanState {
         rows,
         region,
+        shared_region: None,
         next_index: 0,
     })
+}
+
+fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_uncached(relation_oid);
+    }
+    if let Some(cached) =
+        with_catalog_scan_cache(|cache| cache.entries.get(&relation_oid.0).map(Arc::clone))
+    {
+        return Some(scan_state_from_cached_catalog_scan(cached));
+    }
+    let scan = catalog_scan_state_uncached(relation_oid)?;
+    let cached = Arc::new(CachedCatalogScan {
+        rows: scan.rows,
+        region: Arc::new(scan.region),
+    });
+    with_catalog_scan_cache(|cache| {
+        cache.entries.insert(relation_oid.0, Arc::clone(&cached));
+    });
+    Some(scan_state_from_cached_catalog_scan(cached))
 }
 
 #[unsafe(no_mangle)]
