@@ -865,6 +865,11 @@ pgstat_reset_counters(void)
 {
 	TimestampTz ts = GetCurrentTimestamp();
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return;
+#endif
+
 	pgstat_reset_matching_entries(match_db_entries,
 								  ObjectIdGetDatum(MyDatabaseId),
 								  ts);
@@ -884,6 +889,11 @@ pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 	TimestampTz ts = GetCurrentTimestamp();
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return;
+#endif
 
 	/* not needed atm, and doesn't make sense with the current signature */
 	Assert(!pgstat_get_kind_info(kind)->fixed_amount);
@@ -906,6 +916,11 @@ pgstat_reset_of_kind(PgStat_Kind kind)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 	TimestampTz ts = GetCurrentTimestamp();
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return;
+#endif
 
 	if (kind_info->fixed_amount)
 		kind_info->reset_all_cb(ts);
@@ -977,6 +992,11 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 	 */
 	if (may_free)
 		*may_free = false;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return NULL;
+#endif
 
 	pgstat_prep_snapshot();
 
@@ -1091,6 +1111,11 @@ pgstat_have_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	/* fixed-numbered stats always exist */
 	if (pgstat_get_kind_info(kind)->fixed_amount)
 		return true;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return false;
+#endif
 
 	return pgstat_get_entry_ref(kind, dboid, objid, false, NULL) != NULL;
 }
@@ -1348,6 +1373,11 @@ PgStat_EntryRef *
 pgstat_fetch_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 	PgStat_EntryRef *entry_ref;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return NULL;
+#endif
 
 	entry_ref = pgstat_get_entry_ref(kind, dboid, objid, false, NULL);
 

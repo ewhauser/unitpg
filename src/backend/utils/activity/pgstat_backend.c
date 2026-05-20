@@ -26,6 +26,7 @@
 
 #include "access/xlog.h"
 #include "executor/instrument.h"
+#include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
@@ -115,6 +116,15 @@ pgstat_fetch_stat_backend_by_pid(int pid, BackendType *bktype)
 	PgBackendStatus *beentry;
 	ProcNumber	procNumber;
 	PgStat_Backend *backend_stats;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (bktype)
+			*bktype = B_INVALID;
+		return NULL;
+	}
+#endif
 
 	proc = BackendPidGetProc(pid);
 	if (bktype)

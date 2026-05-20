@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "miscadmin.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
 
@@ -45,10 +46,18 @@ void
 pgstat_reset_slru(const char *name)
 {
 	TimestampTz ts = GetCurrentTimestamp();
+	int			index;
 
 	Assert(name != NULL);
 
-	pgstat_reset_slru_counter_internal(pgstat_get_slru_index(name), ts);
+	index = pgstat_get_slru_index(name);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shmem == NULL)
+		return;
+#endif
+
+	pgstat_reset_slru_counter_internal(index, ts);
 }
 
 /*
@@ -142,8 +151,15 @@ pgstat_get_slru_index(const char *name)
 bool
 pgstat_slru_flush_cb(bool nowait)
 {
-	PgStatShared_SLRU *stats_shmem = &pgStatLocal.shmem->slru;
+	PgStatShared_SLRU *stats_shmem;
 	int			i;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shmem == NULL)
+		return false;
+#endif
+
+	stats_shmem = &pgStatLocal.shmem->slru;
 
 	if (!have_slrustats)
 		return false;
@@ -190,6 +206,11 @@ pgstat_slru_init_shmem_cb(void *stats)
 void
 pgstat_slru_reset_all_cb(TimestampTz ts)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shmem == NULL)
+		return;
+#endif
+
 	for (int i = 0; i < SLRU_NUM_ELEMENTS; i++)
 		pgstat_reset_slru_counter_internal(i, ts);
 }
@@ -197,7 +218,18 @@ pgstat_slru_reset_all_cb(TimestampTz ts)
 void
 pgstat_slru_snapshot_cb(void)
 {
-	PgStatShared_SLRU *stats_shmem = &pgStatLocal.shmem->slru;
+	PgStatShared_SLRU *stats_shmem;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shmem == NULL)
+	{
+		memset(pgStatLocal.snapshot.slru, 0,
+			   sizeof(PgStat_SLRUStats) * SLRU_NUM_ELEMENTS);
+		return;
+	}
+#endif
+
+	stats_shmem = &pgStatLocal.shmem->slru;
 
 	LWLockAcquire(&stats_shmem->lock, LW_SHARED);
 

@@ -246,6 +246,11 @@ pg_stat_get_backend_idset(PG_FUNCTION_ARGS)
 	funcctx = SRF_PERCALL_SETUP();
 	fctx = funcctx->user_fctx;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		SRF_RETURN_DONE(funcctx);
+#endif
+
 	fctx[0] += 1;
 
 	/*
@@ -2027,6 +2032,11 @@ pg_stat_reset_backend_stats(PG_FUNCTION_ARGS)
 	PgBackendStatus *beentry;
 	ProcNumber	procNumber;
 	int			backend_pid = PG_GETARG_INT32(0);
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		PG_RETURN_VOID();
+#endif
 
 	proc = BackendPidGetProc(backend_pid);
 

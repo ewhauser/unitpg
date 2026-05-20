@@ -328,6 +328,11 @@ XLogPrefetchShmemInit(void *arg)
 void
 XLogPrefetchResetStats(void)
 {
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && SharedStats == NULL)
+		return;
+#endif
+
 	pg_atomic_write_u64(&SharedStats->reset_time, GetCurrentTimestamp());
 	pg_atomic_write_u64(&SharedStats->prefetch, 0);
 	pg_atomic_write_u64(&SharedStats->hit, 0);
@@ -837,6 +842,16 @@ pg_stat_get_recovery_prefetch(PG_FUNCTION_ARGS)
 
 	for (int i = 0; i < PG_STAT_GET_RECOVERY_PREFETCH_COLS; ++i)
 		nulls[i] = false;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && SharedStats == NULL)
+	{
+		MemSet(values, 0, sizeof(values));
+		values[0] = TimestampTzGetDatum(0);
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+		return (Datum) 0;
+	}
+#endif
 
 	values[0] = TimestampTzGetDatum(pg_atomic_read_u64(&SharedStats->reset_time));
 	values[1] = Int64GetDatum(pg_atomic_read_u64(&SharedStats->prefetch));

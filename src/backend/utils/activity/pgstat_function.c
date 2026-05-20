@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "utils/inval.h"
 #include "utils/pgstat_internal.h"
 #include "utils/syscache.h"
@@ -82,6 +83,14 @@ pgstat_init_function_usage(FunctionCallInfo fcinfo,
 		fcu->fs = NULL;
 		return;
 	}
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+	{
+		fcu->fs = NULL;
+		return;
+	}
+#endif
 
 	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_FUNCTION,
 										  MyDatabaseId,
