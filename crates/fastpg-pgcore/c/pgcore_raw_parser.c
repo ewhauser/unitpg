@@ -1655,12 +1655,15 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 	DestReceiver *dest = NULL;
 	bool		snapshot_pushed = false;
 	volatile bool executor_started = false;
+	Oid			statement_userid = InvalidOid;
+	int			statement_sec_context = 0;
 
 	result = (FastPgPgCoreExecuteResult *) calloc(1, sizeof(FastPgPgCoreExecuteResult));
 	if (result == NULL)
 		return NULL;
 
 	fastpg_pgcore_enter();
+	GetUserIdAndSecContext(&statement_userid, &statement_sec_context);
 	fastpg_pgcore_start_statement_timestamp();
 	oldcontext = CurrentMemoryContext;
 	result->context = AllocSetContextCreate(TopMemoryContext,
@@ -1786,6 +1789,10 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		MemoryContextSwitchTo(oldcontext);
 		if (dest != NULL)
 			dest->rDestroy(dest);
+#ifdef USE_FASTPG
+		if (!IsUnderPostmaster)
+			SetUserIdAndSecContext(statement_userid, statement_sec_context);
+#endif
 #ifdef USE_FASTPG
 		if (!fastpg_rust_xact_is_explicit())
 		{

@@ -2463,6 +2463,58 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_error_restores_security_restricted_context() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_restricted_error_{}", std::process::id());
+        let temp_table = format!("fastpg_pgcore_temp_after_restricted_{}", std::process::id());
+
+        session
+            .prepare(&format!("create table {table}(id int not null, denominator int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1, 0)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        let matview = format!("fastpg_pgcore_restricted_mv_{}", std::process::id());
+
+        session
+            .prepare(&format!(
+                "create materialized view {matview} as select 1 / denominator as value from {table} with no data"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let refresh_error = session
+            .prepare(&format!("refresh materialized view {matview}"))
+            .unwrap()
+            .execute()
+            .unwrap_err();
+        assert_eq!(refresh_error.sqlstate, "22012");
+
+        session
+            .prepare(&format!("create temp table {temp_table}(id int)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        session
+            .prepare(&format!("drop materialized view if exists {matview}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_transaction_utilities() {
         let session = PgCoreSession::new();
 
