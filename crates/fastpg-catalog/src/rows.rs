@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::OnceLock;
 
 use fastpg_types::Oid;
@@ -1860,6 +1860,161 @@ pub fn catalog_rows_matching_filters(
     )
 }
 
+fn static_row_attribute_key_from_values(
+    table: &StaticCatalogTable,
+    row: &StaticCatalogRow,
+) -> Option<(u32, i16)> {
+    let relid_index = table
+        .columns
+        .iter()
+        .position(|column| column.name == "attrelid")?;
+    let attnum_index = table
+        .columns
+        .iter()
+        .position(|column| column.name == "attnum")?;
+    let relid = row
+        .values
+        .get(relid_index)
+        .copied()
+        .and_then(static_value_as_u32)?;
+    let attnum = row
+        .values
+        .get(attnum_index)
+        .copied()
+        .and_then(static_value_as_i32)
+        .and_then(|value| i16::try_from(value).ok())?;
+    Some((relid, attnum))
+}
+
+fn synthetic_static_attribute_row_id(relation_oid: Oid, attnum: i16) -> u64 {
+    (u64::from(relation_oid.0) << 16)
+        | SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG
+        | u64::from(attnum as u16)
+}
+
+fn synthetic_system_attribute_row_id(relation_oid: Oid, attnum: i16) -> u64 {
+    (u64::from(relation_oid.0) << 16) | u64::from(attnum.unsigned_abs())
+}
+
+fn insert_compat_row_ids(
+    relation_oid: Oid,
+    rows: &mut BTreeSet<u64>,
+    compat_rows: &crate::state::CompatCatalogRows,
+) {
+    if let Some(tombstones) = compat_rows.tombstones.get(&relation_oid.0) {
+        for row_id in tombstones {
+            rows.remove(row_id);
+        }
+    }
+    if let Some(overlay_rows) = compat_rows.rows.get(&relation_oid.0) {
+        rows.extend(overlay_rows.keys().copied());
+    }
+}
+
+fn synthetic_ts_config_map_row_count() -> usize {
+    const SIMPLE_TOKEN_TYPE_COUNT: usize = 13;
+    const ENGLISH_TOKEN_TYPE_COUNT: usize = 6;
+    SIMPLE_TOKEN_TYPE_COUNT + ENGLISH_TOKEN_TYPE_COUNT
+}
+
+pub fn catalog_row_count(relation_oid: Oid) -> Option<usize> {
+    let table = static_catalog_by_relation_oid(relation_oid)?;
+    Some(with_visible_catalog_snapshot(|snapshot| {
+        let mut row_ids = table
+            .rows
+            .iter()
+            .map(|row| row.row_id)
+            .collect::<BTreeSet<_>>();
+
+        match relation_oid {
+            PG_NAMESPACE_RELATION_OID => {
+                row_ids.insert(u64::from(INFORMATION_SCHEMA_NAMESPACE_OID.0));
+                row_ids.extend(snapshot.namespaces.keys().copied());
+            }
+            PG_CLASS_RELATION_OID => {
+                row_ids.insert(u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+                row_ids.extend(snapshot.relations.keys().copied());
+            }
+            PG_ATTRIBUTE_RELATION_OID => {
+                row_ids.extend(snapshot.columns.keys().copied());
+                let mut existing_attributes = table
+                    .rows
+                    .iter()
+                    .filter_map(|row| static_row_attribute_key_from_values(table, row))
+                    .collect::<HashSet<_>>();
+                existing_attributes.extend(
+                    snapshot
+                        .columns
+                        .values()
+                        .map(|column| (column.relation_oid.0, column.attnum)),
+                );
+                for relation_table in static_catalogs() {
+                    for (index, _) in relation_table.columns.iter().enumerate() {
+                        let Some(attnum) = i16::try_from(index + 1).ok() else {
+                            continue;
+                        };
+                        if existing_attributes.insert((relation_table.oid.0, attnum)) {
+                            row_ids.insert(synthetic_static_attribute_row_id(
+                                relation_table.oid,
+                                attnum,
+                            ));
+                        }
+                    }
+                    for spec in SYSTEM_ATTRIBUTE_SPECS {
+                        if existing_attributes.insert((relation_table.oid.0, spec.attnum)) {
+                            row_ids.insert(synthetic_system_attribute_row_id(
+                                relation_table.oid,
+                                spec.attnum,
+                            ));
+                        }
+                    }
+                }
+            }
+            PG_TYPE_RELATION_OID => {
+                row_ids.extend(snapshot.types.keys().copied());
+                row_ids.extend(
+                    INFORMATION_SCHEMA_DOMAIN_SPECS
+                        .iter()
+                        .map(|spec| u64::from(spec.oid.0)),
+                );
+                row_ids.extend(
+                    static_catalogs()
+                        .iter()
+                        .map(|table| u64::from(synthetic_static_relation_rowtype_oid(table).0)),
+                );
+            }
+            PG_INDEX_RELATION_OID => {
+                row_ids.insert(u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+                row_ids.extend(snapshot.indexes.keys().copied());
+            }
+            PG_CONSTRAINT_RELATION_OID => {
+                row_ids.extend(snapshot.constraints.keys().copied());
+            }
+            PG_INIT_PRIVS_RELATION_OID => {
+                row_ids.insert(
+                    SYNTHETIC_INIT_PRIVS_ROW_ID_BASE | u64::from(PG_CATALOG_NAMESPACE_OID.0),
+                );
+            }
+            PG_TS_DICT_RELATION_OID => {
+                row_ids.insert(u64::from(ENGLISH_TS_DICT_OID.0));
+            }
+            PG_TS_CONFIG_RELATION_OID => {
+                row_ids.insert(u64::from(ENGLISH_TS_CONFIG_OID.0));
+            }
+            PG_TS_CONFIG_MAP_RELATION_OID => {
+                row_ids.extend(
+                    (0..synthetic_ts_config_map_row_count())
+                        .map(|index| SYNTHETIC_TS_CONFIG_MAP_ROW_ID_BASE | index as u64),
+                );
+            }
+            _ => {}
+        }
+
+        insert_compat_row_ids(relation_oid, &mut row_ids, &snapshot.compat_rows);
+        row_ids.len()
+    }))
+}
+
 fn insert_matching_row(
     rows: &mut BTreeMap<u64, CatalogRow>,
     row: Option<CatalogRow>,
@@ -1884,8 +2039,7 @@ pub fn relation_rowtype_oid_by_oid(relation_oid: Oid) -> Option<Oid> {
 }
 
 pub fn relation_planner_stats_by_oid(relation_oid: Oid) -> Option<RelationPlannerStats> {
-    static_catalog_by_relation_oid(relation_oid)?;
-    let row_count = catalog_rows(relation_oid).len();
+    let row_count = catalog_row_count(relation_oid)?;
     let relpages = if row_count == 0 {
         0
     } else {

@@ -23,7 +23,7 @@ pub use lookups::{
 };
 pub use model::*;
 pub use rows::{
-    CatalogFilterValue, CatalogRowFilter, catalog_row_value, catalog_rows,
+    CatalogFilterValue, CatalogRowFilter, catalog_row_count, catalog_row_value, catalog_rows,
     catalog_rows_matching_filters, delete_catalog_row, ensure_database,
     relation_planner_stats_by_oid, relation_rowtype_oid_by_oid, resolve_generated_catalog_oid_name,
     static_catalog_by_name, static_catalog_by_relation_oid, static_catalog_rowtype_oid,

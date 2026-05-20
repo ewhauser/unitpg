@@ -17,8 +17,8 @@ use fastpg_catalog::{
     TIMESTAMP_OID, VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
     builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
     builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_value, catalog_rows, catalog_rows_matching_filters,
-    current_generation, delete_catalog_row, enum_oids_by_sort_order,
+    builtin_operators_by_name, catalog_row_count, catalog_row_value, catalog_rows,
+    catalog_rows_matching_filters, current_generation, delete_catalog_row, enum_oids_by_sort_order,
     has_uncommitted_catalog_changes, index_record_by_index_oid, index_records_for_relation_oid,
     lookup_type, primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
@@ -4032,7 +4032,7 @@ pub extern "C" fn fastpg_rust_relation_row_count(relid: u32) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_catalog_row_count(relid: u32) -> usize {
-    catalog_rows(Oid(relid)).len()
+    catalog_row_count(Oid(relid)).unwrap_or(0)
 }
 
 #[unsafe(no_mangle)]
