@@ -2342,6 +2342,52 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_ctas_distinct_can_spill_to_temp_file() {
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fastpg_pgcore_distinct_spill");
+
+        session
+            .prepare("set work_mem = '64kB'")
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare("set enable_hashagg = false")
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare("set jit_above_cost = 0")
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create table {table} as select distinct g % 1000 as value from generate_series(0, 9999) g"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let rows = session
+            .prepare(&format!("select count(*) from {table}"))
+            .unwrap()
+            .execute()
+            .unwrap()
+            .statements[0]
+            .rows
+            .clone();
+        assert_eq!(rows, vec![vec![PgCoreValue::Text("1000".to_owned())]]);
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_regress_compatibility_noop_utilities() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_noop_{}", std::process::id());

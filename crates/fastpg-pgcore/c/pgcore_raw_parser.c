@@ -8,7 +8,10 @@
  */
 #include "postgres.h"
 
+#include <errno.h>
 #include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
 #include <unistd.h>
 
 #include "access/session.h"
@@ -45,6 +48,7 @@
 #include "parser/parser.h"
 #include "pgtime.h"
 #include "postmaster/postmaster.h"
+#include "storage/fd.h"
 #include "tcop/cmdtag.h"
 #include "tcop/dest.h"
 #include "tcop/pquery.h"
@@ -300,6 +304,53 @@ fastpg_pgcore_configure_library_paths(void)
 					PGC_SUSET, PGC_S_OVERRIDE);
 }
 
+static void
+fastpg_pgcore_make_directory(const char *path)
+{
+	if (MakePGDirectory(path) < 0 && errno != EEXIST)
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not create directory \"%s\": %m", path)));
+}
+
+static void
+fastpg_pgcore_configure_data_dir(void)
+{
+	static char data_dir[MAXPGPATH];
+	const char *configured_dir;
+
+	if (DataDir != NULL)
+		return;
+
+	configured_dir = getenv("FASTPG_PGDATA");
+	if (configured_dir != NULL && configured_dir[0] != '\0')
+	{
+		if (strlen(configured_dir) >= sizeof(data_dir))
+			ereport(ERROR,
+					(errmsg("FASTPG_PGDATA path is too long")));
+		strlcpy(data_dir, configured_dir, sizeof(data_dir));
+		fastpg_pgcore_make_directory(data_dir);
+	}
+	else
+	{
+		char		template[MAXPGPATH];
+
+		snprintf(template, sizeof(template),
+				 "/private/tmp/fastpg-pgcore-%ld-XXXXXX", (long) getpid());
+		if (mkdtemp(template) == NULL)
+			ereport(ERROR,
+					(errcode_for_file_access(),
+					 errmsg("could not create fastpg pgcore data directory: %m")));
+		strlcpy(data_dir, template, sizeof(data_dir));
+	}
+
+	SetDataDir(data_dir);
+	ChangeToDataDir();
+	fastpg_pgcore_make_directory("base");
+	fastpg_pgcore_make_directory("base/5");
+	fastpg_pgcore_make_directory("base/pgsql_tmp");
+}
+
 /*
  * We link selected backend objects without backend/main/main.c because that file
  * also owns the postgres executable's main(). Some cold command-line paths in
@@ -331,10 +382,14 @@ fastpg_pgcore_init_once(void)
 
 	MyProcPid = getpid();
 	MemoryContextInit();
+	fastpg_pgcore_configure_data_dir();
+	InitFileAccess();
+	InitTemporaryFileAccess();
 	MyDatabaseId = PostgresDbOid;
 	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
 	DatabasePath = pstrdup("base/5");
 	InitializeGUCOptions();
+	SetConfigOption("track_counts", "off", PGC_SUSET, PGC_S_OVERRIDE);
 	fastpg_pgcore_configure_library_paths();
 	pg_timezone_initialize();
 	RelationCacheInitialize();
