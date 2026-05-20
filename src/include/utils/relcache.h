@@ -138,6 +138,10 @@ extern void RelationCacheInvalidateEntry(Oid relationId);
 
 extern void RelationCacheInvalidate(bool debug_discard);
 
+#ifdef USE_FASTPG
+extern void FastPgReconcileRelcacheAfterCatalogRollback(void);
+#endif
+
 #ifdef USE_ASSERT_CHECKING
 extern void AssertPendingSyncs_RelationCache(void);
 #else

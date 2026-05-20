@@ -680,6 +680,11 @@ ReadNextMultiXactId(void)
 {
 	MultiXactId mxid;
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && MultiXactState == NULL)
+		return FirstMultiXactId;
+#endif
+
 	/* XXX we could presumably do this without a lock. */
 	LWLockAcquire(MultiXactGenLock, LW_SHARED);
 	mxid = MultiXactState->nextMXact;

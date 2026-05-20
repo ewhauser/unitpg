@@ -144,15 +144,33 @@ impl StorageState {
     }
 
     pub(crate) fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
-        self.relations.insert(relid, RelationStorage::default());
-        for overlay in &mut session.transaction_stack {
-            overlay.relation_checkpoints.remove(&relid);
-            overlay.page_checkpoints.remove(&relid);
-            overlay.new_pages.remove(&relid);
-            overlay.inserted_tids.remove(&relid);
-            overlay.invalidated_tids.remove(&relid);
-            overlay.primary_key_inserts.remove(&relid);
-            overlay.primary_key_deletes.remove(&relid);
+        if session.transaction_stack.is_empty() {
+            self.relations.insert(relid, RelationStorage::default());
+            return;
+        }
+
+        let visible_tids = self.visible_tids(session, relid);
+        let primary_keys = primary_index_spec_for_relation_oid(Oid(relid))
+            .map(|index_spec| {
+                visible_tids
+                    .iter()
+                    .filter_map(|tid| {
+                        self.find_visible_tuple(session, relid, *tid)
+                            .and_then(|tuple| index_key_for_decoded(&index_spec, &tuple.values))
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction stack was checked");
+        for tid in visible_tids {
+            overlay.invalidate(relid, tid);
+        }
+        for key in primary_keys {
+            overlay.delete_primary_key(relid, key);
         }
     }
 

@@ -1462,11 +1462,28 @@ impl StorageState {
     }
 
     fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
-        self.relations.insert(relid, RelationRows::default());
-        for overlay in &mut session.transaction_stack {
-            overlay.relations.remove(&relid);
-            overlay.deleted_row_ids.remove(&relid);
+        if session.transaction_stack.is_empty() {
+            self.relations.insert(relid, RelationRows::default());
+            return;
         }
+
+        let visible_row_ids = self
+            .visible_rows(session, relid)
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect::<BTreeSet<_>>();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction stack was checked");
+        if let Some(segment) = overlay.relations.get_mut(&relid) {
+            segment.remove_row_ids(&visible_row_ids);
+        }
+        overlay
+            .deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .extend(visible_row_ids);
     }
 
     fn commit_top_overlay(&mut self, session: &mut SessionStorage) -> BTreeSet<u32> {
@@ -5854,6 +5871,48 @@ mod tests {
         assert_eq!(fastpg_rust_relation_row_count(relid), 1);
         assert!(fastpg_rust_relation_contains_row(relid, parent_row_id));
         assert!(!fastpg_rust_relation_contains_row(relid, nested_row_id));
+    }
+
+    #[test]
+    fn subxact_abort_restores_parent_relation_clear() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut parent_row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut parent_row_id));
+        }
+        fastpg_rust_subxact_begin();
+        fastpg_rust_relation_clear(relid);
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, parent_row_id));
+        fastpg_rust_subxact_abort();
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 1);
+        assert!(fastpg_rust_relation_contains_row(relid, parent_row_id));
+    }
+
+    #[test]
+    fn subxact_commit_preserves_relation_clear() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut parent_row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut parent_row_id));
+        }
+        fastpg_rust_subxact_begin();
+        fastpg_rust_relation_clear(relid);
+        fastpg_rust_subxact_commit();
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, parent_row_id));
+        fastpg_rust_xact_commit();
+
+        assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+        assert!(!fastpg_rust_relation_contains_row(relid, parent_row_id));
     }
 
     #[test]

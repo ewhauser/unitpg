@@ -4074,6 +4074,60 @@ AtEOSubXact_cleanup(Relation relation, bool isCommit,
 	}
 }
 
+#ifdef USE_FASTPG
+/*
+ * fastpg's standalone pgcore path keeps catalog/savepoint state in Rust rather
+ * than driving PostgreSQL's full transaction block machinery.  When Rust rolls
+ * back a catalog drop to a savepoint, relcache entries can still carry a
+ * dropped-subtransaction marker.  Reconcile those entries against the typed
+ * Rust catalog so RelationIdGetRelation can rebuild from restored metadata.
+ */
+void
+FastPgReconcileRelcacheAfterCatalogRollback(void)
+{
+	HASH_SEQ_STATUS status;
+	RelIdCacheEnt *idhentry;
+
+	hash_seq_init(&status, RelationIdCache);
+	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
+	{
+		Relation	relation = idhentry->reldesc;
+		Oid			relid = RelationGetRelid(relation);
+		bool		exists;
+		bool		changed = false;
+
+		if (!OidIsValid(relid))
+			continue;
+
+		exists = fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relid);
+		if (exists)
+		{
+			if (relation->rd_droppedSubid != InvalidSubTransactionId)
+			{
+				relation->rd_droppedSubid = InvalidSubTransactionId;
+				changed = true;
+			}
+			if (relation->rd_newRelfilelocatorSubid != InvalidSubTransactionId)
+			{
+				relation->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
+				changed = true;
+			}
+			if (changed)
+				RelationInvalidateRelation(relation);
+		}
+		else if (relation->rd_createSubid != InvalidSubTransactionId &&
+				 RelationHasReferenceCountZero(relation))
+		{
+			relation->rd_createSubid = InvalidSubTransactionId;
+			relation->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
+			relation->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
+			relation->rd_droppedSubid = InvalidSubTransactionId;
+			RelationClearRelation(relation);
+		}
+	}
+}
+#endif
+
 
 /*
  *		RelationBuildLocalRelation
