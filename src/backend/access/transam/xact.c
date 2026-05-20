@@ -1486,6 +1486,8 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 
 	if (TopTransactionResourceOwner != NULL)
 	{
+		CallXactCallbacks(isCommit ? XACT_EVENT_COMMIT : XACT_EVENT_ABORT);
+
 		CurrentResourceOwner = TopTransactionResourceOwner;
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_BEFORE_LOCKS,

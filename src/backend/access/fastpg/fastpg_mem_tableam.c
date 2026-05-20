@@ -24,6 +24,7 @@
 #include "access/xact.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
+#include "miscadmin.h"
 #include "nodes/pathnodes.h"
 #include "nodes/primnodes.h"
 #include "storage/off.h"
@@ -306,6 +307,9 @@ fastpg_mem_has_storage_error(void)
 static void
 fastpg_mem_xact_callback(XactEvent event, void *arg)
 {
+	if (!IsUnderPostmaster)
+		return;
+
 	switch (event)
 	{
 		case XACT_EVENT_COMMIT:
@@ -330,6 +334,9 @@ static void
 fastpg_mem_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							SubTransactionId parentSubid, void *arg)
 {
+	if (!IsUnderPostmaster)
+		return;
+
 	switch (event)
 	{
 		case SUBXACT_EVENT_START_SUB:
