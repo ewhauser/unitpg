@@ -68,6 +68,7 @@
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/memutils.h"
+#include "utils/portal.h"
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/timeout.h"
@@ -1486,6 +1487,9 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 
 	if (TopTransactionResourceOwner != NULL)
 	{
+		if (!isCommit)
+			AtAbort_Portals();
+
 		CallXactCallbacks(isCommit ? XACT_EVENT_COMMIT : XACT_EVENT_ABORT);
 
 		CurrentResourceOwner = TopTransactionResourceOwner;
@@ -1501,6 +1505,10 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 							 RESOURCE_RELEASE_AFTER_LOCKS,
 							 isCommit,
 							 true);
+
+		if (!isCommit)
+			AtCleanup_Portals();
+
 		ResourceOwnerDelete(TopTransactionResourceOwner);
 	}
 

@@ -609,6 +609,11 @@ fastpg_pgcore_release_error_resources(void)
 	{
 		if (!fastpg_rust_xact_is_explicit())
 			FastPgReleaseStandaloneStatementResources(false);
+		else
+		{
+			AtAbort_Portals();
+			AtCleanup_Portals();
+		}
 		fastpg_pgcore_ensure_execution_owner();
 		return;
 	}
