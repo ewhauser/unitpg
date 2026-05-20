@@ -17,9 +17,9 @@ pub use lookups::{
     relation_by_oid, relation_column_by_attnum, relation_column_count,
     relation_oid_by_name_in_namespace, relation_oid_exists, relation_oid_for_index_oid,
     relation_physical_column_by_attnum, relation_summary_by_name_in_namespace,
-    relation_summary_by_oid, relations, type_by_name, unique_index_oids_for_relation_oid,
-    unique_index_records_for_relation_oid, virtual_catalog_by_name,
-    virtual_catalog_by_relation_oid, virtual_catalogs,
+    relation_summary_by_oid, relations, static_attribute_row_id, type_by_name,
+    unique_index_oids_for_relation_oid, unique_index_records_for_relation_oid,
+    virtual_catalog_by_name, virtual_catalog_by_relation_oid, virtual_catalogs,
 };
 pub use model::*;
 pub use rows::{

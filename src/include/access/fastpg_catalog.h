@@ -93,10 +93,12 @@ typedef struct FastPgRustCatalogColumn
 	uint8_t		attalign;
 	uint8_t		attstorage;
 	uint8_t		_padding;
+	uint64_t	row_id;
 } FastPgRustCatalogColumn;
 
 typedef struct FastPgRustPrimaryKeyIndexInfo
 {
+	uint64_t	row_id;
 	uint32_t	index_oid;
 	uint32_t	heap_oid;
 	uint16_t	key_count;

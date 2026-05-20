@@ -214,6 +214,7 @@ pub struct RelationName {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ColumnRecord {
+    pub row_id: u64,
     pub name: String,
     pub type_oid: Oid,
     pub type_mod: i32,
@@ -225,6 +226,7 @@ pub struct ColumnRecord {
 impl ColumnRecord {
     pub fn new(name: impl Into<String>, type_oid: Oid, type_mod: i32, is_not_null: bool) -> Self {
         Self {
+            row_id: 0,
             name: normalize_identifier(&name.into()),
             type_oid,
             type_mod,
@@ -237,6 +239,7 @@ impl ColumnRecord {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PhysicalColumnRecord {
+    pub row_id: u64,
     pub name: String,
     pub type_oid: Oid,
     pub type_mod: i32,
@@ -287,6 +290,7 @@ pub struct RelationPlannerStats {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct IndexRecord {
+    pub row_id: u64,
     pub index_oid: Oid,
     pub relation_oid: Oid,
     pub key_attnums: Vec<i16>,

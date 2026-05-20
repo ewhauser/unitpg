@@ -392,7 +392,7 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
         return relation_table
             .columns
             .iter()
-            .map(column_record_from_static_catalog_column)
+            .map(|column| column_record_from_static_catalog_column(relation_oid, column))
             .collect();
     }
 
@@ -418,8 +418,12 @@ fn relation_columns_from_pg_attribute(relation_oid: Oid) -> Vec<ColumnRecord> {
     columns.into_iter().map(|(_, column)| column).collect()
 }
 
-fn column_record_from_static_catalog_column(column: &StaticCatalogColumn) -> ColumnRecord {
+fn column_record_from_static_catalog_column(
+    relation_oid: Oid,
+    column: &StaticCatalogColumn,
+) -> ColumnRecord {
     ColumnRecord {
+        row_id: static_attribute_row_id(relation_oid, column.attnum),
         name: normalize_identifier(column.name),
         type_oid: column.type_oid,
         type_mod: -1,
@@ -465,6 +469,7 @@ pub(crate) fn column_record_from_pg_attribute_row(
     Some((
         attnum,
         ColumnRecord {
+            row_id: row.row_id,
             name: normalize_identifier(&name),
             type_oid,
             type_mod,
@@ -532,6 +537,7 @@ fn physical_column_record_from_pg_attribute_row(
     Some((
         attnum,
         PhysicalColumnRecord {
+            row_id: row.row_id,
             name: normalize_identifier(&name),
             type_oid,
             type_mod,
@@ -548,7 +554,7 @@ fn physical_column_record_from_pg_attribute_row(
     ))
 }
 
-fn static_attribute_row_id(relation_oid: Oid, attnum: i16) -> u64 {
+pub fn static_attribute_row_id(relation_oid: Oid, attnum: i16) -> u64 {
     (u64::from(relation_oid.0) << 16)
         | SYNTHETIC_STATIC_ATTRIBUTE_ROW_ID_FLAG
         | u64::from(attnum as u16)
@@ -570,10 +576,12 @@ fn catalog_row_matches_attribute(
 }
 
 fn physical_column_from_static_catalog_column(
+    relation_oid: Oid,
     column: &StaticCatalogColumn,
 ) -> Option<PhysicalColumnRecord> {
     let type_record = lookup_builtin_type(column.type_oid)?;
     Some(PhysicalColumnRecord {
+        row_id: static_attribute_row_id(relation_oid, column.attnum),
         name: normalize_identifier(column.name),
         type_oid: column.type_oid,
         type_mod: -1,
@@ -655,7 +663,7 @@ fn relation_column_by_attnum_uncached(relation_oid: Oid, attnum: i16) -> Option<
     }
     if let Some(column) = static_catalog_by_relation_oid(relation_oid)
         .and_then(|table| table.columns.get(usize::try_from(attnum - 1).ok()?))
-        .map(column_record_from_static_catalog_column)
+        .map(|column| column_record_from_static_catalog_column(relation_oid, column))
     {
         return Some(column);
     }
@@ -716,7 +724,7 @@ fn relation_physical_column_by_attnum_uncached(
                 .columns
                 .get(usize::try_from(attnum - 1).ok()?)
         })
-        .and_then(physical_column_from_static_catalog_column)
+        .and_then(|column| physical_column_from_static_catalog_column(relation_oid, column))
     {
         return Some(column);
     }
@@ -740,6 +748,7 @@ pub(crate) fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> 
     }
 
     Some(IndexRecord {
+        row_id: row.row_id,
         index_oid,
         relation_oid,
         key_attnums,

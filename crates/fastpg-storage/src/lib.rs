@@ -108,11 +108,13 @@ pub struct FastPgRustCatalogColumn {
     pub attalign: u8,
     pub attstorage: u8,
     pub _padding: u8,
+    pub row_id: u64,
 }
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct FastPgRustPrimaryKeyIndexInfo {
+    pub row_id: u64,
     pub index_oid: u32,
     pub heap_oid: u32,
     pub key_count: u16,
@@ -923,11 +925,11 @@ impl Default for TransactionOverlay {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug)]
 struct ScanState {
     rows: Vec<Row>,
     region: StorageRegion,
-    shared_region: Option<Arc<StorageRegion>>,
+    shared_scan: Option<Arc<CachedCatalogScan>>,
     next_index: usize,
 }
 
@@ -945,16 +947,22 @@ impl ScanState {
         Ok(Self {
             rows,
             region,
-            shared_region: None,
+            shared_scan: None,
             next_index: 0,
         })
     }
 
+    fn rows(&self) -> &[Row] {
+        self.shared_scan
+            .as_ref()
+            .map_or(self.rows.as_slice(), |scan| scan.rows.as_slice())
+    }
+
     fn bytes(&self) -> usize {
         self.region.bytes().saturating_add(
-            self.shared_region
+            self.shared_scan
                 .as_ref()
-                .map_or(0, |region| region.bytes()),
+                .map_or(0, |scan| scan.region.bytes()),
         )
     }
 }
@@ -1008,9 +1016,9 @@ fn clear_catalog_scan_cache() {
 
 fn scan_state_from_cached_catalog_scan(cache: Arc<CachedCatalogScan>) -> ScanState {
     ScanState {
-        rows: cache.rows.clone(),
+        rows: Vec::new(),
         region: StorageRegion::new(StorageRegionKind::Scan),
-        shared_region: Some(Arc::clone(&cache.region)),
+        shared_scan: Some(cache),
         next_index: 0,
     }
 }
@@ -2147,6 +2155,7 @@ fn column_to_ffi(column: &ColumnRecord) -> FastPgRustCatalogColumn {
         attalign: pg_type.as_ref().map_or(b'i', |pg_type| pg_type.typalign),
         attstorage: pg_type.as_ref().map_or(b'p', |pg_type| pg_type.typstorage),
         _padding: 0,
+        row_id: column.row_id,
     }
 }
 
@@ -2165,10 +2174,12 @@ fn physical_column_to_ffi(column: &PhysicalColumnRecord) -> FastPgRustCatalogCol
         attalign: column.attalign,
         attstorage: column.attstorage,
         _padding: 0,
+        row_id: column.row_id,
     }
 }
 
 fn static_catalog_column_to_ffi(
+    relation_oid: Oid,
     column: &fastpg_catalog::StaticCatalogColumn,
 ) -> FastPgRustCatalogColumn {
     FastPgRustCatalogColumn {
@@ -2185,6 +2196,7 @@ fn static_catalog_column_to_ffi(
         attalign: column.attalign,
         attstorage: column.attstorage,
         _padding: 0,
+        row_id: fastpg_catalog::static_attribute_row_id(relation_oid, column.attnum),
     }
 }
 
@@ -2740,6 +2752,7 @@ fn primary_key_index_cache_entry(
     }
 
     let info = FastPgRustPrimaryKeyIndexInfo {
+        row_id: record.row_id,
         index_oid: index_oid.0,
         heap_oid: relation.oid.0,
         key_count: key_count as u16,
@@ -3300,7 +3313,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_column_by_index(
             return false;
         };
         unsafe {
-            *out = static_catalog_column_to_ffi(column);
+            *out = static_catalog_column_to_ffi(Oid(relation_oid), column);
         }
         true
     } else {
@@ -5152,7 +5165,7 @@ fn catalog_scan_state_from_rows(
     Some(ScanState {
         rows,
         region,
-        shared_region: None,
+        shared_scan: None,
         next_index: 0,
     })
 }
@@ -5355,7 +5368,7 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
             None => return false,
         };
 
-        let row_count = scan.rows.len();
+        let row_count = scan.rows().len();
         let row_index = if forward != 0 {
             if scan.next_index >= row_count {
                 return false;
@@ -5374,7 +5387,7 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
             scan.next_index
         };
 
-        let Some(row) = scan.rows.get(row_index) else {
+        let Some(row) = scan.rows().get(row_index) else {
             return false;
         };
         unsafe { copy_row_to_outputs(row, values_out, is_null_out, natts, row_id_out) }
@@ -6885,6 +6898,7 @@ mod tests {
             row_id: 0,
         };
         let mut index_info = FastPgRustPrimaryKeyIndexInfo {
+            row_id: 0,
             index_oid: 0,
             heap_oid: 0,
             key_count: 0,
