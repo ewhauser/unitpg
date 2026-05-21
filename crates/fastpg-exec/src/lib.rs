@@ -882,6 +882,50 @@ mod tests {
             ))
         );
         assert_eq!(
+            executor.execute("select 16::numeric + '0/16AE7F7'::pg_lsn", &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("?column?", PgType::Varchar, 3220)],
+                vec![vec![Value::Text("0/016AE807".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                r##"select substring('abcdefg' similar 'a#"(b_d)#"%' escape '#') as bcd"##,
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("bcd", PgType::Varchar, 25)],
+                vec![vec![Value::Text("bcd".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute("select age(timestamp 'infinity')", &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("age", PgType::Varchar, 1186)],
+                vec![vec![Value::Text("-infinity".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                "select timestamptz(date '2001-02-03', time '04:05')::date as d",
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("d", PgType::Varchar, 1082)],
+                vec![vec![Value::Text("2001-02-03".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                "select (timestamptz '2001-01-01', interval '2 days') overlaps (timestamptz '2001-01-02', interval '2 days') as ok",
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("ok", PgType::Varchar, 16)],
+                vec![vec![Value::Text("t".to_owned())]]
+            ))
+        );
+        assert_eq!(
             executor.execute("select log('-12.34'::numeric)", &[]),
             QueryExecution::Error {
                 sqlstate: "2201E".to_owned(),

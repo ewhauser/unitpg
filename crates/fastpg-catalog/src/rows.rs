@@ -397,9 +397,40 @@ fn normalize_pg_proc_system_function_body(table: &StaticCatalogTable, values: &m
         return;
     };
     let body = match oid.0 {
+        879 => "select lpad($1, $2, ' ')",
+        880 => "select rpad($1, $2, ' ')",
+        1176 => "select cast(($1 + $2) as timestamptz)",
+        1215 => {
+            "select description from pg_description where objoid = $1 and classoid = (select oid from pg_class where relname = $2 and relnamespace = 'pg_catalog'::regnamespace) and objsubid = 0"
+        }
+        1216 => {
+            "select description from pg_description where objoid = $1 and classoid = 'pg_class'::regclass and objsubid = $2"
+        }
+        1296 | 1298 | 1848 | 2546 | 2547 | 2548 | 2549 | 2550 | 2631 | 5023 => "select $2 + $1",
+        1305 | 1309 | 2042 => "select ($1, ($1 + $2)) overlaps ($3, ($3 + $4))",
+        1306 | 1310 | 2043 => "select ($1, $2) overlaps ($3, ($3 + $4))",
+        1307 | 1311 | 2044 => "select ($1, ($1 + $2)) overlaps ($3, $4)",
+        1345 => "select description from pg_description where objoid = $1 and objsubid = 0",
+        1384 => "select date_part($1, cast($2 as timestamp))",
+        1386 => "select age(cast(current_date as timestamptz), $1)",
+        1426 => "select on_ppath($2, $1)",
         1708 => "select round($1, 0)",
         1710 => "select trunc($1, 0)",
         1741 | 1481 => "select log(10, $1)",
+        1810 | 1811 => "select octet_length($1) * 8",
+        1812 => "select length($1)",
+        1993 => {
+            "select description from pg_shdescription where objoid = $1 and classoid = (select oid from pg_class where relname = $2 and relnamespace = 'pg_catalog'::regnamespace)"
+        }
+        2059 => "select age(cast(current_date as timestamp), $1)",
+        2074 => "select substring($1, similar_to_escape($2, $3))",
+        2325 => "select pg_relation_size($1, 'main')",
+        2932 => "select xpath($1, $2, '{}'::text[])",
+        3050 => "select xpath_exists($1, $2, '{}'::text[])",
+        3935 => {
+            "select pg_sleep(extract(epoch from clock_timestamp() + $1) - extract(epoch from clock_timestamp()))"
+        }
+        3936 => "select pg_sleep(extract(epoch from $1) - extract(epoch from clock_timestamp()))",
         _ => return,
     };
     values[prosrc_index] = CatalogValue::Text(body.to_owned());
