@@ -68,15 +68,22 @@ impl From<BTreeMap<String, String>> for StartupParameters {
 #[derive(Debug)]
 pub struct ServerState {
     executor: Arc<QueryExecutorShared>,
+    server_version: String,
     next_session_id: AtomicU64,
 }
 
 impl ServerState {
     pub fn new(server_version: impl Into<String>) -> Self {
+        let server_version = server_version.into();
         Self {
-            executor: Arc::new(QueryExecutorShared::new(server_version)),
+            executor: Arc::new(QueryExecutorShared::new(server_version.clone())),
+            server_version,
             next_session_id: AtomicU64::new(1),
         }
+    }
+
+    pub fn server_version(&self) -> &str {
+        &self.server_version
     }
 
     fn allocate_session_id(&self) -> u64 {
@@ -340,27 +347,9 @@ impl SessionCopyState {
             self.done = true;
             return Ok(());
         }
-        if line.contains("\\.") {
-            return Err(copy_error_with_line_context(
-                &self.target,
-                self.line_number,
-                "end-of-copy marker is not alone on its line".to_owned(),
-            ));
-        }
         self.lines.push((self.line_number, line.to_owned()));
         Ok(())
     }
-}
-
-fn copy_error_with_line_context(
-    target: &CopyTarget,
-    line_number: usize,
-    message: String,
-) -> String {
-    format!(
-        "{COPY_ERROR_CONTEXT_PREFIX}{message}\nCOPY {}, line {}",
-        target.table, line_number
-    )
 }
 
 fn copy_error_with_context(

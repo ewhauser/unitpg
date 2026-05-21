@@ -2925,7 +2925,7 @@ index_update_stats(Relation rel,
 	}
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		pg_class = table_open(RelationRelationId, RowExclusiveLock);
 		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));

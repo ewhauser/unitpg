@@ -329,6 +329,20 @@ extern void fastpg_rust_subxact_begin(void);
 extern void fastpg_rust_subxact_commit(void);
 extern void fastpg_rust_subxact_abort(void);
 
+#else							/* USE_FASTPG */
+
+static inline bool
+fastpg_catalog_mode_uses_postgres(void)
+{
+	return false;
+}
+
+static inline bool
+fastpg_use_rust_catalog(void)
+{
+	return false;
+}
+
 #endif							/* USE_FASTPG */
 
 #endif							/* FASTPG_CATALOG_H */

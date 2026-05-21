@@ -20,6 +20,9 @@
 #include <dlfcn.h>
 #endif							/* !WIN32 */
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
@@ -305,6 +308,15 @@ internal_load_library(const char *libname)
 			file_tail->next = file_scanner;
 		file_tail = file_scanner;
 	}
+#ifdef USE_FASTPG
+	else if (fastpg_catalog_mode_uses_postgres() &&
+			 strstr(libname, "plpgsql") != NULL)
+	{
+		PG_init = (PG_init_t) dlsym(file_scanner->handle, "_PG_init");
+		if (PG_init)
+			(*PG_init) ();
+	}
+#endif
 
 	return file_scanner->handle;
 }

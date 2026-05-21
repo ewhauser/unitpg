@@ -13,6 +13,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -118,6 +121,16 @@ static bool obtain_object_name_namespace(const ObjectAddress *object,
 static const char *stringify_grant_objtype(ObjectType objtype);
 static const char *stringify_adefprivs_objtype(ObjectType objtype);
 static void SetDatabaseHasLoginEventTriggers(void);
+
+static bool
+EventTriggersDisabledByProcessMode(void)
+{
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+		return false;
+#endif
+	return !IsUnderPostmaster;
+}
 
 /*
  * Create an event trigger.
@@ -417,6 +430,7 @@ SetDatabaseHasLoginEventTriggers(void)
 		CatalogTupleUpdate(pg_db, &otid, tuple);
 		CommandCounterIncrement();
 	}
+	MyDatabaseHasLoginEventTriggers = true;
 	UnlockTuple(pg_db, &otid, InplaceUpdateTupleLock);
 	table_close(pg_db, RowExclusiveLock);
 	heap_freetuple(tuple);
@@ -748,7 +762,7 @@ EventTriggerDDLCommandStart(Node *parsetree)
 	 * Additionally, event triggers can be disabled with a superuser-only GUC
 	 * to make fixing database easier as per 1 above.
 	 */
-	if (!IsUnderPostmaster || !event_triggers)
+	if (EventTriggersDisabledByProcessMode() || !event_triggers)
 		return;
 
 	runlist = EventTriggerCommonSetup(parsetree,
@@ -784,7 +798,7 @@ EventTriggerDDLCommandEnd(Node *parsetree)
 	 * See EventTriggerDDLCommandStart for a discussion about why event
 	 * triggers are disabled in single user mode or via GUC.
 	 */
-	if (!IsUnderPostmaster || !event_triggers)
+	if (EventTriggersDisabledByProcessMode() || !event_triggers)
 		return;
 
 	/*
@@ -832,7 +846,7 @@ EventTriggerSQLDrop(Node *parsetree)
 	 * See EventTriggerDDLCommandStart for a discussion about why event
 	 * triggers are disabled in single user mode or via a GUC.
 	 */
-	if (!IsUnderPostmaster || !event_triggers)
+	if (EventTriggersDisabledByProcessMode() || !event_triggers)
 		return;
 
 	/*
@@ -906,7 +920,7 @@ EventTriggerOnLogin(void)
 	 * triggers are disabled in single user mode or via a GUC.  We also need a
 	 * database connection (some background workers don't have it).
 	 */
-	if (!IsUnderPostmaster || !event_triggers ||
+	if (EventTriggersDisabledByProcessMode() || !event_triggers ||
 		!OidIsValid(MyDatabaseId) || !MyDatabaseHasLoginEventTriggers)
 		return;
 
@@ -1011,7 +1025,7 @@ EventTriggerTableRewrite(Node *parsetree, Oid tableOid, int reason)
 	 * See EventTriggerDDLCommandStart for a discussion about why event
 	 * triggers are disabled in single user mode or via a GUC.
 	 */
-	if (!IsUnderPostmaster || !event_triggers)
+	if (EventTriggersDisabledByProcessMode() || !event_triggers)
 		return;
 
 	/*
@@ -1188,7 +1202,7 @@ EventTriggerBeginCompleteQuery(void)
 	MemoryContext cxt;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster || !event_triggers)
+	if (EventTriggersDisabledByProcessMode() || !event_triggers)
 		return false;
 #endif
 
@@ -1252,7 +1266,7 @@ bool
 trackDroppedObjectsNeeded(void)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster || !event_triggers)
+	if (EventTriggersDisabledByProcessMode() || !event_triggers)
 		return false;
 #endif
 

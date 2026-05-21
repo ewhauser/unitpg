@@ -17,6 +17,9 @@
 
 #include <ctype.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/detoast.h"
 #include "access/htup_details.h"
 #include "access/tupconvert.h"
@@ -8280,7 +8283,7 @@ exec_simple_check_plan(PLpgSQL_execstate *estate, PLpgSQL_expr *expr)
 											estate->simple_eval_resowner))
 	{
 #ifdef USE_FASTPG
-		if (!IsUnderPostmaster)
+		if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		{
 			ReleaseCachedPlan(cplan, CurrentResourceOwner);
 			return;

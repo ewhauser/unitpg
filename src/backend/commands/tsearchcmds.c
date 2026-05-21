@@ -47,6 +47,9 @@
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/syscache.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 
 /* Single entry of List returned by getTokenTypes() */
 typedef struct
@@ -352,7 +355,11 @@ verify_dictoptions(Oid tmplId, List *dictoptions)
 	 * that can't be translated into template1's encoding).  We want to create
 	 * them anyway, since they might be usable later in other databases.
 	 */
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster
+#ifdef USE_FASTPG
+		&& !fastpg_catalog_mode_uses_postgres()
+#endif
+		)
 		return;
 
 	tup = SearchSysCache1(TSTEMPLATEOID, ObjectIdGetDatum(tmplId));

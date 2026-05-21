@@ -103,6 +103,10 @@ extern Oid	RangeVarGetRelidExtended(const RangeVar *relation,
 									 LOCKMODE lockmode, uint32 flags,
 									 RangeVarGetRelidCallback callback,
 									 void *callback_arg);
+#ifdef USE_FASTPG
+extern bool FastPgTempNamespaceCreatedInCurrentTransaction(void);
+extern void FastPgResetTempNamespaceSessionState(void);
+#endif
 extern Oid	RangeVarGetCreationNamespace(const RangeVar *newRelation);
 extern Oid	RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 												 LOCKMODE lockmode,

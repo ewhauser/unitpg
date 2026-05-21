@@ -15,6 +15,17 @@ pub const VARCHAR_OID: u32 = 1043;
 pub const REGCLASS_OID: u32 = 2205;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreNotice {
+    pub severity: String,
+    pub sqlstate: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub context: Option<String>,
+    pub cursorpos: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreError {
     pub sqlstate: String,
     pub message: String,
@@ -24,6 +35,8 @@ pub struct PgCoreError {
     pub cursorpos: i32,
     pub internal_query: Option<String>,
     pub internalpos: i32,
+    pub notices: Vec<PgCoreNotice>,
+    pub partial: Vec<ExecutionStatement>,
 }
 
 impl PgCoreError {
@@ -37,6 +50,8 @@ impl PgCoreError {
             cursorpos,
             internal_query: None,
             internalpos: 0,
+            notices: Vec::new(),
+            partial: Vec::new(),
         }
     }
 
@@ -59,6 +74,33 @@ impl PgCoreError {
             cursorpos,
             internal_query,
             internalpos,
+            notices: Vec::new(),
+            partial: Vec::new(),
+        }
+    }
+
+    pub fn with_fields_and_notices(
+        sqlstate: impl Into<String>,
+        message: impl Into<String>,
+        detail: Option<String>,
+        hint: Option<String>,
+        context: Option<String>,
+        cursorpos: i32,
+        internal_query: Option<String>,
+        internalpos: i32,
+        notices: Vec<PgCoreNotice>,
+    ) -> Self {
+        Self {
+            sqlstate: sqlstate.into(),
+            message: message.into(),
+            detail,
+            hint,
+            context,
+            cursorpos,
+            internal_query,
+            internalpos,
+            notices,
+            partial: Vec::new(),
         }
     }
 }
@@ -115,17 +157,6 @@ pub struct PgCoreInputDatum {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PgCoreNotice {
-    pub severity: String,
-    pub sqlstate: String,
-    pub message: String,
-    pub detail: Option<String>,
-    pub hint: Option<String>,
-    pub context: Option<String>,
-    pub cursorpos: i32,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreCopyIn {
     pub source_sql: String,
     pub table: String,
@@ -139,6 +170,7 @@ pub struct PgCoreCopyIn {
     pub foreign_table: bool,
     pub partitioned_table: bool,
     pub has_insert_triggers: bool,
+    pub has_generated_columns: bool,
     pub delimiter: String,
     pub null_print: String,
     pub default_print: Option<String>,
@@ -165,6 +197,7 @@ pub struct PgCoreCopyOut {
 pub struct ExecutionStatement {
     pub command_tag: Cow<'static, str>,
     pub command_rows: Option<usize>,
+    pub is_select: bool,
     pub fields: Vec<PgCoreField>,
     pub rows: Vec<Vec<PgCoreValue>>,
     pub copy_in: Option<PgCoreCopyIn>,
@@ -173,8 +206,8 @@ pub struct ExecutionStatement {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
-    pub statements: Vec<ExecutionStatement>,
     pub notices: Vec<PgCoreNotice>,
+    pub statements: Vec<ExecutionStatement>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -285,6 +318,7 @@ impl PgCoreSession {
             statements: vec![ExecutionStatement {
                 command_tag: command.command_tag().into(),
                 command_rows: None,
+                is_select: false,
                 fields: Vec::new(),
                 rows: Vec::new(),
                 copy_in: None,
@@ -316,6 +350,11 @@ impl PgCoreSession {
     pub fn reset_session_state(&self) {
         let _guard = self.enter_storage();
         self.inner.reset_session_state();
+    }
+
+    pub fn start_client_session(&self) {
+        let _guard = self.enter_storage();
+        self.inner.start_client_session();
     }
 }
 
@@ -548,6 +587,7 @@ mod inner {
         fn fastpg_pgcore_notice_capture_context(index: i32) -> *const c_char;
         fn fastpg_pgcore_notice_capture_cursorpos(index: i32) -> i32;
         fn fastpg_pgcore_reset_session_state();
+        fn fastpg_pgcore_start_client_session();
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
         fn fastpg_pgcore_parse_result_statement_count(
@@ -577,6 +617,39 @@ mod inner {
         fn fastpg_pgcore_prepared_hint(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_context(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_cursorpos(prepared: *const FastPgPgCorePrepared) -> i32;
+        fn fastpg_pgcore_prepared_internal_query(
+            prepared: *const FastPgPgCorePrepared,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_internalpos(prepared: *const FastPgPgCorePrepared) -> i32;
+        fn fastpg_pgcore_prepared_notice_count(prepared: *const FastPgPgCorePrepared) -> i32;
+        fn fastpg_pgcore_prepared_notice_severity(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_notice_sqlstate(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_notice_message(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_notice_detail(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_notice_hint(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_notice_context(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_prepared_notice_cursorpos(
+            prepared: *const FastPgPgCorePrepared,
+            notice_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_prepared_parameter_count(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_type_oid(
             prepared: *const FastPgPgCorePrepared,
@@ -669,6 +742,10 @@ mod inner {
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_is_select(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
         fn fastpg_pgcore_execute_statement_column_count(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
@@ -756,6 +833,10 @@ mod inner {
             statement_index: i32,
         ) -> bool;
         fn fastpg_pgcore_execute_statement_copy_has_insert_triggers(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_copy_has_generated_columns(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> bool;
@@ -1059,6 +1140,14 @@ mod inner {
             }
         }
 
+        pub fn start_client_session(&self) {
+            let _guard = enter_pgcore_lane("start_client_session");
+            self.set_database();
+            unsafe {
+                fastpg_pgcore_start_client_session();
+            }
+        }
+
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
             check_sql(sql)?;
             let _guard = enter_pgcore_lane("prepare");
@@ -1079,15 +1168,18 @@ mod inner {
                 drop(_guard);
                 Ok(prepared)
             } else {
-                let error = PgCoreError::with_fields(
+                let error = PgCoreError::with_fields_and_notices(
                     unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared.as_ptr())) },
                     unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr())) },
                     unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
-                    None,
-                    0,
+                    unsafe {
+                        optional_c_string(fastpg_pgcore_prepared_internal_query(prepared.as_ptr()))
+                    },
+                    unsafe { fastpg_pgcore_prepared_internalpos(prepared.as_ptr()) },
+                    prepared_notices_from_ptr(prepared.as_ptr()),
                 );
                 drop(_guard);
                 Err(error)
@@ -1406,6 +1498,7 @@ mod inner {
         params: &EncodedParams,
     ) -> Result<ExecutionResult, PgCoreError> {
         let _keep_text_params_alive = &params.encoded_text_params;
+        let mut prepared_notices = prepared_notices_from_ptr(prepared);
         let result = if params.param_count == 0 {
             unsafe { fastpg_pgcore_execute(prepared) }
         } else {
@@ -1420,20 +1513,79 @@ mod inner {
                 )
             }
         };
-        execution_result_from_ptr(result)
+        match execution_result_from_ptr(result) {
+            Ok(mut result) => {
+                if !prepared_notices.is_empty() {
+                    prepared_notices.extend(result.notices);
+                    result.notices = prepared_notices;
+                }
+                Ok(result)
+            }
+            Err(mut error) => {
+                if !prepared_notices.is_empty() {
+                    prepared_notices.extend(error.notices);
+                    error.notices = prepared_notices;
+                }
+                Err(error)
+            }
+        }
     }
 
     fn prepared_error_from_ptr(prepared: *const FastPgPgCorePrepared) -> PgCoreError {
-        PgCoreError::with_fields(
+        PgCoreError::with_fields_and_notices(
             unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared)) },
             unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared)) },
             unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
-            None,
-            0,
+            unsafe { optional_c_string(fastpg_pgcore_prepared_internal_query(prepared)) },
+            unsafe { fastpg_pgcore_prepared_internalpos(prepared) },
+            prepared_notices_from_ptr(prepared),
         )
+    }
+
+    fn prepared_notices_from_ptr(prepared: *const FastPgPgCorePrepared) -> Vec<PgCoreNotice> {
+        let notice_count = unsafe { fastpg_pgcore_prepared_notice_count(prepared) }.max(0);
+        let mut notices = Vec::with_capacity(notice_count as usize);
+        for notice_index in 0..notice_count {
+            notices.push(PgCoreNotice {
+                severity: unsafe {
+                    c_string(fastpg_pgcore_prepared_notice_severity(
+                        prepared,
+                        notice_index,
+                    ))
+                },
+                sqlstate: unsafe {
+                    c_string(fastpg_pgcore_prepared_notice_sqlstate(
+                        prepared,
+                        notice_index,
+                    ))
+                },
+                message: unsafe {
+                    c_string(fastpg_pgcore_prepared_notice_message(
+                        prepared,
+                        notice_index,
+                    ))
+                },
+                detail: unsafe {
+                    optional_c_string(fastpg_pgcore_prepared_notice_detail(prepared, notice_index))
+                },
+                hint: unsafe {
+                    optional_c_string(fastpg_pgcore_prepared_notice_hint(prepared, notice_index))
+                },
+                context: unsafe {
+                    optional_c_string(fastpg_pgcore_prepared_notice_context(
+                        prepared,
+                        notice_index,
+                    ))
+                },
+                cursorpos: unsafe {
+                    fastpg_pgcore_prepared_notice_cursorpos(prepared, notice_index)
+                },
+            });
+        }
+        notices
     }
 
     fn execution_result_from_ptr(
@@ -1450,7 +1602,8 @@ mod inner {
         if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
             Ok(result.to_execution_result())
         } else {
-            Err(PgCoreError::with_fields(
+            let partial = result.to_execution_result().statements;
+            let mut error = PgCoreError::with_fields_and_notices(
                 unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
                 unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr())) },
@@ -1461,7 +1614,10 @@ mod inner {
                     optional_c_string(fastpg_pgcore_execute_result_internal_query(result.as_ptr()))
                 },
                 unsafe { fastpg_pgcore_execute_result_internalpos(result.as_ptr()) },
-            ))
+                result.to_notices(),
+            );
+            error.partial = partial;
+            Err(error)
         }
     }
 
@@ -1481,7 +1637,7 @@ mod inner {
             self.0.as_ptr()
         }
 
-        fn to_execution_result(&self) -> ExecutionResult {
+        fn to_notices(&self) -> Vec<PgCoreNotice> {
             let notice_count = unsafe { fastpg_pgcore_execute_notice_count(self.as_ptr()) }.max(0);
             let mut notices = Vec::with_capacity(notice_count as usize);
             for notice_index in 0..notice_count {
@@ -1527,6 +1683,11 @@ mod inner {
                     },
                 });
             }
+            notices
+        }
+
+        fn to_execution_result(&self) -> ExecutionResult {
+            let notices = self.to_notices();
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
             let mut statements = Vec::with_capacity(statement_count as usize);
@@ -1682,6 +1843,12 @@ mod inner {
                                 statement_index,
                             )
                         },
+                        has_generated_columns: unsafe {
+                            fastpg_pgcore_execute_statement_copy_has_generated_columns(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
                         delimiter: unsafe {
                             optional_c_string(fastpg_pgcore_execute_statement_copy_delimiter(
                                 self.as_ptr(),
@@ -1821,6 +1988,9 @@ mod inner {
                         ))
                     },
                     command_rows,
+                    is_select: unsafe {
+                        fastpg_pgcore_execute_statement_is_select(self.as_ptr(), statement_index)
+                    },
                     fields,
                     rows,
                     copy_in,
@@ -1916,6 +2086,8 @@ mod inner {
         }
 
         pub fn reset_session_state(&self) {}
+
+        pub fn start_client_session(&self) {}
     }
 
     #[derive(Debug)]

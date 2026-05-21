@@ -14,6 +14,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup_details.h"
 #include "access/multixact.h"
 #include "access/relation.h"
@@ -21,6 +24,7 @@
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/xact.h"
+#include "access/xlog.h"
 #include "access/xloginsert.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
@@ -74,6 +78,10 @@ typedef struct SeqTableData
 	/* if last != cached, we have not used up all the cached values */
 	int64		increment;		/* copy of sequence's increment field */
 	/* note that increment is zero until we first do nextval_internal() */
+#ifdef USE_FASTPG
+	bool		reset_pending;	/* next nextval should use reset_value */
+	int64		reset_value;
+#endif
 } SeqTableData;
 
 typedef SeqTableData *SeqTable;
@@ -85,6 +93,14 @@ static HTAB *seqhashtab = NULL; /* hash table for SeqTable items */
  * sequence.
  */
 static SeqTableData *last_used_seq = NULL;
+
+#ifdef USE_FASTPG
+static inline bool
+fastpg_sequence_uses_virtual_state(void)
+{
+	return !fastpg_catalog_mode_uses_postgres();
+}
+#endif
 
 static void fill_seq_with_data(Relation rel, HeapTuple tuple);
 static void fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum);
@@ -317,6 +333,10 @@ ResetSequence(Oid seq_relid)
 	/* Clear local cache so that we don't think we have cached numbers */
 	/* Note that we do not change the currval() state */
 	elm->cached = elm->last;
+#ifdef USE_FASTPG
+	elm->reset_pending = true;
+	elm->reset_value = startv;
+#endif
 
 	sequence_close(seq_rel, NoLock);
 }
@@ -334,10 +354,13 @@ fill_seq_with_data(Relation rel, HeapTuple tuple)
 	/*
 	 * The Rust server keeps relation contents outside PostgreSQL's buffer
 	 * manager.  ProcessUtility still needs the catalog-visible sequence rows,
-	 * but initializing a sequence fork would walk uninitialized shared buffer
-	 * state in the embedded backend.
+	 * but virtual-catalog mode cannot initialize a sequence fork because that
+	 * walks uninitialized shared buffer state in the embedded backend.  The
+	 * normal-catalog experiment initializes the buffer manager, so keep normal
+	 * PostgreSQL sequence storage there.
 	 */
-	return;
+	if (fastpg_sequence_uses_virtual_state())
+		return;
 #endif
 
 	fill_seq_fork_with_data(rel, tuple, MAIN_FORKNUM);
@@ -441,14 +464,10 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	Oid			relid;
 	SeqTable	elm;
 	Relation	seqrel;
-#ifndef USE_FASTPG
 	Buffer		buf;
 	HeapTupleData datatuple;
-#endif
 	Form_pg_sequence seqform;
-#ifndef USE_FASTPG
 	Form_pg_sequence_data newdataform;
-#endif
 	bool		need_seq_rewrite;
 	List	   *owned_by;
 	ObjectAddress address;
@@ -457,9 +476,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	bool		reset_state = false;
 	bool		is_called;
 	int64		last_value;
-#ifndef USE_FASTPG
 	HeapTuple	newdatatuple;
-#endif
 
 	/* Open and lock sequence, and check for ownership along the way. */
 	relid = RangeVarGetRelidExtended(stmt->sequence,
@@ -487,9 +504,14 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	seqform = (Form_pg_sequence) GETSTRUCT(seqtuple);
 
 #ifdef USE_FASTPG
-	last_value = seqform->seqstart;
-	is_called = false;
-#else
+	if (fastpg_sequence_uses_virtual_state())
+	{
+		last_value = seqform->seqstart;
+		is_called = false;
+	}
+	else
+#endif
+	{
 	/* lock page buffer and read tuple into new sequence structure */
 	(void) read_seq_tuple(seqrel, &buf, &datatuple);
 
@@ -500,7 +522,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	is_called = newdataform->is_called;
 
 	UnlockReleaseBuffer(buf);
-#endif
+	}
 
 	/* Check and set new values */
 	init_params(pstate, stmt->options, stmt->for_identity, false,
@@ -510,7 +532,15 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	/* If needed, rewrite the sequence relation itself */
 	if (need_seq_rewrite)
 	{
-#ifndef USE_FASTPG
+#ifdef USE_FASTPG
+		if (fastpg_sequence_uses_virtual_state())
+		{
+			elm->reset_pending = true;
+			elm->reset_value = last_value;
+		}
+		else
+#endif
+		{
 		/* check the comment above nextval_internal()'s equivalent call. */
 		if (RelationNeedsWAL(seqrel))
 			GetTopTransactionId();
@@ -537,7 +567,7 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 		if (reset_state)
 			newdataform->log_cnt = 0;
 		fill_seq_with_data(seqrel, newdatatuple);
-#endif
+		}
 	}
 
 	/* Clear local cache so that we don't think we have cached numbers */
@@ -713,56 +743,64 @@ nextval_internal(Oid relid, bool check_permissions)
 	ReleaseSysCache(pgstuple);
 
 #ifdef USE_FASTPG
-	if (!elm->last_valid)
+	if (fastpg_sequence_uses_virtual_state())
 	{
-		result = startv;
-	}
-	else
-	{
-		result = elm->last;
-		if (incby > 0)
+		if (elm->reset_pending)
 		{
-			if ((maxv >= 0 && result > maxv - incby) ||
-				(maxv < 0 && result + incby > maxv))
-			{
-				if (!cycle)
-					ereport(ERROR,
-							(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
-							 errmsg("nextval: reached maximum value of sequence \"%s\" (%" PRId64 ")",
-									RelationGetRelationName(seqrel),
-									maxv)));
-				result = minv;
-			}
-			else
-				result += incby;
+			result = elm->reset_value;
+			elm->reset_pending = false;
+		}
+		else if (!elm->last_valid)
+		{
+			result = startv;
 		}
 		else
 		{
-			if ((minv < 0 && result < minv - incby) ||
-				(minv >= 0 && result + incby < minv))
+			result = elm->last;
+			if (incby > 0)
 			{
-				if (!cycle)
-					ereport(ERROR,
-							(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
-							 errmsg("nextval: reached minimum value of sequence \"%s\" (%" PRId64 ")",
-									RelationGetRelationName(seqrel),
-									minv)));
-				result = maxv;
+				if ((maxv >= 0 && result > maxv - incby) ||
+					(maxv < 0 && result + incby > maxv))
+				{
+					if (!cycle)
+						ereport(ERROR,
+								(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
+								 errmsg("nextval: reached maximum value of sequence \"%s\" (%" PRId64 ")",
+										RelationGetRelationName(seqrel),
+										maxv)));
+					result = minv;
+				}
+				else
+					result += incby;
 			}
 			else
-				result += incby;
+			{
+				if ((minv < 0 && result < minv - incby) ||
+					(minv >= 0 && result + incby < minv))
+				{
+					if (!cycle)
+						ereport(ERROR,
+								(errcode(ERRCODE_SEQUENCE_GENERATOR_LIMIT_EXCEEDED),
+								 errmsg("nextval: reached minimum value of sequence \"%s\" (%" PRId64 ")",
+										RelationGetRelationName(seqrel),
+										minv)));
+					result = maxv;
+				}
+				else
+					result += incby;
+			}
 		}
+
+		elm->increment = incby;
+		elm->last = result;
+		elm->cached = result;
+		elm->last_valid = true;
+		last_used_seq = elm;
+
+		sequence_close(seqrel, NoLock);
+
+		return result;
 	}
-
-	elm->increment = incby;
-	elm->last = result;
-	elm->cached = result;
-	elm->last_valid = true;
-	last_used_seq = elm;
-
-	sequence_close(seqrel, NoLock);
-
-	return result;
 #endif
 
 	/* lock page buffer and read tuple */
@@ -1060,6 +1098,33 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 	 * sequence information.  Currently, we don't support that.
 	 */
 	PreventCommandIfParallelMode("setval()");
+
+#ifdef USE_FASTPG
+	if (fastpg_sequence_uses_virtual_state())
+	{
+		if ((next < minv) || (next > maxv))
+			ereport(ERROR,
+					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+					 errmsg("setval: value %" PRId64 " is out of bounds for sequence \"%s\" (%" PRId64 "..%" PRId64 ")",
+							next, RelationGetRelationName(seqrel),
+							minv, maxv)));
+
+		if (iscalled)
+		{
+			elm->last = next;		/* last returned number */
+			elm->last_valid = true;
+		}
+		else
+		{
+			elm->reset_pending = true;
+			elm->reset_value = next;
+		}
+
+		elm->cached = elm->last;
+		sequence_close(seqrel, NoLock);
+		return;
+	}
+#endif
 
 	/* lock page buffer and read tuple */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
@@ -1914,13 +1979,24 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
 		Page		page;
+		XLogRecPtr	page_lsn;
 
 		seq = read_seq_tuple(seqrel, &buf, &seqtuple);
 		page = BufferGetPage(buf);
+		page_lsn = PageGetLSN(page);
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			XLogRecPtr	current_lsn = GetXLogWriteRecPtr();
+
+			if (page_lsn > current_lsn)
+				page_lsn = current_lsn;
+		}
+#endif
 
 		values[0] = Int64GetDatum(seq->last_value);
 		values[1] = BoolGetDatum(seq->is_called);
-		values[2] = LSNGetDatum(PageGetLSN(page));
+		values[2] = LSNGetDatum(page_lsn);
 
 		UnlockReleaseBuffer(buf);
 	}

@@ -2384,10 +2384,16 @@ UseFastPgMemTableAm(Relation relation)
 	if (OidIsValid(relation->rd_rel->relrewrite))
 		return UseFastPgMemTableAmOid(relation->rd_rel->relrewrite);
 
-	return relation->rd_rel->relkind == RELKIND_RELATION &&
-		relation->rd_rel->relam == HEAP_TABLE_AM_OID &&
-		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
-		!IsToastNamespace(relnamespace);
+	if (!RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) ||
+		RelationGetRelid(relation) < (Oid) FirstNormalObjectId ||
+		IsToastNamespace(relnamespace))
+		return false;
+	if (fastpg_catalog_mode_uses_postgres() &&
+		relation->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+		return false;
+
+	return fastpg_catalog_mode_uses_postgres() ||
+		relation->rd_rel->relam == HEAP_TABLE_AM_OID;
 }
 
 static bool
@@ -2395,9 +2401,10 @@ UseFastPgMemTableAmOid(Oid relid)
 {
 	if (relid < (Oid) FirstNormalObjectId)
 		return false;
-	if (get_rel_relkind(relid) != RELKIND_RELATION)
+	if (!RELKIND_HAS_TABLE_AM(get_rel_relkind(relid)))
 		return false;
-	if (get_rel_relam(relid) != HEAP_TABLE_AM_OID)
+	if (fastpg_catalog_mode_uses_postgres() &&
+		get_rel_persistence(relid) == RELPERSISTENCE_TEMP)
 		return false;
 	return !IsToastNamespace(get_rel_namespace(relid));
 }
@@ -3660,7 +3667,16 @@ RelationCacheInvalidate(bool debug_discard)
 		 */
 		if (relation->rd_createSubid != InvalidSubTransactionId ||
 			relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
+		{
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres() && relation->rd_pubdesc)
+			{
+				pfree(relation->rd_pubdesc);
+				relation->rd_pubdesc = NULL;
+			}
+#endif
 			continue;
+		}
 
 		relcacheInvalsReceived++;
 

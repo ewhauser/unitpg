@@ -510,16 +510,31 @@ class PgBenchCompare:
 
         old_name = "/usr/local/pgsql/lib/libpq.5.dylib"
         new_name = str(libdir / "libpq.5.dylib")
-        for binary_name in ("psql", "pgbench"):
-            binary = bindir / binary_name
-            otool = self.command(["otool", "-L", str(binary)], output_dir, f"otool-{binary_name}")
+        targets = [bindir / "psql", bindir / "pgbench"]
+        targets.extend(sorted(libdir.glob("*.dylib")))
+
+        for target in targets:
+            target_label = target.relative_to(libdir if target.parent == libdir else bindir)
+            command_label = str(target_label).replace(os.sep, "-").replace(".", "-")
+            otool = self.command(["otool", "-L", str(target)], output_dir, f"otool-{command_label}")
             if otool.returncode != 0:
                 raise BenchmarkFailure(variant, "setup", otool, output_dir)
+
+            if target.name == "libpq.5.dylib" and old_name in otool.stdout:
+                changed = self.command(
+                    ["install_name_tool", "-id", new_name, str(target)],
+                    output_dir,
+                    f"install-name-id-{command_label}",
+                )
+                if changed.returncode != 0:
+                    raise BenchmarkFailure(variant, "setup", changed, output_dir)
+                continue
+
             if old_name in otool.stdout:
                 changed = self.command(
-                    ["install_name_tool", "-change", old_name, new_name, str(binary)],
+                    ["install_name_tool", "-change", old_name, new_name, str(target)],
                     output_dir,
-                    f"install-name-{binary_name}",
+                    f"install-name-{command_label}",
                 )
                 if changed.returncode != 0:
                     raise BenchmarkFailure(variant, "setup", changed, output_dir)

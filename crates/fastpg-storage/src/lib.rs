@@ -319,6 +319,9 @@ impl Cell {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct Row {
     row_id: u64,
+    xmin: u32,
+    xmax: u32,
+    cmin: u32,
     cells: Vec<Cell>,
 }
 
@@ -519,6 +522,23 @@ impl StorageRegion {
             .saturating_add(estimated_row_bytes(row));
     }
 
+    fn account_shallow_scan_row(&mut self, row: &Row) {
+        self.account_row(row);
+        for cell in &row.cells {
+            if cell.is_null {
+                continue;
+            }
+            let StoredDatum::ByRef(value_ref) = cell.datum else {
+                continue;
+            };
+            self.accounting.byref_bytes = self.accounting.byref_bytes.saturating_add(value_ref.len);
+            self.accounting.overhead_bytes = self
+                .accounting
+                .overhead_bytes
+                .saturating_add(std::mem::size_of::<Box<[u8]>>());
+        }
+    }
+
     fn copy_row(&mut self, row: &Row) -> Option<Row> {
         let mut cells = Vec::with_capacity(row.cells.len());
         for cell in &row.cells {
@@ -527,6 +547,9 @@ impl StorageRegion {
 
         let copied = Row {
             row_id: row.row_id,
+            xmin: row.xmin,
+            xmax: row.xmax,
+            cmin: row.cmin,
             cells,
         };
         self.account_row(&copied);
@@ -779,6 +802,14 @@ impl RowSegment {
         self.rows.push(row);
     }
 
+    fn truncate_rows_to(&mut self, len: usize) {
+        while self.rows.len() > len {
+            if let Some(row) = self.rows.pop() {
+                self.region.unaccount_row(&row);
+            }
+        }
+    }
+
     fn remove_row_id(&mut self, row_id: u64) {
         self.remove_row_ids(&BTreeSet::from([row_id]));
     }
@@ -882,7 +913,23 @@ struct TransactionOverlay {
     region_kind: StorageRegionKind,
     relations: HashMap<u32, RowSegment>,
     deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+    deleted_row_metadata: HashMap<u32, BTreeMap<u64, DeleteMetadata>>,
+    deleted_rows: HashMap<u32, RowSegment>,
+    remembered_deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+    saved_next_row_ids: HashMap<u32, u64>,
     pending_primary_key_rebuilds: BTreeSet<u32>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DeleteMetadata {
+    xid: u32,
+    cid: u32,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ScanSnapshot {
+    current_xid: u32,
+    curcid: u32,
 }
 
 impl TransactionOverlay {
@@ -891,6 +938,10 @@ impl TransactionOverlay {
             region_kind,
             relations: HashMap::new(),
             deleted_row_ids: HashMap::new(),
+            deleted_row_metadata: HashMap::new(),
+            deleted_rows: HashMap::new(),
+            remembered_deleted_row_ids: HashMap::new(),
+            saved_next_row_ids: HashMap::new(),
             pending_primary_key_rebuilds: BTreeSet::new(),
         }
     }
@@ -910,12 +961,53 @@ impl TransactionOverlay {
             .or_insert_with(|| RowSegment::new(region_kind))
     }
 
+    fn deleted_row_segment_mut(&mut self, relid: u32) -> &mut RowSegment {
+        let region_kind = self.region_kind;
+        self.deleted_rows
+            .entry(relid)
+            .or_insert_with(|| RowSegment::new(region_kind))
+    }
+
+    fn remember_deleted_row(&mut self, relid: u32, row: &Row) {
+        if !self
+            .remembered_deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .insert(row.row_id)
+        {
+            return;
+        }
+        let segment = self.deleted_row_segment_mut(relid);
+        if let Some(row) = segment.region.copy_row(row) {
+            segment.push_row(row);
+        }
+    }
+
+    fn mark_deleted_row(&mut self, relid: u32, row_id: u64, xid: u32, cid: u32) {
+        self.deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .insert(row_id);
+        self.deleted_row_metadata
+            .entry(relid)
+            .or_default()
+            .insert(row_id, DeleteMetadata { xid, cid });
+    }
+
     fn mark_primary_key_rebuild(&mut self, relid: u32) {
         self.pending_primary_key_rebuilds.insert(relid);
     }
 
+    fn save_next_row_id(&mut self, relid: u32, next_row_id: u64) {
+        self.saved_next_row_ids.entry(relid).or_insert(next_row_id);
+    }
+
     fn bytes(&self) -> usize {
-        self.relations.values().map(RowSegment::bytes).sum()
+        self.relations
+            .values()
+            .chain(self.deleted_rows.values())
+            .map(RowSegment::bytes)
+            .sum()
     }
 }
 
@@ -925,113 +1017,136 @@ impl Default for TransactionOverlay {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum ScanRows {
+    Materialized {
+        rows: Vec<Row>,
+        region: StorageRegion,
+    },
+    Committed {
+        relid: u32,
+        row_ids: Vec<u64>,
+        region: StorageRegion,
+    },
+}
+
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+enum ScanPosition {
+    Unpositioned,
+    BeforeStart,
+    On(usize),
+    AfterEnd,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct ScanState {
-    rows: Vec<Row>,
-    region: StorageRegion,
-    shared_scan: Option<Arc<CachedCatalogScan>>,
-    next_index: usize,
-    positioned: bool,
+    rows: ScanRows,
+    position: ScanPosition,
 }
 
 impl ScanState {
-    fn materialize<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Result<Self, CatalogError> {
-        let mut region = StorageRegion::new(StorageRegionKind::Scan);
-        let rows = rows
-            .into_iter()
-            .map(|row| {
-                region
-                    .copy_row(row)
-                    .ok_or_else(|| invalid_ffi_argument("invalid stored by-reference cell".into()))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(Self {
-            rows,
-            region,
-            shared_scan: None,
-            next_index: 0,
-            positioned: false,
-        })
+    fn from_materialized(rows: Vec<Row>, region: StorageRegion) -> Self {
+        Self {
+            rows: ScanRows::Materialized { rows, region },
+            position: ScanPosition::Unpositioned,
+        }
     }
 
-    fn rows(&self) -> &[Row] {
-        self.shared_scan
-            .as_ref()
-            .map_or(self.rows.as_slice(), |scan| scan.rows.as_slice())
+    fn materialize<'a>(rows: impl IntoIterator<Item = &'a Row>) -> Result<Self, CatalogError> {
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+        let mut materialized = Vec::new();
+        for row in rows {
+            for cell in &row.cells {
+                if cell.byref_bytes().is_none()
+                    && matches!(cell.datum, StoredDatum::ByRef(_))
+                    && !cell.is_null
+                {
+                    return Err(invalid_ffi_argument(
+                        "invalid stored by-reference cell".into(),
+                    ));
+                }
+            }
+            region.account_shallow_scan_row(row);
+            materialized.push(row.clone());
+        }
+        Ok(Self::from_materialized(materialized, region))
+    }
+
+    fn committed(relid: u32, relation: &RelationRows) -> Self {
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+        let mut row_ids = Vec::with_capacity(relation.committed_row_ids.len());
+        for row_id in &relation.committed_row_ids {
+            if let Some(row) = relation.committed_row_index.get(row_id) {
+                region.account_shallow_scan_row(row);
+                row_ids.push(*row_id);
+            }
+        }
+        Self {
+            rows: ScanRows::Committed {
+                relid,
+                row_ids,
+                region,
+            },
+            position: ScanPosition::Unpositioned,
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match &self.rows {
+            ScanRows::Materialized { rows, .. } => rows.len(),
+            ScanRows::Committed { row_ids, .. } => row_ids.len(),
+        }
+    }
+
+    fn row_at<'a>(&'a self, state: &'a StorageState, index: usize) -> Option<&'a Row> {
+        match &self.rows {
+            ScanRows::Materialized { rows, .. } => rows.get(index),
+            ScanRows::Committed { relid, row_ids, .. } => {
+                let row_id = row_ids.get(index)?;
+                state.relations.get(relid)?.committed_row_index.get(row_id)
+            }
+        }
+    }
+
+    fn next_row_index(&mut self, forward: u8) -> Option<usize> {
+        let row_count = self.row_count();
+        let row_index = if forward != 0 {
+            match self.position {
+                ScanPosition::Unpositioned | ScanPosition::BeforeStart => 0,
+                ScanPosition::On(index) => index + 1,
+                ScanPosition::AfterEnd => return None,
+            }
+        } else {
+            match self.position {
+                ScanPosition::Unpositioned | ScanPosition::AfterEnd => {
+                    if row_count == 0 {
+                        self.position = ScanPosition::BeforeStart;
+                        return None;
+                    }
+                    row_count - 1
+                }
+                ScanPosition::On(0) => {
+                    self.position = ScanPosition::BeforeStart;
+                    return None;
+                }
+                ScanPosition::On(index) => index - 1,
+                ScanPosition::BeforeStart => return None,
+            }
+        };
+        if row_index >= row_count {
+            self.position = ScanPosition::AfterEnd;
+            return None;
+        }
+        self.position = ScanPosition::On(row_index);
+        Some(row_index)
     }
 
     fn bytes(&self) -> usize {
-        self.region.bytes().saturating_add(
-            self.shared_scan
-                .as_ref()
-                .map_or(0, |scan| scan.region.bytes()),
-        )
-    }
-}
-
-#[derive(Debug)]
-struct CachedCatalogScan {
-    rows: Vec<Row>,
-    region: Arc<StorageRegion>,
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-struct CatalogScanFilterCacheKey {
-    relation_oid: u32,
-    filters: Vec<CatalogRowFilter>,
-}
-
-#[derive(Debug)]
-struct CatalogScanCache {
-    generation: u64,
-    entries: HashMap<u32, Arc<CachedCatalogScan>>,
-    filtered_entries: HashMap<CatalogScanFilterCacheKey, Arc<CachedCatalogScan>>,
-}
-
-impl Default for CatalogScanCache {
-    fn default() -> Self {
-        Self {
-            generation: current_generation(),
-            entries: HashMap::new(),
-            filtered_entries: HashMap::new(),
+        match &self.rows {
+            ScanRows::Materialized { region, .. } | ScanRows::Committed { region, .. } => {
+                region.bytes()
+            }
         }
-    }
-}
-
-static CATALOG_SCAN_CACHE: OnceLock<Mutex<CatalogScanCache>> = OnceLock::new();
-
-fn catalog_scan_cache() -> &'static Mutex<CatalogScanCache> {
-    CATALOG_SCAN_CACHE.get_or_init(|| Mutex::new(CatalogScanCache::default()))
-}
-
-fn with_catalog_scan_cache<R>(f: impl FnOnce(&mut CatalogScanCache) -> R) -> R {
-    let generation = current_generation();
-    let mut cache = catalog_scan_cache()
-        .lock()
-        .expect("catalog scan cache mutex poisoned");
-    if cache.generation != generation {
-        cache.generation = generation;
-        cache.entries.clear();
-        cache.filtered_entries.clear();
-    }
-    f(&mut cache)
-}
-
-fn clear_catalog_scan_cache() {
-    if let Some(cache) = CATALOG_SCAN_CACHE.get() {
-        let mut cache = cache.lock().expect("catalog scan cache mutex poisoned");
-        cache.generation = current_generation();
-        cache.entries.clear();
-        cache.filtered_entries.clear();
-    }
-}
-
-fn scan_state_from_cached_catalog_scan(cache: Arc<CachedCatalogScan>) -> ScanState {
-    ScanState {
-        rows: Vec::new(),
-        region: StorageRegion::new(StorageRegionKind::Scan),
-        shared_scan: Some(cache),
-        next_index: 0,
     }
 }
 
@@ -1275,6 +1390,7 @@ impl StorageState {
     }
 
     fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
+        self.restore_saved_next_row_ids(session);
         session.transaction_stack.clear();
         fastpg_catalog::abort_explicit_transaction();
         session.explicit_transaction = false;
@@ -1294,8 +1410,21 @@ impl StorageState {
 
     fn abort_implicit_transaction(&mut self, session: &mut SessionStorage) {
         if !session.explicit_transaction {
+            self.restore_saved_next_row_ids(session);
             session.transaction_stack.clear();
             fastpg_catalog::abort_implicit_transaction();
+        }
+    }
+
+    fn restore_saved_next_row_ids(&mut self, session: &mut SessionStorage) {
+        while let Some(overlay) = session.transaction_stack.pop() {
+            self.restore_overlay_next_row_ids(&overlay);
+        }
+    }
+
+    fn restore_overlay_next_row_ids(&mut self, overlay: &TransactionOverlay) {
+        for (relid, next_row_id) in &overlay.saved_next_row_ids {
+            self.relations.entry(*relid).or_default().next_row_id = *next_row_id;
         }
     }
 
@@ -1367,11 +1496,27 @@ impl StorageState {
         rows.into_values().collect()
     }
 
-    fn visible_scan_state(
+    fn visible_scan_state_with_snapshot(
         &self,
         session: &SessionStorage,
         relid: u32,
+        snapshot: Option<ScanSnapshot>,
     ) -> Result<ScanState, CatalogError> {
+        let overlays = self.visible_overlay_stack(session);
+        let has_overlay_rows = overlays.iter().any(|overlay| {
+            overlay
+                .deleted_row_ids
+                .get(&relid)
+                .is_some_and(|row_ids| !row_ids.is_empty())
+                || overlay
+                    .relations
+                    .get(&relid)
+                    .is_some_and(|segment| !segment.rows.is_empty())
+        });
+        if !has_overlay_rows && let Some(relation) = self.relations.get(&relid) {
+            return Ok(ScanState::committed(relid, relation));
+        }
+
         let mut rows = BTreeMap::new();
         if let Some(relation) = self.relations.get(&relid) {
             for row_id in &relation.committed_row_ids {
@@ -1380,14 +1525,35 @@ impl StorageState {
                 }
             }
         }
-        for overlay in self.visible_overlay_stack(session) {
+        for overlay in overlays {
             if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
                 for row_id in deleted_row_ids {
-                    rows.remove(row_id);
+                    let delete_visible = overlay
+                        .deleted_row_metadata
+                        .get(&relid)
+                        .and_then(|metadata| metadata.get(row_id))
+                        .is_none_or(|metadata| delete_visible_to_snapshot(*metadata, snapshot));
+                    if delete_visible {
+                        rows.remove(row_id);
+                    } else if let Some(row) = overlay
+                        .deleted_rows
+                        .get(&relid)
+                        .and_then(|segment| find_row_in_segment(segment, *row_id))
+                    {
+                        rows.insert(*row_id, row);
+                    }
                 }
             }
             if let Some(segment) = overlay.relations.get(&relid) {
                 for row in &segment.rows {
+                    let delete_visible = overlay
+                        .deleted_row_metadata
+                        .get(&relid)
+                        .and_then(|metadata| metadata.get(&row.row_id))
+                        .is_none_or(|metadata| delete_visible_to_snapshot(*metadata, snapshot));
+                    if !delete_visible {
+                        continue;
+                    }
                     rows.insert(row.row_id, row);
                 }
             }
@@ -1418,6 +1584,51 @@ impl StorageState {
         self.find_committed_row(relid, row_id)
     }
 
+    fn find_row_with_snapshot(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        row_id: u64,
+        snapshot: Option<ScanSnapshot>,
+    ) -> Option<Row> {
+        if row_id == 0 {
+            return None;
+        }
+
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
+            if let Some(segment) = overlay.relations.get(&relid)
+                && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
+            {
+                if row_visible_to_snapshot(row, snapshot) {
+                    return Some(row.clone());
+                }
+            }
+            if overlay
+                .deleted_row_ids
+                .get(&relid)
+                .is_some_and(|deleted| deleted.contains(&row_id))
+            {
+                let delete_visible = overlay
+                    .deleted_row_metadata
+                    .get(&relid)
+                    .and_then(|metadata| metadata.get(&row_id))
+                    .is_none_or(|metadata| delete_visible_to_snapshot(*metadata, snapshot));
+                if delete_visible {
+                    return None;
+                }
+                return overlay
+                    .deleted_rows
+                    .get(&relid)
+                    .and_then(|segment| find_row_in_segment(segment, row_id))
+                    .filter(|row| row_visible_to_snapshot(row, snapshot))
+                    .cloned();
+            }
+        }
+
+        self.find_committed_row(relid, row_id)
+            .filter(|row| row_visible_to_snapshot(row, snapshot))
+    }
+
     fn find_any_row(&self, session: &SessionStorage, relid: u32, row_id: u64) -> Option<Row> {
         if row_id == 0 {
             return None;
@@ -1429,36 +1640,14 @@ impl StorageState {
             {
                 return Some(row.clone());
             }
+            if let Some(segment) = overlay.deleted_rows.get(&relid)
+                && let Some(row) = segment.rows.iter().rev().find(|row| row.row_id == row_id)
+            {
+                return Some(row.clone());
+            }
         }
 
         self.find_committed_row(relid, row_id)
-    }
-
-    fn visible_row_exists(&self, session: &SessionStorage, relid: u32, row_id: u64) -> bool {
-        if row_id == 0 {
-            return false;
-        }
-
-        for overlay in self.visible_overlay_stack(session).iter().rev() {
-            if overlay
-                .relations
-                .get(&relid)
-                .is_some_and(|segment| segment.rows.iter().any(|row| row.row_id == row_id))
-            {
-                return true;
-            }
-            if overlay
-                .deleted_row_ids
-                .get(&relid)
-                .is_some_and(|deleted| deleted.contains(&row_id))
-            {
-                return false;
-            }
-        }
-
-        self.relations
-            .get(&relid)
-            .is_some_and(|relation| relation.committed_row_index.contains_key(&row_id))
     }
 
     fn find_committed_row(&self, relid: u32, row_id: u64) -> Option<Row> {
@@ -1526,9 +1715,54 @@ impl StorageState {
         key: &IndexKey,
         replacing_row_id: Option<u64>,
     ) -> Option<Row> {
-        self.visible_rows(session, relid).into_iter().find(|row| {
-            Some(row.row_id) != replacing_row_id
-                && index_key_for_row(index_spec, row).as_ref() == Some(key)
+        let mut committed_candidate = if index_spec.is_primary {
+            self.relations
+                .get(&relid)
+                .and_then(|relation| relation.primary_key_index.get(key).copied())
+        } else {
+            None
+        };
+
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
+            if let Some(segment) = overlay.relations.get(&relid)
+                && let Some(row) = segment.rows.iter().find(|row| {
+                    Some(row.row_id) != replacing_row_id
+                        && index_key_for_row(index_spec, row).as_ref() == Some(key)
+                })
+            {
+                return Some(row.clone());
+            }
+
+            if let Some(row_id) = committed_candidate
+                && overlay
+                    .deleted_row_ids
+                    .get(&relid)
+                    .is_some_and(|deleted| deleted.contains(&row_id))
+            {
+                committed_candidate = None;
+            }
+        }
+
+        if let Some(row_id) = committed_candidate
+            && Some(row_id) != replacing_row_id
+        {
+            return self.find_committed_row(relid, row_id);
+        }
+
+        if index_spec.is_primary {
+            return None;
+        }
+
+        self.relations.get(&relid).and_then(|relation| {
+            relation
+                .committed_row_ids
+                .iter()
+                .filter_map(|row_id| relation.committed_row_index.get(row_id))
+                .find(|row| {
+                    Some(row.row_id) != replacing_row_id
+                        && index_key_for_row(index_spec, row).as_ref() == Some(key)
+                })
+                .cloned()
         })
     }
 
@@ -1565,23 +1799,7 @@ impl StorageState {
             return;
         }
 
-        let visible_row_ids = self
-            .visible_rows(session, relid)
-            .into_iter()
-            .map(|row| row.row_id)
-            .collect::<BTreeSet<_>>();
-        let overlay = session
-            .transaction_stack
-            .last_mut()
-            .expect("transaction stack was checked");
-        if let Some(segment) = overlay.relations.get_mut(&relid) {
-            segment.remove_row_ids(&visible_row_ids);
-        }
-        overlay
-            .deleted_row_ids
-            .entry(relid)
-            .or_default()
-            .extend(visible_row_ids);
+        self.clear_relation_transactional(session, relid);
     }
 
     fn clear_relation_transactional(&mut self, session: &mut SessionStorage, relid: u32) {
@@ -1590,13 +1808,20 @@ impl StorageState {
             .into_iter()
             .map(|row| row.row_id)
             .collect::<BTreeSet<_>>();
+        let relation = self.relations.entry(relid).or_default();
+        let saved_next_row_id = relation.next_row_id;
+        relation.next_row_id = 1;
 
         session.ensure_transaction();
         let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
+        overlay.save_next_row_id(relid, saved_next_row_id);
         overlay.relations.remove(&relid);
+        overlay.deleted_row_metadata.remove(&relid);
+        overlay.deleted_rows.remove(&relid);
+        overlay.remembered_deleted_row_ids.remove(&relid);
         if visible_row_ids.is_empty() {
             overlay.deleted_row_ids.remove(&relid);
         } else {
@@ -1664,6 +1889,10 @@ impl StorageState {
             region_kind: _,
             relations,
             deleted_row_ids,
+            deleted_row_metadata: _,
+            deleted_rows: _,
+            remembered_deleted_row_ids: _,
+            saved_next_row_ids: _,
             pending_primary_key_rebuilds,
         } = overlay;
         let mut unchanged_primary_key_updates: HashMap<u32, BTreeSet<u64>> = HashMap::new();
@@ -1798,11 +2027,35 @@ fn committed_contains_row_id(relation: &RelationRows, row_id: u64) -> bool {
     relation.committed_row_index.contains_key(&row_id)
 }
 
+fn delete_visible_to_snapshot(metadata: DeleteMetadata, snapshot: Option<ScanSnapshot>) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    if metadata.xid == 0 || metadata.xid != snapshot.current_xid {
+        return true;
+    }
+    metadata.cid < snapshot.curcid
+}
+
+fn row_visible_to_snapshot(row: &Row, snapshot: Option<ScanSnapshot>) -> bool {
+    let Some(snapshot) = snapshot else {
+        return true;
+    };
+    if row.xmin == 0 || row.xmin != snapshot.current_xid {
+        return true;
+    }
+    row.cmin < snapshot.curcid
+}
+
 fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: TransactionOverlay) {
     let TransactionOverlay {
         region_kind: _,
         relations,
         deleted_row_ids,
+        deleted_row_metadata,
+        deleted_rows,
+        remembered_deleted_row_ids,
+        saved_next_row_ids,
         pending_primary_key_rebuilds,
     } = overlay;
 
@@ -1820,12 +2073,49 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
             .extend(deleted_row_ids);
     }
 
+    for (relid, metadata) in deleted_row_metadata {
+        if metadata.is_empty() {
+            continue;
+        }
+        parent
+            .deleted_row_metadata
+            .entry(relid)
+            .or_default()
+            .extend(metadata);
+    }
+
     for (relid, mut segment) in relations {
         if segment.rows.is_empty() {
             continue;
         }
         let parent_segment = parent.row_segment_mut(relid);
         parent_segment.append_from(&mut segment);
+    }
+
+    for (relid, mut segment) in deleted_rows {
+        if segment.rows.is_empty() {
+            continue;
+        }
+        let parent_segment = parent.deleted_row_segment_mut(relid);
+        parent_segment.append_from(&mut segment);
+    }
+
+    for (relid, row_ids) in remembered_deleted_row_ids {
+        if row_ids.is_empty() {
+            continue;
+        }
+        parent
+            .remembered_deleted_row_ids
+            .entry(relid)
+            .or_default()
+            .extend(row_ids);
+    }
+
+    for (relid, next_row_id) in saved_next_row_ids {
+        parent
+            .saved_next_row_ids
+            .entry(relid)
+            .or_insert(next_row_id);
     }
 
     parent
@@ -4214,9 +4504,11 @@ pub extern "C" fn fastpg_rust_subxact_commit() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_subxact_abort() {
-    with_storage(|_state, session| {
+    with_storage(|state, session| {
         if session.transaction_stack.len() > 1 {
-            session.transaction_stack.pop();
+            if let Some(overlay) = session.transaction_stack.pop() {
+                state.restore_overlay_next_row_ids(&overlay);
+            }
             fastpg_catalog::abort_subtransaction();
         }
     });
@@ -4260,6 +4552,133 @@ pub extern "C" fn fastpg_rust_catalog_row_count(relid: u32) -> usize {
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_contains_row(relid: u32, row_id: u64) -> bool {
     with_storage(|state, session| state.find_visible_row(session, relid, row_id).is_some())
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_set_row_xmin(
+    relid: u32,
+    row_id: u64,
+    xmin: u32,
+    cmin: u32,
+) -> bool {
+    with_storage(|state, session| {
+        for overlay in session.transaction_stack.iter_mut().rev() {
+            if let Some(segment) = overlay.relations.get_mut(&relid)
+                && let Some(row) = segment
+                    .rows
+                    .iter_mut()
+                    .rev()
+                    .find(|row| row.row_id == row_id)
+            {
+                row.xmin = xmin;
+                row.cmin = cmin;
+                return true;
+            }
+        }
+        if let Some(row) = state
+            .relations
+            .get_mut(&relid)
+            .and_then(|relation| relation.committed_row_index.get_mut(&row_id))
+        {
+            row.xmin = xmin;
+            row.cmin = cmin;
+            return true;
+        }
+        false
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_set_row_xmax(relid: u32, row_id: u64, xmax: u32) -> bool {
+    with_storage(|state, session| {
+        for overlay in session.transaction_stack.iter_mut().rev() {
+            if let Some(segment) = overlay.relations.get_mut(&relid)
+                && let Some(row) = segment
+                    .rows
+                    .iter_mut()
+                    .rev()
+                    .find(|row| row.row_id == row_id)
+            {
+                row.xmax = xmax;
+                return true;
+            }
+        }
+        if let Some(row) = state
+            .relations
+            .get_mut(&relid)
+            .and_then(|relation| relation.committed_row_index.get_mut(&row_id))
+        {
+            row.xmax = xmax;
+            return true;
+        }
+        false
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_row_xmin(relid: u32, row_id: u64) -> u32 {
+    with_storage(|state, session| {
+        state
+            .find_visible_row(session, relid, row_id)
+            .map(|row| row.xmin)
+            .unwrap_or(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_row_xmax(relid: u32, row_id: u64) -> u32 {
+    with_storage(|state, session| {
+        state
+            .find_visible_row(session, relid, row_id)
+            .map(|row| row.xmax)
+            .unwrap_or(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_row_delete_xid(relid: u32, row_id: u64) -> u32 {
+    with_storage(|_state, session| {
+        session
+            .transaction_stack
+            .iter()
+            .rev()
+            .find_map(|overlay| {
+                overlay
+                    .deleted_row_metadata
+                    .get(&relid)
+                    .and_then(|metadata| metadata.get(&row_id))
+                    .map(|metadata| metadata.xid)
+            })
+            .unwrap_or(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_row_delete_cid(relid: u32, row_id: u64) -> u32 {
+    with_storage(|_state, session| {
+        session
+            .transaction_stack
+            .iter()
+            .rev()
+            .find_map(|overlay| {
+                overlay
+                    .deleted_row_metadata
+                    .get(&relid)
+                    .and_then(|metadata| metadata.get(&row_id))
+                    .map(|metadata| metadata.cid)
+            })
+            .unwrap_or(0)
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_row_cmin(relid: u32, row_id: u64) -> u32 {
+    with_storage(|state, session| {
+        state
+            .find_visible_row(session, relid, row_id)
+            .map(|row| row.cmin)
+            .unwrap_or(0)
+    })
 }
 
 #[unsafe(no_mangle)]
@@ -4326,7 +4745,6 @@ pub extern "C" fn fastpg_rust_storage_set_limits(
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_storage_reset_limits() {
     with_storage(|state, _session| state.reset_limits());
-    clear_catalog_scan_cache();
     clear_last_storage_error();
 }
 
@@ -4531,6 +4949,8 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
+    let is_primary = primary_key_relation_oid_for_index_oid(Oid(index_relid))
+        .is_some_and(|relation_oid| relation_oid == Oid(heap_relid));
     let Some(index_spec) = (unsafe {
         unique_index_spec_from_ffi(
             index_relid,
@@ -4539,7 +4959,7 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
             typbyval,
             typlen,
             nkeys,
-            true,
+            is_primary,
             false,
         )
     }) else {
@@ -4592,6 +5012,8 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
     if nkeys > 0 && (values.is_null() || is_null.is_null()) {
         return false;
     }
+    let is_primary = primary_key_relation_oid_for_index_oid(Oid(index_relid))
+        .is_some_and(|relation_oid| relation_oid == Oid(heap_relid));
     let Some(index_spec) = (unsafe {
         unique_index_spec_from_ffi(
             index_relid,
@@ -4600,7 +5022,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
             typbyval,
             typlen,
             nkeys,
-            false,
+            is_primary,
             nulls_not_distinct != 0,
         )
     }) else {
@@ -4653,6 +5075,8 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
     nulls_not_distinct: u8,
     row_id_out: *mut u64,
 ) -> bool {
+    let is_primary = primary_key_relation_oid_for_index_oid(Oid(index_relid))
+        .is_some_and(|relation_oid| relation_oid == Oid(heap_relid));
     let Some(index_spec) = (unsafe {
         unique_index_spec_from_ffi(
             index_relid,
@@ -4661,7 +5085,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
             typbyval,
             typlen,
             nkeys,
-            false,
+            is_primary,
             nulls_not_distinct != 0,
         )
     }) else {
@@ -4753,6 +5177,144 @@ pub unsafe extern "C" fn fastpg_rust_relation_insert_unchecked(
     }
 }
 
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass row-major value/null/byval/length arrays sized
+/// `nrows * natts` and a writable row id array when `nrows` is nonzero.
+pub unsafe extern "C" fn fastpg_rust_relation_multi_insert_unchecked(
+    relid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    nrows: usize,
+    row_ids_out: *mut u64,
+) -> usize {
+    clear_last_storage_error();
+    if nrows == 0 {
+        return 0;
+    }
+    if row_ids_out.is_null() {
+        set_last_storage_error(invalid_ffi_argument(
+            "invalid row id output array".to_owned(),
+        ));
+        return 0;
+    }
+    let Some(total_values) = natts.checked_mul(nrows) else {
+        set_last_storage_error(invalid_ffi_argument("row input is too large".to_owned()));
+        return 0;
+    };
+    let Some((values, is_null, byval, value_lens)) =
+        (unsafe { row_input_arrays(values, is_null, byval, value_lens, total_values) })
+    else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays".to_owned()));
+        return 0;
+    };
+
+    let result = with_storage(|state, session| -> Result<usize, CatalogError> {
+        session.ensure_transaction();
+        let (checkpoint, base_row_len) = {
+            let segment = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured")
+                .row_segment_mut(relid);
+            (segment.checkpoint(), segment.rows.len())
+        };
+
+        for row_index in 0..nrows {
+            let start = row_index * natts;
+            let end = start + natts;
+            let row_values = &values[start..end];
+            let row_is_null = &is_null[start..end];
+            let row_byval = &byval[start..end];
+            let row_value_lens = &value_lens[start..end];
+            let estimated_row_bytes =
+                estimated_input_row_bytes(row_is_null, row_byval, row_value_lens);
+
+            if let Err(error) = state.check_row_limit(estimated_row_bytes) {
+                rollback_multi_insert_batch(session, relid, checkpoint, base_row_len);
+                return Err(error);
+            }
+            if let Err(error) = state.check_transaction_limit(session, estimated_row_bytes) {
+                rollback_multi_insert_batch(session, relid, checkpoint, base_row_len);
+                return Err(error);
+            }
+            if let Err(error) = state.check_committed_projection_limit(session, estimated_row_bytes)
+            {
+                rollback_multi_insert_batch(session, relid, checkpoint, base_row_len);
+                return Err(error);
+            }
+
+            let row_id = match state.relations.entry(relid).or_default().allocate_row_id() {
+                Some(row_id) => row_id,
+                None => {
+                    rollback_multi_insert_batch(session, relid, checkpoint, base_row_len);
+                    return Ok(row_index);
+                }
+            };
+
+            let row = {
+                let segment = session
+                    .transaction_stack
+                    .last_mut()
+                    .expect("transaction was just ensured")
+                    .row_segment_mut(relid);
+                let Some(cells) = copy_cells_to_segment(
+                    segment,
+                    row_values,
+                    row_is_null,
+                    row_byval,
+                    row_value_lens,
+                ) else {
+                    rollback_multi_insert_batch(session, relid, checkpoint, base_row_len);
+                    return Err(invalid_ffi_argument(
+                        "invalid by-reference row input".to_owned(),
+                    ));
+                };
+                Row {
+                    row_id,
+                    xmin: 0,
+                    xmax: 0,
+                    cmin: 0,
+                    cells,
+                }
+            };
+
+            let index_bytes = primary_index_spec_for_relation_oid(Oid(relid))
+                .and_then(|index_spec| index_key_for_row(&index_spec, &row))
+                .map(|key| estimated_index_key_bytes(&key))
+                .unwrap_or(0);
+            if let Err(error) = state.check_committed_projection_limit(session, index_bytes) {
+                rollback_multi_insert_batch(session, relid, checkpoint, base_row_len);
+                return Err(error);
+            }
+
+            let segment = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured")
+                .row_segment_mut(relid);
+            segment.push_row(row);
+            unsafe {
+                *row_ids_out.add(row_index) = row_id;
+            }
+        }
+
+        Ok(nrows)
+    });
+
+    match result {
+        Ok(inserted) => inserted,
+        Err(error) => {
+            set_last_storage_error(error);
+            0
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct RawRowInput {
     relid: u32,
@@ -4823,7 +5385,13 @@ unsafe fn relation_insert_impl(
             }
         };
 
-        let row = Row { row_id, cells };
+        let row = Row {
+            row_id,
+            xmin: 0,
+            xmax: 0,
+            cmin: 0,
+            cells,
+        };
         let index_bytes = primary_index_spec_for_relation_oid(Oid(input.relid))
             .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
@@ -4900,6 +5468,8 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
                 natts,
             },
             row_id,
+            0,
+            0,
             UniqueCheck::Enforce,
         )
     }
@@ -4931,12 +5501,55 @@ pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked(
                 natts,
             },
             row_id,
+            0,
+            0,
             UniqueCheck::Skip,
         )
     }
 }
 
-unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: UniqueCheck) -> bool {
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_relation_update_with_metadata(
+    relid: u32,
+    row_id: u64,
+    delete_xid: u32,
+    delete_cid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+) -> bool {
+    clear_last_storage_error();
+    unsafe {
+        relation_update_impl(
+            RawRowInput {
+                relid,
+                values,
+                is_null,
+                byval,
+                value_lens,
+                natts,
+            },
+            row_id,
+            delete_xid,
+            delete_cid,
+            UniqueCheck::Skip,
+        )
+    }
+}
+
+unsafe fn relation_update_impl(
+    input: RawRowInput,
+    row_id: u64,
+    delete_xid: u32,
+    delete_cid: u32,
+    unique_check: UniqueCheck,
+) -> bool {
     if row_id == 0 {
         return false;
     }
@@ -4954,9 +5567,9 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
     };
 
     let result = with_storage(|state, session| -> Result<bool, CatalogError> {
-        if !state.visible_row_exists(session, input.relid, row_id) {
+        let Some(old_row) = state.find_visible_row(session, input.relid, row_id) else {
             return Ok(false);
-        }
+        };
 
         let estimated_row_bytes = estimated_input_row_bytes(is_null, byval, value_lens);
         state.check_row_limit(estimated_row_bytes)?;
@@ -4981,7 +5594,13 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
                 }
             }
         };
-        let row = Row { row_id, cells };
+        let row = Row {
+            row_id,
+            xmin: 0,
+            xmax: 0,
+            cmin: 0,
+            cells,
+        };
         let index_bytes = primary_index_spec_for_relation_oid(Oid(input.relid))
             .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
@@ -5013,11 +5632,8 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
-        overlay
-            .deleted_row_ids
-            .entry(input.relid)
-            .or_default()
-            .insert(row_id);
+        overlay.remember_deleted_row(input.relid, &old_row);
+        overlay.mark_deleted_row(input.relid, row_id, delete_xid, delete_cid);
         let segment = overlay.row_segment_mut(input.relid);
         segment.remove_row_id(row_id);
         segment.push_row(row);
@@ -5035,30 +5651,52 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
+    fastpg_rust_relation_delete_with_metadata(relid, row_id, 0, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_delete_with_metadata(
+    relid: u32,
+    row_id: u64,
+    delete_xid: u32,
+    delete_cid: u32,
+) -> bool {
     if row_id == 0 {
         return false;
     }
 
     with_storage(|state, session| {
-        if !state.visible_row_exists(session, relid, row_id) {
+        let old_row = state.find_visible_row(session, relid, row_id);
+        let Some(old_row) = old_row.as_ref() else {
             return false;
-        }
-
+        };
         session.ensure_transaction();
         let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
-        overlay
-            .deleted_row_ids
-            .entry(relid)
-            .or_default()
-            .insert(row_id);
+        overlay.remember_deleted_row(relid, old_row);
+        overlay.mark_deleted_row(relid, row_id, delete_xid, delete_cid);
         if let Some(segment) = overlay.relations.get_mut(&relid) {
             segment.remove_row_id(row_id);
         }
         true
     })
+}
+
+fn rollback_multi_insert_batch(
+    session: &mut SessionStorage,
+    relid: u32,
+    checkpoint: RegionCheckpoint,
+    base_row_len: usize,
+) {
+    let segment = session
+        .transaction_stack
+        .last_mut()
+        .expect("transaction was just ensured")
+        .row_segment_mut(relid);
+    segment.truncate_rows_to(base_row_len);
+    segment.rewind_to(checkpoint);
 }
 
 type RowInputArrays<'a> = (&'a [usize], &'a [u8], &'a [u8], &'a [usize]);
@@ -5583,6 +6221,9 @@ fn catalog_scan_state_from_rows(
         }
         let row = Row {
             row_id: catalog_row.row_id,
+            xmin: 0,
+            xmax: 0,
+            cmin: 0,
             cells: table
                 .columns
                 .iter()
@@ -5593,17 +6234,7 @@ fn catalog_scan_state_from_rows(
         region.account_row(&row);
         rows.push(row);
     }
-    Some(ScanState {
-        rows,
-        region,
-        shared_scan: None,
-        next_index: 0,
-        positioned: false,
-    })
-}
-
-fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
-    catalog_scan_state_from_rows(relation_oid, catalog_rows(relation_oid))
+    Some(ScanState::from_materialized(rows, region))
 }
 
 fn catalog_scan_state_filtered(
@@ -5613,35 +6244,6 @@ fn catalog_scan_state_filtered(
     if filters.is_empty() {
         return catalog_scan_state(relation_oid);
     }
-    if has_uncommitted_catalog_changes() {
-        return catalog_scan_state_filtered_uncached(relation_oid, filters);
-    }
-    let cache_key = CatalogScanFilterCacheKey {
-        relation_oid: relation_oid.0,
-        filters: filters.to_vec(),
-    };
-    if let Some(cached) =
-        with_catalog_scan_cache(|cache| cache.filtered_entries.get(&cache_key).map(Arc::clone))
-    {
-        return Some(scan_state_from_cached_catalog_scan(cached));
-    }
-    let scan = catalog_scan_state_filtered_uncached(relation_oid, filters)?;
-    let cached = Arc::new(CachedCatalogScan {
-        rows: scan.rows,
-        region: Arc::new(scan.region),
-    });
-    with_catalog_scan_cache(|cache| {
-        cache
-            .filtered_entries
-            .insert(cache_key, Arc::clone(&cached));
-    });
-    Some(scan_state_from_cached_catalog_scan(cached))
-}
-
-fn catalog_scan_state_filtered_uncached(
-    relation_oid: Oid,
-    filters: &[CatalogRowFilter],
-) -> Option<ScanState> {
     catalog_scan_state_from_rows(
         relation_oid,
         catalog_rows_matching_filters(relation_oid, filters),
@@ -5649,23 +6251,7 @@ fn catalog_scan_state_filtered_uncached(
 }
 
 fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
-    if has_uncommitted_catalog_changes() {
-        return catalog_scan_state_uncached(relation_oid);
-    }
-    if let Some(cached) =
-        with_catalog_scan_cache(|cache| cache.entries.get(&relation_oid.0).map(Arc::clone))
-    {
-        return Some(scan_state_from_cached_catalog_scan(cached));
-    }
-    let scan = catalog_scan_state_uncached(relation_oid)?;
-    let cached = Arc::new(CachedCatalogScan {
-        rows: scan.rows,
-        region: Arc::new(scan.region),
-    });
-    with_catalog_scan_cache(|cache| {
-        cache.entries.insert(relation_oid.0, Arc::clone(&cached));
-    });
-    Some(scan_state_from_cached_catalog_scan(cached))
+    catalog_scan_state_from_rows(relation_oid, catalog_rows(relation_oid))
 }
 
 unsafe fn catalog_name_filter_value(datum: usize) -> Option<String> {
@@ -5726,16 +6312,34 @@ unsafe fn catalog_scan_filters_from_datums(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
+    fastpg_rust_scan_begin_with_snapshot(relid, 0, 0, 0)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_scan_begin_with_snapshot(
+    relid: u32,
+    has_snapshot: u8,
+    current_xid: u32,
+    curcid: u32,
+) -> u64 {
     clear_last_storage_error();
     let virtual_scan =
         virtual_catalog_by_relation_oid(Oid(relid)).and_then(|_| catalog_scan_state(Oid(relid)));
+    let snapshot = if has_snapshot != 0 {
+        Some(ScanSnapshot {
+            current_xid,
+            curcid,
+        })
+    } else {
+        None
+    };
 
     let result = with_storage(|state, session| -> Result<u64, CatalogError> {
         let scan = match virtual_scan {
             Some(scan) => scan,
             None => {
                 state.relations.entry(relid).or_default();
-                state.visible_scan_state(session, relid)?
+                state.visible_scan_state_with_snapshot(session, relid, snapshot)?
             }
         };
         state.check_scan_limit(scan.bytes())?;
@@ -5776,7 +6380,7 @@ pub unsafe extern "C" fn fastpg_rust_scan_begin_filtered(
             Some(scan) => scan,
             None => {
                 state.relations.entry(relid).or_default();
-                state.visible_scan_state(session, relid)?
+                state.visible_scan_state_with_snapshot(session, relid, None)?
             }
         };
         state.check_scan_limit(scan.bytes())?;
@@ -5798,8 +6402,7 @@ pub unsafe extern "C" fn fastpg_rust_scan_begin_filtered(
 pub extern "C" fn fastpg_rust_scan_reset(scan_handle: u64) {
     with_storage(|_state, session| {
         if let Some(scan) = session.scans.get_mut(&scan_handle) {
-            scan.next_index = 0;
-            scan.positioned = false;
+            scan.position = ScanPosition::Unpositioned;
         }
     });
 }
@@ -5824,37 +6427,242 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
-    with_storage(|_state, session| {
+    with_storage(|state, session| {
         let scan = match session.scans.get_mut(&scan_handle) {
             Some(scan) => scan,
             None => return false,
         };
 
-        let row_count = scan.rows().len();
-        let row_index = if forward != 0 {
-            if scan.next_index >= row_count {
-                return false;
-            }
-            scan.positioned = true;
-            let row_index = scan.next_index;
-            scan.next_index += 1;
-            row_index
-        } else {
-            if !scan.positioned {
-                scan.next_index = row_count;
-                scan.positioned = true;
-            }
-            if scan.next_index == 0 {
-                return false;
-            }
-            scan.next_index -= 1;
-            scan.next_index
+        let Some(row_index) = scan.next_row_index(forward) else {
+            return false;
         };
-
-        let Some(row) = scan.rows().get(row_index) else {
+        let Some(row) = scan.row_at(state, row_index) else {
             return false;
         };
         unsafe { copy_row_to_outputs(row, values_out, is_null_out, natts, row_id_out) }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_scan_next_with_stored_natts(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    row_id_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> bool {
+    with_storage(|state, session| {
+        let scan = match session.scans.get_mut(&scan_handle) {
+            Some(scan) => scan,
+            None => return false,
+        };
+
+        let Some(row_index) = scan.next_row_index(forward) else {
+            return false;
+        };
+        let Some(row) = scan.row_at(state, row_index) else {
+            return false;
+        };
+        unsafe {
+            copy_row_to_outputs_with_stored_natts(
+                row,
+                values_out,
+                is_null_out,
+                natts,
+                row_id_out,
+                stored_natts_out,
+            )
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_scan_next_with_metadata(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    row_id_out: *mut u64,
+    stored_natts_out: *mut usize,
+    xmin_out: *mut u32,
+    cmin_out: *mut u32,
+) -> bool {
+    with_storage(|state, session| {
+        let scan = match session.scans.get_mut(&scan_handle) {
+            Some(scan) => scan,
+            None => return false,
+        };
+
+        let Some(row_index) = scan.next_row_index(forward) else {
+            return false;
+        };
+        let Some(row) = scan.row_at(state, row_index) else {
+            return false;
+        };
+        unsafe {
+            copy_row_to_outputs_with_stored_natts(
+                row,
+                values_out,
+                is_null_out,
+                natts,
+                row_id_out,
+                stored_natts_out,
+            ) && copy_row_metadata_to_outputs(row, xmin_out, cmin_out)
+        }
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass output arrays large enough for `max_rows * natts`
+/// values/null flags plus `max_rows` row IDs and stored attribute counts.
+pub unsafe extern "C" fn fastpg_rust_scan_next_batch_with_stored_natts(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    max_rows: usize,
+    row_ids_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
+    if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
+        return 0;
+    }
+    if row_ids_out.is_null() || stored_natts_out.is_null() {
+        return 0;
+    }
+
+    with_storage(|state, session| {
+        let scan = match session.scans.get_mut(&scan_handle) {
+            Some(scan) => scan,
+            None => return 0,
+        };
+
+        let mut copied = 0;
+        while copied < max_rows {
+            let Some(row_index) = scan.next_row_index(forward) else {
+                break;
+            };
+            let Some(row) = scan.row_at(state, row_index) else {
+                break;
+            };
+            let value_offset = copied * natts;
+            let row_values_out = if natts == 0 {
+                values_out
+            } else {
+                unsafe { values_out.add(value_offset) }
+            };
+            let row_is_null_out = if natts == 0 {
+                is_null_out
+            } else {
+                unsafe { is_null_out.add(value_offset) }
+            };
+            if !unsafe {
+                copy_row_to_outputs_with_stored_natts(
+                    row,
+                    row_values_out,
+                    row_is_null_out,
+                    natts,
+                    row_ids_out.add(copied),
+                    stored_natts_out.add(copied),
+                )
+            } {
+                break;
+            }
+            copied += 1;
+        }
+        copied
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass output arrays large enough for `max_rows * natts`
+/// values/null flags plus `max_rows` row IDs, stored attribute counts, and row
+/// metadata values.
+pub unsafe extern "C" fn fastpg_rust_scan_next_batch_with_metadata(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    max_rows: usize,
+    row_ids_out: *mut u64,
+    stored_natts_out: *mut usize,
+    xmins_out: *mut u32,
+    cmins_out: *mut u32,
+) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
+    if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
+        return 0;
+    }
+    if row_ids_out.is_null()
+        || stored_natts_out.is_null()
+        || xmins_out.is_null()
+        || cmins_out.is_null()
+    {
+        return 0;
+    }
+
+    with_storage(|state, session| {
+        let scan = match session.scans.get_mut(&scan_handle) {
+            Some(scan) => scan,
+            None => return 0,
+        };
+
+        let mut copied = 0;
+        while copied < max_rows {
+            let Some(row_index) = scan.next_row_index(forward) else {
+                break;
+            };
+            let Some(row) = scan.row_at(state, row_index) else {
+                break;
+            };
+            let value_offset = copied * natts;
+            let row_values_out = if natts == 0 {
+                values_out
+            } else {
+                unsafe { values_out.add(value_offset) }
+            };
+            let row_is_null_out = if natts == 0 {
+                is_null_out
+            } else {
+                unsafe { is_null_out.add(value_offset) }
+            };
+            if !unsafe {
+                copy_row_to_outputs_with_stored_natts(
+                    row,
+                    row_values_out,
+                    row_is_null_out,
+                    natts,
+                    row_ids_out.add(copied),
+                    stored_natts_out.add(copied),
+                ) && copy_row_metadata_to_outputs(row, xmins_out.add(copied), cmins_out.add(copied))
+            } {
+                break;
+            }
+            copied += 1;
+        }
+        copied
     })
 }
 
@@ -5885,6 +6693,81 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row(
 ///
 /// C callers must pass valid output pointers where required; any C strings or
 /// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_fetch_row_with_stored_natts(
+    relid: u32,
+    row_id: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    let row = with_storage(|state, session| state.find_visible_row(session, relid, row_id));
+
+    match row {
+        Some(row) => unsafe {
+            copy_row_to_outputs_with_stored_natts(
+                &row,
+                values_out,
+                is_null_out,
+                natts,
+                std::ptr::null_mut(),
+                stored_natts_out,
+            )
+        },
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_fetch_row_with_snapshot_stored_natts(
+    relid: u32,
+    row_id: u64,
+    has_snapshot: u8,
+    current_xid: u32,
+    curcid: u32,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+    xmin_out: *mut u32,
+    cmin_out: *mut u32,
+) -> bool {
+    let snapshot = if has_snapshot != 0 {
+        Some(ScanSnapshot {
+            current_xid,
+            curcid,
+        })
+    } else {
+        None
+    };
+    let row = with_storage(|state, session| {
+        state.find_row_with_snapshot(session, relid, row_id, snapshot)
+    });
+
+    match row {
+        Some(row) => unsafe {
+            copy_row_to_outputs_with_stored_natts(
+                &row,
+                values_out,
+                is_null_out,
+                natts,
+                std::ptr::null_mut(),
+                stored_natts_out,
+            ) && copy_row_metadata_to_outputs(&row, xmin_out, cmin_out)
+        },
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
 pub unsafe extern "C" fn fastpg_rust_fetch_row_any(
     relid: u32,
     row_id: u64,
@@ -5897,6 +6780,36 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row_any(
     match row {
         Some(row) => unsafe {
             copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
+        },
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_fetch_row_any_with_stored_natts(
+    relid: u32,
+    row_id: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    let row = with_storage(|state, session| state.find_any_row(session, relid, row_id));
+
+    match row {
+        Some(row) => unsafe {
+            copy_row_to_outputs_with_stored_natts(
+                &row,
+                values_out,
+                is_null_out,
+                natts,
+                std::ptr::null_mut(),
+                stored_natts_out,
+            )
         },
         None => false,
     }
@@ -5939,6 +6852,37 @@ unsafe fn copy_row_to_outputs(
     if !row_id_out.is_null() {
         unsafe {
             *row_id_out = row.row_id;
+        }
+    }
+    true
+}
+
+unsafe fn copy_row_to_outputs_with_stored_natts(
+    row: &Row,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    row_id_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> bool {
+    let copied = unsafe { copy_row_to_outputs(row, values_out, is_null_out, natts, row_id_out) };
+    if copied && !stored_natts_out.is_null() {
+        unsafe {
+            *stored_natts_out = row.cells.len();
+        }
+    }
+    copied
+}
+
+unsafe fn copy_row_metadata_to_outputs(row: &Row, xmin_out: *mut u32, cmin_out: *mut u32) -> bool {
+    if !xmin_out.is_null() {
+        unsafe {
+            *xmin_out = row.xmin;
+        }
+    }
+    if !cmin_out.is_null() {
+        unsafe {
+            *cmin_out = row.cmin;
         }
     }
     true
@@ -6427,6 +7371,107 @@ mod tests {
 
         fastpg_rust_relation_clear(relid);
         assert_eq!(fastpg_rust_relation_row_count(relid), 0);
+    }
+
+    #[test]
+    fn bidirectional_scans_advance_past_the_current_row_on_direction_switch() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut first_row_id = 0;
+        let mut second_row_id = 0;
+        let mut third_row_id = 0;
+        let mut values = [0usize; 1];
+        let mut nulls = [0u8; 1];
+        let mut row_id = 0;
+
+        unsafe {
+            assert!(insert_byval(relid, &[11], &[0], &mut first_row_id));
+            assert!(insert_byval(relid, &[22], &[0], &mut second_row_id));
+            assert!(insert_byval(relid, &[33], &[0], &mut third_row_id));
+        }
+
+        let scan = fastpg_rust_scan_begin(relid);
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                1,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, first_row_id);
+        assert!(!unsafe {
+            fastpg_rust_scan_next(
+                scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            )
+        });
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                1,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, first_row_id);
+        fastpg_rust_scan_end(scan);
+
+        let scan = fastpg_rust_scan_begin(relid);
+        while unsafe {
+            fastpg_rust_scan_next(
+                scan,
+                1,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            )
+        } {}
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, third_row_id);
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, second_row_id);
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                scan,
+                1,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, third_row_id);
+        fastpg_rust_scan_end(scan);
+
+        fastpg_rust_relation_clear(relid);
     }
 
     #[test]

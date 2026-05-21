@@ -64,6 +64,7 @@
 #include "access/xact.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
+#include "nodes/tidbitmap.h"
 #include "nodes/nodeFuncs.h"
 #include "storage/bufmgr.h"
 #include "utils/builtins.h"
@@ -80,6 +81,37 @@ static inline void tts_buffer_heap_store_tuple(TupleTableSlot *slot,
 											   Buffer buffer,
 											   bool transfer_pin);
 static void tts_heap_store_tuple(TupleTableSlot *slot, HeapTuple tuple, bool shouldFree);
+
+#ifdef USE_FASTPG
+extern uint32_t fastpg_rust_relation_row_xmin(uint32_t relid, uint64_t row_id);
+extern uint32_t fastpg_rust_relation_row_xmax(uint32_t relid, uint64_t row_id);
+extern uint32_t fastpg_rust_relation_row_delete_xid(uint32_t relid,
+													uint64_t row_id);
+extern uint32_t fastpg_rust_relation_row_cmin(uint32_t relid, uint64_t row_id);
+extern bool fastpg_rust_relation_contains_row(uint32_t relid, uint64_t row_id);
+extern bool fastpg_mem_tableoid_tid_to_row_id(uint32_t relid, ItemPointer tid,
+											  uint64_t *row_id);
+
+static bool
+fastpg_slot_system_attrs_available(TupleTableSlot *slot)
+{
+	Oid			reltype;
+
+	if (!OidIsValid(slot->tts_tableOid))
+		return false;
+	if (slot->tts_tupleDescriptor == NULL)
+		return true;
+
+	reltype = get_rel_type_id(slot->tts_tableOid);
+	if (get_rel_relispartition(slot->tts_tableOid) &&
+		OidIsValid(reltype) &&
+		OidIsValid(slot->tts_tupleDescriptor->tdtypeid) &&
+		slot->tts_tupleDescriptor->tdtypeid != reltype)
+		return false;
+
+	return true;
+}
+#endif
 
 
 const TupleTableSlotOps TTSOpsVirtual;
@@ -144,17 +176,80 @@ tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 	Assert(!TTS_EMPTY(slot));
 
 #ifdef USE_FASTPG
-	if (OidIsValid(slot->tts_tableOid))
+	if (fastpg_slot_system_attrs_available(slot))
 	{
 		switch (attnum)
 		{
 			case MinTransactionIdAttributeNumber:
+				if (ItemPointerIsValid(&slot->tts_tid))
+				{
+					uint64_t	row_id;
+					uint32_t	xmin;
+
+					if (!fastpg_mem_tableoid_tid_to_row_id((uint32_t) slot->tts_tableOid,
+														   &slot->tts_tid,
+														   &row_id))
+						break;
+					xmin = fastpg_rust_relation_row_xmin((uint32_t) slot->tts_tableOid,
+														 row_id);
+					if (xmin != 0)
+					{
+						*isnull = false;
+						return TransactionIdGetDatum(xmin);
+					}
+				}
+				else
+					break;
 				*isnull = false;
 				return TransactionIdGetDatum(GetCurrentTransactionId());
 			case MaxTransactionIdAttributeNumber:
+				if (ItemPointerIsValid(&slot->tts_tid))
+				{
+					uint64_t	row_id;
+					uint32_t	xmax;
+
+					if (!fastpg_mem_tableoid_tid_to_row_id((uint32_t) slot->tts_tableOid,
+														   &slot->tts_tid,
+														   &row_id))
+						break;
+					xmax = fastpg_rust_relation_row_xmax((uint32_t) slot->tts_tableOid,
+														 row_id);
+					if (xmax != 0)
+					{
+						*isnull = false;
+						return TransactionIdGetDatum(xmax);
+					}
+					xmax = fastpg_rust_relation_row_delete_xid((uint32_t) slot->tts_tableOid,
+															   row_id);
+					if (xmax != 0)
+					{
+						*isnull = false;
+						return TransactionIdGetDatum(xmax);
+					}
+				}
+				else
+					break;
 				*isnull = false;
 				return TransactionIdGetDatum(InvalidTransactionId);
 			case MinCommandIdAttributeNumber:
+				if (ItemPointerIsValid(&slot->tts_tid))
+				{
+					uint64_t	row_id;
+					uint32_t	cmin;
+
+					if (!fastpg_mem_tableoid_tid_to_row_id((uint32_t) slot->tts_tableOid,
+														   &slot->tts_tid,
+														   &row_id))
+						break;
+					cmin = fastpg_rust_relation_row_cmin((uint32_t) slot->tts_tableOid,
+														 row_id);
+					*isnull = false;
+					return CommandIdGetDatum(cmin);
+				}
+				else
+					break;
+				*isnull = false;
+				return CommandIdGetDatum(FirstCommandId);
 			case MaxCommandIdAttributeNumber:
 				*isnull = false;
 				return CommandIdGetDatum(FirstCommandId);
@@ -179,6 +274,11 @@ static bool
 tts_virtual_is_current_xact_tuple(TupleTableSlot *slot)
 {
 	Assert(!TTS_EMPTY(slot));
+
+#ifdef USE_FASTPG
+	if (fastpg_slot_system_attrs_available(slot))
+		return true;
+#endif
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -381,6 +481,69 @@ tts_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 
 	Assert(!TTS_EMPTY(slot));
 
+#ifdef USE_FASTPG
+	if (fastpg_slot_system_attrs_available(slot) &&
+		ItemPointerIsValid(&slot->tts_tid) &&
+		(attnum == MinTransactionIdAttributeNumber ||
+		 attnum == MaxTransactionIdAttributeNumber ||
+		 attnum == MinCommandIdAttributeNumber ||
+		 attnum == MaxCommandIdAttributeNumber))
+	{
+		uint64_t	row_id;
+
+		if (fastpg_mem_tableoid_tid_to_row_id((uint32_t) slot->tts_tableOid,
+											  &slot->tts_tid,
+											  &row_id))
+		{
+			switch (attnum)
+			{
+				case MinTransactionIdAttributeNumber:
+					{
+						uint32_t	xmin;
+
+						xmin = fastpg_rust_relation_row_xmin((uint32_t) slot->tts_tableOid,
+															 row_id);
+						*isnull = false;
+						return TransactionIdGetDatum(xmin != 0 ? xmin : GetCurrentTransactionId());
+					}
+				case MaxTransactionIdAttributeNumber:
+					{
+						uint32_t	xmax;
+
+						xmax = fastpg_rust_relation_row_xmax((uint32_t) slot->tts_tableOid,
+															 row_id);
+						if (xmax != 0)
+						{
+							*isnull = false;
+							return TransactionIdGetDatum(xmax);
+						}
+						xmax = fastpg_rust_relation_row_delete_xid((uint32_t) slot->tts_tableOid,
+																   row_id);
+						if (xmax != 0)
+						{
+							*isnull = false;
+							return TransactionIdGetDatum(xmax);
+						}
+						*isnull = false;
+						return TransactionIdGetDatum(InvalidTransactionId);
+					}
+				case MinCommandIdAttributeNumber:
+					{
+						uint32_t	cmin;
+
+						cmin = fastpg_rust_relation_row_cmin((uint32_t) slot->tts_tableOid,
+															 row_id);
+						*isnull = false;
+						return CommandIdGetDatum(cmin);
+					}
+				case MaxCommandIdAttributeNumber:
+					*isnull = false;
+					return CommandIdGetDatum(FirstCommandId);
+			}
+		}
+	}
+#endif
+
 	/*
 	 * In some code paths it's possible to get here with a non-materialized
 	 * slot, in which case we can't retrieve system columns.
@@ -581,6 +744,69 @@ tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 {
 	Assert(!TTS_EMPTY(slot));
 
+#ifdef USE_FASTPG
+	if (fastpg_slot_system_attrs_available(slot) &&
+		ItemPointerIsValid(&slot->tts_tid) &&
+		(attnum == MinTransactionIdAttributeNumber ||
+		 attnum == MaxTransactionIdAttributeNumber ||
+		 attnum == MinCommandIdAttributeNumber ||
+		 attnum == MaxCommandIdAttributeNumber))
+	{
+		uint64_t	row_id;
+
+		if (fastpg_mem_tableoid_tid_to_row_id((uint32_t) slot->tts_tableOid,
+											  &slot->tts_tid,
+											  &row_id))
+		{
+			switch (attnum)
+			{
+				case MinTransactionIdAttributeNumber:
+					{
+						uint32_t	xmin;
+
+						xmin = fastpg_rust_relation_row_xmin((uint32_t) slot->tts_tableOid,
+															 row_id);
+						*isnull = false;
+						return TransactionIdGetDatum(xmin != 0 ? xmin : GetCurrentTransactionId());
+					}
+				case MaxTransactionIdAttributeNumber:
+					{
+						uint32_t	xmax;
+
+						xmax = fastpg_rust_relation_row_xmax((uint32_t) slot->tts_tableOid,
+															 row_id);
+						if (xmax != 0)
+						{
+							*isnull = false;
+							return TransactionIdGetDatum(xmax);
+						}
+						xmax = fastpg_rust_relation_row_delete_xid((uint32_t) slot->tts_tableOid,
+																   row_id);
+						if (xmax != 0)
+						{
+							*isnull = false;
+							return TransactionIdGetDatum(xmax);
+						}
+						*isnull = false;
+						return TransactionIdGetDatum(InvalidTransactionId);
+					}
+				case MinCommandIdAttributeNumber:
+					{
+						uint32_t	cmin;
+
+						cmin = fastpg_rust_relation_row_cmin((uint32_t) slot->tts_tableOid,
+															 row_id);
+						*isnull = false;
+						return CommandIdGetDatum(cmin);
+					}
+				case MaxCommandIdAttributeNumber:
+					*isnull = false;
+					return CommandIdGetDatum(FirstCommandId);
+			}
+		}
+	}
+#endif
+
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("cannot retrieve a system column in this context")));
@@ -597,6 +823,11 @@ static bool
 tts_minimal_is_current_xact_tuple(TupleTableSlot *slot)
 {
 	Assert(!TTS_EMPTY(slot));
+
+#ifdef USE_FASTPG
+	if (OidIsValid(slot->tts_tableOid))
+		return true;
+#endif
 
 	ereport(ERROR,
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),

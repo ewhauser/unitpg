@@ -18,6 +18,7 @@
 #include <limits.h>
 #include <math.h>
 
+#include "access/fastpg_catalog.h"
 #include "access/genam.h"
 #include "access/parallel.h"
 #include "access/sysattr.h"
@@ -416,7 +417,7 @@ standard_planner(Query *parse, const char *query_string, int cursorOptions,
 	 * trying to create their own parallel workers.
 	 */
 	if ((cursorOptions & CURSOR_OPT_PARALLEL_OK) != 0 &&
-		IsUnderPostmaster &&
+		(IsUnderPostmaster || fastpg_catalog_mode_uses_postgres()) &&
 		parse->commandType == CMD_SELECT &&
 		!parse->hasModifyingCTE &&
 		max_parallel_workers_per_gather > 0 &&

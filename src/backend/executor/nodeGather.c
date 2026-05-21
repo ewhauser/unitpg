@@ -30,6 +30,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "executor/execParallel.h"
 #include "executor/executor.h"
 #include "executor/nodeGather.h"
@@ -44,6 +45,35 @@ static TupleTableSlot *ExecGather(PlanState *pstate);
 static TupleTableSlot *gather_getnext(GatherState *gatherstate);
 static MinimalTuple gather_readnext(GatherState *gatherstate);
 static void ExecShutdownGatherWorkers(GatherState *node);
+static bool fastpg_gather_emulates_parallel_workers(EState *estate,
+													int num_workers);
+static void fastpg_gather_rethrow_parallel_worker_error(void);
+
+static bool
+fastpg_gather_emulates_parallel_workers(EState *estate, int num_workers)
+{
+	return num_workers > 0 &&
+		estate->es_use_parallel_mode &&
+		!IsUnderPostmaster &&
+		fastpg_catalog_mode_uses_postgres();
+}
+
+static void
+fastpg_gather_rethrow_parallel_worker_error(void)
+{
+	ErrorData  *edata = CopyErrorData();
+
+	FlushErrorState();
+	if (debug_parallel_query != DEBUG_PARALLEL_REGRESS)
+	{
+		if (edata->context)
+			edata->context = psprintf("%s\n%s", edata->context,
+									  _("parallel worker"));
+		else
+			edata->context = pstrdup(_("parallel worker"));
+	}
+	ThrowErrorData(edata);
+}
 
 
 /* ----------------------------------------------------------------
@@ -158,7 +188,8 @@ ExecGather(PlanState *pstate)
 		 * Sometimes we might have to run without parallelism; but if parallel
 		 * mode is active then we can try to fire up some workers.
 		 */
-		if (gather->num_workers > 0 && estate->es_use_parallel_mode)
+		if (gather->num_workers > 0 && estate->es_use_parallel_mode &&
+			(IsUnderPostmaster || !fastpg_catalog_mode_uses_postgres()))
 		{
 			ParallelContext *pcxt;
 
@@ -208,6 +239,13 @@ ExecGather(PlanState *pstate)
 				node->reader = NULL;
 			}
 			node->nextreader = 0;
+		}
+		else if (fastpg_gather_emulates_parallel_workers(estate,
+														 gather->num_workers))
+		{
+			node->nworkers_launched = gather->num_workers;
+			estate->es_parallel_workers_to_launch += gather->num_workers;
+			estate->es_parallel_workers_launched += gather->num_workers;
 		}
 
 		/* Run plan locally if no workers or enabled and not single-copy. */
@@ -288,11 +326,27 @@ gather_getnext(GatherState *gatherstate)
 		if (gatherstate->need_to_scan_locally)
 		{
 			EState	   *estate = gatherstate->ps.state;
+			Gather	   *gather = (Gather *) gatherstate->ps.plan;
 
 			/* Install our DSA area while executing the plan. */
 			estate->es_query_dsa =
 				gatherstate->pei ? gatherstate->pei->area : NULL;
-			outerTupleSlot = ExecProcNode(outerPlan);
+			if (fastpg_gather_emulates_parallel_workers(estate,
+														gather->num_workers))
+			{
+				PG_TRY();
+				{
+					outerTupleSlot = ExecProcNode(outerPlan);
+				}
+				PG_CATCH();
+				{
+					estate->es_query_dsa = NULL;
+					fastpg_gather_rethrow_parallel_worker_error();
+				}
+				PG_END_TRY();
+			}
+			else
+				outerTupleSlot = ExecProcNode(outerPlan);
 			estate->es_query_dsa = NULL;
 
 			if (!TupIsNull(outerTupleSlot))

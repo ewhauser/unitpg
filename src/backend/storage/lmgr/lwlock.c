@@ -76,6 +76,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "miscadmin.h"
 #include "pg_trace.h"
 #include "pgstat.h"
@@ -1161,7 +1164,7 @@ LWLockAcquire(LWLock *lock, LWLockMode mode)
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return true;
 #endif
 
@@ -1330,7 +1333,7 @@ LWLockConditionalAcquire(LWLock *lock, LWLockMode mode)
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return true;
 #endif
 
@@ -1399,7 +1402,7 @@ LWLockAcquireOrWait(LWLock *lock, LWLockMode mode)
 	Assert(mode == LW_SHARED || mode == LW_EXCLUSIVE);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return true;
 #endif
 
@@ -1593,7 +1596,7 @@ LWLockWaitForVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 oldval,
 	PRINT_LWDEBUG("LWLockWaitForVar", lock, LW_WAIT_UNTIL_FREE);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		if (newval != NULL)
 			*newval = pg_atomic_read_u64(valptr);
@@ -1796,7 +1799,7 @@ LWLockRelease(LWLock *lock)
 	int			i;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return;
 #endif
 

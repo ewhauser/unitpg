@@ -207,6 +207,16 @@ static Oid	myTempToastNamespace = InvalidOid;
 
 static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
 
+#ifdef USE_FASTPG
+static bool fastpgTempNamespaceExitCallbackRegistered = false;
+
+bool
+FastPgTempNamespaceCreatedInCurrentTransaction(void)
+{
+	return myTempNamespaceSubID != InvalidSubTransactionId;
+}
+#endif
+
 /*
  * This is the user's textual search path specification --- it's the value
  * of the GUC variable 'search_path'.
@@ -238,6 +248,24 @@ static void InvalidationCallback(Datum arg, SysCacheIdentifier cacheid,
 static bool MatchNamedCall(HeapTuple proctup, int nargs, List *argnames,
 						   bool include_out_arguments, int pronargs,
 						   int **argnumbers, int *fgc_flags);
+
+#ifdef USE_FASTPG
+void
+FastPgResetTempNamespaceSessionState(void)
+{
+	if (OidIsValid(myTempNamespace))
+	{
+		RemoveTempRelations(myTempNamespace);
+		myTempNamespace = InvalidOid;
+		myTempToastNamespace = InvalidOid;
+		myTempNamespaceSubID = InvalidSubTransactionId;
+		baseSearchPathValid = false;
+		searchPathCacheValid = false;
+		if (MyProc != NULL)
+			MyProc->tempNamespaceId = InvalidOid;
+	}
+}
+#endif
 
 /*
  * Recomputing the namespace path can be costly when done frequently, such as
@@ -4721,7 +4749,20 @@ AtEOXact_Namespace(bool isCommit, bool parallel)
 	if (myTempNamespaceSubID != InvalidSubTransactionId && !parallel)
 	{
 		if (isCommit)
+		{
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres())
+			{
+				if (!fastpgTempNamespaceExitCallbackRegistered)
+				{
+					before_shmem_exit(RemoveTempRelationsCallback, 0);
+					fastpgTempNamespaceExitCallbackRegistered = true;
+				}
+			}
+			else
+#endif
 			before_shmem_exit(RemoveTempRelationsCallback, 0);
+		}
 		else
 		{
 			myTempNamespace = InvalidOid;

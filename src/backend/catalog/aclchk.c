@@ -3939,9 +3939,12 @@ object_aclcheck_ext(Oid classid, Oid objectid,
 					bool *is_missing)
 {
 #ifdef USE_FASTPG
-	if (is_missing != NULL)
-		*is_missing = false;
-	return ACLCHECK_OK;
+	if (fastpg_use_rust_catalog())
+	{
+		if (is_missing != NULL)
+			*is_missing = false;
+		return ACLCHECK_OK;
+	}
 #endif
 
 	if (object_aclmask_ext(classid, objectid, roleid, mode, ACLMASK_ANY,
@@ -3977,6 +3980,15 @@ AclResult
 pg_attribute_aclcheck_ext(Oid table_oid, AttrNumber attnum,
 						  Oid roleid, AclMode mode, bool *is_missing)
 {
+#ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
+	{
+		if (is_missing != NULL)
+			*is_missing = false;
+		return ACLCHECK_OK;
+	}
+#endif
+
 	if (pg_attribute_aclmask_ext(table_oid, attnum, roleid, mode,
 								 ACLMASK_ANY, is_missing) != 0)
 		return ACLCHECK_OK;
@@ -4019,6 +4031,14 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 							  AclMode mode, AclMaskHow how,
 							  bool *is_missing)
 {
+#ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
+	{
+		if (is_missing != NULL)
+			*is_missing = false;
+		return ACLCHECK_OK;
+	}
+#endif
 	AclResult	result;
 	HeapTuple	classTuple;
 	Form_pg_class classForm;

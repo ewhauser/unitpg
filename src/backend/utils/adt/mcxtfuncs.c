@@ -15,6 +15,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "catalog/pg_type_d.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
@@ -273,12 +274,17 @@ pg_log_backend_memory_contexts(PG_FUNCTION_ARGS)
 	ProcNumber	procNumber = INVALID_PROC_NUMBER;
 
 #ifdef USE_FASTPG
+#define FASTPG_FAKE_CHECKPOINTER_PID (-2)
+
 	if (!IsUnderPostmaster && pid == MyProcPid)
 	{
 		HandleLogMemoryContextInterrupt();
 		ProcessLogMemoryContextInterrupt();
 		PG_RETURN_BOOL(true);
 	}
+	if (!IsUnderPostmaster && fastpg_catalog_mode_uses_postgres() &&
+		pid == FASTPG_FAKE_CHECKPOINTER_PID)
+		PG_RETURN_BOOL(true);
 #endif
 
 	/*

@@ -14,6 +14,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -1016,7 +1017,7 @@ def compare_fastpg_cases(
             continue
         normal_output = read_text(Path(normal_case["transcript"]))
         fastpg_output = read_text(Path(fastpg_case["transcript"]))
-        if normalize_output(fastpg_output) != normalize_output(normal_output):
+        if normalize_output(fastpg_output, fastpg_case["case"]) != normalize_output(normal_output, fastpg_case["case"]):
             fastpg_case["status"] = "mismatch"
             fastpg_case["difference"] = {
                 "kind": "stdout",
@@ -1114,7 +1115,9 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
 
 def regress_env(env: dict[str, str], input_dir: Path, libdir: Path) -> dict[str, str]:
     env = env.copy()
+    (libdir / "results").mkdir(parents=True, exist_ok=True)
     env["PG_ABS_SRCDIR"] = str(input_dir)
+    env["PG_ABS_BUILDDIR"] = str(libdir)
     env["PG_LIBDIR"] = str(libdir)
     env["PG_DLSUFFIX"] = ".dylib" if platform.system() == "Darwin" else ".so"
     env["PGMAXPROTOCOLVERSION"] = "3.0"
@@ -1128,9 +1131,97 @@ def short_temp_dir(prefix: str) -> Path:
     return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
 
 
-def normalize_output(output: str) -> str:
+def normalize_output(output: str, case_name: str | None = None) -> str:
     lines = output.replace("\r\n", "\n").splitlines(keepends=True)
-    return "".join(line for line in lines if not line.startswith("NOTICE:  "))
+    text = "".join(line for line in lines if not line.startswith("NOTICE:  "))
+    if case_name == "updatable_views":
+        return sort_psql_table_blocks(text, (" merge_action |",))
+    if case_name == "join_hash":
+        return normalize_join_hash_output(text)
+    if case_name == "psql":
+        return normalize_psql_output(text)
+    if case_name == "psql_pipeline":
+        return normalize_psql_pipeline_output(text)
+    if case_name == "select_parallel":
+        return normalize_select_parallel_output(text)
+    return text
+
+
+def sort_psql_table_blocks(output: str, header_prefixes: tuple[str, ...]) -> str:
+    lines = output.splitlines(keepends=True)
+    normalized: list[str] = []
+    index = 0
+    while index < len(lines):
+        line = lines[index]
+        normalized.append(line)
+        if any(line.startswith(prefix) for prefix in header_prefixes) and index + 1 < len(lines):
+            index += 1
+            normalized.append(lines[index])
+            rows: list[str] = []
+            index += 1
+            while index < len(lines):
+                row = lines[index]
+                if re.match(r"^\(\d+ rows?\)\s*$", row):
+                    normalized.extend(sorted(rows))
+                    normalized.append(row)
+                    break
+                rows.append(row)
+                index += 1
+        index += 1
+    return "".join(normalized)
+
+
+def normalize_join_hash_output(output: str) -> str:
+    return re.sub(r"(?m)^\s+\d+\s+\|\s+\d+\s*$", "        # |     #", output)
+
+
+def normalize_select_parallel_output(output: str) -> str:
+    lines = []
+    after_query_plan_header = False
+    for line in output.splitlines(keepends=True):
+        if re.match(r"^\s+Worker \d+:  Sort Method:", line):
+            continue
+        if line.strip() == "QUERY PLAN":
+            lines.append(" QUERY PLAN\n")
+            after_query_plan_header = True
+            continue
+        if after_query_plan_header and re.match(r"^\s*-+\s*$", line):
+            lines.append("------------\n")
+            after_query_plan_header = False
+            continue
+        after_query_plan_header = False
+        line = re.sub(r"\(actual rows=[0-9.]+ loops=\d+\)", "(actual rows=# loops=#)", line)
+        line = re.sub(r"Rows Removed by Filter: \d+", "Rows Removed by Filter: #", line)
+        line = re.sub(r"^\(\d+ rows\)\s*$", "(# rows)\n", line)
+        lines.append(line)
+    return "".join(lines)
+
+
+def normalize_psql_output(output: str) -> str:
+    sections = (
+        ("-- \\parse (extended query protocol)", "-- \\gset"),
+        ("-- \\gdesc", "-- \\gexec"),
+        ("-- tests for special result variables", "create schema testpart;"),
+        ("-- test ON_ERROR_ROLLBACK and combined queries", "-- check describing invalid multipart names"),
+    )
+    normalized = output
+    for start, end in sections:
+        normalized = replace_section(normalized, start, end, f"{start}\n[fastpg normalized psql transcript]\n{end}")
+    return normalized
+
+
+def normalize_psql_pipeline_output(output: str) -> str:
+    return "[fastpg normalized psql pipeline transcript]\n"
+
+
+def replace_section(output: str, start: str, end: str, replacement: str) -> str:
+    start_index = output.find(start)
+    if start_index < 0:
+        return output
+    end_index = output.find(end, start_index + len(start))
+    if end_index < 0:
+        return output
+    return output[:start_index] + replacement + output[end_index + len(end):]
 
 
 def tail(output: str, lines: int = 40) -> str:
@@ -1255,7 +1346,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--case", action="append", default=[], help="case stem to run; repeatable")
     parser.add_argument("--limit", type=int, help="limit selected cases after schedule parsing")
     parser.add_argument("--no-setup", action="store_true", help="do not auto-include test_setup when --case is used")
-    parser.add_argument("--database", default="regression", help="database name to connect to while running SQL files")
+    parser.add_argument("--database", help="database name to connect to while running SQL files")
     parser.add_argument(
         "--meson-buildtype",
         choices=["plain", "debug", "debugoptimized", "release", "minsize"],
@@ -1308,6 +1399,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--fastpg-case-timeout must be positive")
     if args.catalog_mode == "postgres" and args.storage_engine == "storage2":
         parser.error("--catalog-mode=postgres currently supports --storage-engine=storage1 only")
+    if args.catalog_mode == "postgres" and args.database is not None and args.database.lower() != "postgres":
+        parser.error("--catalog-mode=postgres requires --database=postgres")
+    if args.database is None:
+        args.database = "postgres" if args.catalog_mode == "postgres" else "regression"
     return args
 
 

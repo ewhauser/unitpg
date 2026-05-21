@@ -14,6 +14,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "access/htup_details.h"
 #include "executor/executor.h"
 #include "executor/execParallel.h"
@@ -60,6 +61,35 @@ static void gather_merge_clear_tuples(GatherMergeState *gm_state);
 static bool gather_merge_readnext(GatherMergeState *gm_state, int reader,
 								  bool nowait);
 static void load_tuple_array(GatherMergeState *gm_state, int reader);
+static bool fastpg_gather_merge_emulates_parallel_workers(EState *estate,
+														  int num_workers);
+static void fastpg_gather_merge_rethrow_parallel_worker_error(void);
+
+static bool
+fastpg_gather_merge_emulates_parallel_workers(EState *estate, int num_workers)
+{
+	return num_workers > 0 &&
+		estate->es_use_parallel_mode &&
+		!IsUnderPostmaster &&
+		fastpg_catalog_mode_uses_postgres();
+}
+
+static void
+fastpg_gather_merge_rethrow_parallel_worker_error(void)
+{
+	ErrorData  *edata = CopyErrorData();
+
+	FlushErrorState();
+	if (debug_parallel_query != DEBUG_PARALLEL_REGRESS)
+	{
+		if (edata->context)
+			edata->context = psprintf("%s\n%s", edata->context,
+									  _("parallel worker"));
+		else
+			edata->context = pstrdup(_("parallel worker"));
+	}
+	ThrowErrorData(edata);
+}
 
 /* ----------------------------------------------------------------
  *		ExecInitGather
@@ -202,7 +232,8 @@ ExecGatherMerge(PlanState *pstate)
 		 * Sometimes we might have to run without parallelism; but if parallel
 		 * mode is active then we can try to fire up some workers.
 		 */
-		if (gm->num_workers > 0 && estate->es_use_parallel_mode)
+		if (gm->num_workers > 0 && estate->es_use_parallel_mode &&
+			(IsUnderPostmaster || !fastpg_catalog_mode_uses_postgres()))
 		{
 			ParallelContext *pcxt;
 
@@ -248,6 +279,13 @@ ExecGatherMerge(PlanState *pstate)
 				node->nreaders = 0;
 				node->reader = NULL;
 			}
+		}
+		else if (fastpg_gather_merge_emulates_parallel_workers(estate,
+															   gm->num_workers))
+		{
+			node->nworkers_launched = gm->num_workers;
+			estate->es_parallel_workers_to_launch += gm->num_workers;
+			estate->es_parallel_workers_launched += gm->num_workers;
 		}
 
 		/* allow leader to participate if enabled or no choice */
@@ -652,7 +690,22 @@ gather_merge_readnext(GatherMergeState *gm_state, int reader, bool nowait)
 
 			/* Install our DSA area while executing the plan. */
 			estate->es_query_dsa = gm_state->pei ? gm_state->pei->area : NULL;
-			outerTupleSlot = ExecProcNode(outerPlan);
+			if (fastpg_gather_merge_emulates_parallel_workers(estate,
+															  ((GatherMerge *) gm_state->ps.plan)->num_workers))
+			{
+				PG_TRY();
+				{
+					outerTupleSlot = ExecProcNode(outerPlan);
+				}
+				PG_CATCH();
+				{
+					estate->es_query_dsa = NULL;
+					fastpg_gather_merge_rethrow_parallel_worker_error();
+				}
+				PG_END_TRY();
+			}
+			else
+				outerTupleSlot = ExecProcNode(outerPlan);
 			estate->es_query_dsa = NULL;
 
 			if (!TupIsNull(outerTupleSlot))

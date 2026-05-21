@@ -2893,6 +2893,16 @@ PrepareTransaction(void)
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
 
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		if (FastPgTempNamespaceCreatedInCurrentTransaction())
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
+	}
+#endif
+
 	/*
 	 * Likewise, don't allow PREPARE after pg_export_snapshot.  This could be
 	 * supported if we added cleanup logic to twophase.c, but for now it

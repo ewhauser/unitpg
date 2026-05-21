@@ -17,6 +17,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -95,7 +98,7 @@ pgstat_init_relation(Relation rel)
 	char		relkind = rel->rd_rel->relkind;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		rel->pgstat_enabled = false;
 		rel->pgstat_info = NULL;
@@ -142,7 +145,7 @@ void
 pgstat_assoc_relation(Relation rel)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return;
 #endif
 
@@ -184,7 +187,7 @@ void
 pgstat_create_relation(Relation rel)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return;
 #endif
 
@@ -203,7 +206,7 @@ pgstat_drop_relation(Relation rel)
 	PgStat_TableStatus *pgstat_info;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return;
 #endif
 
