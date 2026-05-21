@@ -1,6 +1,7 @@
 use fastpg_types::Oid;
 
 pub const BOOL_OID: Oid = Oid(16);
+pub const BYTEA_OID: Oid = Oid(17);
 pub const CHAR_OID: Oid = Oid(18);
 pub const NAME_OID: Oid = Oid(19);
 pub const INT8_OID: Oid = Oid(20);

@@ -96,6 +96,12 @@ extern bool fastpg_rust_relation_update_unchecked(uint32_t relid,
 extern bool fastpg_rust_relation_delete(uint32_t relid, uint64_t row_id);
 extern bool fastpg_rust_relation_contains_row(uint32_t relid,
 											  uint64_t row_id);
+extern bool fastpg_rust_relation_modified_cid(uint32_t relid,
+											  uint64_t row_id,
+											  uint32_t *cid_out);
+extern void fastpg_rust_relation_record_modified_cid(uint32_t relid,
+													 uint64_t row_id,
+													 uint32_t cid);
 extern uint64_t fastpg_rust_scan_begin(uint32_t relid);
 extern uint64_t fastpg_rust_scan_begin_filtered(uint32_t relid,
 												const int16_t *attnums,
@@ -673,6 +679,38 @@ fastpg_mem_fill_deleted_tmfd(ItemPointer tid, TM_FailureData *tmfd)
 	tmfd->xmax = InvalidTransactionId;
 	tmfd->cmax = InvalidCommandId;
 	tmfd->traversed = false;
+}
+
+static void
+fastpg_mem_fill_self_modified_tmfd(ItemPointer tid, CommandId cid,
+								   TM_FailureData *tmfd)
+{
+	if (tmfd == NULL)
+		return;
+
+	tmfd->ctid = *tid;
+	tmfd->xmax = GetCurrentTransactionIdIfAny();
+	tmfd->cmax = cid;
+	tmfd->traversed = false;
+}
+
+static bool
+fastpg_mem_row_self_modified(uint32_t relid, uint64_t row_id,
+							 CommandId *cid_out)
+{
+	uint32_t	cid;
+
+	if (!fastpg_rust_relation_modified_cid(relid, row_id, &cid))
+		return false;
+	if (cid_out != NULL)
+		*cid_out = (CommandId) cid;
+	return true;
+}
+
+static void
+fastpg_mem_record_row_modified(uint32_t relid, uint64_t row_id, CommandId cid)
+{
+	fastpg_rust_relation_record_modified_cid(relid, row_id, (uint32_t) cid);
 }
 
 static const TupleTableSlotOps *
@@ -1633,7 +1671,9 @@ fastpg_mem_tuple_delete(Relation rel,
 										TM_FailureData *tmfd)
 {
 	uint64_t	row_id;
+	CommandId	prior_cid;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
 
 	if (storage2)
 	{
@@ -1651,14 +1691,20 @@ fastpg_mem_tuple_delete(Relation rel,
 	}
 
 	fastpg_mem_ensure_write_xact();
+	if (fastpg_mem_row_self_modified(relid, row_id, &prior_cid))
+	{
+		fastpg_mem_fill_self_modified_tmfd(tid, prior_cid, tmfd);
+		return TM_SelfModified;
+	}
 	if (!(storage2 ?
-		  fastpg_storage2_relation_delete(RelationGetRelid(rel), row_id) :
-		  fastpg_rust_relation_delete(RelationGetRelid(rel), row_id)))
+		  fastpg_storage2_relation_delete(relid, row_id) :
+		  fastpg_rust_relation_delete(relid, row_id)))
 	{
 		fastpg_mem_fill_deleted_tmfd(tid, tmfd);
 		return TM_Deleted;
 	}
 
+	fastpg_mem_record_row_modified(relid, row_id, cid);
 	return TM_Ok;
 }
 
@@ -1681,7 +1727,10 @@ fastpg_mem_tuple_update(Relation rel,
 	uint8_t    *byval;
 	size_t	   *value_lens;
 	uint64_t	row_id;
+	uint64_t	original_row_id;
+	CommandId	prior_cid;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
 
 	if (update_indexes != NULL)
 		*update_indexes = storage2 ? TU_All : TU_None;
@@ -1702,12 +1751,18 @@ fastpg_mem_tuple_update(Relation rel,
 		fastpg_mem_fill_deleted_tmfd(otid, tmfd);
 		return TM_Deleted;
 	}
+	original_row_id = row_id;
 
 	fastpg_mem_ensure_write_xact();
+	if (fastpg_mem_row_self_modified(relid, original_row_id, &prior_cid))
+	{
+		fastpg_mem_fill_self_modified_tmfd(otid, prior_cid, tmfd);
+		return TM_SelfModified;
+	}
 	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
 								   &value_lens);
 	if (!(storage2 ?
-		  fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
+		  fastpg_storage2_relation_update_unchecked(relid,
 													row_id,
 													values,
 													isnull,
@@ -1715,7 +1770,7 @@ fastpg_mem_tuple_update(Relation rel,
 													value_lens,
 													tupdesc->natts,
 													&row_id) :
-		  fastpg_rust_relation_update_unchecked(RelationGetRelid(rel),
+		  fastpg_rust_relation_update_unchecked(relid,
 												row_id,
 												values,
 												isnull,
@@ -1748,6 +1803,7 @@ fastpg_mem_tuple_update(Relation rel,
 	pfree(byval);
 	pfree(value_lens);
 
+	fastpg_mem_record_row_modified(relid, original_row_id, cid);
 	return TM_Ok;
 }
 
@@ -1762,11 +1818,39 @@ fastpg_mem_tuple_lock(Relation rel,
 					  uint8 flags,
 					  TM_FailureData *tmfd)
 {
+	uint64_t	row_id;
+	CommandId	prior_cid;
+	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+
+	if (storage2)
+	{
+		row_id = fastpg_mem_tid_to_storage2_tid(tid);
+		if (row_id == 0)
+		{
+			fastpg_mem_fill_deleted_tmfd(tid, tmfd);
+			return TM_Deleted;
+		}
+	}
+	else if (!fastpg_mem_tid_to_row_id(tid, &row_id))
+	{
+		fastpg_mem_fill_deleted_tmfd(tid, tmfd);
+		return TM_Deleted;
+	}
+
+	if (fastpg_mem_row_self_modified(relid, row_id, &prior_cid))
+	{
+		fastpg_mem_fill_self_modified_tmfd(tid, prior_cid, tmfd);
+		return TM_SelfModified;
+	}
+
 	if (!fastpg_mem_tuple_fetch_row_version(rel, tid, snapshot, slot))
 	{
 		fastpg_mem_fill_deleted_tmfd(tid, tmfd);
 		return TM_Deleted;
 	}
+	if (tmfd != NULL)
+		tmfd->traversed = false;
 	return TM_Ok;
 }
 

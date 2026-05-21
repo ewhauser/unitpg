@@ -9,16 +9,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
-    ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BOOL_OID, BPCHAR_OID, CHAR_ARRAY_OID, CHAR_OID,
-    CID_OID, CatalogError, CatalogFilterValue, CatalogRow, CatalogRowFilter, CatalogValue,
-    ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID, INT4_ARRAY_OID, INT4_OID,
-    INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID, PG_CATALOG_NAMESPACE_OID,
-    PG_NODE_TREE_OID, PhysicalColumnRecord, REGCLASS_OID, TEXT_ARRAY_OID, TEXT_OID, TID_OID,
-    TIMESTAMP_OID, VARCHAR_OID, XID_OID, btree_opclass_for_type as catalog_btree_opclass_for_type,
-    builtin_aggregate_by_proc_oid, builtin_cast_by_source_target, builtin_namespace_by_name,
-    builtin_namespace_by_oid, builtin_operator_by_oid, builtin_operator_by_signature,
-    builtin_operators_by_name, catalog_row_count, catalog_row_value, catalog_rows,
-    catalog_rows_matching_filters, current_generation, delete_catalog_row, enum_oids_by_sort_order,
+    ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BOOL_OID, BPCHAR_OID, BYTEA_OID, CHAR_ARRAY_OID,
+    CHAR_OID, CID_OID, CatalogError, CatalogFilterValue, CatalogRow, CatalogRowFilter,
+    CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
+    INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
+    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, REGCLASS_OID, TEXT_ARRAY_OID,
+    TEXT_OID, TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
+    btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
+    builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
+    builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
+    catalog_row_count, catalog_row_value, catalog_rows, catalog_rows_matching_filters,
+    current_generation, delete_catalog_row, enum_oids_by_sort_order,
     has_uncommitted_catalog_changes, index_record_by_index_oid, index_records_for_relation_oid,
     lookup_type, primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
@@ -882,6 +883,7 @@ struct TransactionOverlay {
     region_kind: StorageRegionKind,
     relations: HashMap<u32, RowSegment>,
     deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+    modified_row_cids: HashMap<u32, HashMap<u64, u32>>,
     pending_primary_key_rebuilds: BTreeSet<u32>,
 }
 
@@ -891,6 +893,7 @@ impl TransactionOverlay {
             region_kind,
             relations: HashMap::new(),
             deleted_row_ids: HashMap::new(),
+            modified_row_cids: HashMap::new(),
             pending_primary_key_rebuilds: BTreeSet::new(),
         }
     }
@@ -1599,6 +1602,7 @@ impl StorageState {
         for overlay in &mut session.transaction_stack {
             swap_hashmap_entries(&mut overlay.relations, left, right);
             swap_hashmap_entries(&mut overlay.deleted_row_ids, left, right);
+            swap_hashmap_entries(&mut overlay.modified_row_cids, left, right);
             swap_btreeset_members(&mut overlay.pending_primary_key_rebuilds, left, right);
         }
     }
@@ -1625,6 +1629,7 @@ impl StorageState {
             region_kind: _,
             relations,
             deleted_row_ids,
+            modified_row_cids: _,
             pending_primary_key_rebuilds,
         } = overlay;
         let mut unchanged_primary_key_updates: HashMap<u32, BTreeSet<u64>> = HashMap::new();
@@ -1764,6 +1769,7 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
         region_kind: _,
         relations,
         deleted_row_ids,
+        modified_row_cids,
         pending_primary_key_rebuilds,
     } = overlay;
 
@@ -1787,6 +1793,14 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
         }
         let parent_segment = parent.row_segment_mut(relid);
         parent_segment.append_from(&mut segment);
+    }
+
+    for (relid, row_cids) in modified_row_cids {
+        parent
+            .modified_row_cids
+            .entry(relid)
+            .or_default()
+            .extend(row_cids);
     }
 
     parent
@@ -4654,6 +4668,55 @@ pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked(
     }
 }
 
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_modified_cid(
+    relid: u32,
+    row_id: u64,
+    cid_out: *mut u32,
+) -> bool {
+    if row_id == 0 {
+        return false;
+    }
+
+    with_storage(|_state, session| {
+        for overlay in session.transaction_stack.iter().rev() {
+            if let Some(cid) = overlay
+                .modified_row_cids
+                .get(&relid)
+                .and_then(|row_cids| row_cids.get(&row_id))
+            {
+                if !cid_out.is_null() {
+                    unsafe {
+                        *cid_out = *cid;
+                    }
+                }
+                return true;
+            }
+        }
+        false
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_record_modified_cid(relid: u32, row_id: u64, cid: u32) {
+    if row_id == 0 {
+        return;
+    }
+
+    with_storage(|_state, session| {
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        overlay
+            .modified_row_cids
+            .entry(relid)
+            .or_default()
+            .insert(row_id, cid);
+    });
+}
+
 unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: UniqueCheck) -> bool {
     if row_id == 0 {
         return false;
@@ -5200,6 +5263,70 @@ fn text_datum(value: &str, region: &mut StorageRegion) -> Cell {
     byref_datum(&postgres_text_payload(value.as_bytes()), region)
 }
 
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn parse_bytea_output(value: &str) -> Option<Vec<u8>> {
+    if let Some(hex) = value.strip_prefix("\\x") {
+        let bytes = hex.as_bytes();
+        if bytes.len() % 2 != 0 {
+            return None;
+        }
+        return bytes
+            .chunks_exact(2)
+            .map(|pair| Some((hex_value(pair[0])? << 4) | hex_value(pair[1])?))
+            .collect();
+    }
+
+    let bytes = value.as_bytes();
+    let mut parsed = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] != b'\\' {
+            parsed.push(bytes[index]);
+            index += 1;
+            continue;
+        }
+
+        if index + 1 < bytes.len() && bytes[index + 1] == b'\\' {
+            parsed.push(b'\\');
+            index += 2;
+            continue;
+        }
+
+        if index + 3 < bytes.len()
+            && bytes[index + 1].is_ascii_digit()
+            && bytes[index + 2].is_ascii_digit()
+            && bytes[index + 3].is_ascii_digit()
+        {
+            let mut value = 0u8;
+            for digit in &bytes[index + 1..index + 4] {
+                if !(b'0'..=b'7').contains(digit) {
+                    return None;
+                }
+                value = (value << 3) | (digit - b'0');
+            }
+            parsed.push(value);
+            index += 4;
+            continue;
+        }
+
+        return None;
+    }
+
+    Some(parsed)
+}
+
+fn bytea_datum(value: &str, region: &mut StorageRegion) -> Option<Cell> {
+    parse_bytea_output(value).map(|payload| byref_datum(&postgres_text_payload(&payload), region))
+}
+
 fn catalog_value_to_cell(
     column: &fastpg_catalog::StaticCatalogColumn,
     value: &CatalogValue,
@@ -5222,6 +5349,7 @@ fn catalog_value_to_cell(
         CatalogValue::Int2Vector(values) => int2vector_datum(values, region),
         CatalogValue::Raw(value) => match column.type_oid {
             NAME_OID => name_datum(value, region),
+            BYTEA_OID => bytea_datum(value, region).unwrap_or_else(null_datum),
             TEXT_OID | PG_NODE_TREE_OID => text_datum(value, region),
             _ if column.type_name.starts_with("reg") => {
                 fastpg_catalog::resolve_generated_catalog_oid_name(value)
@@ -5725,6 +5853,48 @@ mod tests {
         let oid_vector = oidvector_datum(&[23, 26], &mut region);
         let oid_vector_bytes = oid_vector.byref_bytes().expect("oidvector bytes");
         assert_eq!(i32_from_bytes(oid_vector_bytes, 20), 0);
+    }
+
+    #[test]
+    fn catalog_raw_bytea_values_render_as_postgres_varlena() {
+        let mut region = StorageRegion::new(StorageRegionKind::Scan);
+
+        let hex =
+            bytea_datum("\\x6265666f72655f696e735f73746d7400", &mut region).expect("hex bytea");
+        let hex_bytes = hex.byref_bytes().expect("hex bytea bytes");
+        assert_eq!(&hex_bytes[4..], b"before_ins_stmt\0",);
+
+        let escaped = bytea_datum(r"before\\after\000", &mut region).expect("escaped bytea");
+        let escaped_bytes = escaped.byref_bytes().expect("escaped bytea bytes");
+        assert_eq!(&escaped_bytes[4..], b"before\\after\0");
+    }
+
+    #[test]
+    fn modified_command_ids_follow_transaction_overlays() {
+        let _guard = test_guard();
+        let mut cid = 0;
+
+        fastpg_rust_xact_begin();
+        fastpg_rust_relation_record_modified_cid(60_100, 7, 11);
+        assert!(fastpg_rust_relation_modified_cid(60_100, 7, &mut cid));
+        assert_eq!(cid, 11);
+
+        fastpg_rust_subxact_begin();
+        fastpg_rust_relation_record_modified_cid(60_100, 8, 12);
+        assert!(fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+        assert_eq!(cid, 12);
+        fastpg_rust_subxact_abort();
+        assert!(!fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+
+        fastpg_rust_subxact_begin();
+        fastpg_rust_relation_record_modified_cid(60_100, 8, 13);
+        fastpg_rust_subxact_commit();
+        assert!(fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+        assert_eq!(cid, 13);
+
+        fastpg_rust_xact_abort();
+        assert!(!fastpg_rust_relation_modified_cid(60_100, 7, &mut cid));
+        assert!(!fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
     }
 
     #[test]
