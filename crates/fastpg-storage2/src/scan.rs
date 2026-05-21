@@ -40,9 +40,14 @@ impl ScanCursor {
                 block: tid.block,
                 offset: tid.offset - 1,
             }
+        } else if tid.block == 0 {
+            Self {
+                block: 0,
+                offset: 0,
+            }
         } else {
             Self {
-                block: tid.block.saturating_sub(1),
+                block: tid.block - 1,
                 offset: u16::MAX,
             }
         }

@@ -334,6 +334,10 @@ impl StorageState {
             return None;
         }
 
+        if cursor.block == 0 && cursor.offset == 0 {
+            return None;
+        }
+
         let mut block = if cursor.block == u32::MAX {
             high_water_offsets.len().checked_sub(1)?.try_into().ok()?
         } else {
@@ -403,6 +407,10 @@ impl StorageState {
                 }
                 block = block.checked_add(1)?;
             }
+            return None;
+        }
+
+        if cursor.block == 0 && cursor.offset == 0 {
             return None;
         }
 

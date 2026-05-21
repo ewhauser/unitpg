@@ -931,6 +931,7 @@ struct ScanState {
     region: StorageRegion,
     shared_scan: Option<Arc<CachedCatalogScan>>,
     next_index: usize,
+    backward_started: bool,
 }
 
 impl ScanState {
@@ -949,6 +950,7 @@ impl ScanState {
             region,
             shared_scan: None,
             next_index: 0,
+            backward_started: false,
         })
     }
 
@@ -1030,6 +1032,7 @@ fn scan_state_from_cached_catalog_scan(cache: Arc<CachedCatalogScan>) -> ScanSta
         region: StorageRegion::new(StorageRegionKind::Scan),
         shared_scan: Some(cache),
         next_index: 0,
+        backward_started: false,
     }
 }
 
@@ -5228,6 +5231,7 @@ fn catalog_scan_state_from_rows(
         region,
         shared_scan: None,
         next_index: 0,
+        backward_started: false,
     })
 }
 
@@ -5428,6 +5432,7 @@ pub extern "C" fn fastpg_rust_scan_reset(scan_handle: u64) {
     with_storage(|_state, session| {
         if let Some(scan) = session.scans.get_mut(&scan_handle) {
             scan.next_index = 0;
+            scan.backward_started = false;
         }
     });
 }
@@ -5467,8 +5472,9 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
             scan.next_index += 1;
             row_index
         } else {
-            if scan.next_index == 0 {
+            if !scan.backward_started && scan.next_index == 0 {
                 scan.next_index = row_count;
+                scan.backward_started = true;
             }
             if scan.next_index == 0 {
                 return false;
@@ -5999,6 +6005,37 @@ mod tests {
         assert_eq!(row_id, second_row_id);
         assert_eq!(values, second_values);
         assert_eq!(nulls, second_nulls);
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                backward_scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, first_row_id);
+        assert_eq!(values, first_values);
+        assert_eq!(nulls, first_nulls);
+        unsafe {
+            assert!(!fastpg_rust_scan_next(
+                backward_scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+            assert!(!fastpg_rust_scan_next(
+                backward_scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
         fastpg_rust_scan_end(backward_scan);
 
         fastpg_rust_relation_clear(relid);

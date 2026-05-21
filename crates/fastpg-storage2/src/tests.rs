@@ -252,6 +252,52 @@ fn scan_tracks_tids_not_materialized_rows() {
         )
     });
     fastpg_storage2_scan_end(scan);
+
+    let backward_scan = fastpg_storage2_scan_begin(relid);
+    assert_ne!(backward_scan, 0);
+    assert!(unsafe {
+        fastpg_storage2_scan_next(
+            backward_scan,
+            0,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            1,
+            &mut tid,
+        )
+    });
+    assert_eq!(values[0], 11);
+    assert!(unsafe {
+        fastpg_storage2_scan_next(
+            backward_scan,
+            0,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            1,
+            &mut tid,
+        )
+    });
+    assert_eq!(values[0], 10);
+    assert!(!unsafe {
+        fastpg_storage2_scan_next(
+            backward_scan,
+            0,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            1,
+            &mut tid,
+        )
+    });
+    assert!(!unsafe {
+        fastpg_storage2_scan_next(
+            backward_scan,
+            0,
+            values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            1,
+            &mut tid,
+        )
+    });
+    fastpg_storage2_scan_end(backward_scan);
 }
 
 #[test]
