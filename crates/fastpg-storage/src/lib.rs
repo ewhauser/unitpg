@@ -19,9 +19,10 @@ use fastpg_catalog::{
     builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
     builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
     catalog_row_by_row_id, catalog_row_count, catalog_row_value, catalog_rows,
-    catalog_rows_matching_filters, current_generation, delete_catalog_row, enum_oids_by_sort_order,
-    has_uncommitted_catalog_changes, index_record_by_index_oid, index_records_for_relation_oid,
-    lookup_type, primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
+    catalog_rows_matching_filters, current_generation, default_opclass_for_type,
+    delete_catalog_row, enum_oids_by_sort_order, has_uncommitted_catalog_changes,
+    index_record_by_index_oid, index_records_for_relation_oid, lookup_type,
+    primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
     relation_column_count, relation_oid_by_name_in_namespace, relation_oid_exists,
     relation_oid_for_index_oid, relation_physical_column_by_attnum, relation_planner_stats_by_oid,
@@ -36,6 +37,7 @@ const NAMEDATALEN: usize = 64;
 const FASTPG_PROC_MAX_ARGS: usize = 8;
 const FASTPG_PROC_SOURCE_LEN: usize = 64;
 const FASTPG_MAX_INDEX_KEYS: usize = 32;
+const BTREE_INDEX_AM_OID: Oid = Oid(403);
 const ROW_ARENA_DEFAULT_CHUNK_SIZE: usize = 4096;
 
 static NEXT_STORAGE_REGION_ID: AtomicU64 = AtomicU64::new(1);
@@ -2791,6 +2793,9 @@ fn index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueI
     if !record.is_valid || !record.is_ready || !record.is_live {
         return None;
     }
+    if !index_relation_uses_btree_am(record.index_oid) {
+        return None;
+    }
     let mut columns = Vec::with_capacity(record.key_attnums.len());
     for attnum in &record.key_attnums {
         if *attnum <= 0 {
@@ -2798,6 +2803,7 @@ fn index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueI
         }
         let column_index = usize::try_from(*attnum - 1).ok()?;
         let column = relation_column_by_attnum(record.relation_oid, *attnum)?;
+        catalog_btree_opclass_for_type(column.type_oid)?;
         let pg_type = lookup_type(column.type_oid)?;
         columns.push(IndexColumnSpec {
             column_index,
@@ -2817,6 +2823,29 @@ fn index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueI
         nulls_not_distinct: record.nulls_not_distinct,
         columns,
     })
+}
+
+fn index_relation_uses_btree_am(index_oid: Oid) -> bool {
+    let Some(table) = static_catalog_by_name("pg_class") else {
+        return false;
+    };
+    let Some(oid_attnum) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "oid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+    else {
+        return false;
+    };
+    let filters = [CatalogRowFilter {
+        attnum: oid_attnum,
+        value: CatalogFilterValue::Oid(index_oid),
+    }];
+    catalog_rows_matching_filters(table.oid, &filters)
+        .into_iter()
+        .next()
+        .and_then(|row| catalog_row_value(table, &row, "relam").and_then(catalog_value_oid))
+        == Some(BTREE_INDEX_AM_OID)
 }
 
 fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
@@ -4121,6 +4150,27 @@ pub unsafe extern "C" fn fastpg_rust_catalog_btree_opclass_for_type(
         return false;
     }
     let Some(opclass_oid) = catalog_btree_opclass_for_type(Oid(type_oid)) else {
+        return false;
+    };
+    unsafe {
+        *oid_out = opclass_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer for `oid_out`.
+pub unsafe extern "C" fn fastpg_rust_catalog_default_opclass_for_type(
+    method_oid: u32,
+    type_oid: u32,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let Some(opclass_oid) = default_opclass_for_type(Oid(method_oid), Oid(type_oid)) else {
         return false;
     };
     unsafe {
@@ -6406,6 +6456,189 @@ mod tests {
         assert_eq!(info.is_unique, 0);
         assert_eq!(info.is_primary, 0);
         assert_eq!(info.attnums[0], 2);
+    }
+
+    #[test]
+    fn non_btree_simple_index_has_no_fastpg_index_info() {
+        let _guard = test_guard();
+        let (_, _) = install_primary_key_test_catalog();
+        let index_oid = Oid(50_105);
+
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", "50105"),
+                ("relname", "pk_storage_value_gist"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "783"),
+                ("relfilenode", "50105"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50105"),
+                ("attname", "value"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", "50105"),
+                ("indrelid", "50100"),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "f"),
+                ("indisprimary", "f"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "2"),
+            ],
+        );
+        fastpg_rust_xact_commit_if_implicit();
+        clear_primary_key_index_info_cache();
+
+        let mut info: FastPgRustPrimaryKeyIndexInfo = unsafe { std::mem::zeroed() };
+        unsafe {
+            assert!(!fastpg_rust_catalog_primary_key_index_info(
+                index_oid.0,
+                &mut info,
+            ));
+        }
+    }
+
+    #[test]
+    fn unsupported_btree_key_type_has_no_fastpg_index_info() {
+        let _guard = test_guard();
+        let (_, _) = install_primary_key_test_catalog();
+        let index_oid = Oid(50_106);
+
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50100"),
+                ("attname", "point_value"),
+                ("atttypid", "600"),
+                ("attlen", "16"),
+                ("attnum", "3"),
+                ("atttypmod", "-1"),
+                ("attbyval", "f"),
+                ("attalign", "d"),
+                ("attstorage", "p"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", "50106"),
+                ("relname", "pk_storage_point_idx"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "403"),
+                ("relfilenode", "50106"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50106"),
+                ("attname", "point_value"),
+                ("atttypid", "600"),
+                ("attlen", "16"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "f"),
+                ("attalign", "d"),
+                ("attstorage", "p"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", "50106"),
+                ("indrelid", "50100"),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "f"),
+                ("indisprimary", "f"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "3"),
+            ],
+        );
+        fastpg_rust_xact_commit_if_implicit();
+        clear_primary_key_index_info_cache();
+
+        let mut info: FastPgRustPrimaryKeyIndexInfo = unsafe { std::mem::zeroed() };
+        unsafe {
+            assert!(!fastpg_rust_catalog_primary_key_index_info(
+                index_oid.0,
+                &mut info,
+            ));
+        }
+    }
+
+    #[test]
+    fn default_opclass_lookup_rejects_unsupported_btree_type() {
+        let _guard = test_guard();
+        let mut opclass_oid = 0;
+
+        unsafe {
+            assert!(fastpg_rust_catalog_default_opclass_for_type(
+                BTREE_INDEX_AM_OID.0,
+                INT4_OID.0,
+                &mut opclass_oid,
+            ));
+            assert_ne!(opclass_oid, 0);
+            assert_eq!(
+                lookup_type(Oid(600)).map(|record| record.typtype),
+                Some(b'b')
+            );
+            let direct_point_opclass = default_opclass_for_type(BTREE_INDEX_AM_OID, Oid(600));
+            assert!(
+                direct_point_opclass.is_none(),
+                "unexpected direct point opclass {direct_point_opclass:?}"
+            );
+            let has_point_opclass = fastpg_rust_catalog_default_opclass_for_type(
+                BTREE_INDEX_AM_OID.0,
+                600,
+                &mut opclass_oid,
+            );
+            assert!(
+                !has_point_opclass,
+                "unexpected point opclass oid {opclass_oid}"
+            );
+        }
     }
 
     fn relation_oid_by_name_via_ffi(name: &str, namespace_oid: u32) -> Option<u32> {

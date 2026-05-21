@@ -107,24 +107,75 @@ pub fn builtin_namespace_by_name(name: &str) -> Option<&'static PgNamespaceRecor
         .find(|record| record.name == name.as_str())
 }
 
-pub fn btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
-    static_btree_opclass_for_type(type_oid).or_else(|| {
-        let record = lookup_type(type_oid)?;
-        (record.typtype == b'e').then(|| static_btree_opclass_for_type(ANYENUM_OID))?
-    })
-}
-
-fn static_btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
+pub fn default_opclass_for_type(method_oid: Oid, type_oid: Oid) -> Option<Oid> {
+    let target_type = lookup_type(type_oid)?;
     let table = static_catalog_by_name("pg_opclass")?;
-    table.rows.iter().find_map(|static_row| {
+    let mut exact = Vec::new();
+    let mut compatible = Vec::new();
+    let mut compatible_preferred = Vec::new();
+
+    for static_row in table.rows {
         let row = static_row_to_catalog_row(table, static_row);
         let opcmethod = catalog_row_value(table, &row, "opcmethod").and_then(catalog_value_oid)?;
         let opcintype = catalog_row_value(table, &row, "opcintype").and_then(catalog_value_oid)?;
         let opcdefault =
             catalog_row_value(table, &row, "opcdefault").and_then(catalog_value_bool)?;
         let oid = catalog_row_value(table, &row, "oid").and_then(catalog_value_oid)?;
-        (opcmethod == BTREE_INDEX_AM_OID && opcintype == type_oid && opcdefault).then_some(oid)
-    })
+        if opcmethod != method_oid || !opcdefault {
+            continue;
+        }
+        if opcintype == type_oid {
+            exact.push(oid);
+        } else if exact.is_empty() && is_binary_coercible_to_opclass_input(type_oid, opcintype) {
+            if is_preferred_type(target_type.typcategory, opcintype) {
+                compatible_preferred.push(oid);
+            } else if compatible_preferred.is_empty() {
+                compatible.push(oid);
+            }
+        }
+    }
+
+    if exact.len() == 1 {
+        exact.into_iter().next()
+    } else if compatible_preferred.len() == 1 {
+        compatible_preferred.into_iter().next()
+    } else if compatible_preferred.is_empty() && compatible.len() == 1 {
+        compatible.into_iter().next()
+    } else {
+        None
+    }
+}
+
+pub fn btree_opclass_for_type(type_oid: Oid) -> Option<Oid> {
+    default_opclass_for_type(BTREE_INDEX_AM_OID, type_oid)
+}
+
+fn is_binary_coercible_to_opclass_input(source_type: Oid, target_type: Oid) -> bool {
+    if source_type == target_type {
+        return true;
+    }
+    let Some(source_record) = lookup_type(source_type) else {
+        return false;
+    };
+    if target_type == ANYARRAY_OID
+        && source_record.typelem != INVALID_OID
+        && source_record.typsubscript == ARRAY_SUBSCRIPT_HANDLER_OID
+    {
+        return true;
+    }
+    if target_type == ANYENUM_OID && source_record.typtype == b'e' {
+        return true;
+    }
+    if target_type == RECORD_OID && source_record.typtype == b'c' {
+        return true;
+    }
+    builtin_cast_by_source_target(source_type, target_type)
+        .is_some_and(|cast| cast.method == b'b' && cast.context == b'i')
+}
+
+fn is_preferred_type(category: u8, type_oid: Oid) -> bool {
+    lookup_type(type_oid)
+        .is_some_and(|record| record.typcategory == category && record.typispreferred)
 }
 
 fn primary_key_index_oid_cache() -> &'static Mutex<PrimaryKeyIndexOidCache> {

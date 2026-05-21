@@ -3407,7 +3407,7 @@ get_element_type(Oid typid)
 	FastPgRustCatalogType fastpg_type;
 
 	if (fastpg_lookup_type(typid, &fastpg_type))
-		return fastpg_type.typsubscript != InvalidOid ?
+		return fastpg_type.typsubscript == F_ARRAY_SUBSCRIPT_HANDLER ?
 			fastpg_type.typelem : InvalidOid;
 #endif
 
@@ -3505,7 +3505,7 @@ get_base_element_type(Oid typid)
 		if (fastpg_lookup_type(typid, &fastpg_type))
 		{
 			if ((char) fastpg_type.typtype != TYPTYPE_DOMAIN)
-				return fastpg_type.typsubscript != InvalidOid ?
+				return fastpg_type.typsubscript == F_ARRAY_SUBSCRIPT_HANDLER ?
 					fastpg_type.typelem : InvalidOid;
 
 			typid = fastpg_type.typbasetype;

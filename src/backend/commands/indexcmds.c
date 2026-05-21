@@ -2374,25 +2374,13 @@ ResolveOpClass(const List *opclass, Oid attrType,
 static Oid
 FastPgGetDefaultOpClass(Oid type_id, Oid am_id)
 {
-	if (am_id != BTREE_AM_OID)
-		return InvalidOid;
+	uint32_t	opclass_oid;
 
-	switch (type_id)
-	{
-		case INT2OID:
-			return INT2_BTREE_OPS_OID;
-		case INT4OID:
-			return INT4_BTREE_OPS_OID;
-		case INT8OID:
-			return INT8_BTREE_OPS_OID;
-		case OIDOID:
-			return OID_BTREE_OPS_OID;
-		case TEXTOID:
-		case VARCHAROID:
-			return TEXT_BTREE_OPS_OID;
-		default:
-			return InvalidOid;
-	}
+	if (fastpg_rust_catalog_default_opclass_for_type((uint32_t) am_id,
+													 (uint32_t) type_id,
+													 &opclass_oid))
+		return (Oid) opclass_oid;
+	return InvalidOid;
 }
 #endif
 
@@ -2414,8 +2402,7 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 
 #ifdef USE_FASTPG
 	result = FastPgGetDefaultOpClass(type_id, am_id);
-	if (OidIsValid(result))
-		return result;
+	return result;
 #endif
 
 	tcategory = TypeCategory(type_id);

@@ -141,6 +141,12 @@ fn generated_static_catalog_has_core_rows() {
             .any(|row| { value_name(row_value("pg_am", row, "amname")) == Some("hash") })
     );
     assert!(btree_opclass_for_type(INT4_OID).is_some());
+    assert!(default_opclass_for_type(Oid(403), INT4_OID).is_some());
+    assert!(default_opclass_for_type(Oid(405), INT4_OID).is_some());
+    assert!(default_opclass_for_type(Oid(403), VARCHAR_OID).is_some());
+    assert!(default_opclass_for_type(Oid(405), VARCHAR_OID).is_some());
+    assert!(default_opclass_for_type(Oid(403), INT4_ARRAY_OID).is_some());
+    assert!(default_opclass_for_type(Oid(403), Oid(600)).is_none());
     assert!(builtin_cast_by_source_target(INT4_OID, OID_OID).is_some());
 }
 

@@ -33,8 +33,10 @@ pub const REGCLASS_OID: Oid = Oid(2205);
 pub const ANY_OID: Oid = Oid(2276);
 pub const ANYARRAY_OID: Oid = Oid(2277);
 pub const INTERNAL_OID: Oid = Oid(2281);
+pub const RECORD_OID: Oid = Oid(2249);
 pub const LSN_OID: Oid = Oid(3220);
 pub const ANYENUM_OID: Oid = Oid(3500);
+pub const ARRAY_SUBSCRIPT_HANDLER_OID: Oid = Oid(6179);
 
 pub const DEFAULT_COLLATION_OID: Oid = Oid(100);
 pub const C_COLLATION_OID: Oid = Oid(950);

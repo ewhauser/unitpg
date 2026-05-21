@@ -296,6 +296,9 @@ extern bool fastpg_rust_catalog_opclass_by_name(uint32_t method_oid,
 												FastPgRustCatalogOpclass *out);
 extern bool fastpg_rust_catalog_btree_opclass_for_type(uint32_t type_oid,
 													   uint32_t *oid_out);
+extern bool fastpg_rust_catalog_default_opclass_for_type(uint32_t method_oid,
+														 uint32_t type_oid,
+														 uint32_t *oid_out);
 extern bool fastpg_rust_catalog_relation_column_count(const char *name,
 													  size_t *count_out,
 													  char *sqlstate_out,

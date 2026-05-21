@@ -1682,6 +1682,65 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_created_table_uses_public_namespace() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_namespace_{}", std::process::id());
+        let partitioned = format!("fastpg_pgcore_namespace_part_{}", std::process::id());
+        session
+            .prepare(&format!("create table {table}(id int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create table {partitioned}(id int not null) partition by range (id)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let result = session
+            .execute_with_params(
+                &format!(
+                    "select c.relname, n.nspname from pg_class c join pg_namespace n on n.oid = c.relnamespace where c.relname in ('{table}', '{partitioned}') order by c.relname"
+                ),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![
+                vec![
+                    PgCoreValue::Text(table.clone()),
+                    PgCoreValue::Text("public".to_owned()),
+                ],
+                vec![
+                    PgCoreValue::Text(partitioned.clone()),
+                    PgCoreValue::Text("public".to_owned()),
+                ],
+            ]
+        );
+
+        let qualified_lookup = session
+            .execute_with_params(
+                &format!("select to_regclass('pg_catalog.{table}')::text"),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            qualified_lookup.statements[0].rows,
+            vec![vec![PgCoreValue::Null]]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}, {partitioned}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_insert_and_count_user_relation() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_count_{}", std::process::id());
