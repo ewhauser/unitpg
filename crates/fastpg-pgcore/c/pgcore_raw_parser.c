@@ -1500,6 +1500,7 @@ fastpg_pgcore_prepare(const char *query)
 {
 	FastPgPgCorePrepared *result;
 	MemoryContext oldcontext;
+	bool		snapshot_pushed = false;
 
 	result = (FastPgPgCorePrepared *) calloc(1, sizeof(FastPgPgCorePrepared));
 	if (result == NULL)
@@ -1543,6 +1544,8 @@ fastpg_pgcore_prepare(const char *query)
 #endif
 			if (strchr(result->source_text, '$') == NULL)
 			{
+				PushActiveSnapshot(GetTransactionSnapshot());
+				snapshot_pushed = true;
 				result->query = parse_analyze_fixedparams(rawstmt,
 														 result->source_text,
 														 NULL,
@@ -1551,6 +1554,8 @@ fastpg_pgcore_prepare(const char *query)
 			}
 			else
 			{
+				PushActiveSnapshot(GetTransactionSnapshot());
+				snapshot_pushed = true;
 				result->query = parse_analyze_varparams(rawstmt,
 														result->source_text,
 														&result->parameter_type_oids,
@@ -1563,6 +1568,9 @@ fastpg_pgcore_prepare(const char *query)
 														 result->source_text,
 														 cursor_options,
 														 NULL);
+			if (snapshot_pushed && ActiveSnapshotSet())
+				PopActiveSnapshot();
+			snapshot_pushed = false;
 			result->ok = true;
 			MemoryContextSwitchTo(oldcontext);
 		}
@@ -1571,6 +1579,8 @@ fastpg_pgcore_prepare(const char *query)
 	{
 		ErrorData  *edata;
 
+		if (snapshot_pushed && ActiveSnapshotSet())
+			PopActiveSnapshot();
 		MemoryContextSwitchTo(oldcontext);
 		edata = CopyErrorData();
 		FlushErrorState();

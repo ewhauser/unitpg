@@ -826,6 +826,34 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn executes_system_function_sql_bodies() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        assert_eq!(
+            executor.execute("select round(4.2::numeric)", &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("round", PgType::Varchar, 1700)],
+                vec![vec![Value::Text("4".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute("select trunc('-7.777'::numeric)", &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("trunc", PgType::Varchar, 1700)],
+                vec![vec![Value::Text("-7".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute("select log(100::numeric)::int4", &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::new("log", PgType::Int4)],
+                vec![vec![Value::Int4(2)]]
+            ))
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn copy_from_stdin_uses_pgcore_and_rust_storage() {
         let executor = QueryExecutor::new("17.0-fastpg");
         let table = format!("fastpg_exec_copy_{}", std::process::id());

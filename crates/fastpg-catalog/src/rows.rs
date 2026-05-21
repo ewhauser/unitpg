@@ -309,6 +309,8 @@ fn normalize_pg_proc_bootstrap_defaults(table: &StaticCatalogTable, values: &mut
     if table.oid != PG_PROC_RELATION_OID {
         return;
     }
+    normalize_pg_proc_system_function_body(table, values);
+
     let Some(pronargs_index) = table
         .columns
         .iter()
@@ -372,6 +374,35 @@ fn normalize_pg_proc_bootstrap_defaults(table: &StaticCatalogTable, values: &mut
         return;
     };
     values[proargdefaults_index] = CatalogValue::Text(format!("({})", nodes.join(" ")));
+}
+
+fn normalize_pg_proc_system_function_body(table: &StaticCatalogTable, values: &mut [CatalogValue]) {
+    let Some(oid_index) = table.columns.iter().position(|column| column.name == "oid") else {
+        return;
+    };
+    let Some(prosrc_index) = table
+        .columns
+        .iter()
+        .position(|column| column.name == "prosrc")
+    else {
+        return;
+    };
+    if !matches!(
+        values.get(prosrc_index),
+        Some(CatalogValue::Text(value)) if value == "see system_functions.sql"
+    ) {
+        return;
+    }
+    let Some(CatalogValue::Oid(oid)) = values.get(oid_index) else {
+        return;
+    };
+    let body = match oid.0 {
+        1708 => "select round($1, 0)",
+        1710 => "select trunc($1, 0)",
+        1741 | 1481 => "select log(10, $1)",
+        _ => return,
+    };
+    values[prosrc_index] = CatalogValue::Text(body.to_owned());
 }
 
 fn static_row_to_catalog_row_uncached(
