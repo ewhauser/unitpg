@@ -166,6 +166,12 @@ fn is_binary_coercible_to_opclass_input(source_type: Oid, target_type: Oid) -> b
     if target_type == ANYENUM_OID && source_record.typtype == b'e' {
         return true;
     }
+    if target_type == ANYRANGE_OID && source_record.typtype == b'r' {
+        return true;
+    }
+    if target_type == ANYMULTIRANGE_OID && source_record.typtype == b'm' {
+        return true;
+    }
     if target_type == RECORD_OID && source_record.typtype == b'c' {
         return true;
     }

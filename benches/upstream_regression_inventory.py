@@ -323,7 +323,11 @@ class UpstreamRegressionInventory:
                 host=host,
                 port=port,
                 socket_path=socket_path,
-                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
+                server_env={
+                    "FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"])),
+                    "FASTPG_PGBINDIR": str(paths["client_bindir"]),
+                    "FASTPG_TIMEZONE": self.normal_postgres_timezone(),
+                },
             )
             run_record["commands"]["start"] = server["result"].as_json()
             prelude = self.install_regression_prelude("fastpg", paths["client_bindir"], host, port, env, run_dir)
@@ -398,6 +402,18 @@ class UpstreamRegressionInventory:
             "create-database",
             env=env,
         )
+
+    def normal_postgres_timezone(self) -> str:
+        config = self.result_root / "normal" / "run" / "data" / "postgresql.conf"
+        try:
+            lines = config.read_text().splitlines()
+        except FileNotFoundError:
+            return os.environ.get("FASTPG_TIMEZONE") or os.environ.get("PGTZ") or "GMT"
+        for line in lines:
+            stripped = line.strip()
+            if stripped.startswith("timezone ="):
+                return stripped.split("=", 1)[1].strip().strip("'\"")
+        return os.environ.get("FASTPG_TIMEZONE") or os.environ.get("PGTZ") or "GMT"
 
     def install_regression_prelude(
         self,

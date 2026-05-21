@@ -146,6 +146,11 @@ fn generated_static_catalog_has_core_rows() {
     assert!(default_opclass_for_type(Oid(403), VARCHAR_OID).is_some());
     assert!(default_opclass_for_type(Oid(405), VARCHAR_OID).is_some());
     assert!(default_opclass_for_type(Oid(403), INT4_ARRAY_OID).is_some());
+    assert!(default_opclass_for_type(Oid(403), Oid(3906)).is_some());
+    assert!(default_opclass_for_type(Oid(405), Oid(3906)).is_some());
+    assert!(default_opclass_for_type(Oid(783), Oid(3904)).is_some());
+    assert!(default_opclass_for_type(Oid(4000), Oid(3904)).is_some());
+    assert!(default_opclass_for_type(Oid(783), Oid(4451)).is_some());
     assert!(default_opclass_for_type(Oid(403), Oid(600)).is_none());
     assert!(builtin_cast_by_source_target(INT4_OID, OID_OID).is_some());
 }
@@ -197,6 +202,44 @@ fn text_search_catalog_exposes_initdb_english_config() {
         Some(DEFAULT_TS_PARSER_OID)
     );
 
+    let template_table = static_catalog_by_name("pg_ts_template").expect("pg_ts_template");
+    let snowball_template_row = catalog_rows(PG_TS_TEMPLATE_RELATION_OID)
+        .into_iter()
+        .find(|row| {
+            catalog_row_value(template_table, row, "oid").and_then(catalog_value_oid)
+                == Some(SNOWBALL_TS_TEMPLATE_OID)
+        })
+        .expect("snowball text search template");
+    assert_eq!(
+        catalog_row_value(template_table, &snowball_template_row, "tmplinit")
+            .and_then(catalog_value_oid),
+        Some(DSNOWBALL_INIT_PROC_OID)
+    );
+    assert_eq!(
+        catalog_row_value(template_table, &snowball_template_row, "tmpllexize")
+            .and_then(catalog_value_oid),
+        Some(DSNOWBALL_LEXIZE_PROC_OID)
+    );
+
+    let proc_table = static_catalog_by_name("pg_proc").expect("pg_proc");
+    let proc_rows = catalog_rows(PG_PROC_RELATION_OID);
+    assert!(proc_rows.iter().any(|row| {
+        catalog_row_value(proc_table, row, "oid").and_then(catalog_value_oid)
+            == Some(DSNOWBALL_INIT_PROC_OID)
+            && catalog_row_value(proc_table, row, "probin").and_then(catalog_value_string)
+                == Some("$libdir/dict_snowball".to_owned())
+    }));
+    assert!(proc_rows.iter().any(|row| {
+        let arg_types = catalog_row_value(proc_table, row, "proargtypes");
+        catalog_row_value(proc_table, row, "oid").and_then(catalog_value_oid)
+            == Some(DSNOWBALL_LEXIZE_PROC_OID)
+            && matches!(
+                arg_types,
+                Some(CatalogValue::OidVector(values))
+                    if values == &vec![INTERNAL_OID, INTERNAL_OID, INTERNAL_OID, INTERNAL_OID]
+            )
+    }));
+
     let map_table = static_catalog_by_name("pg_ts_config_map").expect("pg_ts_config_map");
     let english_map_rows = catalog_rows(PG_TS_CONFIG_MAP_RELATION_OID)
         .into_iter()
@@ -207,6 +250,14 @@ fn text_search_catalog_exposes_initdb_english_config() {
         .collect::<Vec<_>>();
 
     assert_eq!(english_map_rows.len(), 19);
+    let token_types = english_map_rows
+        .iter()
+        .map(|row| catalog_row_value(map_table, row, "maptokentype").and_then(catalog_value_i32))
+        .collect::<Option<Vec<_>>>()
+        .expect("map token types");
+    let mut sorted_token_types = token_types.clone();
+    sorted_token_types.sort();
+    assert_eq!(token_types, sorted_token_types);
     assert!(english_map_rows.iter().any(|row| {
         catalog_row_value(map_table, row, "maptokentype").and_then(catalog_value_i32) == Some(1)
             && catalog_row_value(map_table, row, "mapdict").and_then(catalog_value_oid)
@@ -524,6 +575,12 @@ fn virtual_catalog_index_metadata_is_visible() {
             PG_NAMESPACE_RELATION_OID,
             vec![1],
         ),
+        (
+            PG_TS_CONFIG_MAP_INDEX_OID,
+            "pg_ts_config_map_index",
+            PG_TS_CONFIG_MAP_RELATION_OID,
+            vec![1, 2, 3],
+        ),
     ] {
         assert_catalog_index_metadata(
             pg_class,
@@ -815,7 +872,7 @@ fn operator_implementation_proc_descriptions_are_synthesized() {
 }
 
 #[test]
-fn visible_catalog_snapshot_is_cached_until_overlay_changes() {
+fn visible_catalog_snapshot_cache_updates_after_overlay_changes() {
     let _guard = catalog_test_lock();
     clear_for_tests();
     abort_implicit_transaction();
@@ -868,7 +925,7 @@ fn visible_catalog_snapshot_is_cached_until_overlay_changes() {
     assert!(relation_oid_exists(relation_oid));
     assert_eq!(
         crate::state::visible_catalog_snapshot_materializations_for_tests(),
-        2
+        1
     );
 
     abort_implicit_transaction();

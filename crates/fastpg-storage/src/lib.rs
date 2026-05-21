@@ -788,6 +788,16 @@ impl RowSegment {
         self.rows.push(row);
     }
 
+    fn push_copied_row(&mut self, row: &Row) -> Option<()> {
+        let copied = self.region.copy_row(row)?;
+        self.rows.push(copied);
+        Some(())
+    }
+
+    fn contains_row_id(&self, row_id: u64) -> bool {
+        self.rows.iter().any(|row| row.row_id == row_id)
+    }
+
     fn remove_row_id(&mut self, row_id: u64) {
         self.remove_row_ids(&BTreeSet::from([row_id]));
     }
@@ -891,6 +901,7 @@ struct TransactionOverlay {
     region_kind: StorageRegionKind,
     relations: HashMap<u32, RowSegment>,
     deleted_row_ids: HashMap<u32, BTreeSet<u64>>,
+    deleted_rows: HashMap<u32, RowSegment>,
     modified_row_cids: HashMap<u32, HashMap<u64, u32>>,
     pending_primary_key_rebuilds: BTreeSet<u32>,
 }
@@ -901,6 +912,7 @@ impl TransactionOverlay {
             region_kind,
             relations: HashMap::new(),
             deleted_row_ids: HashMap::new(),
+            deleted_rows: HashMap::new(),
             modified_row_cids: HashMap::new(),
             pending_primary_key_rebuilds: BTreeSet::new(),
         }
@@ -921,12 +933,31 @@ impl TransactionOverlay {
             .or_insert_with(|| RowSegment::new(region_kind))
     }
 
+    fn deleted_row_segment_mut(&mut self, relid: u32) -> &mut RowSegment {
+        let region_kind = self.region_kind;
+        self.deleted_rows
+            .entry(relid)
+            .or_insert_with(|| RowSegment::new(region_kind))
+    }
+
+    fn record_deleted_row(&mut self, relid: u32, row: &Row) -> Option<()> {
+        let segment = self.deleted_row_segment_mut(relid);
+        if segment.contains_row_id(row.row_id) {
+            return Some(());
+        }
+        segment.push_copied_row(row)
+    }
+
     fn mark_primary_key_rebuild(&mut self, relid: u32) {
         self.pending_primary_key_rebuilds.insert(relid);
     }
 
     fn bytes(&self) -> usize {
-        self.relations.values().map(RowSegment::bytes).sum()
+        self.relations
+            .values()
+            .chain(self.deleted_rows.values())
+            .map(RowSegment::bytes)
+            .sum()
     }
 }
 
@@ -1009,6 +1040,23 @@ impl Default for CatalogScanCache {
     }
 }
 
+impl CatalogScanCache {
+    fn clear(&mut self) {
+        self.generation = current_generation();
+        self.entries.clear();
+        self.filtered_entries.clear();
+    }
+
+    fn refresh_generation(&mut self) {
+        let generation = current_generation();
+        if self.generation != generation {
+            self.generation = generation;
+            self.entries.clear();
+            self.filtered_entries.clear();
+        }
+    }
+}
+
 static CATALOG_SCAN_CACHE: OnceLock<Mutex<CatalogScanCache>> = OnceLock::new();
 
 fn catalog_scan_cache() -> &'static Mutex<CatalogScanCache> {
@@ -1016,25 +1064,27 @@ fn catalog_scan_cache() -> &'static Mutex<CatalogScanCache> {
 }
 
 fn with_catalog_scan_cache<R>(f: impl FnOnce(&mut CatalogScanCache) -> R) -> R {
-    let generation = current_generation();
     let mut cache = catalog_scan_cache()
         .lock()
         .expect("catalog scan cache mutex poisoned");
-    if cache.generation != generation {
-        cache.generation = generation;
-        cache.entries.clear();
-        cache.filtered_entries.clear();
-    }
+    cache.refresh_generation();
     f(&mut cache)
 }
 
 fn clear_catalog_scan_cache() {
     if let Some(cache) = CATALOG_SCAN_CACHE.get() {
         let mut cache = cache.lock().expect("catalog scan cache mutex poisoned");
-        cache.generation = current_generation();
-        cache.entries.clear();
-        cache.filtered_entries.clear();
+        cache.clear();
     }
+}
+
+fn clear_current_session_catalog_scan_cache() {
+    let session = current_session_storage();
+    let mut session = match session.lock() {
+        Ok(session) => session,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    session.clear_catalog_scan_cache();
 }
 
 fn scan_state_from_cached_catalog_scan(cache: Arc<CachedCatalogScan>) -> ScanState {
@@ -1074,6 +1124,7 @@ pub struct SessionStorage {
     catalog_fetches: Vec<ScanState>,
     next_scan_handle: u64,
     catalog_session: fastpg_catalog::CatalogSessionHandle,
+    catalog_scan_cache: CatalogScanCache,
 }
 
 impl Default for SessionStorage {
@@ -1085,6 +1136,7 @@ impl Default for SessionStorage {
             catalog_fetches: Vec::new(),
             next_scan_handle: 1,
             catalog_session: fastpg_catalog::new_catalog_session(),
+            catalog_scan_cache: CatalogScanCache::default(),
         }
     }
 }
@@ -1197,6 +1249,10 @@ impl SessionStorage {
             .chain(self.catalog_fetches.iter().map(ScanState::bytes))
             .sum()
     }
+
+    fn clear_catalog_scan_cache(&mut self) {
+        self.catalog_scan_cache.clear();
+    }
 }
 
 impl StorageState {
@@ -1288,6 +1344,7 @@ impl StorageState {
             pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
         session.catalog_fetches.clear();
+        session.clear_catalog_scan_cache();
         fastpg_catalog::commit_explicit_transaction();
         session.explicit_transaction = false;
         self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
@@ -1296,6 +1353,7 @@ impl StorageState {
     fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
         session.transaction_stack.clear();
         session.catalog_fetches.clear();
+        session.clear_catalog_scan_cache();
         fastpg_catalog::abort_explicit_transaction();
         session.explicit_transaction = false;
     }
@@ -1309,6 +1367,7 @@ impl StorageState {
             pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
         session.catalog_fetches.clear();
+        session.clear_catalog_scan_cache();
         fastpg_catalog::commit_implicit_transaction();
         self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
     }
@@ -1317,6 +1376,7 @@ impl StorageState {
         if !session.explicit_transaction {
             session.transaction_stack.clear();
             session.catalog_fetches.clear();
+            session.clear_catalog_scan_cache();
             fastpg_catalog::abort_implicit_transaction();
         }
     }
@@ -1495,36 +1555,14 @@ impl StorageState {
             {
                 return Some(row.clone());
             }
+            if let Some(segment) = overlay.deleted_rows.get(&relid)
+                && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
+            {
+                return Some(row.clone());
+            }
         }
 
         self.find_committed_row(relid, row_id)
-    }
-
-    fn visible_row_exists(&self, session: &SessionStorage, relid: u32, row_id: u64) -> bool {
-        if row_id == 0 {
-            return false;
-        }
-
-        for overlay in self.visible_overlay_stack(session).iter().rev() {
-            if overlay
-                .relations
-                .get(&relid)
-                .is_some_and(|segment| segment.rows.iter().any(|row| row.row_id == row_id))
-            {
-                return true;
-            }
-            if overlay
-                .deleted_row_ids
-                .get(&relid)
-                .is_some_and(|deleted| deleted.contains(&row_id))
-            {
-                return false;
-            }
-        }
-
-        self.relations
-            .get(&relid)
-            .is_some_and(|relation| relation.committed_row_index.contains_key(&row_id))
     }
 
     fn find_committed_row(&self, relid: u32, row_id: u64) -> Option<Row> {
@@ -1659,6 +1697,7 @@ impl StorageState {
         for overlay in &mut session.transaction_stack {
             swap_hashmap_entries(&mut overlay.relations, left, right);
             swap_hashmap_entries(&mut overlay.deleted_row_ids, left, right);
+            swap_hashmap_entries(&mut overlay.deleted_rows, left, right);
             swap_hashmap_entries(&mut overlay.modified_row_cids, left, right);
             swap_btreeset_members(&mut overlay.pending_primary_key_rebuilds, left, right);
         }
@@ -1686,6 +1725,7 @@ impl StorageState {
             region_kind: _,
             relations,
             deleted_row_ids,
+            deleted_rows: _,
             modified_row_cids: _,
             pending_primary_key_rebuilds,
         } = overlay;
@@ -1826,6 +1866,7 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
         region_kind: _,
         relations,
         deleted_row_ids,
+        deleted_rows,
         modified_row_cids,
         pending_primary_key_rebuilds,
     } = overlay;
@@ -1842,6 +1883,14 @@ fn merge_overlay_into_overlay(parent: &mut TransactionOverlay, overlay: Transact
             .entry(relid)
             .or_default()
             .extend(deleted_row_ids);
+    }
+
+    for (relid, mut segment) in deleted_rows {
+        if segment.rows.is_empty() {
+            continue;
+        }
+        let parent_segment = parent.deleted_row_segment_mut(relid);
+        parent_segment.append_from(&mut segment);
     }
 
     for (relid, mut segment) in relations {
@@ -4243,6 +4292,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
             .map_err(invalid_ffi_argument)?;
         let pending_primary_key_rebuild = pg_index_heap_relation_from_upsert(relation_oid, &values);
         let row_id = upsert_catalog_row(Oid(relation_oid), row_id, values)?;
+        clear_current_session_catalog_scan_cache();
         if catalog_mutation_invalidates_primary_key_cache(relation_oid) {
             clear_primary_key_index_info_cache();
         }
@@ -4264,6 +4314,9 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
 pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64) -> bool {
     let pending_primary_key_rebuild = pg_index_heap_relation_from_delete(relation_oid, row_id);
     let ok = delete_catalog_row(Oid(relation_oid), row_id).is_ok();
+    if ok {
+        clear_current_session_catalog_scan_cache();
+    }
     if ok && catalog_mutation_invalidates_primary_key_cache(relation_oid) {
         clear_primary_key_index_info_cache();
     }
@@ -4348,6 +4401,7 @@ pub extern "C" fn fastpg_rust_subxact_commit() {
     with_storage(|state, session| {
         if session.transaction_stack.len() > 1 {
             state.commit_top_overlay(session);
+            session.clear_catalog_scan_cache();
             fastpg_catalog::commit_subtransaction();
         }
     });
@@ -4358,6 +4412,7 @@ pub extern "C" fn fastpg_rust_subxact_abort() {
     with_storage(|_state, session| {
         if session.transaction_stack.len() > 1 {
             session.transaction_stack.pop();
+            session.clear_catalog_scan_cache();
             fastpg_catalog::abort_subtransaction();
         }
     });
@@ -4454,7 +4509,10 @@ pub extern "C" fn fastpg_rust_storage_set_limits(
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_storage_reset_limits() {
-    with_storage(|state, _session| state.reset_limits());
+    with_storage(|state, session| {
+        state.reset_limits();
+        session.clear_catalog_scan_cache();
+    });
     clear_catalog_scan_cache();
     clear_last_storage_error();
 }
@@ -4695,6 +4753,12 @@ enum UniqueCheck {
     Skip,
 }
 
+#[derive(Clone, Copy)]
+enum UpdateRowId {
+    Preserve,
+    Allocate(*mut u64),
+}
+
 unsafe fn relation_insert_impl(
     input: RawRowInput,
     row_id_out: *mut u64,
@@ -4827,6 +4891,7 @@ pub unsafe extern "C" fn fastpg_rust_relation_update(
             },
             row_id,
             UniqueCheck::Enforce,
+            UpdateRowId::Preserve,
         )
     }
 }
@@ -4858,6 +4923,40 @@ pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked(
             },
             row_id,
             UniqueCheck::Skip,
+            UpdateRowId::Preserve,
+        )
+    }
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked_new_row(
+    relid: u32,
+    row_id: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    row_id_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    unsafe {
+        relation_update_impl(
+            RawRowInput {
+                relid,
+                values,
+                is_null,
+                byval,
+                value_lens,
+                natts,
+            },
+            row_id,
+            UniqueCheck::Skip,
+            UpdateRowId::Allocate(row_id_out),
         )
     }
 }
@@ -4914,7 +5013,12 @@ pub extern "C" fn fastpg_rust_relation_record_modified_cid(relid: u32, row_id: u
     });
 }
 
-unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: UniqueCheck) -> bool {
+unsafe fn relation_update_impl(
+    input: RawRowInput,
+    row_id: u64,
+    unique_check: UniqueCheck,
+    update_row_id: UpdateRowId,
+) -> bool {
     if row_id == 0 {
         return false;
     }
@@ -4932,14 +5036,27 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
     };
 
     let result = with_storage(|state, session| -> Result<bool, CatalogError> {
-        if !state.visible_row_exists(session, input.relid, row_id) {
+        let Some(old_row) = state.find_visible_row(session, input.relid, row_id) else {
             return Ok(false);
-        }
+        };
 
         let estimated_row_bytes = estimated_input_row_bytes(is_null, byval, value_lens);
         state.check_row_limit(estimated_row_bytes)?;
         state.check_transaction_limit(session, estimated_row_bytes)?;
         state.check_committed_projection_limit(session, estimated_row_bytes)?;
+
+        let updated_row_id = match update_row_id {
+            UpdateRowId::Preserve => row_id,
+            UpdateRowId::Allocate(_) => match state
+                .relations
+                .entry(input.relid)
+                .or_default()
+                .allocate_row_id()
+            {
+                Some(row_id) => row_id,
+                None => return Ok(false),
+            },
+        };
 
         session.ensure_transaction();
         let (cells, checkpoint) = {
@@ -4959,7 +5076,10 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
                 }
             }
         };
-        let row = Row { row_id, cells };
+        let row = Row {
+            row_id: updated_row_id,
+            cells,
+        };
         let index_bytes = primary_index_spec_for_relation_oid(Oid(input.relid))
             .and_then(|index_spec| index_key_for_row(&index_spec, &row))
             .map(|key| estimated_index_key_bytes(&key))
@@ -4991,6 +5111,13 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
+        if overlay.record_deleted_row(input.relid, &old_row).is_none() {
+            let segment = overlay.row_segment_mut(input.relid);
+            segment.rewind_to(checkpoint);
+            return Err(invalid_ffi_argument(
+                "invalid stored row image for update".to_owned(),
+            ));
+        }
         overlay
             .deleted_row_ids
             .entry(input.relid)
@@ -4999,6 +5126,13 @@ unsafe fn relation_update_impl(input: RawRowInput, row_id: u64, unique_check: Un
         let segment = overlay.row_segment_mut(input.relid);
         segment.remove_row_id(row_id);
         segment.push_row(row);
+        if let UpdateRowId::Allocate(row_id_out) = update_row_id
+            && !row_id_out.is_null()
+        {
+            unsafe {
+                *row_id_out = updated_row_id;
+            }
+        }
         Ok(true)
     });
 
@@ -5018,15 +5152,18 @@ pub extern "C" fn fastpg_rust_relation_delete(relid: u32, row_id: u64) -> bool {
     }
 
     with_storage(|state, session| {
-        if !state.visible_row_exists(session, relid, row_id) {
+        let Some(old_row) = state.find_visible_row(session, relid, row_id) else {
             return false;
-        }
+        };
 
         session.ensure_transaction();
         let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
+        if overlay.record_deleted_row(relid, &old_row).is_none() {
+            return false;
+        }
         overlay
             .deleted_row_ids
             .entry(relid)
@@ -5657,6 +5794,20 @@ fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
     catalog_scan_state_from_rows(relation_oid, catalog_rows(relation_oid))
 }
 
+fn catalog_scan_state_cached(cache: &mut CatalogScanCache, relation_oid: Oid) -> Option<ScanState> {
+    cache.refresh_generation();
+    if let Some(cached) = cache.entries.get(&relation_oid.0).map(Arc::clone) {
+        return Some(scan_state_from_cached_catalog_scan(cached));
+    }
+    let scan = catalog_scan_state_uncached(relation_oid)?;
+    let cached = Arc::new(CachedCatalogScan {
+        rows: scan.rows,
+        region: Arc::new(scan.region),
+    });
+    cache.entries.insert(relation_oid.0, Arc::clone(&cached));
+    Some(scan_state_from_cached_catalog_scan(cached))
+}
+
 fn catalog_scan_state_filtered(
     relation_oid: Oid,
     filters: &[CatalogRowFilter],
@@ -5667,26 +5818,9 @@ fn catalog_scan_state_filtered(
     if has_uncommitted_catalog_changes() {
         return catalog_scan_state_filtered_uncached(relation_oid, filters);
     }
-    let cache_key = CatalogScanFilterCacheKey {
-        relation_oid: relation_oid.0,
-        filters: filters.to_vec(),
-    };
-    if let Some(cached) =
-        with_catalog_scan_cache(|cache| cache.filtered_entries.get(&cache_key).map(Arc::clone))
-    {
-        return Some(scan_state_from_cached_catalog_scan(cached));
-    }
-    let scan = catalog_scan_state_filtered_uncached(relation_oid, filters)?;
-    let cached = Arc::new(CachedCatalogScan {
-        rows: scan.rows,
-        region: Arc::new(scan.region),
-    });
     with_catalog_scan_cache(|cache| {
-        cache
-            .filtered_entries
-            .insert(cache_key, Arc::clone(&cached));
-    });
-    Some(scan_state_from_cached_catalog_scan(cached))
+        catalog_scan_state_filtered_cached(cache, relation_oid, filters)
+    })
 }
 
 fn catalog_scan_state_filtered_uncached(
@@ -5699,24 +5833,66 @@ fn catalog_scan_state_filtered_uncached(
     )
 }
 
-fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
-    if has_uncommitted_catalog_changes() {
-        return catalog_scan_state_uncached(relation_oid);
+fn catalog_scan_state_filtered_cached(
+    cache: &mut CatalogScanCache,
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Option<ScanState> {
+    if filters.is_empty() {
+        return catalog_scan_state_cached(cache, relation_oid);
     }
-    if let Some(cached) =
-        with_catalog_scan_cache(|cache| cache.entries.get(&relation_oid.0).map(Arc::clone))
-    {
+    cache.refresh_generation();
+    let cache_key = CatalogScanFilterCacheKey {
+        relation_oid: relation_oid.0,
+        filters: filters.to_vec(),
+    };
+    if let Some(cached) = cache.filtered_entries.get(&cache_key).map(Arc::clone) {
         return Some(scan_state_from_cached_catalog_scan(cached));
     }
-    let scan = catalog_scan_state_uncached(relation_oid)?;
+    let scan = catalog_scan_state_filtered_uncached(relation_oid, filters)?;
     let cached = Arc::new(CachedCatalogScan {
         rows: scan.rows,
         region: Arc::new(scan.region),
     });
-    with_catalog_scan_cache(|cache| {
-        cache.entries.insert(relation_oid.0, Arc::clone(&cached));
-    });
+    cache
+        .filtered_entries
+        .insert(cache_key, Arc::clone(&cached));
     Some(scan_state_from_cached_catalog_scan(cached))
+}
+
+fn catalog_scan_state(relation_oid: Oid) -> Option<ScanState> {
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_uncached(relation_oid);
+    }
+    with_catalog_scan_cache(|cache| catalog_scan_state_cached(cache, relation_oid))
+}
+
+fn catalog_scan_state_for_session(
+    session: &mut SessionStorage,
+    relation_oid: Oid,
+) -> Option<ScanState> {
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_cached(&mut session.catalog_scan_cache, relation_oid);
+    }
+    catalog_scan_state(relation_oid)
+}
+
+fn catalog_scan_state_filtered_for_session(
+    session: &mut SessionStorage,
+    relation_oid: Oid,
+    filters: &[CatalogRowFilter],
+) -> Option<ScanState> {
+    if filters.is_empty() {
+        return catalog_scan_state_for_session(session, relation_oid);
+    }
+    if has_uncommitted_catalog_changes() {
+        return catalog_scan_state_filtered_cached(
+            &mut session.catalog_scan_cache,
+            relation_oid,
+            filters,
+        );
+    }
+    catalog_scan_state_filtered(relation_oid, filters)
 }
 
 unsafe fn catalog_name_filter_value(datum: usize) -> Option<String> {
@@ -5867,16 +6043,16 @@ unsafe fn catalog_index_filters_from_datums(
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_scan_begin(relid: u32) -> u64 {
     clear_last_storage_error();
-    let virtual_scan =
-        virtual_catalog_by_relation_oid(Oid(relid)).and_then(|_| catalog_scan_state(Oid(relid)));
+    let relation_oid = Oid(relid);
+    let is_virtual_catalog = virtual_catalog_by_relation_oid(relation_oid).is_some();
 
     let result = with_storage(|state, session| -> Result<u64, CatalogError> {
-        let scan = match virtual_scan {
-            Some(scan) => scan,
-            None => {
-                state.relations.entry(relid).or_default();
-                state.visible_scan_state(session, relid)?
-            }
+        let scan = if is_virtual_catalog {
+            catalog_scan_state_for_session(session, relation_oid)
+                .ok_or_else(|| invalid_ffi_argument("invalid catalog scan".into()))?
+        } else {
+            state.relations.entry(relid).or_default();
+            state.visible_scan_state(session, relid)?
         };
         state.check_scan_limit(scan.bytes())?;
         let handle = session.allocate_scan_handle();
@@ -5918,17 +6094,14 @@ pub unsafe extern "C" fn fastpg_rust_scan_begin_filtered(
     } else {
         unsafe { storage_scan_filters_from_datums(relation_oid, attnums, values, nkeys) }
     };
-    let virtual_scan =
-        is_virtual_catalog.then(|| catalog_scan_state_filtered(relation_oid, &catalog_filters));
 
     let result = with_storage(|state, session| -> Result<u64, CatalogError> {
-        let scan = match virtual_scan {
-            Some(Some(scan)) => scan,
-            Some(None) => return Err(invalid_ffi_argument("invalid catalog scan".into())),
-            None => {
-                state.relations.entry(relid).or_default();
-                state.visible_scan_state_filtered(session, relid, &storage_filters)?
-            }
+        let scan = if is_virtual_catalog {
+            catalog_scan_state_filtered_for_session(session, relation_oid, &catalog_filters)
+                .ok_or_else(|| invalid_ffi_argument("invalid catalog scan".into()))?
+        } else {
+            state.relations.entry(relid).or_default();
+            state.visible_scan_state_filtered(session, relid, &storage_filters)?
         };
         state.check_scan_limit(scan.bytes())?;
         let handle = session.allocate_scan_handle();
@@ -6286,7 +6459,9 @@ mod tests {
             .iter()
             .map(|column| values.get(column.name).cloned())
             .collect::<Vec<_>>();
-        upsert_catalog_row(table.oid, row_id, row).expect("upsert catalog row")
+        let row_id = upsert_catalog_row(table.oid, row_id, row).expect("upsert catalog row");
+        clear_current_session_catalog_scan_cache();
+        row_id
     }
 
     fn upsert_named_catalog_row_via_ffi(
@@ -6328,6 +6503,44 @@ mod tests {
             ));
         }
         row_id_out
+    }
+
+    fn filtered_catalog_scan_count(table_name: &str, attnum: i16, value: usize) -> usize {
+        let table = static_catalog_by_name(table_name).expect("catalog table");
+        let attnums = [attnum];
+        let values = [value];
+        let scan = unsafe {
+            fastpg_rust_scan_begin_filtered(
+                table.oid.0,
+                attnums.as_ptr(),
+                values.as_ptr(),
+                attnums.len(),
+            )
+        };
+        assert_ne!(scan, 0);
+
+        let mut count = 0;
+        loop {
+            let mut tuple_values = vec![0usize; table.columns.len()];
+            let mut nulls = vec![0u8; table.columns.len()];
+            let mut row_id = 0;
+            let found = unsafe {
+                fastpg_rust_scan_next(
+                    scan,
+                    1,
+                    tuple_values.as_mut_ptr(),
+                    nulls.as_mut_ptr(),
+                    tuple_values.len(),
+                    &mut row_id,
+                )
+            };
+            if !found {
+                break;
+            }
+            count += 1;
+        }
+        fastpg_rust_scan_end(scan);
+        count
     }
 
     #[test]
@@ -6828,6 +7041,29 @@ mod tests {
                 byval.as_ptr(),
                 value_lens.as_ptr(),
                 values.len(),
+            )
+        }
+    }
+
+    unsafe fn update_byval_new_row(
+        relid: u32,
+        row_id: u64,
+        values: &[usize],
+        is_null: &[u8],
+        row_id_out: &mut u64,
+    ) -> bool {
+        let byval = vec![1u8; values.len()];
+        let value_lens = vec![0usize; values.len()];
+        unsafe {
+            fastpg_rust_relation_update_unchecked_new_row(
+                relid,
+                row_id,
+                values.as_ptr(),
+                is_null.as_ptr(),
+                byval.as_ptr(),
+                value_lens.as_ptr(),
+                values.len(),
+                row_id_out,
             )
         }
     }
@@ -7354,6 +7590,47 @@ mod tests {
     }
 
     #[test]
+    fn catalog_scan_cache_invalidates_uncommitted_catalog_deletes() {
+        let _guard = test_guard();
+        let table = static_catalog_by_name("pg_class").expect("pg_class catalog");
+        let relid = next_relid();
+        let relation_name = format!("scan_cache_visible_{relid}");
+        let relid_text = relid.to_string();
+        let namespace_text = PUBLIC_NAMESPACE_OID.0.to_string();
+
+        fastpg_rust_xact_begin();
+        let row_id = upsert_named_catalog_row_via_ffi(
+            "pg_class",
+            relid as u64,
+            &[
+                ("oid", &relid_text),
+                ("relname", &relation_name),
+                ("relnamespace", &namespace_text),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", &relid_text),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "0"),
+            ],
+        );
+
+        assert_eq!(
+            filtered_catalog_scan_count("pg_class", 1, relid as usize),
+            1
+        );
+        assert!(fastpg_rust_catalog_delete_row(table.oid.0, row_id));
+        assert_eq!(
+            filtered_catalog_scan_count("pg_class", 1, relid as usize),
+            0
+        );
+
+        fastpg_rust_xact_abort();
+    }
+
+    #[test]
     fn aborted_rows_are_dropped() {
         let _guard = test_guard();
         let relid = next_relid();
@@ -7527,6 +7804,49 @@ mod tests {
 
         assert_eq!(fastpg_rust_relation_row_count(relid), 0);
         assert!(!fastpg_rust_relation_contains_row(relid, row_id));
+    }
+
+    #[test]
+    fn snapshot_any_finds_overlay_row_replaced_by_new_row_id() {
+        let _guard = test_guard();
+        let relid = next_relid();
+        let mut old_row_id = 0;
+        let mut new_row_id = 0;
+
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1], &[0], &mut old_row_id));
+            assert!(update_byval_new_row(
+                relid,
+                old_row_id,
+                &[2],
+                &[0],
+                &mut new_row_id
+            ));
+        }
+
+        assert_ne!(old_row_id, new_row_id);
+        assert!(!fastpg_rust_relation_contains_row(relid, old_row_id));
+        assert!(fastpg_rust_relation_contains_row(relid, new_row_id));
+        assert_eq!(
+            unsafe { fetch_byval_snapshot_any(relid, old_row_id, 1) },
+            Some((vec![1], vec![0]))
+        );
+        assert_eq!(
+            unsafe { fetch_byval(relid, new_row_id, 1) },
+            Some((vec![2], vec![0]))
+        );
+
+        fastpg_rust_xact_commit();
+
+        assert_eq!(
+            unsafe { fetch_byval_snapshot_any(relid, old_row_id, 1) },
+            None
+        );
+        assert_eq!(
+            unsafe { fetch_byval(relid, new_row_id, 1) },
+            Some((vec![2], vec![0]))
+        );
     }
 
     #[test]

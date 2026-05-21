@@ -22,8 +22,12 @@ fn main() {
         .to_path_buf();
     for relative in [
         "src/backend/access/fastpg/fastpg_mem_tableam.c",
+        "src/backend/access/index/genam.c",
+        "src/backend/access/transam/xact.c",
         "src/backend/commands/indexcmds.c",
         "src/backend/commands/tablecmds.c",
+        "src/backend/utils/adt/misc.c",
+        "src/backend/utils/adt/ri_triggers.c",
         "src/backend/utils/cache/catcache.c",
         "src/backend/utils/cache/lsyscache.c",
         "src/backend/utils/cache/relcache.c",

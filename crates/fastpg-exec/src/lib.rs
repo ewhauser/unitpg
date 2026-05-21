@@ -412,9 +412,10 @@ impl QueryExecutor {
         if parameters.is_empty()
             && let Some(command) = fast_transaction_command(sql)
         {
-            return pgcore_execution_to_query_execution(
-                self.pgcore_session.execute_transaction_command(command),
-            );
+            return match self.pgcore_session.execute_transaction_command(command) {
+                Ok(result) => pgcore_execution_to_query_execution(result),
+                Err(error) => pgcore_error_execution(error),
+            };
         }
 
         let parameters = parameters

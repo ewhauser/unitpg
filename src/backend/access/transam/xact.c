@@ -1103,6 +1103,19 @@ FastPgStartStandaloneStatement(void)
 	FastPgEnsureStandaloneBufferManagerAccess();
 	MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
 }
+
+void
+FastPgEnterStandaloneTransactionBlock(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (IsUnderPostmaster)
+		return;
+
+	FastPgEnsureStandaloneTransactionState();
+	s = CurrentTransactionState;
+	s->blockState = TBLOCK_INPROGRESS;
+}
 #endif
 
 /*
@@ -1487,6 +1500,7 @@ FastPgEnsureStandaloneTransactionState(void)
 
 	AtStart_Memory();
 	AtStart_ResourceOwner();
+	AtStart_GUC();
 	xactStartTimestamp = stmtStartTimestamp != 0 ? stmtStartTimestamp : GetCurrentTimestamp();
 	pgstat_report_xact_timestamp(xactStartTimestamp);
 	xactStopTimestamp = 0;
@@ -1512,9 +1526,20 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	 * statement if control escaped after XLogBeginInsert().
 	 */
 	XLogResetInsertion();
+	AtEOXact_GUC(isCommit, 1);
 	AtEOXact_Enum();
 	if (!isCommit)
 		ResetReindexState(s->nestingLevel);
+
+	if (isCommit)
+	{
+		for (;;)
+		{
+			AfterTriggerFireDeferred();
+			if (!PreCommit_Portals(false))
+				break;
+		}
+	}
 
 	if (TopTransactionResourceOwner != NULL)
 	{
@@ -1548,6 +1573,8 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 		if (!isCommit)
 			AtCleanup_Portals();
 
+		AtEOXact_SPI(isCommit);
+		AtEOXact_Snapshot(isCommit, !isCommit);
 		ResourceOwnerDelete(TopTransactionResourceOwner);
 	}
 
@@ -1555,7 +1582,15 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	CurTransactionResourceOwner = NULL;
 	CurrentResourceOwner = NULL;
 	s->curTransactionOwner = NULL;
-	AtStart_ResourceOwner();
+	if (isCommit)
+		AtCommit_Memory();
+	else
+		AtCleanup_Memory();
+	s->state = TRANS_DEFAULT;
+	s->blockState = TBLOCK_DEFAULT;
+	s->nestingLevel = 0;
+	s->gucNestLevel = 0;
+	MemoryContextSwitchTo(TopMemoryContext);
 }
 
 void

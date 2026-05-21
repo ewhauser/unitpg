@@ -25,6 +25,9 @@
 
 #include "access/amapi.h"
 #include "access/genam.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/htup_details.h"
 #include "access/skey.h"
 #include "access/sysattr.h"
@@ -268,6 +271,7 @@ static bool ri_fastpath_callback_registered = false;
 static bool ri_Check_Pk_Match(Relation pk_rel, Relation fk_rel,
 							  TupleTableSlot *oldslot,
 							  const RI_ConstraintInfo *riinfo);
+static bool ri_slot_is_current_xact_tuple(Relation rel, TupleTableSlot *slot);
 static Datum ri_restrict(TriggerData *trigdata, bool is_no_action);
 static Datum ri_set(TriggerData *trigdata, bool is_set_null, int tgkind);
 static void quoteOneName(char *buffer, const char *name);
@@ -1618,7 +1622,7 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 	 * this if we knew the INSERT trigger already fired, but there is no easy
 	 * way to know that.)
 	 */
-	if (slot_is_current_xact_tuple(oldslot))
+	if (ri_slot_is_current_xact_tuple(fk_rel, oldslot))
 		return true;
 
 	/* If all old and new key values are equal, no check is needed */
@@ -1627,6 +1631,17 @@ RI_FKey_fk_upd_check_required(Trigger *trigger, Relation fk_rel,
 
 	/* Else we need to fire the trigger. */
 	return true;
+}
+
+static bool
+ri_slot_is_current_xact_tuple(Relation rel, TupleTableSlot *slot)
+{
+#ifdef USE_FASTPG
+	if (rel->rd_tableam == GetFastPgMemTableAmRoutine())
+		return FastPgMemSlotIsCurrentXactTuple(rel, slot);
+#endif
+
+	return slot_is_current_xact_tuple(slot);
 }
 
 /*
@@ -2944,8 +2959,9 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	}
 	Assert(riinfo->fpmeta);
 
-	/* Skip array overhead for single-row batches. */
-	if (riinfo->nkeys == 1 && fpentry->batch_count > 1)
+	/* Skip array overhead for single-row batches or index AMs without it. */
+	if (riinfo->nkeys == 1 && fpentry->batch_count > 1 &&
+		idx_rel->rd_indam->amsearcharray)
 		violation_index = ri_FastPathFlushArray(fpentry, fk_slot, riinfo,
 												fk_rel, snapshot, scandesc);
 	else

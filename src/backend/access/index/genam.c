@@ -22,24 +22,166 @@
 #include "access/genam.h"
 #ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
+#include "catalog/pg_type.h"
 #endif
 #include "access/heapam.h"
 #include "access/relscan.h"
 #include "access/tableam.h"
 #include "access/transam.h"
 #include "catalog/index.h"
+#include "fmgr.h"
 #include "lib/stringinfo.h"
 #include "miscadmin.h"
 #include "storage/bufmgr.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
+#include "utils/catcache.h"
 #include "utils/injection_point.h"
+#include "utils/inval.h"
 #include "utils/lsyscache.h"
 #include "utils/rel.h"
 #include "utils/rls.h"
 #include "utils/ruleutils.h"
 #include "utils/snapmgr.h"
 
+#ifdef USE_FASTPG
+static bool
+FastPgIsVirtualCatalog(Relation heapRel)
+{
+	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRel)) != 0;
+}
+
+static bool
+FastPgCatalogRowIdToTid(uint64_t row_id, ItemPointer tid)
+{
+	uint64_t	zero_index;
+	uint64_t	block;
+	OffsetNumber offset;
+
+	if (row_id == 0)
+		return false;
+
+	zero_index = row_id - 1;
+	block = zero_index / (uint64_t) MaxOffsetNumber;
+	if (block > UINT32_MAX)
+		return false;
+
+	offset = (OffsetNumber) (zero_index % (uint64_t) MaxOffsetNumber) +
+		FirstOffsetNumber;
+	ItemPointerSet(tid, (BlockNumber) block, offset);
+	return true;
+}
+
+static bool
+FastPgCatalogTidToRowId(const ItemPointerData *tid, uint64_t *row_id)
+{
+	BlockNumber block = ItemPointerGetBlockNumber(tid);
+	OffsetNumber offset = ItemPointerGetOffsetNumber(tid);
+
+	if (!OffsetNumberIsValid(offset))
+		return false;
+
+	*row_id = ((uint64_t) block * (uint64_t) MaxOffsetNumber) +
+		(uint64_t) offset;
+	return true;
+}
+
+static bool
+FastPgCatalogTypeOutputsOid(Oid type_oid)
+{
+	switch (type_oid)
+	{
+		case OIDOID:
+		case REGPROCOID:
+		case REGPROCEDUREOID:
+		case REGOPEROID:
+		case REGOPERATOROID:
+		case REGCLASSOID:
+		case REGCOLLATIONOID:
+		case REGTYPEOID:
+		case REGROLEOID:
+		case REGNAMESPACEOID:
+		case REGDATABASEOID:
+		case REGCONFIGOID:
+		case REGDICTIONARYOID:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static void
+FastPgCatalogTupleToTextArrays(Relation heapRel,
+							   HeapTuple tup,
+							   const char ***values_out,
+							   uint8_t **is_null_out,
+							   uint64_t *row_id_out)
+{
+	TupleDesc	tupdesc = RelationGetDescr(heapRel);
+	const char **values;
+	uint8_t    *is_null;
+
+	values = palloc0_array(const char *, tupdesc->natts);
+	is_null = palloc0_array(uint8_t, tupdesc->natts);
+
+	for (int index = 0; index < tupdesc->natts; index++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, index);
+		bool		null_value = false;
+		bool		type_is_varlena;
+		Oid			output_function;
+		Datum		value;
+
+		value = heap_getattr(tup, index + 1, tupdesc, &null_value);
+		if (null_value)
+		{
+			is_null[index] = 1;
+			continue;
+		}
+
+		if (row_id_out != NULL &&
+			attr->atttypid == OIDOID &&
+			strcmp(NameStr(attr->attname), "oid") == 0)
+			*row_id_out = DatumGetObjectId(value);
+
+		if (FastPgCatalogTypeOutputsOid(attr->atttypid))
+		{
+			values[index] = psprintf("%u", DatumGetObjectId(value));
+			continue;
+		}
+
+		getTypeOutputInfo(attr->atttypid, &output_function, &type_is_varlena);
+		values[index] = OidOutputFunctionCall(output_function, value);
+	}
+
+	*values_out = values;
+	*is_null_out = is_null;
+}
+
+static void
+FastPgCatalogUpsertTuple(Relation heapRel, HeapTuple tup, uint64_t row_id)
+{
+	TupleDesc	tupdesc = RelationGetDescr(heapRel);
+	const char **values;
+	uint8_t    *is_null;
+	uint64_t	stored_row_id = row_id;
+
+	FastPgCatalogTupleToTextArrays(heapRel, tup, &values, &is_null, &stored_row_id);
+	if (!fastpg_rust_catalog_upsert_row((uint32_t) RelationGetRelid(heapRel),
+										stored_row_id,
+										values,
+										is_null,
+										(size_t) tupdesc->natts,
+										&stored_row_id))
+		elog(ERROR, "fastpg failed to capture catalog row for relation %u",
+			 RelationGetRelid(heapRel));
+	if (!FastPgCatalogRowIdToTid(stored_row_id, &tup->t_self))
+		elog(ERROR, "fastpg catalog row id %llu cannot be represented as a CTID",
+			 (unsigned long long) stored_row_id);
+	CatalogCacheFlushCatalog(RelationGetRelid(heapRel));
+	CacheInvalidateHeapTuple(heapRel, tup, NULL);
+}
+#endif
 
 /* ----------------------------------------------------------------
  *		general access method routines
@@ -705,6 +847,9 @@ systable_beginscan_ordered(Relation heapRelation,
 	SysScanDesc sysscan;
 	int			i;
 	ScanKey		idxkey;
+#ifdef USE_FASTPG
+	bool		fastpg_virtual_catalog_scan;
+#endif
 
 	/* REINDEX can probably be a hard error here ... */
 	if (ReindexIsProcessingIndex(RelationGetRelid(indexRelation)))
@@ -717,6 +862,11 @@ systable_beginscan_ordered(Relation heapRelation,
 		elog(WARNING, "using index \"%s\" despite IgnoreSystemIndexes",
 			 RelationGetRelationName(indexRelation));
 
+#ifdef USE_FASTPG
+	fastpg_virtual_catalog_scan =
+		fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRelation)) != 0;
+#endif
+
 	sysscan = palloc_object(SysScanDescData);
 
 	sysscan->heap_rel = heapRelation;
@@ -727,14 +877,46 @@ systable_beginscan_ordered(Relation heapRelation,
 	{
 		Oid			relid = RelationGetRelid(heapRelation);
 
-		snapshot = RegisterSnapshot(GetCatalogSnapshot(relid));
-		sysscan->snapshot = snapshot;
+#ifdef USE_FASTPG
+		if (fastpg_virtual_catalog_scan)
+		{
+			snapshot = SnapshotAny;
+			sysscan->snapshot = NULL;
+		}
+		else
+#endif
+		{
+			snapshot = RegisterSnapshot(GetCatalogSnapshot(relid));
+			sysscan->snapshot = snapshot;
+		}
 	}
 	else
 	{
 		/* Caller is responsible for any snapshot. */
 		sysscan->snapshot = NULL;
 	}
+
+#ifdef USE_FASTPG
+	if (fastpg_virtual_catalog_scan)
+	{
+		/*
+		 * FastPG virtual catalogs have no physical btree pages.  Use the same
+		 * Rust-backed table scan as systable_beginscan(); catalog row providers
+		 * keep these synthetic rows in the declared index order for callers that
+		 * require ordering.
+		 */
+		sysscan->scan = table_beginscan_strat(heapRelation, snapshot,
+											  nkeys, key,
+											  true, false);
+		sysscan->iscan = NULL;
+		sysscan->irel = NULL;
+
+		if (TransactionIdIsValid(CheckXidAlive))
+			bsysscan = true;
+
+		return sysscan;
+	}
+#endif
 
 	idxkey = palloc_array(ScanKeyData, nkeys);
 
@@ -784,13 +966,27 @@ systable_getnext_ordered(SysScanDesc sysscan, ScanDirection direction)
 {
 	HeapTuple	htup = NULL;
 
-	Assert(sysscan->irel);
-	if (index_getnext_slot(sysscan->iscan, direction, sysscan->slot))
-		htup = ExecFetchSlotHeapTuple(sysscan->slot, false, NULL);
+	if (sysscan->irel)
+	{
+		if (index_getnext_slot(sysscan->iscan, direction, sysscan->slot))
+			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, NULL);
 
 	/* See notes in systable_getnext */
-	if (htup && sysscan->iscan->xs_recheck)
-		elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
+		if (htup && sysscan->iscan->xs_recheck)
+			elog(ERROR, "system catalog scans with lossy index conditions are not implemented");
+	}
+	else if (table_scan_getnextslot(sysscan->scan, direction, sysscan->slot))
+	{
+		bool		shouldFree;
+
+		htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
+		Assert(!shouldFree);
+#ifdef USE_FASTPG
+		if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
+														RelationGetRelid(sysscan->heap_rel)) != 0)
+			ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
+#endif
+	}
 
 	/*
 	 * Handle the concurrent abort while fetching the catalog tuple during
@@ -813,8 +1009,10 @@ systable_endscan_ordered(SysScanDesc sysscan)
 		sysscan->slot = NULL;
 	}
 
-	Assert(sysscan->irel);
-	index_endscan(sysscan->iscan);
+	if (sysscan->irel)
+		index_endscan(sysscan->iscan);
+	else
+		table_endscan(sysscan->scan);
 	if (sysscan->snapshot)
 		UnregisterSnapshot(sysscan->snapshot);
 
@@ -915,6 +1113,14 @@ systable_inplace_update_begin(Relation relation,
 		}
 
 		slot = scan->slot;
+#ifdef USE_FASTPG
+		if (FastPgIsVirtualCatalog(scan->heap_rel))
+		{
+			*oldtupcopy = heap_copytuple(oldtup);
+			*state = scan;
+			return;
+		}
+#endif
 		Assert(TTS_IS_BUFFERTUPLE(slot));
 		bslot = (BufferHeapTupleTableSlot *) slot;
 	} while (!heap_inplace_lock(scan->heap_rel,
@@ -937,6 +1143,20 @@ systable_inplace_update_finish(void *state, HeapTuple tuple)
 	SysScanDesc scan = (SysScanDesc) state;
 	Relation	relation = scan->heap_rel;
 	TupleTableSlot *slot = scan->slot;
+
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(relation))
+	{
+		uint64_t	row_id;
+
+		if (!FastPgCatalogTidToRowId(&tuple->t_self, &row_id))
+			elog(ERROR, "fastpg catalog CTID cannot be converted to a row id");
+		FastPgCatalogUpsertTuple(relation, tuple, row_id);
+		systable_endscan(scan);
+		return;
+	}
+#endif
+
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	HeapTuple	oldtup = bslot->base.tuple;
 	Buffer		buffer = bslot->buffer;
@@ -956,6 +1176,15 @@ systable_inplace_update_cancel(void *state)
 	SysScanDesc scan = (SysScanDesc) state;
 	Relation	relation = scan->heap_rel;
 	TupleTableSlot *slot = scan->slot;
+
+#ifdef USE_FASTPG
+	if (FastPgIsVirtualCatalog(relation))
+	{
+		systable_endscan(scan);
+		return;
+	}
+#endif
+
 	BufferHeapTupleTableSlot *bslot = (BufferHeapTupleTableSlot *) slot;
 	HeapTuple	oldtup = bslot->base.tuple;
 	Buffer		buffer = bslot->buffer;

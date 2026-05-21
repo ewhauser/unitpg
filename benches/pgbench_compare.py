@@ -426,7 +426,10 @@ class PgBenchCompare:
         libdir = build_dir / "fastpg-pgcore-libdir"
         libdir.mkdir(parents=True, exist_ok=True)
 
-        candidates = [build_dir / "src/pl/plpgsql/src" / f"plpgsql{suffix}"]
+        candidates = [
+            build_dir / "src/pl/plpgsql/src" / f"plpgsql{suffix}",
+            build_dir / "src/backend/snowball" / f"dict_snowball{suffix}",
+        ]
         conversion_dir = build_dir / "src/backend/utils/mb/conversion_procs"
         if conversion_dir.exists():
             candidates.extend(sorted(conversion_dir.glob(f"*{suffix}")))
@@ -660,7 +663,10 @@ class PgBenchCompare:
                 host=host,
                 port=port,
                 socket_path=socket_path,
-                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
+                server_env={
+                    "FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"])),
+                    "FASTPG_PGBINDIR": str(paths["client_bindir"]),
+                },
             )
             run_record["commands"]["start"] = server["result"].as_json()
             if "profiler" in server:

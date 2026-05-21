@@ -18,6 +18,8 @@
 
 extern const TableAmRoutine *GetFastPgMemTableAmRoutine(void);
 extern const IndexAmRoutine *GetFastPgMemIndexAmRoutine(void);
+extern bool FastPgMemSlotIsCurrentXactTuple(Relation rel,
+											TupleTableSlot *slot);
 extern bool FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 											  Relation indexRelation,
 											  const Datum *values,

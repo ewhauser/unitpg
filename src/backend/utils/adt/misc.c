@@ -35,6 +35,7 @@
 #include "parser/parse_type.h"
 #include "parser/scansup.h"
 #include "pgstat.h"
+#include "port.h"
 #include "postmaster/syslogger.h"
 #include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
@@ -376,11 +377,15 @@ pg_sleep(PG_FUNCTION_ARGS)
 		else
 			break;
 
+#ifdef USE_FASTPG
+		pg_usleep(delay_ms * 1000L);
+#else
 		(void) WaitLatch(MyLatch,
 						 WL_LATCH_SET | WL_TIMEOUT | WL_EXIT_ON_PM_DEATH,
 						 delay_ms,
 						 WAIT_EVENT_PG_SLEEP);
 		ResetLatch(MyLatch);
+#endif
 	}
 
 	PG_RETURN_VOID();

@@ -93,6 +93,14 @@ extern bool fastpg_rust_relation_update_unchecked(uint32_t relid,
 												  const uint8_t *byval,
 												  const size_t *value_lens,
 												  size_t natts);
+extern bool fastpg_rust_relation_update_unchecked_new_row(uint32_t relid,
+														  uint64_t row_id,
+														  const uintptr_t *values,
+														  const uint8_t *isnull,
+														  const uint8_t *byval,
+														  const size_t *value_lens,
+														  size_t natts,
+														  uint64_t *row_id_out);
 extern bool fastpg_rust_relation_delete(uint32_t relid, uint64_t row_id);
 extern bool fastpg_rust_relation_contains_row(uint32_t relid,
 											  uint64_t row_id);
@@ -362,9 +370,6 @@ static void
 fastpg_mem_subxact_callback(SubXactEvent event, SubTransactionId mySubid,
 							SubTransactionId parentSubid, void *arg)
 {
-	if (!IsUnderPostmaster)
-		return;
-
 	switch (event)
 	{
 		case SUBXACT_EVENT_START_SUB:
@@ -705,6 +710,25 @@ fastpg_mem_row_self_modified(uint32_t relid, uint64_t row_id,
 	if (cid_out != NULL)
 		*cid_out = (CommandId) cid;
 	return true;
+}
+
+bool
+FastPgMemSlotIsCurrentXactTuple(Relation rel, TupleTableSlot *slot)
+{
+	uint64_t	row_id;
+	uint32_t	cid;
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+
+	if (TTS_EMPTY(slot) || !ItemPointerIsValid(&slot->tts_tid))
+		return false;
+
+	if (fastpg_mem_use_storage2_for_relid(relid))
+		return false;
+
+	if (!fastpg_mem_tid_to_row_id(&slot->tts_tid, &row_id))
+		return false;
+
+	return fastpg_rust_relation_modified_cid(relid, row_id, &cid);
 }
 
 static void
@@ -1771,13 +1795,14 @@ fastpg_mem_tuple_update(Relation rel,
 													value_lens,
 													tupdesc->natts,
 													&row_id) :
-		  fastpg_rust_relation_update_unchecked(relid,
-												row_id,
-												values,
-												isnull,
-												byval,
-												value_lens,
-												tupdesc->natts)))
+		  fastpg_rust_relation_update_unchecked_new_row(relid,
+														row_id,
+														values,
+														isnull,
+														byval,
+														value_lens,
+														tupdesc->natts,
+														&row_id)))
 	{
 		pfree(values);
 		pfree(isnull);

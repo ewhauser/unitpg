@@ -360,6 +360,25 @@ fastpg_pgcore_notice_hook(ErrorData *edata)
 }
 
 static void
+fastpg_pgcore_configure_exec_path(void)
+{
+	const char *bindir;
+
+	if (my_exec_path[0] != '\0')
+		return;
+
+	bindir = getenv("FASTPG_PGBINDIR");
+	if (bindir == NULL || bindir[0] == '\0')
+		bindir = getenv("PG_BINDIR");
+	if (bindir == NULL || bindir[0] == '\0')
+		return;
+	if (!is_absolute_path(bindir))
+		return;
+
+	snprintf(my_exec_path, MAXPGPATH, "%s/postgres", bindir);
+}
+
+static void
 fastpg_pgcore_configure_library_paths(void)
 {
 	const char *libdir;
@@ -375,6 +394,27 @@ fastpg_pgcore_configure_library_paths(void)
 	strlcpy(pkglib_path, libdir, MAXPGPATH);
 	SetConfigOption("dynamic_library_path", "$libdir",
 					PGC_SUSET, PGC_S_OVERRIDE);
+}
+
+static void
+fastpg_pgcore_configure_timezone_abbreviations(void)
+{
+	SetConfigOption("timezone_abbreviations", "Default",
+					PGC_USERSET, PGC_S_DYNAMIC_DEFAULT);
+}
+
+static void
+fastpg_pgcore_configure_timezone(void)
+{
+	const char *timezone;
+
+	timezone = getenv("FASTPG_TIMEZONE");
+	if (timezone == NULL || timezone[0] == '\0')
+		timezone = getenv("PGTZ");
+	if (timezone == NULL || timezone[0] == '\0')
+		return;
+
+	SetConfigOption("timezone", timezone, PGC_USERSET, PGC_S_DATABASE);
 }
 
 static void
@@ -461,7 +501,9 @@ fastpg_pgcore_init_once(void)
 	MyDatabaseId = PostgresDbOid;
 	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
 	DatabasePath = pstrdup("base/5");
+	fastpg_pgcore_configure_exec_path();
 	InitializeGUCOptions();
+	fastpg_pgcore_configure_timezone_abbreviations();
 	SetConfigOption("track_counts", "off", PGC_SUSET, PGC_S_OVERRIDE);
 #ifdef USE_FASTPG
 	fastpg_pgcore_init_standalone_aio();
@@ -469,6 +511,7 @@ fastpg_pgcore_init_once(void)
 	smgrinit();
 	fastpg_pgcore_configure_library_paths();
 	pg_timezone_initialize();
+	fastpg_pgcore_configure_timezone();
 	RelationCacheInitialize();
 	InitCatalogCache();
 	InitializeSession();
@@ -655,6 +698,8 @@ fastpg_pgcore_reset_session_transaction_characteristics(void)
 {
 	fastpg_pgcore_enter();
 	ResetAllOptions();
+	fastpg_pgcore_configure_timezone_abbreviations();
+	fastpg_pgcore_configure_timezone();
 #ifdef USE_FASTPG
 	FastPgResetStandaloneSessionTransactionCharacteristics();
 #endif
@@ -721,7 +766,7 @@ fastpg_pgcore_commit_implicit_transaction(void)
 		fastpg_xid_commit();
 		fastpg_rust_xact_commit_if_implicit();
 		fastpg_storage2_xact_commit_if_implicit();
-		AtEOXact_Enum();
+		FastPgReleaseStandaloneStatementResources(true);
 	}
 }
 
@@ -750,6 +795,27 @@ fastpg_pgcore_start_statement_timestamp(void)
 	}
 	else
 		FastPgEnsureStandaloneTransactionState();
+#endif
+}
+
+void
+fastpg_pgcore_start_explicit_transaction_timestamp(void)
+{
+	fastpg_pgcore_enter();
+	fastpg_pgcore_start_statement_timestamp();
+#ifdef USE_FASTPG
+	FastPgEnterStandaloneTransactionBlock();
+#endif
+}
+
+void
+fastpg_pgcore_finish_explicit_transaction(bool is_commit)
+{
+	fastpg_pgcore_enter();
+#ifdef USE_FASTPG
+	FastPgReleaseStandaloneStatementResources(is_commit);
+#else
+	(void) is_commit;
 #endif
 }
 
@@ -852,6 +918,66 @@ fastpg_pgcore_set_execute_error(FastPgPgCoreExecuteResult *result,
 							 edata);
 	free(result->error_context);
 	result->error_context = fastpg_pgcore_strdup(edata->context);
+}
+
+#ifdef USE_FASTPG
+static void
+fastpg_pgcore_cleanup_failed_explicit_transaction_finish(void)
+{
+	PG_TRY();
+	{
+		FastPgReleaseStandaloneStatementResources(false);
+		MemoryContextSwitchTo(TopMemoryContext);
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(TopMemoryContext);
+		FlushErrorState();
+		fastpg_pgcore_release_error_resources();
+	}
+	PG_END_TRY();
+	MemoryContextSwitchTo(TopMemoryContext);
+}
+#endif
+
+FastPgPgCoreParseResult *
+fastpg_pgcore_try_finish_explicit_transaction(bool is_commit)
+{
+	FastPgPgCoreParseResult *result;
+
+	result = fastpg_pgcore_parse_result_alloc();
+	if (result == NULL)
+		return NULL;
+
+	fastpg_pgcore_enter();
+#ifdef USE_FASTPG
+	PG_TRY();
+	{
+		FastPgReleaseStandaloneStatementResources(is_commit);
+		MemoryContextSwitchTo(TopMemoryContext);
+		result->ok = true;
+	}
+	PG_CATCH();
+	{
+		ErrorData  *edata;
+
+		MemoryContextSwitchTo(TopMemoryContext);
+		edata = CopyErrorData();
+		FlushErrorState();
+		fastpg_pgcore_set_error(result, edata);
+		FreeErrorData(edata);
+		if (is_commit)
+			fastpg_pgcore_cleanup_failed_explicit_transaction_finish();
+		else
+			fastpg_pgcore_release_error_resources();
+	}
+	PG_END_TRY();
+#else
+	(void) is_commit;
+	result->ok = true;
+#endif
+
+	return result;
 }
 
 static const char *

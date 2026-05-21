@@ -907,6 +907,47 @@ pub(crate) fn invalidate_visible_catalog_snapshot(session: &mut CatalogSession) 
     session.visible_snapshot_cache = None;
 }
 
+pub(crate) fn update_visible_catalog_snapshot(
+    session: &mut CatalogSession,
+    apply: impl FnOnce(&mut CatalogSnapshot),
+) {
+    let previous_revision = session.visible_snapshot_revision;
+    let next_revision = session.visible_snapshot_revision.wrapping_add(1);
+    session.visible_snapshot_revision = next_revision.max(1);
+
+    let base_generation = current_generation();
+    let Some(cache) = session.visible_snapshot_cache.as_mut() else {
+        return;
+    };
+    if cache.base_generation != base_generation || cache.revision != previous_revision {
+        session.visible_snapshot_cache = None;
+        return;
+    }
+
+    apply(Arc::make_mut(&mut cache.snapshot));
+    cache.revision = session.visible_snapshot_revision;
+}
+
+pub(crate) fn apply_catalog_row_upsert_to_snapshot(
+    snapshot: &mut CatalogSnapshot,
+    table: &StaticCatalogTable,
+    row: CatalogRow,
+) {
+    let mut draft = CatalogDraft::default();
+    draft.upsert_catalog_row(table, row);
+    draft.apply_to_snapshot(snapshot);
+}
+
+pub(crate) fn apply_catalog_row_delete_to_snapshot(
+    snapshot: &mut CatalogSnapshot,
+    relation_oid: Oid,
+    row_id: u64,
+) {
+    let mut draft = CatalogDraft::default();
+    draft.delete_catalog_row(relation_oid, row_id);
+    draft.apply_to_snapshot(snapshot);
+}
+
 fn session_has_visible_drafts(session: &CatalogSession) -> bool {
     session
         .transaction_stack

@@ -230,10 +230,10 @@ impl PgCoreSession {
     pub fn execute_transaction_command(
         &self,
         command: PgCoreTransactionCommand,
-    ) -> ExecutionResult {
+    ) -> Result<ExecutionResult, PgCoreError> {
         let _guard = self.enter_storage();
-        self.inner.execute_transaction_command(command);
-        ExecutionResult {
+        self.inner.execute_transaction_command(command)?;
+        Ok(ExecutionResult {
             statements: vec![ExecutionStatement {
                 command_tag: command.command_tag().into(),
                 fields: Vec::new(),
@@ -241,7 +241,7 @@ impl PgCoreSession {
                 copy_in: None,
             }],
             notices: Vec::new(),
-        }
+        })
     }
 
     pub fn input_text_datum(
@@ -461,10 +461,13 @@ mod inner {
         fn fastpg_xid_begin();
         fn fastpg_xid_commit();
         fn fastpg_xid_rollback();
-        fn AtEOXact_Enum();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_reset_session_transaction_characteristics();
         fn fastpg_pgcore_set_database(database_oid: u32);
+        fn fastpg_pgcore_try_finish_explicit_transaction(
+            is_commit: bool,
+        ) -> *mut FastPgPgCoreParseResult;
+        fn fastpg_pgcore_start_explicit_transaction_timestamp();
         fn fastpg_pgcore_notice_capture_begin();
         fn fastpg_pgcore_notice_capture_end();
         fn fastpg_pgcore_notice_capture_clear();
@@ -716,6 +719,34 @@ mod inner {
         }
     }
 
+    fn parse_result_error(result: *const FastPgPgCoreParseResult) -> PgCoreError {
+        PgCoreError::with_fields(
+            unsafe { c_string(fastpg_pgcore_parse_result_sqlstate(result)) },
+            unsafe { c_string(fastpg_pgcore_parse_result_message(result)) },
+            unsafe { optional_c_string(fastpg_pgcore_parse_result_detail(result)) },
+            unsafe { optional_c_string(fastpg_pgcore_parse_result_hint(result)) },
+            None,
+            unsafe { fastpg_pgcore_parse_result_cursorpos(result) },
+        )
+    }
+
+    fn finish_explicit_transaction(is_commit: bool) -> Result<(), PgCoreError> {
+        let result = unsafe { fastpg_pgcore_try_finish_explicit_transaction(is_commit) };
+        let Some(result) = NonNull::new(result) else {
+            return Err(PgCoreError::new(
+                "XX000",
+                "PostgreSQL transaction finish returned a null result",
+                0,
+            ));
+        };
+        let result = ParseResult(result);
+        if unsafe { fastpg_pgcore_parse_result_ok(result.as_ptr()) } {
+            Ok(())
+        } else {
+            Err(parse_result_error(result.as_ptr()))
+        }
+    }
+
     unsafe fn c_string(value: *const c_char) -> String {
         if value.is_null() {
             return String::new();
@@ -902,36 +933,46 @@ mod inner {
             })
         }
 
-        pub fn execute_transaction_command(&self, command: PgCoreTransactionCommand) {
+        pub fn execute_transaction_command(
+            &self,
+            command: PgCoreTransactionCommand,
+        ) -> Result<(), PgCoreError> {
             let _guard = enter_pgcore_lane("transaction_command");
             self.set_database();
             match command {
                 PgCoreTransactionCommand::Begin => {
                     unsafe {
+                        fastpg_pgcore_start_explicit_transaction_timestamp();
                         fastpg_xid_begin();
                     }
                     fastpg_storage::begin_explicit_transaction();
                     fastpg_storage2::fastpg_storage2_xact_begin();
+                    Ok(())
                 }
                 PgCoreTransactionCommand::Commit => {
+                    if let Err(error) = finish_explicit_transaction(true) {
+                        unsafe {
+                            fastpg_xid_rollback();
+                        }
+                        fastpg_storage::abort_explicit_transaction();
+                        fastpg_storage2::fastpg_storage2_xact_abort();
+                        return Err(error);
+                    }
                     unsafe {
                         fastpg_xid_commit();
                     }
                     fastpg_storage::commit_explicit_transaction();
                     fastpg_storage2::fastpg_storage2_xact_commit();
-                    unsafe {
-                        AtEOXact_Enum();
-                    }
+                    Ok(())
                 }
                 PgCoreTransactionCommand::Rollback => {
+                    let finish_result = finish_explicit_transaction(false);
                     unsafe {
                         fastpg_xid_rollback();
                     }
                     fastpg_storage::abort_explicit_transaction();
                     fastpg_storage2::fastpg_storage2_xact_abort();
-                    unsafe {
-                        AtEOXact_Enum();
-                    }
+                    finish_result
                 }
             }
         }
@@ -1734,6 +1775,143 @@ mod tests {
 
         session
             .prepare(&format!("drop table if exists {table}, {partitioned}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_foreign_key_noop_update_uses_fastpg_tuple_state() {
+        let session = PgCoreSession::new();
+        let pk_table = format!("fastpg_pgcore_fk_pk_{}", std::process::id());
+        let fk_table = format!("fastpg_pgcore_fk_fk_{}", std::process::id());
+
+        session
+            .prepare(&format!("create table {pk_table}(id int primary key)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create table {fk_table}(id int references {pk_table})"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {pk_table} values (1)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {fk_table} values (1)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let update = session
+            .prepare(&format!("update {fk_table} set id = id"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(update.statements[0].command_tag, "UPDATE");
+
+        session
+            .prepare(&format!("drop table if exists {fk_table}, {pk_table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_primary_key_update_exposes_new_key() {
+        let session = PgCoreSession::new();
+        let pk_table = format!("fastpg_pgcore_pk_update_{}", std::process::id());
+
+        session
+            .prepare(&format!("create table {pk_table}(id int primary key)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {pk_table} values (1), (2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("update {pk_table} set id = 3 where id = 2"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let result = session
+            .execute_with_params(&format!("select id from {pk_table} order by id"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![
+                vec![PgCoreValue::Text("1".to_owned())],
+                vec![PgCoreValue::Text("3".to_owned())],
+            ]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {pk_table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_foreign_key_cascade_update_rewrites_referencing_rows() {
+        let session = PgCoreSession::new();
+        let pk_table = format!("fastpg_pgcore_fk_cascade_pk_{}", std::process::id());
+        let fk_table = format!("fastpg_pgcore_fk_cascade_fk_{}", std::process::id());
+
+        session
+            .prepare(&format!("create table {pk_table}(id int primary key)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "create table {fk_table}(id int references {pk_table} on update cascade)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {pk_table} values (1), (2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {fk_table} values (1), (2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("update {pk_table} set id = 3 where id = 2"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let result = session
+            .execute_with_params(&format!("select id from {fk_table} order by id"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![
+                vec![PgCoreValue::Text("1".to_owned())],
+                vec![PgCoreValue::Text("3".to_owned())],
+            ]
+        );
+
+        session
+            .prepare(&format!("drop table if exists {fk_table}, {pk_table}"))
             .unwrap()
             .execute()
             .unwrap();
@@ -2825,6 +3003,63 @@ mod tests {
 
         let commit = session.prepare("commit").unwrap().execute().unwrap();
         assert_eq!(commit.statements[0].command_tag, "COMMIT");
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn fast_transaction_commit_error_leaves_session_usable() {
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fastpg_pgcore_deferred_unique");
+        let constraint = format!("{table}_id_key");
+
+        session
+            .prepare(&format!("create table {table}(id int, value text)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "alter table {table} add constraint {constraint} unique (id) deferrable initially deferred"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1, 'one')"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        session
+            .execute_transaction_command(PgCoreTransactionCommand::Begin)
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} values (1, 'duplicate')"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let commit_error = session
+            .execute_transaction_command(PgCoreTransactionCommand::Commit)
+            .unwrap_err();
+        assert_eq!(commit_error.sqlstate, "23505");
+        assert!(commit_error.message.contains("duplicate key value"));
+
+        let count = session
+            .prepare(&format!("select count(*) from {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            count.statements[0].rows[0][0],
+            PgCoreValue::Text("1".into())
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table} cascade"))
+            .unwrap()
+            .execute()
+            .unwrap();
     }
 
     #[cfg(feature = "postgres-execution")]

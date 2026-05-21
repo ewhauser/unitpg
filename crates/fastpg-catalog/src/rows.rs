@@ -7,8 +7,9 @@ use crate::generated_catalog;
 use crate::lookups::{lookup_builtin_type, relation_by_oid};
 use crate::model::*;
 use crate::state::{
-    CatalogDraft, CatalogState, commit_catalog_draft, ensure_catalog_transaction,
-    invalidate_visible_catalog_snapshot, with_catalog, with_catalog_session,
+    CatalogDraft, CatalogState, apply_catalog_row_delete_to_snapshot,
+    apply_catalog_row_upsert_to_snapshot, commit_catalog_draft, ensure_catalog_transaction,
+    update_visible_catalog_snapshot, with_catalog, with_catalog_session,
     with_visible_catalog_snapshot,
 };
 
@@ -780,6 +781,13 @@ pub(crate) const SYNTHETIC_CATALOG_INDEX_SPECS: &[SyntheticCatalogIndexSpec] = &
         relation_oid: PG_NAMESPACE_RELATION_OID,
         name: "pg_namespace_oid_index",
         key_attnums: &[1],
+        is_primary: true,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_TS_CONFIG_MAP_INDEX_OID,
+        relation_oid: PG_TS_CONFIG_MAP_RELATION_OID,
+        name: "pg_ts_config_map_index",
+        key_attnums: &[1, 2, 3],
         is_primary: true,
     },
     SyntheticCatalogIndexSpec {
@@ -1597,6 +1605,149 @@ fn synthetic_pg_catalog_init_privs_row(table: &StaticCatalogTable) -> CatalogRow
     row
 }
 
+fn synthetic_dsnowball_proc_row(
+    table: &StaticCatalogTable,
+    oid: Oid,
+    name: &str,
+    arg_types: Vec<Oid>,
+) -> CatalogRow {
+    let arg_count = arg_types.len().min(i16::MAX as usize) as i16;
+    let mut row = empty_catalog_row(table, u64::from(oid.0));
+    set_catalog_row_value(table, &mut row, "oid", CatalogValue::Oid(oid));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "proname",
+        CatalogValue::Name(name.to_owned()),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "pronamespace",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "proowner",
+        CatalogValue::Oid(POSTGRES_ROLE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "prolang",
+        CatalogValue::Oid(C_LANGUAGE_OID),
+    );
+    set_catalog_row_value(table, &mut row, "procost", CatalogValue::Float32(1.0));
+    set_catalog_row_value(table, &mut row, "prorows", CatalogValue::Float32(0.0));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "provariadic",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "prosupport",
+        CatalogValue::Oid(INVALID_OID),
+    );
+    set_catalog_row_value(table, &mut row, "prokind", CatalogValue::Char(b'f'));
+    set_catalog_row_value(table, &mut row, "prosecdef", CatalogValue::Bool(false));
+    set_catalog_row_value(table, &mut row, "proleakproof", CatalogValue::Bool(false));
+    set_catalog_row_value(table, &mut row, "proisstrict", CatalogValue::Bool(true));
+    set_catalog_row_value(table, &mut row, "proretset", CatalogValue::Bool(false));
+    set_catalog_row_value(table, &mut row, "provolatile", CatalogValue::Char(b'v'));
+    set_catalog_row_value(table, &mut row, "proparallel", CatalogValue::Char(b'u'));
+    set_catalog_row_value(table, &mut row, "pronargs", CatalogValue::Int16(arg_count));
+    set_catalog_row_value(table, &mut row, "pronargdefaults", CatalogValue::Int16(0));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "prorettype",
+        CatalogValue::Oid(INTERNAL_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "proargtypes",
+        CatalogValue::OidVector(arg_types),
+    );
+    set_catalog_row_value(table, &mut row, "proallargtypes", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "proargmodes", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "proargnames", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "proargdefaults", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "protrftypes", CatalogValue::Null);
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "prosrc",
+        CatalogValue::Text(name.to_owned()),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "probin",
+        CatalogValue::Text("$libdir/dict_snowball".to_owned()),
+    );
+    set_catalog_row_value(table, &mut row, "prosqlbody", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "proconfig", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "proacl", CatalogValue::Null);
+    row
+}
+
+fn synthetic_dsnowball_proc_rows(table: &StaticCatalogTable) -> [CatalogRow; 2] {
+    [
+        synthetic_dsnowball_proc_row(
+            table,
+            DSNOWBALL_INIT_PROC_OID,
+            "dsnowball_init",
+            vec![INTERNAL_OID],
+        ),
+        synthetic_dsnowball_proc_row(
+            table,
+            DSNOWBALL_LEXIZE_PROC_OID,
+            "dsnowball_lexize",
+            vec![INTERNAL_OID, INTERNAL_OID, INTERNAL_OID, INTERNAL_OID],
+        ),
+    ]
+}
+
+fn synthetic_snowball_ts_template_row(table: &StaticCatalogTable) -> CatalogRow {
+    let mut row = empty_catalog_row(table, u64::from(SNOWBALL_TS_TEMPLATE_OID.0));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "oid",
+        CatalogValue::Oid(SNOWBALL_TS_TEMPLATE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "tmplname",
+        CatalogValue::Name("snowball".to_owned()),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "tmplnamespace",
+        CatalogValue::Oid(PG_CATALOG_NAMESPACE_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "tmplinit",
+        CatalogValue::Oid(DSNOWBALL_INIT_PROC_OID),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "tmpllexize",
+        CatalogValue::Oid(DSNOWBALL_LEXIZE_PROC_OID),
+    );
+    row
+}
+
 fn synthetic_english_ts_dict_row(table: &StaticCatalogTable) -> CatalogRow {
     let mut row = empty_catalog_row(table, u64::from(ENGLISH_TS_DICT_OID.0));
     set_catalog_row_value(
@@ -1677,7 +1828,7 @@ fn synthetic_english_ts_config_map_rows(table: &StaticCatalogTable) -> Vec<Catal
     const SIMPLE_TOKEN_TYPES: &[i32] = &[3, 4, 5, 6, 7, 8, 9, 15, 18, 19, 20, 21, 22];
     const ENGLISH_TOKEN_TYPES: &[i32] = &[1, 2, 10, 11, 16, 17];
 
-    SIMPLE_TOKEN_TYPES
+    let mut entries = SIMPLE_TOKEN_TYPES
         .iter()
         .map(|token_type| (*token_type, SIMPLE_TS_DICT_OID))
         .chain(
@@ -1685,6 +1836,11 @@ fn synthetic_english_ts_config_map_rows(table: &StaticCatalogTable) -> Vec<Catal
                 .iter()
                 .map(|token_type| (*token_type, ENGLISH_TS_DICT_OID)),
         )
+        .collect::<Vec<_>>();
+    entries.sort_by_key(|(token_type, _)| *token_type);
+
+    entries
+        .into_iter()
         .enumerate()
         .map(|(index, (token_type, dict_oid))| {
             let mut row = empty_catalog_row(
@@ -1951,6 +2107,18 @@ where
                 insert_matching_row(
                     &mut rows,
                     Some(synthetic_pg_catalog_init_privs_row(table)),
+                    &row_matches,
+                );
+            }
+            PG_PROC_RELATION_OID => {
+                for row in synthetic_dsnowball_proc_rows(table) {
+                    insert_matching_row(&mut rows, Some(row), &row_matches);
+                }
+            }
+            PG_TS_TEMPLATE_RELATION_OID => {
+                insert_matching_row(
+                    &mut rows,
+                    Some(synthetic_snowball_ts_template_row(table)),
                     &row_matches,
                 );
             }
@@ -2637,6 +2805,13 @@ pub fn catalog_row_count(relation_oid: Oid) -> Option<usize> {
                     SYNTHETIC_INIT_PRIVS_ROW_ID_BASE | u64::from(PG_CATALOG_NAMESPACE_OID.0),
                 );
             }
+            PG_PROC_RELATION_OID => {
+                row_ids.insert(u64::from(DSNOWBALL_INIT_PROC_OID.0));
+                row_ids.insert(u64::from(DSNOWBALL_LEXIZE_PROC_OID.0));
+            }
+            PG_TS_TEMPLATE_RELATION_OID => {
+                row_ids.insert(u64::from(SNOWBALL_TS_TEMPLATE_OID.0));
+            }
             PG_TS_DICT_RELATION_OID => {
                 row_ids.insert(u64::from(ENGLISH_TS_DICT_OID.0));
             }
@@ -2930,6 +3105,7 @@ pub fn upsert_catalog_row(
         row_id,
         values,
     };
+    let visible_row = row.clone();
     with_catalog_session(|session| {
         ensure_catalog_transaction(session);
         session
@@ -2937,7 +3113,9 @@ pub fn upsert_catalog_row(
             .last_mut()
             .expect("catalog transaction was just ensured")
             .upsert_catalog_row(table, row);
-        invalidate_visible_catalog_snapshot(session);
+        update_visible_catalog_snapshot(session, |snapshot| {
+            apply_catalog_row_upsert_to_snapshot(snapshot, table, visible_row);
+        });
     });
     Ok(row_id)
 }
@@ -2959,7 +3137,9 @@ pub fn delete_catalog_row(relation_oid: Oid, row_id: u64) -> Result<(), CatalogE
             .last_mut()
             .expect("catalog transaction was just ensured")
             .delete_catalog_row(relation_oid, row_id);
-        invalidate_visible_catalog_snapshot(session);
+        update_visible_catalog_snapshot(session, |snapshot| {
+            apply_catalog_row_delete_to_snapshot(snapshot, relation_oid, row_id);
+        });
     });
     Ok(())
 }
