@@ -29,6 +29,7 @@ pub const BPCHAR_OID: Oid = Oid(1042);
 pub const VARCHAR_OID: Oid = Oid(1043);
 pub const TIMESTAMP_OID: Oid = Oid(1114);
 pub const TIMESTAMPTZ_OID: Oid = Oid(1184);
+pub const INTERVAL_OID: Oid = Oid(1186);
 pub const REGCLASS_OID: Oid = Oid(2205);
 pub const ANY_OID: Oid = Oid(2276);
 pub const ANYARRAY_OID: Oid = Oid(2277);

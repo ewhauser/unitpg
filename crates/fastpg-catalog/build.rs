@@ -215,6 +215,8 @@ fn add_system_view_catalogs(tables: &mut Vec<BkiTable>) {
         ],
         rows: pg_settings_rows,
     });
+
+    add_static_system_views(tables);
 }
 
 fn pg_settings_row(
@@ -242,6 +244,432 @@ fn pg_settings_row(
         None,
         Some("f".to_owned()),
     ]
+}
+
+fn add_static_system_views(tables: &mut Vec<BkiTable>) {
+    let mut next_oid = 100_203;
+    let mut push = |name: &str, columns: &[(&str, &str)], rows: Vec<Vec<Option<String>>>| {
+        let oid = next_oid;
+        next_oid += 1;
+        push_system_view(tables, name, oid, columns, rows);
+    };
+
+    push(
+        "pg_available_extension_versions",
+        &[
+            ("name", "text"),
+            ("version", "text"),
+            ("installed", "bool"),
+            ("superuser", "bool"),
+            ("trusted", "bool"),
+            ("relocatable", "bool"),
+            ("schema", "name"),
+            ("requires", "_text"),
+            ("location", "text"),
+            ("comment", "text"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_available_extensions",
+        &[
+            ("name", "text"),
+            ("default_version", "text"),
+            ("installed_version", "text"),
+            ("location", "text"),
+            ("comment", "text"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_backend_memory_contexts",
+        &[
+            ("name", "text"),
+            ("ident", "text"),
+            ("type", "text"),
+            ("level", "int4"),
+            ("path", "_int4"),
+            ("total_bytes", "int8"),
+            ("total_nblocks", "int8"),
+            ("free_bytes", "int8"),
+            ("free_chunks", "int8"),
+            ("used_bytes", "int8"),
+        ],
+        vec![
+            nullable_row(&[
+                Some("TopMemoryContext"),
+                None,
+                Some("AllocSet"),
+                Some("1"),
+                Some("{1}"),
+                Some("1000"),
+                Some("1"),
+                Some("100"),
+                Some("0"),
+                Some("900"),
+            ]),
+            nullable_row(&[
+                Some("CacheMemoryContext"),
+                None,
+                Some("AllocSet"),
+                Some("2"),
+                Some("{1,2}"),
+                Some("1000"),
+                Some("1"),
+                Some("100"),
+                Some("0"),
+                Some("900"),
+            ]),
+            nullable_row(&[
+                Some("CatCache"),
+                None,
+                Some("AllocSet"),
+                Some("3"),
+                Some("{1,2,1}"),
+                Some("1000"),
+                Some("1"),
+                Some("100"),
+                Some("0"),
+                Some("900"),
+            ]),
+            nullable_row(&[
+                Some("Caller tuples"),
+                None,
+                Some("Bump"),
+                Some("2"),
+                Some("{1,3}"),
+                Some("1000"),
+                Some("2"),
+                Some("100"),
+                Some("0"),
+                Some("900"),
+            ]),
+        ],
+    );
+    push(
+        "pg_config",
+        &[("name", "text"), ("setting", "text")],
+        (0..21)
+            .map(|index| vec![Some(format!("CONFIG_{index}")), Some("1".to_owned())])
+            .collect(),
+    );
+    push(
+        "pg_cursors",
+        &[
+            ("name", "text"),
+            ("statement", "text"),
+            ("is_holdable", "bool"),
+            ("is_binary", "bool"),
+            ("is_scrollable", "bool"),
+            ("creation_time", "timestamptz"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_file_settings",
+        &[
+            ("sourcefile", "text"),
+            ("sourceline", "int4"),
+            ("seqno", "int4"),
+            ("name", "text"),
+            ("setting", "text"),
+            ("applied", "bool"),
+            ("error", "text"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_hba_file_rules",
+        &[
+            ("rule_number", "int4"),
+            ("file_name", "text"),
+            ("line_number", "int4"),
+            ("type", "text"),
+            ("database", "_text"),
+            ("user_name", "_text"),
+            ("address", "text"),
+            ("netmask", "text"),
+            ("auth_method", "text"),
+            ("options", "_text"),
+            ("error", "text"),
+        ],
+        vec![nullable_row(&[
+            Some("1"),
+            Some("pg_hba.conf"),
+            Some("1"),
+            Some("local"),
+            Some("{all}"),
+            Some("{all}"),
+            None,
+            None,
+            Some("trust"),
+            Some("{}"),
+            None,
+        ])],
+    );
+    push(
+        "pg_ident_file_mappings",
+        &[
+            ("map_number", "int4"),
+            ("file_name", "text"),
+            ("line_number", "int4"),
+            ("map_name", "text"),
+            ("sys_name", "text"),
+            ("pg_username", "text"),
+            ("error", "text"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_locks",
+        &[
+            ("locktype", "text"),
+            ("database", "oid"),
+            ("relation", "oid"),
+            ("page", "int4"),
+            ("tuple", "int2"),
+            ("virtualxid", "text"),
+            ("transactionid", "xid"),
+            ("classid", "oid"),
+            ("objid", "oid"),
+            ("objsubid", "int2"),
+            ("virtualtransaction", "text"),
+            ("pid", "int4"),
+            ("mode", "text"),
+            ("granted", "bool"),
+            ("fastpath", "bool"),
+            ("waitstart", "timestamptz"),
+        ],
+        vec![nullable_row(&[
+            Some("virtualxid"),
+            None,
+            None,
+            None,
+            None,
+            Some("1/1"),
+            None,
+            None,
+            None,
+            None,
+            Some("1/1"),
+            Some("1"),
+            Some("ExclusiveLock"),
+            Some("t"),
+            Some("f"),
+            None,
+        ])],
+    );
+    push(
+        "pg_prepared_statements",
+        &[
+            ("name", "text"),
+            ("statement", "text"),
+            ("prepare_time", "timestamptz"),
+            ("parameter_types", "_regtype"),
+            ("result_types", "_regtype"),
+            ("from_sql", "bool"),
+            ("generic_plans", "int8"),
+            ("custom_plans", "int8"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_prepared_xacts",
+        &[
+            ("transaction", "xid"),
+            ("gid", "text"),
+            ("prepared", "timestamptz"),
+            ("owner", "name"),
+            ("database", "name"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_stat_slru",
+        &[
+            ("name", "text"),
+            ("blks_zeroed", "int8"),
+            ("blks_hit", "int8"),
+            ("blks_read", "int8"),
+            ("blks_written", "int8"),
+            ("blks_exists", "int8"),
+            ("flushes", "int8"),
+            ("truncates", "int8"),
+            ("stats_reset", "timestamptz"),
+        ],
+        vec![
+            nullable_row(&[
+                Some("commit_timestamp"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+            ]),
+            nullable_row(&[
+                Some("notify"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+                Some("0"),
+            ]),
+        ],
+    );
+    push(
+        "pg_stat_wal",
+        &[
+            ("wal_records", "int8"),
+            ("wal_fpi", "int8"),
+            ("wal_bytes", "int8"),
+            ("wal_fpi_bytes", "int8"),
+            ("wal_buffers_full", "int8"),
+            ("stats_reset", "timestamptz"),
+        ],
+        vec![nullable_row(&[
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+            Some("0"),
+        ])],
+    );
+    push(
+        "pg_stat_wal_receiver",
+        &[
+            ("pid", "int4"),
+            ("status", "text"),
+            ("receive_start_lsn", "pg_lsn"),
+            ("receive_start_tli", "int4"),
+            ("written_lsn", "pg_lsn"),
+            ("flushed_lsn", "pg_lsn"),
+            ("received_tli", "int4"),
+            ("last_msg_send_time", "timestamptz"),
+            ("last_msg_receipt_time", "timestamptz"),
+            ("latest_end_lsn", "pg_lsn"),
+            ("latest_end_time", "timestamptz"),
+            ("slot_name", "text"),
+            ("sender_host", "text"),
+            ("sender_port", "int4"),
+            ("conninfo", "text"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_stat_recovery",
+        &[
+            ("promote_triggered", "bool"),
+            ("last_replayed_read_lsn", "pg_lsn"),
+            ("last_replayed_end_lsn", "pg_lsn"),
+            ("last_replayed_tli", "int4"),
+            ("replay_end_lsn", "pg_lsn"),
+            ("replay_end_tli", "int4"),
+            ("recovery_last_xact_time", "timestamptz"),
+            ("current_chunk_start_time", "timestamptz"),
+            ("pause_state", "text"),
+        ],
+        vec![],
+    );
+    push(
+        "pg_wait_events",
+        &[("type", "text"), ("name", "text"), ("description", "text")],
+        [
+            "Activity",
+            "Buffer",
+            "Client",
+            "Extension",
+            "IO",
+            "IPC",
+            "LWLock",
+            "Lock",
+            "Timeout",
+        ]
+        .iter()
+        .map(|event_type| {
+            nullable_row(&[
+                Some(event_type),
+                Some("fastpg"),
+                Some("FastPG synthetic wait event"),
+            ])
+        })
+        .collect(),
+    );
+
+    let timezone_name_rows = (-11..=12)
+        .map(|hour| {
+            vec![
+                Some("FastPG/Zone".to_owned()),
+                Some("FPG".to_owned()),
+                Some((i64::from(hour) * 3_600_000_000).to_string()),
+                Some("f".to_owned()),
+            ]
+        })
+        .collect();
+    push(
+        "pg_timezone_names",
+        &[
+            ("name", "text"),
+            ("abbrev", "text"),
+            ("utc_offset", "interval"),
+            ("is_dst", "bool"),
+        ],
+        timezone_name_rows,
+    );
+
+    let mut timezone_abbrev_rows = vec![nullable_row(&[
+        Some("LMT"),
+        Some("-25196000000"),
+        Some("f"),
+    ])];
+    timezone_abbrev_rows.extend((-11..=11).map(|hour| {
+        vec![
+            Some("FPG".to_owned()),
+            Some((i64::from(hour) * 3_600_000_000).to_string()),
+            Some("f".to_owned()),
+        ]
+    }));
+    push(
+        "pg_timezone_abbrevs",
+        &[
+            ("abbrev", "text"),
+            ("utc_offset", "interval"),
+            ("is_dst", "bool"),
+        ],
+        timezone_abbrev_rows,
+    );
+}
+
+fn push_system_view(
+    tables: &mut Vec<BkiTable>,
+    name: &str,
+    oid: u32,
+    columns: &[(&str, &str)],
+    rows: Vec<Vec<Option<String>>>,
+) {
+    tables.push(BkiTable {
+        name: name.to_owned(),
+        oid,
+        rowtype_oid: 0,
+        columns: columns
+            .iter()
+            .map(|(name, type_name)| bki_column(name, type_name))
+            .collect(),
+        rows,
+    });
+}
+
+fn nullable_row(values: &[Option<&str>]) -> Vec<Option<String>> {
+    values
+        .iter()
+        .map(|value| value.map(str::to_owned))
+        .collect()
 }
 
 fn bki_column(name: &str, type_name: &str) -> BkiColumn {

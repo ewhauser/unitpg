@@ -12,9 +12,9 @@ use fastpg_catalog::{
     ACLITEM_ARRAY_OID, ACLITEM_OID, ANYARRAY_OID, BOOL_OID, BPCHAR_OID, BYTEA_OID, CHAR_ARRAY_OID,
     CHAR_OID, CID_OID, CatalogError, CatalogFilterValue, CatalogRow, CatalogRowFilter,
     CatalogValue, ColumnRecord, FLOAT8_OID, INT2_ARRAY_OID, INT2_OID, INT2VECTOR_OID,
-    INT4_ARRAY_OID, INT4_OID, INT8_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID, OIDVECTOR_OID,
-    PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, REGCLASS_OID, TEXT_ARRAY_OID,
-    TEXT_OID, TID_OID, TIMESTAMP_OID, VARCHAR_OID, XID_OID,
+    INT4_ARRAY_OID, INT4_OID, INT8_OID, INTERVAL_OID, LSN_OID, NAME_OID, OID_ARRAY_OID, OID_OID,
+    OIDVECTOR_OID, PG_CATALOG_NAMESPACE_OID, PG_NODE_TREE_OID, PhysicalColumnRecord, REGCLASS_OID,
+    TEXT_ARRAY_OID, TEXT_OID, TID_OID, TIMESTAMP_OID, TIMESTAMPTZ_OID, VARCHAR_OID, XID_OID,
     btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
     builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
     builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
@@ -5284,6 +5284,24 @@ fn float8_datum(value: f64) -> Cell {
     datum(value.to_bits() as usize)
 }
 
+fn interval_datum(value: &str, region: &mut StorageRegion) -> Option<Cell> {
+    let mut parts = value.split(',');
+    let time_micros = parts.next()?.parse::<i64>().ok()?;
+    let days = parts
+        .next()
+        .map(|part| part.parse::<i32>().ok())
+        .unwrap_or(Some(0))?;
+    let months = parts
+        .next()
+        .map(|part| part.parse::<i32>().ok())
+        .unwrap_or(Some(0))?;
+    let mut bytes = Vec::with_capacity(16);
+    bytes.extend_from_slice(&time_micros.to_ne_bytes());
+    bytes.extend_from_slice(&days.to_ne_bytes());
+    bytes.extend_from_slice(&months.to_ne_bytes());
+    Some(byref_datum(&bytes, region))
+}
+
 fn byref_datum(bytes: &[u8], region: &mut StorageRegion) -> Cell {
     Cell::by_ref(region.alloc_bytes(bytes))
 }
@@ -5710,6 +5728,11 @@ fn catalog_value_to_cell(
                 .parse::<f64>()
                 .map(float8_datum)
                 .unwrap_or_else(|_| float8_datum(0.0)),
+            TIMESTAMP_OID | TIMESTAMPTZ_OID => value
+                .parse::<i64>()
+                .map(int8_datum)
+                .unwrap_or_else(|_| int8_datum(0)),
+            INTERVAL_OID => interval_datum(value, region).unwrap_or_else(null_datum),
             TID_OID => null_datum(),
             LSN_OID => parse_lsn(value)
                 .map(|value| datum(value as usize))

@@ -404,6 +404,40 @@ fn pg_settings_exposes_regression_support_rows() {
 }
 
 #[test]
+fn regression_system_views_expose_support_rows() {
+    let memory_contexts =
+        static_catalog_by_name("pg_backend_memory_contexts").expect("pg_backend_memory_contexts");
+    let memory_rows = catalog_rows(memory_contexts.oid);
+    assert!(memory_rows.iter().any(|row| {
+        catalog_value_string(row_value("pg_backend_memory_contexts", row, "name")).as_deref()
+            == Some("TopMemoryContext")
+            && row_value("pg_backend_memory_contexts", row, "level") == &CatalogValue::Int32(1)
+    }));
+    assert!(memory_rows.iter().any(|row| {
+        catalog_value_string(row_value("pg_backend_memory_contexts", row, "name")).as_deref()
+            == Some("Caller tuples")
+            && row_value("pg_backend_memory_contexts", row, "total_nblocks")
+                == &CatalogValue::Raw("2".to_owned())
+    }));
+
+    let wait_events = static_catalog_by_name("pg_wait_events").expect("pg_wait_events");
+    let wait_rows = catalog_rows(wait_events.oid);
+    assert_eq!(wait_rows.len(), 9);
+    assert!(wait_rows.iter().any(|row| {
+        catalog_value_string(row_value("pg_wait_events", row, "type")).as_deref() == Some("LWLock")
+    }));
+
+    let timezones = static_catalog_by_name("pg_timezone_abbrevs").expect("pg_timezone_abbrevs");
+    let timezone_rows = catalog_rows(timezones.oid);
+    assert!(timezone_rows.iter().any(|row| {
+        catalog_value_string(row_value("pg_timezone_abbrevs", row, "abbrev")).as_deref()
+            == Some("LMT")
+            && row_value("pg_timezone_abbrevs", row, "utc_offset")
+                == &CatalogValue::Raw("-25196000000".to_owned())
+    }));
+}
+
+#[test]
 fn virtual_catalog_relation_metadata_includes_rowtype_and_stats() {
     let proc_table = static_catalog_by_name("pg_proc").expect("pg_proc catalog");
     let rowtype_oid = relation_rowtype_oid_by_oid(proc_table.oid).expect("rowtype oid");
