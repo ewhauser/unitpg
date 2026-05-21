@@ -108,6 +108,7 @@
 
 #include "access/genam.h"
 #ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
 #endif
 #include "access/relscan.h"
@@ -139,6 +140,19 @@ static bool check_exclusion_or_unique_constraint(Relation heap, Relation index,
 												 CEOUC_WAIT_MODE waitMode,
 												 bool violationOK,
 												 ItemPointer conflictTid);
+#ifdef USE_FASTPG
+static bool fastpg_relation_uses_mem_tableam(Relation heap);
+static bool fastpg_check_exclusion_constraint_heapscan(Relation heap,
+													   Relation index,
+													   IndexInfo *indexInfo,
+													   const ItemPointerData *tupleid,
+													   const Datum *values,
+													   const bool *isnull,
+													   EState *estate,
+													   bool newIndex,
+													   bool violationOK,
+													   ItemPointer conflictTid);
+#endif
 
 static bool index_recheck_constraint(Relation index, const Oid *constr_procs,
 									 const Datum *existing_values, const bool *existing_isnull,
@@ -182,6 +196,21 @@ ExecOpenIndices(ResultRelInfo *resultRelInfo, bool speculative)
 	 * Get cached list of index OIDs
 	 */
 	indexoidlist = RelationGetIndexList(resultRelation);
+#ifdef USE_FASTPG
+	if (fastpg_relation_uses_mem_tableam(resultRelation))
+	{
+		size_t		fastpg_index_position = 0;
+		uint32_t	fastpg_index_oid;
+
+		while (fastpg_rust_catalog_relation_exclusion_index_oid((uint32_t) RelationGetRelid(resultRelation),
+																fastpg_index_position++,
+																&fastpg_index_oid))
+		{
+			if (!list_member_oid(indexoidlist, (Oid) fastpg_index_oid))
+				indexoidlist = lappend_oid(indexoidlist, (Oid) fastpg_index_oid);
+		}
+	}
+#endif
 	len = list_length(indexoidlist);
 	if (len == 0)
 		return;
@@ -362,11 +391,20 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 		IndexUniqueCheck checkUnique;
 		bool		indexUnchanged;
 		bool		satisfiesConstraint;
+#ifdef USE_FASTPG
+		bool		fastpg_heap_exclusion = false;
+#endif
 
 		if (indexRelation == NULL)
 			continue;
 
 		indexInfo = indexInfoArray[i];
+#ifdef USE_FASTPG
+		fastpg_heap_exclusion =
+			fastpg_relation_uses_mem_tableam(heapRelation) &&
+			indexInfo->ii_ExclusionOps != NULL &&
+			!indexRelation->rd_index->indisunique;
+#endif
 
 		/* If the index is marked as read-only, ignore it */
 		if (!indexInfo->ii_ReadyForInserts)
@@ -449,15 +487,20 @@ ExecInsertIndexTuples(ResultRelInfo *resultRelInfo,
 													indexInfo,
 													indexRelation));
 
-		satisfiesConstraint =
-			index_insert(indexRelation, /* index relation */
-						 values,	/* array of index Datums */
-						 isnull,	/* null flags */
-						 tupleid,	/* tid of heap tuple */
-						 heapRelation,	/* heap relation */
-						 checkUnique,	/* type of uniqueness check to do */
-						 indexUnchanged,	/* UPDATE without logical change? */
-						 indexInfo);	/* index AM may need this */
+#ifdef USE_FASTPG
+		if (fastpg_heap_exclusion)
+			satisfiesConstraint = true;
+		else
+#endif
+			satisfiesConstraint =
+				index_insert(indexRelation, /* index relation */
+							 values,	/* array of index Datums */
+							 isnull,	/* null flags */
+							 tupleid,	/* tid of heap tuple */
+							 heapRelation,	/* heap relation */
+							 checkUnique,	/* type of uniqueness check to do */
+							 indexUnchanged,	/* UPDATE without logical change? */
+							 indexInfo);	/* index AM may need this */
 
 		/*
 		 * If the index has an associated exclusion constraint, check that.
@@ -789,6 +832,19 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	}
 
 #ifdef USE_FASTPG
+	if (indexInfo->ii_ExclusionOps != NULL &&
+		fastpg_relation_uses_mem_tableam(heap))
+		return fastpg_check_exclusion_constraint_heapscan(heap,
+														  index,
+														  indexInfo,
+														  tupleid,
+														  values,
+														  isnull,
+														  estate,
+														  newIndex,
+														  violationOK,
+														  conflictTid);
+
 	if (indexInfo->ii_ExclusionOps == NULL && violationOK)
 	{
 		bool		fastpg_satisfies;
@@ -979,6 +1035,100 @@ retry:
 
 	return !conflict;
 }
+
+#ifdef USE_FASTPG
+static bool
+fastpg_relation_uses_mem_tableam(Relation heap)
+{
+	return heap != NULL && heap->rd_tableam == GetFastPgMemTableAmRoutine();
+}
+
+static bool
+fastpg_check_exclusion_constraint_heapscan(Relation heap,
+										   Relation index,
+										   IndexInfo *indexInfo,
+										   const ItemPointerData *tupleid,
+										   const Datum *values,
+										   const bool *isnull,
+										   EState *estate,
+										   bool newIndex,
+										   bool violationOK,
+										   ItemPointer conflictTid)
+{
+	TableScanDesc scan;
+	TupleTableSlot *existing_slot;
+	ExprContext *econtext;
+	TupleTableSlot *save_scantuple;
+	bool		conflict = false;
+
+	existing_slot = table_slot_create(heap, NULL);
+	econtext = GetPerTupleExprContext(estate);
+	save_scantuple = econtext->ecxt_scantuple;
+	econtext->ecxt_scantuple = existing_slot;
+
+	scan = table_beginscan(heap, SnapshotAny, 0, NULL, 0);
+	while (table_scan_getnextslot(scan, ForwardScanDirection, existing_slot))
+	{
+		Datum		existing_values[INDEX_MAX_KEYS];
+		bool		existing_isnull[INDEX_MAX_KEYS];
+		char	   *error_new;
+		char	   *error_existing;
+
+		if (ItemPointerIsValid(tupleid) &&
+			ItemPointerEquals(tupleid, &existing_slot->tts_tid))
+			continue;
+
+		FormIndexDatum(indexInfo, existing_slot, estate,
+					   existing_values, existing_isnull);
+		if (!index_recheck_constraint(index,
+									  indexInfo->ii_ExclusionProcs,
+									  existing_values,
+									  existing_isnull,
+									  values))
+			continue;
+
+		if (violationOK)
+		{
+			conflict = true;
+			if (conflictTid)
+				*conflictTid = existing_slot->tts_tid;
+			break;
+		}
+
+		error_new = BuildIndexValueDescription(index, values, isnull);
+		error_existing = BuildIndexValueDescription(index, existing_values,
+													existing_isnull);
+		if (newIndex)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXCLUSION_VIOLATION),
+					 errmsg("could not create exclusion constraint \"%s\"",
+							RelationGetRelationName(index)),
+					 error_new && error_existing ?
+					 errdetail("Key %s conflicts with key %s.",
+							   error_new, error_existing) :
+					 errdetail("Key conflicts exist."),
+					 errtableconstraint(heap,
+										RelationGetRelationName(index))));
+		else
+			ereport(ERROR,
+					(errcode(ERRCODE_EXCLUSION_VIOLATION),
+					 errmsg("conflicting key value violates exclusion constraint \"%s\"",
+							RelationGetRelationName(index)),
+					 error_new && error_existing ?
+					 errdetail("Key %s conflicts with existing key %s.",
+							   error_new, error_existing) :
+					 errdetail("Key conflicts with existing key."),
+					 errtableconstraint(heap,
+										RelationGetRelationName(index))));
+	}
+	table_endscan(scan);
+
+	econtext->ecxt_scantuple = save_scantuple;
+	ExecDropSingleTupleTableSlot(existing_slot);
+
+	return !conflict;
+}
+#endif
 
 /*
  * Check for violation of an exclusion constraint

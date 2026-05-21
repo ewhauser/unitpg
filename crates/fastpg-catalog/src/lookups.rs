@@ -761,6 +761,9 @@ pub(crate) fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> 
         is_primary: catalog_row_value(table, row, "indisprimary")
             .and_then(catalog_value_bool)
             .unwrap_or(false),
+        is_exclusion: catalog_row_value(table, row, "indisexclusion")
+            .and_then(catalog_value_bool)
+            .unwrap_or(false),
         is_immediate: catalog_row_value(table, row, "indimmediate")
             .and_then(catalog_value_bool)
             .unwrap_or(true),

@@ -3546,6 +3546,33 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_unique_index_oid(
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// C callers must pass a valid output pointer.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_exclusion_index_oid(
+    relation_oid: u32,
+    index_position: usize,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let mut indexes: Vec<_> = index_records_for_relation_oid(Oid(relation_oid))
+        .into_iter()
+        .filter(|record| record.is_exclusion && record.is_live)
+        .map(|record| record.index_oid)
+        .collect();
+    indexes.sort_by_key(|oid| oid.0);
+    let Some(index_oid) = indexes.get(index_position) else {
+        return false;
+    };
+    unsafe {
+        *oid_out = index_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// C callers must pass a valid output pointer for `oid_out`.
 pub unsafe extern "C" fn fastpg_rust_catalog_enum_endpoint(
     enum_type_oid: u32,

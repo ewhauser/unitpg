@@ -298,6 +298,7 @@ pub struct IndexRecord {
     pub is_unique: bool,
     pub nulls_not_distinct: bool,
     pub is_primary: bool,
+    pub is_exclusion: bool,
     pub is_immediate: bool,
     pub is_valid: bool,
     pub is_ready: bool,
