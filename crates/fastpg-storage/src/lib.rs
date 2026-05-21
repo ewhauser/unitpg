@@ -2854,8 +2854,14 @@ fn index_key_for_datums(
     for (key_index, column) in index_spec.columns.iter().enumerate() {
         let cell = if is_null[key_index] != 0 {
             Cell::null()
-        } else {
+        } else if column.typbyval {
             Cell::by_value(values[key_index])
+        } else {
+            Cell::by_ref(ValueRef {
+                region_id: StorageRegionId(0),
+                ptr: values[key_index],
+                len: usize::MAX,
+            })
         };
         if cell.is_null && !index_spec.nulls_not_distinct {
             return None;

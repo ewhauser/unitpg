@@ -792,6 +792,55 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn rejects_duplicate_byref_unique_index_values() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_unique_uuid_{}", std::process::id());
+        let index = format!("{table}_idx");
+
+        assert_eq!(
+            executor.execute(&format!("create table {table}(id uuid)"), &[]),
+            QueryExecution::Command {
+                tag: "CREATE TABLE".into(),
+                rows: 0,
+            }
+        );
+        let first_insert = executor.execute(
+            &format!("insert into {table} values ('11111111-1111-1111-1111-111111111111')"),
+            &[],
+        );
+        assert!(matches!(
+            first_insert,
+            QueryExecution::Command { ref tag, .. } if tag == "INSERT"
+        ));
+        assert_eq!(
+            executor.execute(&format!("create unique index {index} on {table}(id)"), &[]),
+            QueryExecution::Command {
+                tag: "CREATE INDEX".into(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute(
+                &format!("insert into {table} values ('11111111-1111-1111-1111-111111111111')"),
+                &[]
+            ),
+            QueryExecution::Error {
+                sqlstate: "23505".to_owned(),
+                message: format!("duplicate key value violates unique constraint \"{index}\""),
+                detail: Some(
+                    "Key (id)=(11111111-1111-1111-1111-111111111111) already exists.".to_owned(),
+                ),
+                hint: None,
+                context: None,
+                cursorpos: 0,
+            }
+        );
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn executes_parameterized_int4_through_pgcore() {
         let executor = QueryExecutor::new("17.0-fastpg");
 
