@@ -1548,6 +1548,114 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_sequence_setval_updates_fastpg_state() {
+        let session = PgCoreSession::new();
+        let sequence = unique_pg_name("fastpg_pgcore_seq_setval");
+        session
+            .prepare(&format!("create sequence {sequence}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let result = session
+            .execute_with_params(&format!("select nextval('{sequence}')"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("1".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params(&format!("select setval('{sequence}', 32)"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("32".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params("select lastval()", &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("32".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params(&format!("select nextval('{sequence}')"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("33".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params(&format!("select setval('{sequence}', 99, false)"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("99".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params(
+                &format!(
+                    "select last_value, is_called, page_lsn <= pg_current_wal_lsn() from pg_get_sequence_data('{sequence}')"
+                ),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![
+                PgCoreValue::Text("99".to_owned()),
+                PgCoreValue::Text("f".to_owned()),
+                PgCoreValue::Text("t".to_owned()),
+            ]]
+        );
+
+        let result = session
+            .execute_with_params(&format!("select currval('{sequence}')"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("33".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params(&format!("select nextval('{sequence}')"), &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("99".to_owned())]]
+        );
+
+        let result = session
+            .execute_with_params(
+                &format!(
+                    "select last_value, is_called, page_lsn <= pg_current_wal_lsn() from pg_get_sequence_data('{sequence}')"
+                ),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![
+                PgCoreValue::Text("99".to_owned()),
+                PgCoreValue::Text("t".to_owned()),
+                PgCoreValue::Text("t".to_owned()),
+            ]]
+        );
+
+        session
+            .prepare(&format!("drop sequence if exists {sequence}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn current_database_uses_session_database() {
         let session = PgCoreSession::with_database("regression");
         let result = session

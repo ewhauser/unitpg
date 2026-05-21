@@ -311,6 +311,15 @@ pg_current_wal_lsn(PG_FUNCTION_ARGS)
 				 errmsg("recovery is in progress"),
 				 errhint("WAL control functions cannot be executed during recovery.")));
 
+#ifdef USE_FASTPG
+	/*
+	 * FastPG does not initialize PostgreSQL's WAL shared-memory machinery.
+	 * Expose a stable synthetic LSN so SQL callers can still compare pg_lsn
+	 * values without dereferencing the absent WAL control state.
+	 */
+	PG_RETURN_LSN(FirstNormalUnloggedLSN);
+#endif
+
 	current_recptr = GetXLogWriteRecPtr();
 
 	PG_RETURN_LSN(current_recptr);
@@ -332,6 +341,10 @@ pg_current_wal_insert_lsn(PG_FUNCTION_ARGS)
 				 errmsg("recovery is in progress"),
 				 errhint("WAL control functions cannot be executed during recovery.")));
 
+#ifdef USE_FASTPG
+	PG_RETURN_LSN(FirstNormalUnloggedLSN);
+#endif
+
 	current_recptr = GetXLogInsertRecPtr();
 
 	PG_RETURN_LSN(current_recptr);
@@ -352,6 +365,10 @@ pg_current_wal_flush_lsn(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				 errmsg("recovery is in progress"),
 				 errhint("WAL control functions cannot be executed during recovery.")));
+
+#ifdef USE_FASTPG
+	PG_RETURN_LSN(FirstNormalUnloggedLSN);
+#endif
 
 	current_recptr = GetFlushRecPtr(NULL);
 

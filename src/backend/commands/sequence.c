@@ -74,6 +74,11 @@ typedef struct SeqTableData
 	/* if last != cached, we have not used up all the cached values */
 	int64		increment;		/* copy of sequence's increment field */
 	/* note that increment is zero until we first do nextval_internal() */
+#ifdef USE_FASTPG
+	bool		fastpg_state_valid;	/* have we materialized sequence state? */
+	bool		fastpg_is_called;	/* copy of sequence's is_called field */
+	int64		fastpg_last_value;	/* copy of sequence's last_value field */
+#endif
 } SeqTableData;
 
 typedef SeqTableData *SeqTable;
@@ -90,6 +95,7 @@ static void fill_seq_with_data(Relation rel, HeapTuple tuple);
 static void fill_seq_fork_with_data(Relation rel, HeapTuple tuple, ForkNumber forkNum);
 static Relation lock_and_open_sequence(SeqTable seq);
 static void create_seq_hashtable(void);
+static void init_sequence_entry(Oid relid, SeqTable *p_elm);
 static void init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel);
 static Form_pg_sequence_data read_seq_tuple(Relation rel,
 											Buffer *buf, HeapTuple seqdatatuple);
@@ -270,6 +276,25 @@ ResetSequence(Oid seq_relid)
 	 * indeed a sequence.
 	 */
 	init_sequence(seq_relid, &elm, &seq_rel);
+#ifdef USE_FASTPG
+	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(seq_relid));
+	if (!HeapTupleIsValid(pgstuple))
+		elog(ERROR, "cache lookup failed for sequence %u", seq_relid);
+	pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
+	startv = pgsform->seqstart;
+	ReleaseSysCache(pgstuple);
+
+	elm->fastpg_state_valid = true;
+	elm->fastpg_last_value = startv;
+	elm->fastpg_is_called = false;
+
+	/* Clear local cache without changing currval() state. */
+	elm->cached = elm->last;
+
+	sequence_close(seq_rel, NoLock);
+	return;
+#endif
+
 	(void) read_seq_tuple(seq_rel, &buf, &seqdatatuple);
 
 	pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(seq_relid));
@@ -487,8 +512,16 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	seqform = (Form_pg_sequence) GETSTRUCT(seqtuple);
 
 #ifdef USE_FASTPG
-	last_value = seqform->seqstart;
-	is_called = false;
+	if (elm->fastpg_state_valid)
+	{
+		last_value = elm->fastpg_last_value;
+		is_called = elm->fastpg_is_called;
+	}
+	else
+	{
+		last_value = seqform->seqstart;
+		is_called = false;
+	}
 #else
 	/* lock page buffer and read tuple into new sequence structure */
 	(void) read_seq_tuple(seqrel, &buf, &datatuple);
@@ -510,7 +543,11 @@ AlterSequence(ParseState *pstate, AlterSeqStmt *stmt)
 	/* If needed, rewrite the sequence relation itself */
 	if (need_seq_rewrite)
 	{
-#ifndef USE_FASTPG
+#ifdef USE_FASTPG
+		elm->fastpg_state_valid = true;
+		elm->fastpg_last_value = last_value;
+		elm->fastpg_is_called = is_called;
+#else
 		/* check the comment above nextval_internal()'s equivalent call. */
 		if (RelationNeedsWAL(seqrel))
 			GetTopTransactionId();
@@ -577,6 +614,16 @@ SequenceChangePersistence(Oid relid, char newrelpersistence)
 	 */
 	LockRelationOid(relid, AccessExclusiveLock);
 	init_sequence(relid, &elm, &seqrel);
+
+#ifdef USE_FASTPG
+	/*
+	 * The Rust server does not keep a PostgreSQL sequence fork in shared
+	 * buffers.  Relation persistence is catalog-visible, while the sequence
+	 * value itself stays in SeqTableData.
+	 */
+	sequence_close(seqrel, NoLock);
+	return;
+#endif
 
 	/* check the comment above nextval_internal()'s equivalent call. */
 	if (RelationNeedsWAL(seqrel))
@@ -713,13 +760,17 @@ nextval_internal(Oid relid, bool check_permissions)
 	ReleaseSysCache(pgstuple);
 
 #ifdef USE_FASTPG
-	if (!elm->last_valid)
+	if (!elm->fastpg_state_valid)
 	{
 		result = startv;
 	}
+	else if (!elm->fastpg_is_called)
+	{
+		result = elm->fastpg_last_value;
+	}
 	else
 	{
-		result = elm->last;
+		result = elm->fastpg_last_value;
 		if (incby > 0)
 		{
 			if ((maxv >= 0 && result > maxv - incby) ||
@@ -754,6 +805,9 @@ nextval_internal(Oid relid, bool check_permissions)
 		}
 	}
 
+	elm->fastpg_state_valid = true;
+	elm->fastpg_last_value = result;
+	elm->fastpg_is_called = true;
 	elm->increment = incby;
 	elm->last = result;
 	elm->cached = result;
@@ -1061,6 +1115,32 @@ SetSequence(Oid relid, int64 next, bool iscalled)
 	 */
 	PreventCommandIfParallelMode("setval()");
 
+#ifdef USE_FASTPG
+	if ((next < minv) || (next > maxv))
+		ereport(ERROR,
+				(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
+				 errmsg("setval: value %" PRId64 " is out of bounds for sequence \"%s\" (%" PRId64 "..%" PRId64 ")",
+						next, RelationGetRelationName(seqrel),
+						minv, maxv)));
+
+	elm->fastpg_state_valid = true;
+	elm->fastpg_last_value = next;
+	elm->fastpg_is_called = iscalled;
+
+	/* Set the currval() state only if iscalled = true */
+	if (iscalled)
+	{
+		elm->last = next;		/* last returned number */
+		elm->last_valid = true;
+	}
+
+	/* In any case, forget any future cached numbers */
+	elm->cached = elm->last;
+
+	sequence_close(seqrel, NoLock);
+	return;
+#endif
+
 	/* lock page buffer and read tuple */
 	seq = read_seq_tuple(seqrel, &buf, &seqdatatuple);
 
@@ -1208,14 +1288,12 @@ create_seq_hashtable(void)
 }
 
 /*
- * Given a relation OID, open and lock the sequence.  p_elm and p_rel are
- * output parameters.
+ * Find or create the backend-local state entry for a sequence.
  */
 static void
-init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
+init_sequence_entry(Oid relid, SeqTable *p_elm)
 {
 	SeqTable	elm;
-	Relation	seqrel;
 	bool		found;
 
 	/* Find or create a hash table entry for this sequence */
@@ -1239,7 +1317,28 @@ init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
 		elm->lxid = InvalidLocalTransactionId;
 		elm->last_valid = false;
 		elm->last = elm->cached = 0;
+		elm->increment = 0;
+#ifdef USE_FASTPG
+		elm->fastpg_state_valid = false;
+		elm->fastpg_is_called = false;
+		elm->fastpg_last_value = 0;
+#endif
 	}
+
+	*p_elm = elm;
+}
+
+/*
+ * Given a relation OID, open and lock the sequence.  p_elm and p_rel are
+ * output parameters.
+ */
+static void
+init_sequence(Oid relid, SeqTable *p_elm, Relation *p_rel)
+{
+	SeqTable	elm;
+	Relation	seqrel;
+
+	init_sequence_entry(relid, &elm);
 
 	/*
 	 * Open the sequence relation.
@@ -1910,6 +2009,30 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 		!RELATION_IS_OTHER_TEMP(seqrel) &&
 		(RelationIsPermanent(seqrel) || !RecoveryInProgress()))
 	{
+#ifdef USE_FASTPG
+		SeqTable	elm;
+
+		init_sequence_entry(relid, &elm);
+		if (elm->fastpg_state_valid)
+		{
+			values[0] = Int64GetDatum(elm->fastpg_last_value);
+			values[1] = BoolGetDatum(elm->fastpg_is_called);
+		}
+		else
+		{
+			HeapTuple	pgstuple;
+			Form_pg_sequence pgsform;
+
+			pgstuple = SearchSysCache1(SEQRELID, ObjectIdGetDatum(relid));
+			if (!HeapTupleIsValid(pgstuple))
+				elog(ERROR, "cache lookup failed for sequence %u", relid);
+			pgsform = (Form_pg_sequence) GETSTRUCT(pgstuple);
+			values[0] = Int64GetDatum(pgsform->seqstart);
+			values[1] = BoolGetDatum(false);
+			ReleaseSysCache(pgstuple);
+		}
+		values[2] = LSNGetDatum(InvalidXLogRecPtr);
+#else
 		Buffer		buf;
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
@@ -1923,6 +2046,7 @@ pg_get_sequence_data(PG_FUNCTION_ARGS)
 		values[2] = LSNGetDatum(PageGetLSN(page));
 
 		UnlockReleaseBuffer(buf);
+#endif
 	}
 	else
 		memset(isnull, true, sizeof(isnull));
@@ -1967,6 +2091,13 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		!RELATION_IS_OTHER_TEMP(seqrel) &&
 		(RelationIsPermanent(seqrel) || !RecoveryInProgress()))
 	{
+#ifdef USE_FASTPG
+		if (elm->fastpg_state_valid)
+		{
+			is_called = elm->fastpg_is_called;
+			result = elm->fastpg_last_value;
+		}
+#else
 		Buffer		buf;
 		HeapTupleData seqtuple;
 		Form_pg_sequence_data seq;
@@ -1977,6 +2108,7 @@ pg_sequence_last_value(PG_FUNCTION_ARGS)
 		result = seq->last_value;
 
 		UnlockReleaseBuffer(buf);
+#endif
 	}
 	sequence_close(seqrel, NoLock);
 
