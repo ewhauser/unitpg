@@ -184,6 +184,10 @@ extern void GetTempNamespaceState(Oid *tempNamespaceId,
 extern void SetTempNamespaceState(Oid tempNamespaceId,
 								  Oid tempToastNamespaceId);
 extern void ResetTempTableNamespace(void);
+#ifdef USE_FASTPG
+extern void FastPgForgetTempTableNamespace(void);
+extern void FastPgResetTempTableNamespace(void);
+#endif
 
 extern SearchPathMatcher *GetSearchPathMatcher(MemoryContext context);
 extern SearchPathMatcher *CopySearchPathMatcher(SearchPathMatcher *path);

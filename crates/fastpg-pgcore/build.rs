@@ -23,7 +23,9 @@ fn main() {
     for relative in [
         "src/backend/access/fastpg/fastpg_mem_tableam.c",
         "src/backend/access/index/genam.c",
+        "src/backend/access/transam/multixact.c",
         "src/backend/access/transam/xact.c",
+        "src/backend/catalog/namespace.c",
         "src/backend/commands/indexcmds.c",
         "src/backend/commands/tablecmds.c",
         "src/backend/utils/adt/misc.c",
@@ -33,6 +35,7 @@ fn main() {
         "src/backend/utils/cache/relcache.c",
         "src/include/access/fastpg_catalog.h",
         "src/include/access/fastpg_tableam.h",
+        "src/include/catalog/namespace.h",
     ] {
         println!(
             "cargo:rerun-if-changed={}",

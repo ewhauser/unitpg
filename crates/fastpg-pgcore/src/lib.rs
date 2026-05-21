@@ -161,6 +161,7 @@ pub struct PgCoreSession {
     inner: inner::PgCoreSession,
     storage_session: fastpg_storage::SessionStorageHandle,
     storage2_session: fastpg_storage2::SessionStorageHandle,
+    session_owner: std::sync::Arc<()>,
 }
 
 impl PgCoreSession {
@@ -198,6 +199,7 @@ impl PgCoreSession {
             inner: inner::PgCoreSession::new(database_oid),
             storage_session,
             storage2_session,
+            session_owner: std::sync::Arc::new(()),
         }
     }
 
@@ -258,6 +260,16 @@ impl PgCoreSession {
 impl Default for PgCoreSession {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for PgCoreSession {
+    fn drop(&mut self) {
+        if std::sync::Arc::strong_count(&self.session_owner) != 1 {
+            return;
+        }
+        let _guard = self.enter_storage();
+        self.inner.cleanup_session();
     }
 }
 
@@ -463,6 +475,7 @@ mod inner {
         fn fastpg_xid_rollback();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_reset_session_transaction_characteristics();
+        fn fastpg_pgcore_reset_temp_table_namespace() -> bool;
         fn fastpg_pgcore_set_database(database_oid: u32);
         fn fastpg_pgcore_try_finish_explicit_transaction(
             is_commit: bool,
@@ -857,6 +870,14 @@ mod inner {
                 fastpg_pgcore_reset_session_transaction_characteristics();
             }
             Self { database_oid }
+        }
+
+        pub fn cleanup_session(&self) {
+            let _guard = enter_pgcore_lane("session_cleanup");
+            self.set_database();
+            unsafe {
+                let _ = fastpg_pgcore_reset_temp_table_namespace();
+            }
         }
 
         fn set_database(&self) {
@@ -1423,6 +1444,8 @@ mod inner {
         pub fn new(_database_oid: u32) -> Self {
             Self
         }
+
+        pub fn cleanup_session(&self) {}
 
         pub fn prepare(&self, _sql: &str) -> Result<PreparedStatement, PgCoreError> {
             Err(PgCoreError::new(
@@ -3197,6 +3220,70 @@ mod tests {
             .unwrap();
         second
             .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn temp_tables_are_removed_when_session_drops() {
+        let table = unique_pg_name("fastpg_pgcore_temp_cleanup");
+
+        {
+            let first = PgCoreSession::new();
+            first
+                .prepare(&format!("create temp table {table}(id int)"))
+                .unwrap()
+                .execute()
+                .unwrap();
+            first
+                .prepare(&format!("insert into {table} values (1)"))
+                .unwrap()
+                .execute()
+                .unwrap();
+        }
+
+        let second = PgCoreSession::new();
+        second
+            .prepare(&format!("create temp table {table}(id int, value int)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        second
+            .prepare(&format!("insert into {table} values (1, 2)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn temp_namespace_recreated_after_session_cleanup() {
+        {
+            let first = PgCoreSession::new();
+            let old_table = unique_pg_name("fastpg_pgcore_old_temp");
+            first
+                .prepare(&format!(
+                    "create temp table {old_table}(id int primary key)"
+                ))
+                .unwrap()
+                .execute()
+                .unwrap();
+        }
+
+        let second = PgCoreSession::new();
+        let pk_table = unique_pg_name("fastpg_pgcore_temp_pk");
+        let fk_table = unique_pg_name("fastpg_pgcore_temp_fk");
+        second
+            .prepare(&format!("create temp table {pk_table}(id int primary key)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        second
+            .prepare(&format!(
+                "create temp table {fk_table}(id int references {pk_table}(id))"
+            ))
             .unwrap()
             .execute()
             .unwrap();

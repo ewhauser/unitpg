@@ -204,6 +204,13 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteStatement *statement,
 														   MemoryContext context);
 static char *fastpg_pgcore_strdup(const char *value);
+static void fastpg_pgcore_ensure_execution_owner(void);
+static void fastpg_pgcore_release_error_resources(void);
+static void fastpg_pgcore_start_statement_timestamp(void);
+#ifdef USE_FASTPG
+static void fastpg_pgcore_commit_implicit_transaction(void);
+static void fastpg_pgcore_abort_implicit_transaction(void);
+#endif
 
 static bool fastpg_pgcore_initialized = false;
 
@@ -702,6 +709,44 @@ fastpg_pgcore_reset_session_transaction_characteristics(void)
 	fastpg_pgcore_configure_timezone();
 #ifdef USE_FASTPG
 	FastPgResetStandaloneSessionTransactionCharacteristics();
+#endif
+}
+
+bool
+fastpg_pgcore_reset_temp_table_namespace(void)
+{
+#ifdef USE_FASTPG
+	volatile bool snapshot_pushed = false;
+
+	fastpg_pgcore_enter();
+	PG_TRY();
+	{
+		fastpg_pgcore_start_statement_timestamp();
+		fastpg_pgcore_ensure_execution_owner();
+		PushActiveSnapshot(GetTransactionSnapshot());
+		snapshot_pushed = true;
+		FastPgResetTempTableNamespace();
+		PopActiveSnapshot();
+		snapshot_pushed = false;
+		fastpg_pgcore_commit_implicit_transaction();
+		MemoryContextSwitchTo(TopMemoryContext);
+		return true;
+	}
+	PG_CATCH();
+	{
+		MemoryContextSwitchTo(TopMemoryContext);
+		if (snapshot_pushed)
+			PopActiveSnapshot();
+		fastpg_pgcore_abort_implicit_transaction();
+		FastPgForgetTempTableNamespace();
+		FlushErrorState();
+		fastpg_pgcore_release_error_resources();
+	}
+	PG_END_TRY();
+
+	return false;
+#else
+	return true;
 #endif
 }
 

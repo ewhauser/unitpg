@@ -1639,6 +1639,13 @@ mxid_to_string(MultiXactId multi, int nmembers, MultiXactMember *members)
 void
 AtEOXact_MultiXact(void)
 {
+#ifdef USE_FASTPG
+	if (MultiXactState == NULL ||
+		OldestMemberMXactId == NULL ||
+		OldestVisibleMXactId == NULL)
+		return;
+#endif
+
 	/*
 	 * Reset our OldestMemberMXactId and OldestVisibleMXactId values, both of
 	 * which should only be valid while within a transaction.

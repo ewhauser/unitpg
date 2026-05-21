@@ -4954,6 +4954,41 @@ ResetTempTableNamespace(void)
 		RemoveTempRelations(myTempNamespace);
 }
 
+#ifdef USE_FASTPG
+void
+FastPgForgetTempTableNamespace(void)
+{
+	myTempNamespace = InvalidOid;
+	myTempToastNamespace = InvalidOid;
+	myTempNamespaceSubID = InvalidSubTransactionId;
+
+	if (MyProc != NULL)
+		MyProc->tempNamespaceId = InvalidOid;
+
+	baseSearchPathValid = false;
+	searchPathCacheValid = false;
+}
+
+void
+FastPgResetTempTableNamespace(void)
+{
+	Oid			tempNamespace = myTempNamespace;
+	char	   *namespaceName;
+
+	if (OidIsValid(tempNamespace))
+	{
+		namespaceName = get_namespace_name(tempNamespace);
+		if (namespaceName != NULL)
+		{
+			pfree(namespaceName);
+			RemoveTempRelations(tempNamespace);
+		}
+	}
+
+	FastPgForgetTempTableNamespace();
+}
+#endif
+
 
 /*
  * Routines for handling the GUC variable 'search_path'.
