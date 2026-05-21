@@ -13,6 +13,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/subtrans.h"
@@ -557,7 +560,7 @@ GetNewObjectId(void)
 #ifdef USE_FASTPG
 	static pg_atomic_uint32 fastpg_oid_offset;
 
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return (Oid) FirstNormalObjectId +
 			(Oid) pg_atomic_fetch_add_u32(&fastpg_oid_offset, 1);
 #endif
@@ -584,7 +587,11 @@ GetNewObjectId(void)
 	 */
 	if (TransamVariables->nextOid < ((Oid) FirstNormalObjectId))
 	{
-		if (IsPostmasterEnvironment)
+		if (IsPostmasterEnvironment
+#ifdef USE_FASTPG
+			|| (!IsUnderPostmaster && fastpg_catalog_mode_uses_postgres())
+#endif
+			)
 		{
 			/* wraparound, or first post-initdb assignment, in normal mode */
 			TransamVariables->nextOid = FirstNormalObjectId;

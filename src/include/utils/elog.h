@@ -480,6 +480,14 @@ extern char *GetErrorContextStack(void);
 typedef void (*emit_log_hook_type) (ErrorData *edata);
 extern PGDLLIMPORT emit_log_hook_type emit_log_hook;
 
+#ifdef USE_FASTPG
+/*
+ * Hook for intercepting messages before they are sent to the client.  FastPG's
+ * single-process executor installs this while running against normal catalog
+ * state so it can forward PostgreSQL notices through its Rust pgwire layer.
+ */
+extern PGDLLIMPORT emit_log_hook_type fastpg_client_message_hook;
+#endif
 
 /* GUC-configurable parameters */
 

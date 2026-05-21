@@ -14,6 +14,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "storage/latch.h"
@@ -52,7 +55,8 @@ SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 	 * backend processes.  Command-end local invalidation still runs through
 	 * LocalExecuteInvalidationMessage; commit-time shared broadcast is a no-op.
 	 */
-	return;
+	if (fastpg_use_rust_catalog())
+		return;
 #endif
 	SIInsertDataEntries(msgs, n);
 }
@@ -83,8 +87,9 @@ ReceiveSharedInvalidMessages(void (*invalFunction) (SharedInvalidationMessage *m
 	 * server.  Avoid reading the uninitialized sinval shared-memory state when
 	 * PostgreSQL opens relations during parse/analyze/plan.
 	 */
-	return;
-#else
+	if (fastpg_use_rust_catalog())
+		return;
+#endif
 #define MAXINVALMSGS 32
 	static SharedInvalidationMessage messages[MAXINVALMSGS];
 
@@ -154,7 +159,6 @@ ReceiveSharedInvalidMessages(void (*invalFunction) (SharedInvalidationMessage *m
 		elog(DEBUG4, "sinval catchup complete, cleaning queue");
 		SICleanupQueue(false, 0);
 	}
-#endif
 }
 
 

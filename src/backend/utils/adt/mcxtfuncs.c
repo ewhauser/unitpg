@@ -18,12 +18,14 @@
 #include "catalog/pg_type_d.h"
 #include "funcapi.h"
 #include "mb/pg_wchar.h"
+#include "miscadmin.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "storage/procsignal.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/hsearch.h"
+#include "utils/memutils.h"
 #include "utils/tuplestore.h"
 
 /* ----------
@@ -269,6 +271,15 @@ pg_log_backend_memory_contexts(PG_FUNCTION_ARGS)
 	int			pid = PG_GETARG_INT32(0);
 	PGPROC	   *proc;
 	ProcNumber	procNumber = INVALID_PROC_NUMBER;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pid == MyProcPid)
+	{
+		HandleLogMemoryContextInterrupt();
+		ProcessLogMemoryContextInterrupt();
+		PG_RETURN_BOOL(true);
+	}
+#endif
 
 	/*
 	 * See if the process with given pid is a backend or an auxiliary process.

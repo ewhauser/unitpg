@@ -16,6 +16,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
@@ -773,27 +776,57 @@ standard_ProcessUtility(PlannedStmt *pstmt,
 
 		case T_CreatedbStmt:
 			/* no event triggers for global objects */
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("CREATE DATABASE is not supported in fastpg postgres catalog mode")));
+#endif
 			PreventInTransactionBlock(isTopLevel, "CREATE DATABASE");
 			createdb(pstate, (CreatedbStmt *) parsetree);
 			break;
 
 		case T_AlterDatabaseStmt:
 			/* no event triggers for global objects */
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("ALTER DATABASE is not supported in fastpg postgres catalog mode")));
+#endif
 			AlterDatabase(pstate, (AlterDatabaseStmt *) parsetree, isTopLevel);
 			break;
 
 		case T_AlterDatabaseRefreshCollStmt:
 			/* no event triggers for global objects */
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("ALTER DATABASE is not supported in fastpg postgres catalog mode")));
+#endif
 			AlterDatabaseRefreshColl((AlterDatabaseRefreshCollStmt *) parsetree);
 			break;
 
 		case T_AlterDatabaseSetStmt:
 			/* no event triggers for global objects */
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("ALTER DATABASE is not supported in fastpg postgres catalog mode")));
+#endif
 			AlterDatabaseSet((AlterDatabaseSetStmt *) parsetree);
 			break;
 
 		case T_DropdbStmt:
 			/* no event triggers for global objects */
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres())
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("DROP DATABASE is not supported in fastpg postgres catalog mode")));
+#endif
 			PreventInTransactionBlock(isTopLevel, "DROP DATABASE");
 			DropDatabase(pstate, (DropdbStmt *) parsetree);
 			break;

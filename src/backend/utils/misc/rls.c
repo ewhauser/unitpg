@@ -66,7 +66,8 @@ check_enable_rls(Oid relid, Oid checkAsUser, bool noError)
 		return RLS_NONE;
 
 #ifdef USE_FASTPG
-	if (fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relid))
+	if (fastpg_use_rust_catalog() &&
+		fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relid))
 		return RLS_NONE;
 #endif
 

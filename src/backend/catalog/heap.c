@@ -298,6 +298,7 @@ heap_create(const char *relname,
 			bool shared_relation,
 			bool mapped_relation,
 			bool allow_system_table_mods,
+			Oid relrewrite,
 			TransactionId *relfrozenxid,
 			MultiXactId *relminmxid,
 			bool create_storage)
@@ -374,7 +375,8 @@ heap_create(const char *relname,
 									 shared_relation,
 									 mapped_relation,
 									 relpersistence,
-									 relkind);
+									 relkind,
+									 relrewrite);
 
 	/*
 	 * Have the storage manager create the relation's disk file, if needed.
@@ -1340,6 +1342,7 @@ heap_create_with_catalog(const char *relname,
 							   shared_relation,
 							   mapped_relation,
 							   allow_system_table_mods,
+							   relrewrite,
 							   &relfrozenxid,
 							   &relminmxid,
 							   true);

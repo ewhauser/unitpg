@@ -15,6 +15,7 @@
 #include "postgres.h"
 
 #include "access/htup_details.h"
+#include "access/fastpg_catalog.h"
 #include "access/table.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -716,7 +717,7 @@ ProcedureCreate(const char *procedureName,
 
 	/* Verify function body */
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		languageValidator = InvalidOid;
 #endif
 	if (OidIsValid(languageValidator))

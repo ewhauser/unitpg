@@ -1,16 +1,19 @@
 #![forbid(unsafe_code)]
 
-pub use fastpg_exec::{CopyTarget, QueryDescription, QueryExecution, QueryNotice, QueryResult};
+pub use fastpg_exec::{
+    CopyOutput, CopyTarget, QueryDescription, QueryExecution, QueryNotice, QueryResult,
+};
 pub use fastpg_types::{Column, PgType, Value};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use fastpg_exec::{QueryExecutor, QueryExecutorShared};
+use fastpg_exec::{COPY_HEADER_MATCH, QueryExecutor, QueryExecutorShared};
 
 pub type SessionId = u64;
+pub const COPY_ERROR_CONTEXT_PREFIX: &str = "\x1ffastpg-copy-context\n";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StartupParameters {
@@ -94,6 +97,7 @@ pub struct SessionState {
     executor: QueryExecutor,
     startup: StartupParameters,
     copy: Mutex<Option<SessionCopyState>>,
+    pending_simple: Mutex<VecDeque<String>>,
 }
 
 impl SessionState {
@@ -107,6 +111,7 @@ impl SessionState {
             executor,
             startup,
             copy: Mutex::new(None),
+            pending_simple: Mutex::new(VecDeque::new()),
         }
     }
 
@@ -149,27 +154,54 @@ impl SessionState {
         self.executor.execute(sql, parameters)
     }
 
+    pub fn take_notices(&self) -> Vec<QueryNotice> {
+        self.executor.take_notices()
+    }
+
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
         self.executor.copy_text_line(table, line)
     }
 
     pub fn begin_copy(&self, target: CopyTarget) {
+        let owned_transaction = self.executor.begin_copy();
         let mut copy = self
             .copy
             .lock()
             .expect("fastpg session COPY mutex poisoned");
-        *copy = Some(SessionCopyState::new(target));
+        *copy = Some(SessionCopyState::new(target, owned_transaction));
+    }
+
+    pub fn set_pending_simple_statements(&self, statements: Vec<String>) {
+        *self
+            .pending_simple
+            .lock()
+            .expect("fastpg session pending simple mutex poisoned") = VecDeque::from(statements);
+    }
+
+    pub fn take_pending_simple_statements(&self) -> VecDeque<String> {
+        std::mem::take(
+            &mut *self
+                .pending_simple
+                .lock()
+                .expect("fastpg session pending simple mutex poisoned"),
+        )
     }
 
     pub fn push_copy_data(&self, data: &[u8]) -> Result<(), String> {
-        let mut copy = self
-            .copy
-            .lock()
-            .expect("fastpg session COPY mutex poisoned");
-        let copy = copy
-            .as_mut()
-            .ok_or_else(|| "COPY data received without an active COPY target".to_owned())?;
-        copy.push_data(&self.executor, data)
+        let result = {
+            let mut copy = self
+                .copy
+                .lock()
+                .expect("fastpg session COPY mutex poisoned");
+            let copy = copy
+                .as_mut()
+                .ok_or_else(|| "COPY data received without an active COPY target".to_owned())?;
+            copy.push_data(&self.executor, data)
+        };
+        if result.is_err() {
+            self.abort_active_copy();
+        }
+        result
     }
 
     pub fn finish_active_copy(&self) -> Result<usize, String> {
@@ -183,11 +215,11 @@ impl SessionState {
 
         match copy.finish(&self.executor) {
             Ok(rows) => {
-                self.executor.finish_copy();
+                self.executor.finish_copy(copy.owned_transaction);
                 Ok(rows)
             }
             Err(error) => {
-                self.executor.abort_copy();
+                self.executor.abort_copy(copy.owned_transaction);
                 Err(error)
             }
         }
@@ -198,16 +230,19 @@ impl SessionState {
             .copy
             .lock()
             .expect("fastpg session COPY mutex poisoned");
-        copy.take();
-        self.executor.abort_copy();
+        let owned_transaction = copy
+            .take()
+            .map(|copy| copy.owned_transaction)
+            .unwrap_or(false);
+        self.executor.abort_copy(owned_transaction);
     }
 
     pub fn finish_copy(&self) {
-        self.executor.finish_copy();
+        self.executor.finish_copy(false);
     }
 
     pub fn abort_copy(&self) {
-        self.executor.abort_copy();
+        self.executor.abort_copy(false);
     }
 }
 
@@ -228,15 +263,23 @@ impl Default for SessionState {
 struct SessionCopyState {
     target: CopyTarget,
     pending: String,
+    lines: Vec<(usize, String)>,
     rows: usize,
+    done: bool,
+    line_number: usize,
+    owned_transaction: bool,
 }
 
 impl SessionCopyState {
-    fn new(target: CopyTarget) -> Self {
+    fn new(target: CopyTarget, owned_transaction: bool) -> Self {
         Self {
             target,
             pending: String::new(),
+            lines: Vec::new(),
             rows: 0,
+            done: false,
+            line_number: 0,
+            owned_transaction,
         }
     }
 
@@ -258,15 +301,78 @@ impl SessionCopyState {
             let line = std::mem::take(&mut self.pending);
             self.process_line(executor, line.trim_end_matches('\r'))?;
         }
+        let buffered_lines = self
+            .lines
+            .iter()
+            .map(|(_, line)| line.as_str())
+            .collect::<Vec<_>>();
+        if let Some(rows) = executor.copy_target_buffered_lines(&self.target, &buffered_lines)? {
+            self.rows = rows;
+            return Ok(rows);
+        }
+        let data_start = self.target.header_lines_to_skip().min(self.lines.len());
+        if self.target.header_line == COPY_HEADER_MATCH && data_start > 0 {
+            let (line_number, line) = &self.lines[data_start - 1];
+            self.target.validate_header_line(line).map_err(|error| {
+                copy_error_with_context(&self.target, *line_number, line, error)
+            })?;
+        }
+        if self.target.freeze && self.target.foreign_table {
+            return Err("cannot perform COPY FREEZE on a foreign table".to_owned());
+        }
+        for (line_number, line) in &self.lines[data_start..] {
+            if executor
+                .copy_target_text_line(&self.target, line)
+                .map_err(|error| copy_error_with_context(&self.target, *line_number, line, error))?
+            {
+                self.rows += 1;
+            }
+        }
         Ok(self.rows)
     }
 
-    fn process_line(&mut self, executor: &QueryExecutor, line: &str) -> Result<(), String> {
-        if executor.copy_target_text_line(&self.target, line)? {
-            self.rows += 1;
+    fn process_line(&mut self, _executor: &QueryExecutor, line: &str) -> Result<(), String> {
+        self.line_number += 1;
+        if self.done {
+            return Err("received copy data after EOF marker".to_owned());
         }
+        if line == "\\." {
+            self.done = true;
+            return Ok(());
+        }
+        if line.contains("\\.") {
+            return Err(copy_error_with_line_context(
+                &self.target,
+                self.line_number,
+                "end-of-copy marker is not alone on its line".to_owned(),
+            ));
+        }
+        self.lines.push((self.line_number, line.to_owned()));
         Ok(())
     }
+}
+
+fn copy_error_with_line_context(
+    target: &CopyTarget,
+    line_number: usize,
+    message: String,
+) -> String {
+    format!(
+        "{COPY_ERROR_CONTEXT_PREFIX}{message}\nCOPY {}, line {}",
+        target.table, line_number
+    )
+}
+
+fn copy_error_with_context(
+    target: &CopyTarget,
+    line_number: usize,
+    line: &str,
+    message: String,
+) -> String {
+    format!(
+        "{COPY_ERROR_CONTEXT_PREFIX}{message}\nCOPY {}, line {}: \"{}\"",
+        target.table, line_number, line
+    )
 }
 
 #[cfg(test)]

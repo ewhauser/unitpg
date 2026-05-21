@@ -410,6 +410,7 @@ systable_beginscan(Relation heapRelation,
 
 #ifdef USE_FASTPG
 	fastpg_virtual_catalog_scan =
+		fastpg_use_rust_catalog() &&
 		fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRelation)) != 0;
 
 	/*
@@ -564,9 +565,10 @@ systable_getnext(SysScanDesc sysscan)
 			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
 			Assert(!shouldFree);
 #ifdef USE_FASTPG
-			if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
-															RelationGetRelid(sysscan->heap_rel)) != 0)
-				ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
+				if (fastpg_use_rust_catalog() &&
+					fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
+																RelationGetRelid(sysscan->heap_rel)) != 0)
+					ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
 #endif
 
 			/*
@@ -590,9 +592,10 @@ systable_getnext(SysScanDesc sysscan)
 			htup = ExecFetchSlotHeapTuple(sysscan->slot, false, &shouldFree);
 			Assert(!shouldFree);
 #ifdef USE_FASTPG
-			if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
-															RelationGetRelid(sysscan->heap_rel)) != 0)
-				ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
+				if (fastpg_use_rust_catalog() &&
+					fastpg_rust_catalog_policy_by_relation_oid((uint32_t)
+																RelationGetRelid(sysscan->heap_rel)) != 0)
+					ItemPointerCopy(&sysscan->slot->tts_tid, &htup->t_self);
 #endif
 		}
 	}

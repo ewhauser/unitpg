@@ -9,6 +9,7 @@
 
 #ifdef USE_FASTPG
 
+#include "access/fastpg_catalog.h"
 #include "utils/fastpg_ipc_guard.h"
 
 bool
@@ -19,7 +20,7 @@ fastpg_internal_ipc_forbidden(void)
 	 * shared-memory, semaphore, background worker, or wait-latch IPC paths is
 	 * a bug in the Rust-server execution path.
 	 */
-	return true;
+	return !fastpg_catalog_mode_uses_postgres();
 }
 
 void

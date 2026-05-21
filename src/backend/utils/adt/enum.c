@@ -74,7 +74,7 @@ check_safe_enum_use(HeapTuple enumval_tup)
 	Form_pg_enum en = (Form_pg_enum) GETSTRUCT(enumval_tup);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 		return;
 #endif
 
@@ -412,7 +412,7 @@ enum_endpoint(Oid enumtypoid, ScanDirection direction)
 	Oid			minmax;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 	{
 		uint32_t	fastpg_enum_oid = InvalidOid;
 
@@ -584,7 +584,7 @@ enum_range_internal(Oid enumtypoid, Oid lower, Oid upper)
 	bool		left_found;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 		return fastpg_enum_range_internal(enumtypoid, lower, upper);
 #endif
 
@@ -657,7 +657,8 @@ fastpg_enum_range_internal(Oid enumtypoid, Oid lower, Oid upper)
 	int			cnt = 0;
 	bool		left_found = !OidIsValid(lower);
 
-	if (!fastpg_rust_catalog_enum_oids_by_sort_order((uint32_t) enumtypoid,
+	if (!fastpg_use_rust_catalog() ||
+		!fastpg_rust_catalog_enum_oids_by_sort_order((uint32_t) enumtypoid,
 													 NULL,
 													 0,
 													 &count))

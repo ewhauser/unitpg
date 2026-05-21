@@ -54,6 +54,7 @@
 #include "postgres.h"
 
 #ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
 #endif
 #include "access/htup_details.h"
@@ -1224,7 +1225,8 @@ ExecInsert(ModifyTableContext *context,
 			}
 
 #ifdef USE_FASTPG
-			if (!IsUnderPostmaster &&
+			if (fastpg_use_rust_catalog() &&
+				!IsUnderPostmaster &&
 				resultRelationDesc->rd_tableam == GetFastPgMemTableAmRoutine())
 			{
 				table_tuple_insert(resultRelationDesc, slot,
@@ -3101,6 +3103,15 @@ ExecOnConflictLockRow(ModifyTableContext *context,
 			 * to find conflicting tuples, speculative insertion wouldn't have
 			 * seen this row to conflict with.
 			 */
+#ifdef USE_FASTPG
+			if (relation->rd_tableam == GetFastPgMemTableAmRoutine())
+				ereport(ERROR,
+						(errcode(ERRCODE_CARDINALITY_VIOLATION),
+				/* translator: %s is a SQL command name */
+						 errmsg("%s command cannot affect row a second time",
+								isUpdate ? "ON CONFLICT DO UPDATE" : "ON CONFLICT DO SELECT"),
+						 errhint("Ensure that no rows proposed for insertion within the same command have duplicate constrained values.")));
+#endif
 			elog(ERROR, "unexpected self-updated tuple");
 			break;
 

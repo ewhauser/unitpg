@@ -33,6 +33,10 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
@@ -79,6 +83,11 @@
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
 #include "utils/wait_event_types.h"
+
+#ifdef USE_FASTPG
+extern bool fastpg_rust_relation_replace_from(uint32_t dst_relid,
+											  uint32_t src_relid);
+#endif
 
 /*
  * This struct is used to pass around the information on tables to be
@@ -1885,6 +1894,9 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	ObjectAddress object;
 	Oid			mapped_tables[4];
 	int			i;
+#ifdef USE_FASTPG
+	bool		fastpg_replace_rewritten_storage = false;
+#endif
 
 	/* Report that we are now swapping relation files */
 	pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
@@ -1897,10 +1909,30 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 	 * Swap the contents of the heap relations (including any toast tables).
 	 * Also set old heap's relfrozenxid to frozenXid.
 	 */
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		Relation	oldrel = table_open(OIDOldHeap, NoLock);
+
+		fastpg_replace_rewritten_storage =
+			oldrel->rd_tableam == GetFastPgMemTableAmRoutine();
+		table_close(oldrel, NoLock);
+	}
+#endif
+
 	swap_relation_files(OIDOldHeap, OIDNewHeap,
 						(OIDOldHeap == RelationRelationId),
 						swap_toast_by_content, is_internal,
 						frozenXid, cutoffMulti, mapped_tables);
+
+#ifdef USE_FASTPG
+	if (fastpg_replace_rewritten_storage &&
+		!fastpg_rust_relation_replace_from((uint32_t) OIDOldHeap,
+										   (uint32_t) OIDNewHeap))
+		elog(ERROR,
+			 "fastpg failed to replace rewritten relation storage for relation %u",
+			 OIDOldHeap);
+#endif
 
 	/*
 	 * If it's a system catalog, queue a sinval message to flush all catcaches

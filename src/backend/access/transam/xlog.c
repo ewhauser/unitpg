@@ -46,6 +46,9 @@
 #include <sys/time.h>
 #include <unistd.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/clog.h"
 #include "access/commit_ts.h"
 #include "access/heaptoast.h"
@@ -2816,6 +2819,38 @@ XLogFlush(XLogRecPtr record)
 		UpdateMinRecoveryPoint(record, false);
 		return;
 	}
+
+#ifdef USE_FASTPG
+	/*
+	 * The normal-catalog experiment runs a single embedded backend against a
+	 * harness-owned temporary PGDATA.  There is no durability contract for
+	 * that directory, and synchronous upstream regression setup can otherwise
+	 * spin waiting for WAL insertion state that a normal postmaster topology
+	 * would drive.  Treat explicit flush requests as satisfied in-memory.
+	 */
+	if (!IsUnderPostmaster && fastpg_catalog_mode_uses_postgres())
+	{
+		if (record > LogwrtResult.Write)
+			LogwrtResult.Write = record;
+		if (record > LogwrtResult.Flush)
+			LogwrtResult.Flush = record;
+
+		if (XLogCtl != NULL)
+		{
+			SpinLockAcquire(&XLogCtl->info_lck);
+			if (XLogCtl->LogwrtRqst.Write < LogwrtResult.Write)
+				XLogCtl->LogwrtRqst.Write = LogwrtResult.Write;
+			if (XLogCtl->LogwrtRqst.Flush < LogwrtResult.Flush)
+				XLogCtl->LogwrtRqst.Flush = LogwrtResult.Flush;
+			SpinLockRelease(&XLogCtl->info_lck);
+
+			pg_atomic_write_u64(&XLogCtl->logWriteResult, LogwrtResult.Write);
+			pg_write_barrier();
+			pg_atomic_write_u64(&XLogCtl->logFlushResult, LogwrtResult.Flush);
+		}
+		return;
+	}
+#endif
 
 	/* Quick exit if already known flushed */
 	if (record <= LogwrtResult.Flush)
@@ -6832,7 +6867,7 @@ bool
 RecoveryInProgress(void)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return false;
 #endif
 

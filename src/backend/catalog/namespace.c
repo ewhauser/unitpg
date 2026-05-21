@@ -567,7 +567,7 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 			break;
 
 #ifdef USE_FASTPG
-		if (OidIsValid(relId))
+		if (fastpg_use_rust_catalog() && OidIsValid(relId))
 		{
 			if (fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relId))
 				break;
@@ -1863,16 +1863,17 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 			HeapTuple	opertup;
 
 #ifdef USE_FASTPG
-			FastPgRustCatalogOperator fastpg_operator;
+				FastPgRustCatalogOperator fastpg_operator;
 
-			if (fastpg_rust_catalog_operator_by_signature(opername,
-														  (uint32_t) oprleft,
-														  (uint32_t) oprright,
-														  (uint32_t) namespaceId,
-														  &fastpg_operator))
-				return (Oid) fastpg_operator.oid;
-			if (!IsUnderPostmaster)
-				return InvalidOid;
+				if (fastpg_use_rust_catalog() &&
+					fastpg_rust_catalog_operator_by_signature(opername,
+															  (uint32_t) oprleft,
+															  (uint32_t) oprright,
+															  (uint32_t) namespaceId,
+															  &fastpg_operator))
+					return (Oid) fastpg_operator.oid;
+				if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
+					return InvalidOid;
 #endif
 			opertup = SearchSysCache4(OPERNAMENSP,
 									  CStringGetDatum(opername),
@@ -1893,6 +1894,7 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 	}
 
 #ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
 	{
 		FastPgRustCatalogOperator fastpg_operator;
 		ListCell   *nsp;
@@ -2024,6 +2026,7 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok,
 	}
 
 #ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
 	{
 		size_t		operator_count =
 			fastpg_rust_catalog_operator_count_by_name(opername);

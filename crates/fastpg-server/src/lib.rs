@@ -7,9 +7,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use fastpg_wire::FastPgServerHandlers;
-use pgwire::tokio::process_socket;
 #[cfg(unix)]
-use pgwire::tokio::process_socket_unix;
+use fastpg_wire::process_socket_unix;
+use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;

@@ -470,6 +470,8 @@ FastPgBuildRustCatalogTupleDesc(Oid relation_oid)
 	FastPgRustCatalogRelation relation;
 	TupleDesc	tupdesc;
 
+	Assert(fastpg_use_rust_catalog());
+
 	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) relation_oid, &relation))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -508,6 +510,9 @@ FastPgCatalogCacheInitializeCache(CatCache *cache)
 	const char *relname = NULL;
 	FastPgRustCatalogRelation relation;
 	int			i;
+
+	if (!fastpg_use_rust_catalog())
+		return false;
 
 	Assert(CacheMemoryContext != NULL);
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
@@ -615,6 +620,9 @@ FastPgCatalogScanBeginForKeys(CatCache *cache, int nkeys, Datum *arguments)
 static bool
 FastPgCatalogCacheHandlesMiss(CatCache *cache, int nkeys)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
 		return true;
 
@@ -649,6 +657,9 @@ FastPgCatalogCacheHandlesMiss(CatCache *cache, int nkeys)
 static bool
 FastPgCatalogCacheIsEmpty(CatCache *cache)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) ==
 		FASTPG_VIRTUAL_CATALOG_EMPTY;
 }
@@ -786,6 +797,9 @@ FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 	bool		ordered;
 	int			nmembers;
 	int			i = 0;
+
+	if (!fastpg_use_rust_catalog())
+		return NULL;
 
 	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) == 0)
 		return NULL;
@@ -1389,6 +1403,9 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 	size_t		natts;
 	HeapTuple	tuple = NULL;
 
+	if (!fastpg_use_rust_catalog())
+		return NULL;
+
 	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) == 0)
 		return NULL;
 	if (cache->cc_tupdesc == NULL)
@@ -1451,6 +1468,9 @@ FastPgCatalogCacheLookupGeneric(CatCache *cache, int nkeys, Datum *arguments)
 static HeapTuple
 FastPgCatalogCacheLookup(CatCache *cache, int nkeys, Datum *arguments)
 {
+	if (!fastpg_use_rust_catalog())
+		return NULL;
+
 	if (cache->cc_reloid == RelationRelationId &&
 		fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid) != 0)
 	{
@@ -2533,7 +2553,7 @@ CatalogCacheInitializeCache(CatCache *cache)
 #ifdef USE_FASTPG
 	if (FastPgCatalogCacheInitializeCache(cache))
 		return;
-	if (!IsUnderPostmaster)
+	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 	{
 		uint8_t		policy =
 			fastpg_rust_catalog_policy_by_relation_oid((uint32_t) cache->cc_reloid);

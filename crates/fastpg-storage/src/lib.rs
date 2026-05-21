@@ -931,6 +931,7 @@ struct ScanState {
     region: StorageRegion,
     shared_scan: Option<Arc<CachedCatalogScan>>,
     next_index: usize,
+    positioned: bool,
 }
 
 impl ScanState {
@@ -949,6 +950,7 @@ impl ScanState {
             region,
             shared_scan: None,
             next_index: 0,
+            positioned: false,
         })
     }
 
@@ -1416,6 +1418,22 @@ impl StorageState {
         self.find_committed_row(relid, row_id)
     }
 
+    fn find_any_row(&self, session: &SessionStorage, relid: u32, row_id: u64) -> Option<Row> {
+        if row_id == 0 {
+            return None;
+        }
+
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
+            if let Some(segment) = overlay.relations.get(&relid)
+                && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
+            {
+                return Some(row.clone());
+            }
+        }
+
+        self.find_committed_row(relid, row_id)
+    }
+
     fn visible_row_exists(&self, session: &SessionStorage, relid: u32, row_id: u64) -> bool {
         if row_id == 0 {
             return false;
@@ -1564,6 +1582,64 @@ impl StorageState {
             .entry(relid)
             .or_default()
             .extend(visible_row_ids);
+    }
+
+    fn clear_relation_transactional(&mut self, session: &mut SessionStorage, relid: u32) {
+        let visible_row_ids = self
+            .visible_rows(session, relid)
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect::<BTreeSet<_>>();
+
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        overlay.relations.remove(&relid);
+        if visible_row_ids.is_empty() {
+            overlay.deleted_row_ids.remove(&relid);
+        } else {
+            overlay
+                .deleted_row_ids
+                .entry(relid)
+                .or_default()
+                .extend(visible_row_ids);
+        }
+        overlay.mark_primary_key_rebuild(relid);
+    }
+
+    fn replace_relation_transactional_from(
+        &mut self,
+        session: &mut SessionStorage,
+        dst_relid: u32,
+        src_relid: u32,
+    ) -> Result<(), CatalogError> {
+        let rows = self.visible_rows(session, src_relid);
+        let next_row_id = rows
+            .iter()
+            .filter_map(|row| row.row_id.checked_add(1))
+            .max()
+            .unwrap_or(1);
+
+        self.clear_relation_transactional(session, dst_relid);
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        let segment = overlay.row_segment_mut(dst_relid);
+        for row in rows {
+            let copied = segment.region.copy_row(&row).ok_or_else(|| {
+                invalid_ffi_argument("invalid stored by-reference cell".to_owned())
+            })?;
+            segment.rows.push(copied);
+        }
+        overlay.mark_primary_key_rebuild(dst_relid);
+
+        let relation = self.relations.entry(dst_relid).or_default();
+        relation.next_row_id = relation.next_row_id.max(next_row_id);
+        Ok(())
     }
 
     fn commit_top_overlay(&mut self, session: &mut SessionStorage) -> BTreeSet<u32> {
@@ -2806,11 +2882,7 @@ fn index_key_for_datums(
 
     let mut key = IndexKey::new();
     for (key_index, column) in index_spec.columns.iter().enumerate() {
-        let cell = if is_null[key_index] != 0 {
-            Cell::null()
-        } else {
-            Cell::by_value(values[key_index])
-        };
+        let cell = cell_for_index_datum(column, values[key_index], is_null[key_index] != 0)?;
         if cell.is_null && !index_spec.nulls_not_distinct {
             return None;
         }
@@ -2818,6 +2890,24 @@ fn index_key_for_datums(
     }
 
     Some(key)
+}
+
+fn cell_for_index_datum(column: &IndexColumnSpec, value: usize, is_null: bool) -> Option<Cell> {
+    if is_null {
+        return Some(Cell::null());
+    }
+    if column.typbyval {
+        return Some(Cell::by_value(value));
+    }
+    if value == 0 {
+        return None;
+    }
+
+    Some(Cell::by_ref(ValueRef {
+        region_id: StorageRegionId(0),
+        ptr: value,
+        len: usize::MAX,
+    }))
 }
 
 fn index_key_part(column: &IndexColumnSpec, cell: &Cell) -> Option<IndexKeyPart> {
@@ -2953,11 +3043,100 @@ pub fn copy_text_line(table: &str, line: &str) -> Result<bool, String> {
     }
 }
 
-struct CopyDatum {
+pub fn insert_copy_datums_by_oid(
+    relid: u32,
+    relation_name: &str,
+    relation_columns: usize,
+    datums: Vec<Option<CopyDatum>>,
+) -> Result<bool, String> {
+    if datums.len() != relation_columns {
+        return Err(format!(
+            "COPY row for relation \"{}\" has {} fields but {} columns",
+            relation_name,
+            datums.len(),
+            relation_columns
+        ));
+    }
+
+    let mut values = Vec::with_capacity(relation_columns);
+    let mut is_null = Vec::with_capacity(relation_columns);
+    let mut byval = Vec::with_capacity(relation_columns);
+    let mut value_lens = Vec::with_capacity(relation_columns);
+    let mut byref_payloads = Vec::<Box<[u8]>>::new();
+
+    for datum in datums {
+        let Some(copy_value) = datum else {
+            values.push(0);
+            is_null.push(1);
+            byval.push(0);
+            value_lens.push(0);
+            continue;
+        };
+
+        let CopyDatum {
+            mut value,
+            byval: datum_byval,
+            value_len,
+            payload,
+        } = copy_value;
+        if let Some(payload) = payload {
+            value = payload.as_ptr() as usize;
+            byref_payloads.push(payload);
+        }
+        values.push(value);
+        is_null.push(0);
+        byval.push(u8::from(datum_byval));
+        value_lens.push(value_len);
+    }
+
+    let mut row_id = 0u64;
+    let inserted = unsafe {
+        fastpg_rust_relation_insert(
+            relid,
+            values.as_ptr(),
+            is_null.as_ptr(),
+            byval.as_ptr(),
+            value_lens.as_ptr(),
+            relation_columns,
+            &mut row_id,
+        )
+    };
+    if inserted {
+        Ok(true)
+    } else {
+        Err(format!(
+            "failed to insert COPY row into \"{}\"",
+            relation_name
+        ))
+    }
+}
+
+pub struct CopyDatum {
     value: usize,
     byval: bool,
     value_len: usize,
     payload: Option<Box<[u8]>>,
+}
+
+impl CopyDatum {
+    pub fn by_value(value: usize) -> Self {
+        Self {
+            value,
+            byval: true,
+            value_len: 0,
+            payload: None,
+        }
+    }
+
+    pub fn by_reference(payload: Vec<u8>) -> Self {
+        let payload = payload.into_boxed_slice();
+        Self {
+            value: 0,
+            byval: false,
+            value_len: payload.len(),
+            payload: Some(payload),
+        }
+    }
 }
 
 fn copy_text_field_to_datum(field: &str, type_oid: Oid) -> Result<CopyDatum, String> {
@@ -4049,6 +4228,26 @@ pub extern "C" fn fastpg_rust_relation_clear(relid: u32) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_clear_transactional(relid: u32) {
+    with_storage(|state, session| state.clear_relation_transactional(session, relid));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_rust_relation_replace_from(dst_relid: u32, src_relid: u32) -> bool {
+    clear_last_storage_error();
+    let result = with_storage(|state, session| {
+        state.replace_relation_transactional_from(session, dst_relid, src_relid)
+    });
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            set_last_storage_error(error);
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_relation_row_count(relid: u32) -> usize {
     with_storage(|state, session| state.visible_row_count(session, relid))
 }
@@ -4265,6 +4464,228 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict(
     if !row_id_out.is_null() {
         unsafe {
             *row_id_out = row.row_id;
+        }
+    }
+    true
+}
+
+unsafe fn unique_index_spec_from_ffi(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    nkeys: usize,
+    is_primary: bool,
+    nulls_not_distinct: bool,
+) -> Option<UniqueIndexSpec> {
+    if nkeys == 0
+        || nkeys > FASTPG_MAX_INDEX_KEYS
+        || attnums.is_null()
+        || typbyval.is_null()
+        || typlen.is_null()
+    {
+        return None;
+    }
+    let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let typbyval = unsafe { slice::from_raw_parts(typbyval, nkeys) };
+    let typlen = unsafe { slice::from_raw_parts(typlen, nkeys) };
+    let mut columns = Vec::with_capacity(nkeys);
+    for index in 0..nkeys {
+        let attnum = attnums[index];
+        if attnum <= 0 {
+            return None;
+        }
+        columns.push(IndexColumnSpec {
+            column_index: usize::try_from(attnum - 1).ok()?,
+            typbyval: typbyval[index] != 0,
+            typlen: typlen[index],
+        });
+    }
+
+    Some(UniqueIndexSpec {
+        index_oid: Oid(index_relid),
+        relation_oid: Oid(heap_relid),
+        is_primary,
+        nulls_not_distinct,
+        columns,
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid arrays for `nkeys` entries and a valid output
+/// pointer when `row_id_out` is non-null.
+pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    row_id_out: *mut u64,
+) -> bool {
+    if nkeys > 0 && (values.is_null() || is_null.is_null()) {
+        return false;
+    }
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            true,
+            false,
+        )
+    }) else {
+        return false;
+    };
+    let values = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(values, nkeys) }
+    };
+    let is_null = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(is_null, nkeys) }
+    };
+    let row = with_storage(|state, session| {
+        let key = index_key_for_datums(&index_spec, values, is_null)?;
+        Some(state.find_visible_row_by_index_key(session, heap_relid, &index_spec, &key))
+    })
+    .flatten();
+    let Some(row) = row else {
+        return false;
+    };
+    if !row_id_out.is_null() {
+        unsafe {
+            *row_id_out = row.row_id;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid value/null arrays for `nkeys` entries and a valid
+/// output pointer when `row_id_out` is non-null.
+pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    nulls_not_distinct: u8,
+    replacing_row_id: u64,
+    row_id_out: *mut u64,
+) -> bool {
+    if nkeys > 0 && (values.is_null() || is_null.is_null()) {
+        return false;
+    }
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            false,
+            nulls_not_distinct != 0,
+        )
+    }) else {
+        return false;
+    };
+    let values = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(values, nkeys) }
+    };
+    let is_null = if nkeys == 0 {
+        &[]
+    } else {
+        unsafe { slice::from_raw_parts(is_null, nkeys) }
+    };
+    let row = with_storage(|state, session| {
+        let key = index_key_for_datums(&index_spec, values, is_null)?;
+        Some(state.find_visible_row_by_index_key_excluding(
+            session,
+            heap_relid,
+            &index_spec,
+            &key,
+            Some(replacing_row_id),
+        ))
+    })
+    .flatten();
+    let Some(row) = row else {
+        return false;
+    };
+    if !row_id_out.is_null() {
+        unsafe {
+            *row_id_out = row.row_id;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid arrays for `nkeys` entries and a valid output
+/// pointer when `row_id_out` is non-null.
+pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    nkeys: usize,
+    nulls_not_distinct: u8,
+    row_id_out: *mut u64,
+) -> bool {
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            false,
+            nulls_not_distinct != 0,
+        )
+    }) else {
+        return false;
+    };
+    let conflict = with_storage(|state, session| {
+        let mut seen = BTreeMap::new();
+        for row in state.visible_rows(session, heap_relid) {
+            let Some(key) = index_key_for_row(&index_spec, &row) else {
+                continue;
+            };
+            if let Some(existing_row_id) = seen.get(&key).copied() {
+                return Some(existing_row_id);
+            }
+            seen.insert(key, row.row_id);
+        }
+        None
+    });
+    let Some(row_id) = conflict else {
+        return false;
+    };
+    if !row_id_out.is_null() {
+        unsafe {
+            *row_id_out = row_id;
         }
     }
     true
@@ -5177,6 +5598,7 @@ fn catalog_scan_state_from_rows(
         region,
         shared_scan: None,
         next_index: 0,
+        positioned: false,
     })
 }
 
@@ -5377,6 +5799,7 @@ pub extern "C" fn fastpg_rust_scan_reset(scan_handle: u64) {
     with_storage(|_state, session| {
         if let Some(scan) = session.scans.get_mut(&scan_handle) {
             scan.next_index = 0;
+            scan.positioned = false;
         }
     });
 }
@@ -5412,12 +5835,14 @@ pub unsafe extern "C" fn fastpg_rust_scan_next(
             if scan.next_index >= row_count {
                 return false;
             }
+            scan.positioned = true;
             let row_index = scan.next_index;
             scan.next_index += 1;
             row_index
         } else {
-            if scan.next_index == 0 {
+            if !scan.positioned {
                 scan.next_index = row_count;
+                scan.positioned = true;
             }
             if scan.next_index == 0 {
                 return false;
@@ -5455,6 +5880,28 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row(
     }
 }
 
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_fetch_row_any(
+    relid: u32,
+    row_id: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+) -> bool {
+    let row = with_storage(|state, session| state.find_any_row(session, relid, row_id));
+
+    match row {
+        Some(row) => unsafe {
+            copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
+        },
+        None => false,
+    }
+}
+
 unsafe fn copy_row_to_outputs(
     row: &Row,
     values_out: *mut usize,
@@ -5462,7 +5909,7 @@ unsafe fn copy_row_to_outputs(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
-    if row.cells.len() != natts {
+    if row.cells.len() > natts {
         return false;
     }
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
@@ -5479,9 +5926,14 @@ unsafe fn copy_row_to_outputs(
     } else {
         unsafe { slice::from_raw_parts_mut(is_null_out, natts) }
     };
-    for (index, cell) in row.cells.iter().enumerate() {
-        values_out[index] = cell.output_value();
-        is_null_out[index] = u8::from(cell.is_null);
+    for index in 0..natts {
+        if let Some(cell) = row.cells.get(index) {
+            values_out[index] = cell.output_value();
+            is_null_out[index] = u8::from(cell.is_null);
+        } else {
+            values_out[index] = 0;
+            is_null_out[index] = 1;
+        }
     }
 
     if !row_id_out.is_null() {
@@ -5948,6 +6400,29 @@ mod tests {
         assert_eq!(row_id, second_row_id);
         assert_eq!(values, second_values);
         assert_eq!(nulls, second_nulls);
+        unsafe {
+            assert!(fastpg_rust_scan_next(
+                backward_scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            ));
+        }
+        assert_eq!(row_id, first_row_id);
+        assert_eq!(values, first_values);
+        assert_eq!(nulls, first_nulls);
+        assert!(!unsafe {
+            fastpg_rust_scan_next(
+                backward_scan,
+                0,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+                &mut row_id,
+            )
+        });
         fastpg_rust_scan_end(backward_scan);
 
         fastpg_rust_relation_clear(relid);

@@ -21,6 +21,20 @@
 #define FASTPG_VIRTUAL_CATALOG_DYNAMIC 2
 #define FASTPG_VIRTUAL_CATALOG_EMPTY 3
 
+static inline bool
+fastpg_catalog_mode_uses_postgres(void)
+{
+	const char *mode = getenv("FASTPG_CATALOG_MODE");
+
+	return mode != NULL && strcmp(mode, "postgres") == 0;
+}
+
+static inline bool
+fastpg_use_rust_catalog(void)
+{
+	return !fastpg_catalog_mode_uses_postgres();
+}
+
 #ifndef INTEGER_BTREE_FAM_OID
 #define INTEGER_BTREE_FAM_OID 1976
 #endif

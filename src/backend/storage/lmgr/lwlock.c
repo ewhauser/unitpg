@@ -1597,7 +1597,7 @@ LWLockWaitForVar(LWLock *lock, pg_atomic_uint64 *valptr, uint64 oldval,
 	{
 		if (newval != NULL)
 			*newval = pg_atomic_read_u64(valptr);
-		return false;
+		return true;
 	}
 #endif
 

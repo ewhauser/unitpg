@@ -20,7 +20,10 @@ pub struct PgCoreError {
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
+    pub context: Option<String>,
     pub cursorpos: i32,
+    pub internal_query: Option<String>,
+    pub internalpos: i32,
 }
 
 impl PgCoreError {
@@ -30,7 +33,10 @@ impl PgCoreError {
             message: message.into(),
             detail: None,
             hint: None,
+            context: None,
             cursorpos,
+            internal_query: None,
+            internalpos: 0,
         }
     }
 
@@ -39,14 +45,20 @@ impl PgCoreError {
         message: impl Into<String>,
         detail: Option<String>,
         hint: Option<String>,
+        context: Option<String>,
         cursorpos: i32,
+        internal_query: Option<String>,
+        internalpos: i32,
     ) -> Self {
         Self {
             sqlstate: sqlstate.into(),
             message: message.into(),
             detail,
             hint,
+            context,
             cursorpos,
+            internal_query,
+            internalpos,
         }
     }
 }
@@ -115,17 +127,48 @@ pub struct PgCoreNotice {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreCopyIn {
+    pub source_sql: String,
     pub table: String,
+    pub table_oid: u32,
+    pub relation_columns: usize,
     pub columns: usize,
+    pub format: i32,
+    pub header_line: i32,
+    pub on_error: i32,
+    pub freeze: bool,
+    pub foreign_table: bool,
+    pub partitioned_table: bool,
+    pub has_insert_triggers: bool,
+    pub delimiter: String,
+    pub null_print: String,
+    pub default_print: Option<String>,
     pub column_names: Vec<String>,
+    pub column_metadata: Vec<PgCoreCopyColumn>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreCopyColumn {
+    pub name: String,
+    pub attnum: i16,
+    pub type_oid: u32,
+    pub type_modifier: i32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreCopyOut {
+    pub format: i8,
+    pub columns: usize,
+    pub chunks: Vec<Vec<u8>>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionStatement {
     pub command_tag: Cow<'static, str>,
+    pub command_rows: Option<usize>,
     pub fields: Vec<PgCoreField>,
     pub rows: Vec<Vec<PgCoreValue>>,
     pub copy_in: Option<PgCoreCopyIn>,
+    pub copy_out: Option<PgCoreCopyOut>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -189,7 +232,16 @@ impl PgCoreSession {
         database: impl Into<String>,
     ) -> Self {
         let database = database.into();
-        let database_oid = fastpg_catalog::ensure_database(&database).0;
+        let database_oid = if inner::postgres_catalog_enabled() {
+            if !database.eq_ignore_ascii_case("postgres") {
+                panic!(
+                    "FASTPG_CATALOG_MODE=postgres only supports database \"postgres\" in this experiment"
+                );
+            }
+            5
+        } else {
+            fastpg_catalog::ensure_database(&database).0
+        };
         Self {
             inner: inner::PgCoreSession::new(database_oid),
             storage_session,
@@ -232,12 +284,23 @@ impl PgCoreSession {
         ExecutionResult {
             statements: vec![ExecutionStatement {
                 command_tag: command.command_tag().into(),
+                command_rows: None,
                 fields: Vec::new(),
                 rows: Vec::new(),
                 copy_in: None,
+                copy_out: None,
             }],
             notices: Vec::new(),
         }
+    }
+
+    pub fn execute_copy_from_stdin(
+        &self,
+        sql: &str,
+        data: &[u8],
+    ) -> Result<ExecutionResult, PgCoreError> {
+        let _guard = self.enter_storage();
+        self.inner.execute_copy_from_stdin(sql, data)
     }
 
     pub fn input_text_datum(
@@ -248,6 +311,11 @@ impl PgCoreSession {
     ) -> Result<PgCoreInputDatum, PgCoreError> {
         let _guard = self.enter_storage();
         self.inner.input_text_datum(type_oid, typmod, value)
+    }
+
+    pub fn reset_session_state(&self) {
+        let _guard = self.enter_storage();
+        self.inner.reset_session_state();
     }
 }
 
@@ -334,9 +402,9 @@ mod inner {
     use std::time::Instant;
 
     use super::{
-        ExecutionResult, ExecutionStatement, PgCoreCopyIn, PgCoreError, PgCoreField,
-        PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice, PgCoreParam, PgCoreTransactionCommand,
-        PgCoreValue, RawParseSummary, StatementDescription,
+        ExecutionResult, ExecutionStatement, PgCoreCopyColumn, PgCoreCopyIn, PgCoreCopyOut,
+        PgCoreError, PgCoreField, PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice, PgCoreParam,
+        PgCoreTransactionCommand, PgCoreValue, RawParseSummary, StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
@@ -422,6 +490,9 @@ mod inner {
     }
 
     fn refresh_pgcore_caches_if_catalog_changed() {
+        if postgres_catalog_enabled() {
+            return;
+        }
         let current_generation = fastpg_catalog::current_generation();
         if PGCORE_CATALOG_GENERATION.load(Ordering::Relaxed) == current_generation {
             return;
@@ -430,6 +501,12 @@ mod inner {
             fastpg_pgcore_invalidate_system_caches();
         }
         PGCORE_CATALOG_GENERATION.store(current_generation, Ordering::Relaxed);
+    }
+
+    pub(super) fn postgres_catalog_enabled() -> bool {
+        std::env::var("FASTPG_CATALOG_MODE")
+            .map(|value| value.eq_ignore_ascii_case("postgres"))
+            .unwrap_or(false)
     }
 
     #[repr(C)]
@@ -470,6 +547,7 @@ mod inner {
         fn fastpg_pgcore_notice_capture_hint(index: i32) -> *const c_char;
         fn fastpg_pgcore_notice_capture_context(index: i32) -> *const c_char;
         fn fastpg_pgcore_notice_capture_cursorpos(index: i32) -> i32;
+        fn fastpg_pgcore_reset_session_state();
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
         fn fastpg_pgcore_parse_result_statement_count(
@@ -486,6 +564,9 @@ mod inner {
         ) -> *const c_char;
         fn fastpg_pgcore_parse_result_hint(result: *const FastPgPgCoreParseResult)
         -> *const c_char;
+        fn fastpg_pgcore_parse_result_context(
+            result: *const FastPgPgCoreParseResult,
+        ) -> *const c_char;
         fn fastpg_pgcore_parse_result_cursorpos(result: *const FastPgPgCoreParseResult) -> i32;
         fn fastpg_pgcore_prepare(sql: *const c_char) -> *mut FastPgPgCorePrepared;
         fn fastpg_pgcore_prepared_free(prepared: *mut FastPgPgCorePrepared);
@@ -494,6 +575,7 @@ mod inner {
         fn fastpg_pgcore_prepared_message(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_detail(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_hint(prepared: *const FastPgPgCorePrepared) -> *const c_char;
+        fn fastpg_pgcore_prepared_context(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_cursorpos(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_count(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_type_oid(
@@ -524,6 +606,11 @@ mod inner {
             parameter_is_datum: *const bool,
             parameter_count: i32,
         ) -> *mut FastPgPgCoreExecuteResult;
+        fn fastpg_pgcore_execute_copy_from_stdin(
+            sql: *const c_char,
+            data: *const c_char,
+            data_len: usize,
+        ) -> *mut FastPgPgCoreExecuteResult;
         fn fastpg_pgcore_execute_result_free(result: *mut FastPgPgCoreExecuteResult);
         fn fastpg_pgcore_execute_result_ok(result: *const FastPgPgCoreExecuteResult) -> bool;
         fn fastpg_pgcore_execute_result_sqlstate(
@@ -538,7 +625,45 @@ mod inner {
         fn fastpg_pgcore_execute_result_hint(
             result: *const FastPgPgCoreExecuteResult,
         ) -> *const c_char;
+        fn fastpg_pgcore_execute_result_context(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> *const c_char;
         fn fastpg_pgcore_execute_result_cursorpos(result: *const FastPgPgCoreExecuteResult) -> i32;
+        fn fastpg_pgcore_execute_result_internal_query(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_result_internalpos(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> i32;
+        fn fastpg_pgcore_execute_notice_count(result: *const FastPgPgCoreExecuteResult) -> i32;
+        fn fastpg_pgcore_execute_notice_severity(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notice_sqlstate(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notice_message(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notice_detail(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notice_hint(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notice_context(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notice_cursorpos(
+            result: *const FastPgPgCoreExecuteResult,
+            notice_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute_statement_count(result: *const FastPgPgCoreExecuteResult) -> i32;
         fn fastpg_pgcore_execute_statement_command_tag(
             result: *const FastPgPgCoreExecuteResult,
@@ -552,23 +677,124 @@ mod inner {
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> i32;
+        fn fastpg_pgcore_execute_statement_has_processed_count(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_processed_count(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> u64;
         fn fastpg_pgcore_execute_statement_is_copy_in(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> bool;
+        fn fastpg_pgcore_execute_statement_is_copy_out(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_copy_out_format(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_out_columns(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_out_chunk_count(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_out_chunk_data(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            chunk_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_copy_out_chunk_len(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            chunk_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute_statement_copy_table(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_copy_table_oid(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> u32;
+        fn fastpg_pgcore_execute_statement_copy_relation_column_count(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute_statement_copy_column_count(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
         ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_format(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_header_line(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_on_error(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_freeze(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_copy_foreign_table(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_copy_partitioned_table(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_copy_has_insert_triggers(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> bool;
+        fn fastpg_pgcore_execute_statement_copy_source_text(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_copy_delimiter(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_copy_null_print(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_copy_default_print(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+        ) -> *const c_char;
         fn fastpg_pgcore_execute_statement_copy_column_name(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
             column_index: i32,
         ) -> *const c_char;
+        fn fastpg_pgcore_execute_statement_copy_column_attnum(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            column_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_statement_copy_column_type_oid(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            column_index: i32,
+        ) -> u32;
+        fn fastpg_pgcore_execute_statement_copy_column_type_modifier(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            column_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute_column_name(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
@@ -614,6 +840,9 @@ mod inner {
             result: *const FastPgPgCoreInputDatumResult,
         ) -> *const c_char;
         fn fastpg_pgcore_input_datum_result_hint(
+            result: *const FastPgPgCoreInputDatumResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_input_datum_result_context(
             result: *const FastPgPgCoreInputDatumResult,
         ) -> *const c_char;
         fn fastpg_pgcore_input_datum_result_cursorpos(
@@ -684,7 +913,10 @@ mod inner {
                 unsafe { c_string(fastpg_pgcore_parse_result_message(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_parse_result_detail(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_parse_result_hint(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_parse_result_context(result.as_ptr())) },
                 unsafe { fastpg_pgcore_parse_result_cursorpos(result.as_ptr()) },
+                None,
+                0,
             ))
         }
     }
@@ -820,6 +1052,13 @@ mod inner {
             }
         }
 
+        pub fn reset_session_state(&self) {
+            let _guard = enter_pgcore_lane("reset_session_state");
+            unsafe {
+                fastpg_pgcore_reset_session_state();
+            }
+        }
+
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
             check_sql(sql)?;
             let _guard = enter_pgcore_lane("prepare");
@@ -845,7 +1084,10 @@ mod inner {
                     unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr())) },
+                    unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr())) },
                     unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
+                    None,
+                    0,
                 );
                 drop(_guard);
                 Err(error)
@@ -915,6 +1157,24 @@ mod inner {
             }
         }
 
+        pub fn execute_copy_from_stdin(
+            &self,
+            sql: &str,
+            data: &[u8],
+        ) -> Result<ExecutionResult, PgCoreError> {
+            check_sql(sql)?;
+            let _guard = enter_pgcore_lane("copy_from_stdin");
+            self.set_database();
+            let result = with_c_sql(sql, |c_sql| unsafe {
+                fastpg_pgcore_execute_copy_from_stdin(
+                    c_sql,
+                    data.as_ptr().cast::<c_char>(),
+                    data.len(),
+                )
+            });
+            execution_result_from_ptr(result)
+        }
+
         pub fn input_text_datum(
             &self,
             type_oid: u32,
@@ -975,7 +1235,12 @@ mod inner {
                     unsafe {
                         optional_c_string(fastpg_pgcore_input_datum_result_hint(result.as_ptr()))
                     },
+                    unsafe {
+                        optional_c_string(fastpg_pgcore_input_datum_result_context(result.as_ptr()))
+                    },
                     unsafe { fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr()) },
+                    None,
+                    0,
                 ))
             }
         }
@@ -1164,7 +1429,10 @@ mod inner {
             unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
+            unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared)) },
             unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
+            None,
+            0,
         )
     }
 
@@ -1187,7 +1455,12 @@ mod inner {
                 unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_execute_result_context(result.as_ptr())) },
                 unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
+                unsafe {
+                    optional_c_string(fastpg_pgcore_execute_result_internal_query(result.as_ptr()))
+                },
+                unsafe { fastpg_pgcore_execute_result_internalpos(result.as_ptr()) },
             ))
         }
     }
@@ -1209,6 +1482,51 @@ mod inner {
         }
 
         fn to_execution_result(&self) -> ExecutionResult {
+            let notice_count = unsafe { fastpg_pgcore_execute_notice_count(self.as_ptr()) }.max(0);
+            let mut notices = Vec::with_capacity(notice_count as usize);
+            for notice_index in 0..notice_count {
+                notices.push(PgCoreNotice {
+                    severity: unsafe {
+                        c_string(fastpg_pgcore_execute_notice_severity(
+                            self.as_ptr(),
+                            notice_index,
+                        ))
+                    },
+                    sqlstate: unsafe {
+                        c_string(fastpg_pgcore_execute_notice_sqlstate(
+                            self.as_ptr(),
+                            notice_index,
+                        ))
+                    },
+                    message: unsafe {
+                        c_string(fastpg_pgcore_execute_notice_message(
+                            self.as_ptr(),
+                            notice_index,
+                        ))
+                    },
+                    detail: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_notice_detail(
+                            self.as_ptr(),
+                            notice_index,
+                        ))
+                    },
+                    hint: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_notice_hint(
+                            self.as_ptr(),
+                            notice_index,
+                        ))
+                    },
+                    context: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_notice_context(
+                            self.as_ptr(),
+                            notice_index,
+                        ))
+                    },
+                    cursorpos: unsafe {
+                        fastpg_pgcore_execute_notice_cursorpos(self.as_ptr(), notice_index)
+                    },
+                });
+            }
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
             let mut statements = Vec::with_capacity(statement_count as usize);
@@ -1221,6 +1539,21 @@ mod inner {
                     fastpg_pgcore_execute_statement_row_count(self.as_ptr(), statement_index)
                 }
                 .max(0);
+                let command_rows = unsafe {
+                    fastpg_pgcore_execute_statement_has_processed_count(
+                        self.as_ptr(),
+                        statement_index,
+                    )
+                }
+                .then(|| {
+                    let rows = unsafe {
+                        fastpg_pgcore_execute_statement_processed_count(
+                            self.as_ptr(),
+                            statement_index,
+                        )
+                    };
+                    usize::try_from(rows).unwrap_or(usize::MAX)
+                });
                 let copy_in = unsafe {
                     fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
                 }
@@ -1244,16 +1577,188 @@ mod inner {
                             name.filter(|name| !name.is_empty())
                         })
                         .collect();
+                    let column_metadata = (0..columns)
+                        .map(|column_index| {
+                            let name = unsafe {
+                                c_string(fastpg_pgcore_execute_statement_copy_column_name(
+                                    self.as_ptr(),
+                                    statement_index,
+                                    column_index,
+                                ))
+                            };
+                            PgCoreCopyColumn {
+                                name,
+                                attnum: unsafe {
+                                    fastpg_pgcore_execute_statement_copy_column_attnum(
+                                        self.as_ptr(),
+                                        statement_index,
+                                        column_index,
+                                    )
+                                } as i16,
+                                type_oid: unsafe {
+                                    fastpg_pgcore_execute_statement_copy_column_type_oid(
+                                        self.as_ptr(),
+                                        statement_index,
+                                        column_index,
+                                    )
+                                },
+                                type_modifier: unsafe {
+                                    fastpg_pgcore_execute_statement_copy_column_type_modifier(
+                                        self.as_ptr(),
+                                        statement_index,
+                                        column_index,
+                                    )
+                                },
+                            }
+                        })
+                        .collect();
 
                     PgCoreCopyIn {
+                        source_sql: unsafe {
+                            c_string(fastpg_pgcore_execute_statement_copy_source_text(
+                                self.as_ptr(),
+                                statement_index,
+                            ))
+                        },
                         table: unsafe {
                             c_string(fastpg_pgcore_execute_statement_copy_table(
                                 self.as_ptr(),
                                 statement_index,
                             ))
                         },
+                        table_oid: unsafe {
+                            fastpg_pgcore_execute_statement_copy_table_oid(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        relation_columns: unsafe {
+                            fastpg_pgcore_execute_statement_copy_relation_column_count(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        }
+                        .max(0) as usize,
                         columns: columns as usize,
+                        format: unsafe {
+                            fastpg_pgcore_execute_statement_copy_format(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        header_line: unsafe {
+                            fastpg_pgcore_execute_statement_copy_header_line(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        on_error: unsafe {
+                            fastpg_pgcore_execute_statement_copy_on_error(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        freeze: unsafe {
+                            fastpg_pgcore_execute_statement_copy_freeze(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        foreign_table: unsafe {
+                            fastpg_pgcore_execute_statement_copy_foreign_table(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        partitioned_table: unsafe {
+                            fastpg_pgcore_execute_statement_copy_partitioned_table(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        has_insert_triggers: unsafe {
+                            fastpg_pgcore_execute_statement_copy_has_insert_triggers(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        delimiter: unsafe {
+                            optional_c_string(fastpg_pgcore_execute_statement_copy_delimiter(
+                                self.as_ptr(),
+                                statement_index,
+                            ))
+                        }
+                        .unwrap_or_else(|| "\t".to_owned()),
+                        null_print: unsafe {
+                            optional_c_string(fastpg_pgcore_execute_statement_copy_null_print(
+                                self.as_ptr(),
+                                statement_index,
+                            ))
+                        }
+                        .unwrap_or_else(|| "\\N".to_owned()),
+                        default_print: unsafe {
+                            optional_c_string(fastpg_pgcore_execute_statement_copy_default_print(
+                                self.as_ptr(),
+                                statement_index,
+                            ))
+                        },
                         column_names,
+                        column_metadata,
+                    }
+                });
+                let copy_out = unsafe {
+                    fastpg_pgcore_execute_statement_is_copy_out(self.as_ptr(), statement_index)
+                }
+                .then(|| {
+                    let chunk_count = unsafe {
+                        fastpg_pgcore_execute_statement_copy_out_chunk_count(
+                            self.as_ptr(),
+                            statement_index,
+                        )
+                    }
+                    .max(0);
+                    let mut chunks = Vec::with_capacity(chunk_count as usize);
+                    for chunk_index in 0..chunk_count {
+                        let len = unsafe {
+                            fastpg_pgcore_execute_statement_copy_out_chunk_len(
+                                self.as_ptr(),
+                                statement_index,
+                                chunk_index,
+                            )
+                        }
+                        .max(0) as usize;
+                        let ptr = unsafe {
+                            fastpg_pgcore_execute_statement_copy_out_chunk_data(
+                                self.as_ptr(),
+                                statement_index,
+                                chunk_index,
+                            )
+                        };
+                        if len == 0 {
+                            chunks.push(Vec::new());
+                        } else if !ptr.is_null() {
+                            chunks.push(
+                                unsafe { std::slice::from_raw_parts(ptr.cast::<u8>(), len) }
+                                    .to_vec(),
+                            );
+                        }
+                    }
+
+                    PgCoreCopyOut {
+                        format: unsafe {
+                            fastpg_pgcore_execute_statement_copy_out_format(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        } as i8,
+                        columns: unsafe {
+                            fastpg_pgcore_execute_statement_copy_out_columns(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        }
+                        .max(0) as usize,
+                        chunks,
                     }
                 });
                 let mut fields = Vec::with_capacity(field_count as usize);
@@ -1315,14 +1820,16 @@ mod inner {
                             statement_index,
                         ))
                     },
+                    command_rows,
                     fields,
                     rows,
                     copy_in,
+                    copy_out,
                 });
             }
             ExecutionResult {
+                notices,
                 statements,
-                notices: Vec::new(),
             }
         }
     }
@@ -1345,6 +1852,10 @@ mod inner {
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
         PgCoreLaneMetrics::default()
+    }
+
+    pub(super) fn postgres_catalog_enabled() -> bool {
+        false
     }
 
     pub fn raw_parse(_sql: &str) -> Result<RawParseSummary, PgCoreError> {
@@ -1379,6 +1890,18 @@ mod inner {
             ))
         }
 
+        pub fn execute_copy_from_stdin(
+            &self,
+            _sql: &str,
+            _data: &[u8],
+        ) -> Result<ExecutionResult, PgCoreError> {
+            Err(PgCoreError::new(
+                "0A000",
+                "fastpg-pgcore was built without PostgreSQL execution",
+                0,
+            ))
+        }
+
         pub fn input_text_datum(
             &self,
             _type_oid: u32,
@@ -1391,6 +1914,8 @@ mod inner {
                 0,
             ))
         }
+
+        pub fn reset_session_state(&self) {}
     }
 
     #[derive(Debug)]
@@ -2390,14 +2915,9 @@ mod tests {
             .execute()
             .unwrap();
         assert_eq!(copy.statements[0].command_tag, "COPY");
-        assert_eq!(
-            copy.statements[0].copy_in,
-            Some(PgCoreCopyIn {
-                table: table.clone(),
-                columns: 2,
-                column_names: Vec::new(),
-            })
-        );
+        let copy_in = copy.statements[0].copy_in.as_ref().unwrap();
+        assert_eq!(copy_in.table, table);
+        assert_eq!(copy_in.columns, 2);
 
         session
             .prepare(&format!("drop table if exists {table}"))

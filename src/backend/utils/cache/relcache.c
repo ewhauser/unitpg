@@ -440,6 +440,9 @@ FastPgBuildPgClassTuple(Oid targetRelId)
 	int32_t		relpages = 0;
 	float4		reltuples = -1.0;
 
+	if (!fastpg_use_rust_catalog())
+		return NULL;
+
 	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) targetRelId,
 											 &fastpg_relation))
 		return NULL;
@@ -641,6 +644,9 @@ FastPgInitIndexAccessInfo(Relation relation)
 	MemoryContext oldcontext;
 	int			indnkeyatts;
 
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	if (!fastpg_rust_catalog_primary_key_index_info((uint32_t) RelationGetRelid(relation),
 													&index_info))
 		return false;
@@ -701,6 +707,8 @@ FastPgInitIndexAccessInfo(Relation relation)
 	relation->rd_amcache = NULL;
 	return true;
 }
+
+static bool UseFastPgMemIndexAm(Relation relation);
 #endif
 
 /*
@@ -1041,6 +1049,9 @@ FastPgBuildTupleDesc(Relation relation)
 	FastPgRustCatalogRelation fastpg_relation;
 	TupleConstr *constr;
 	int			ndef = 0;
+
+	if (!fastpg_use_rust_catalog())
+		return false;
 
 	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(relation)) != 0)
 		return FastPgBuildVirtualCatalogTupleDesc(relation);
@@ -1939,8 +1950,14 @@ InitIndexAmRoutine(Relation relation)
 	MemoryContext oldctx;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster &&
+	if (fastpg_use_rust_catalog() &&
+		!IsUnderPostmaster &&
 		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId)
+	{
+		relation->rd_indam = GetFastPgMemIndexAmRoutine();
+		return;
+	}
+	if (UseFastPgMemIndexAm(relation))
 	{
 		relation->rd_indam = GetFastPgMemIndexAmRoutine();
 		return;
@@ -2351,18 +2368,71 @@ InitTableAmRoutine(Relation relation)
 static bool
 IsFastPgVirtualCatalogRelation(Relation relation)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(relation)) != 0;
 }
+
+static bool UseFastPgMemTableAmOid(Oid relid);
 
 static bool
 UseFastPgMemTableAm(Relation relation)
 {
 	Oid			relnamespace = RelationGetNamespace(relation);
 
+	if (OidIsValid(relation->rd_rel->relrewrite))
+		return UseFastPgMemTableAmOid(relation->rd_rel->relrewrite);
+
 	return relation->rd_rel->relkind == RELKIND_RELATION &&
 		relation->rd_rel->relam == HEAP_TABLE_AM_OID &&
 		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
 		!IsToastNamespace(relnamespace);
+}
+
+static bool
+UseFastPgMemTableAmOid(Oid relid)
+{
+	if (relid < (Oid) FirstNormalObjectId)
+		return false;
+	if (get_rel_relkind(relid) != RELKIND_RELATION)
+		return false;
+	if (get_rel_relam(relid) != HEAP_TABLE_AM_OID)
+		return false;
+	return !IsToastNamespace(get_rel_namespace(relid));
+}
+
+static bool
+UseFastPgMemIndexAm(Relation relation)
+{
+	int			key_count;
+	const char *use_mem_index_am = getenv("FASTPG_USE_MEM_INDEX_AM");
+
+	if (!fastpg_catalog_mode_uses_postgres() ||
+		IsUnderPostmaster ||
+		use_mem_index_am == NULL ||
+		strcmp(use_mem_index_am, "1") != 0 ||
+		relation->rd_index == NULL ||
+		relation->rd_indextuple == NULL ||
+		!relation->rd_index->indisunique ||
+		relation->rd_index->indisexclusion ||
+		relation->rd_rel->relam != BTREE_AM_OID ||
+		!UseFastPgMemTableAmOid(relation->rd_index->indrelid))
+		return false;
+	if (!heap_attisnull(relation->rd_indextuple, Anum_pg_index_indexprs, NULL) ||
+		!heap_attisnull(relation->rd_indextuple, Anum_pg_index_indpred, NULL))
+		return false;
+
+	key_count = IndexRelationGetNumberOfKeyAttributes(relation);
+	if (key_count <= 0 || key_count > INDEX_MAX_KEYS)
+		return false;
+	for (int index = 0; index < key_count; index++)
+	{
+		if (relation->rd_index->indkey.values[index] <= 0)
+			return false;
+	}
+
+	return true;
 }
 #endif
 
@@ -4145,7 +4215,8 @@ RelationBuildLocalRelation(const char *relname,
 						   bool shared_relation,
 						   bool mapped_relation,
 						   char relpersistence,
-						   char relkind)
+						   char relkind,
+						   Oid relrewrite)
 {
 	Relation	rel;
 	MemoryContext oldcxt;
@@ -4294,6 +4365,7 @@ RelationBuildLocalRelation(const char *relname,
 		rel->rd_rel->relispopulated = false;
 	else
 		rel->rd_rel->relispopulated = true;
+	rel->rd_rel->relrewrite = relrewrite;
 
 	/* set replica identity -- system catalogs and non-tables don't have one */
 	if (!IsCatalogNamespace(relnamespace) &&
@@ -5478,6 +5550,7 @@ RelationGetIndexList(Relation relation)
 	}
 
 #ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
 	{
 		FastPgRustCatalogRelation fastpg_relation;
 		uint32_t	fastpg_index_oid;
@@ -5654,6 +5727,7 @@ RelationGetStatExtList(Relation relation)
 		return list_copy(relation->rd_statlist);
 
 #ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
 	{
 		FastPgRustCatalogRelation fastpg_relation;
 

@@ -26,6 +26,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/transam.h"
 #include "access/xact.h"
 #include "funcapi.h"
@@ -429,8 +432,9 @@ Datum
 pg_current_xact_id(PG_FUNCTION_ARGS)
 {
 #ifdef USE_FASTPG
-	PG_RETURN_FULLTRANSACTIONID(fastpg_current_fxid());
-#else
+	if (fastpg_use_rust_catalog())
+		PG_RETURN_FULLTRANSACTIONID(fastpg_current_fxid());
+#endif
 	/*
 	 * Must prevent during recovery because if an xid is not assigned we try
 	 * to assign one, which would fail. Programs already rely on this function
@@ -440,7 +444,6 @@ pg_current_xact_id(PG_FUNCTION_ARGS)
 	PreventCommandDuringRecovery("pg_current_xact_id()");
 
 	PG_RETURN_FULLTRANSACTIONID(GetTopFullTransactionId());
-#endif
 }
 
 /*
@@ -450,18 +453,22 @@ pg_current_xact_id(PG_FUNCTION_ARGS)
 Datum
 pg_current_xact_id_if_assigned(PG_FUNCTION_ARGS)
 {
+	FullTransactionId topfxid;
+
 #ifdef USE_FASTPG
-	if (!fastpg_xid_assigned)
-		PG_RETURN_NULL();
-	PG_RETURN_FULLTRANSACTIONID(fastpg_xid_current);
-#else
-	FullTransactionId topfxid = GetTopFullTransactionIdIfAny();
+	if (fastpg_use_rust_catalog())
+	{
+		if (!fastpg_xid_assigned)
+			PG_RETURN_NULL();
+		PG_RETURN_FULLTRANSACTIONID(fastpg_xid_current);
+	}
+#endif
+	topfxid = GetTopFullTransactionIdIfAny();
 
 	if (!FullTransactionIdIsValid(topfxid))
 		PG_RETURN_NULL();
 
 	PG_RETURN_FULLTRANSACTIONID(topfxid);
-#endif
 }
 
 /*
@@ -474,26 +481,30 @@ pg_current_xact_id_if_assigned(PG_FUNCTION_ARGS)
 Datum
 pg_current_snapshot(PG_FUNCTION_ARGS)
 {
-#ifdef USE_FASTPG
-	pg_snapshot *snap;
-	FullTransactionId current_fxid = fastpg_current_fxid();
-	FullTransactionId xmax = current_fxid;
-
-	FullTransactionIdAdvance(&xmax);
-	snap = palloc(PG_SNAPSHOT_SIZE(1));
-	snap->xmin = current_fxid;
-	snap->xmax = xmax;
-	snap->nxip = 1;
-	snap->xip[0] = current_fxid;
-	SET_VARSIZE(snap, PG_SNAPSHOT_SIZE(snap->nxip));
-
-	PG_RETURN_POINTER(snap);
-#else
 	pg_snapshot *snap;
 	uint32		nxip,
 				i;
 	Snapshot	cur;
-	FullTransactionId next_fxid = ReadNextFullTransactionId();
+	FullTransactionId next_fxid;
+
+#ifdef USE_FASTPG
+	if (fastpg_use_rust_catalog())
+	{
+		FullTransactionId current_fxid = fastpg_current_fxid();
+		FullTransactionId xmax = current_fxid;
+
+		FullTransactionIdAdvance(&xmax);
+		snap = palloc(PG_SNAPSHOT_SIZE(1));
+		snap->xmin = current_fxid;
+		snap->xmax = xmax;
+		snap->nxip = 1;
+		snap->xip[0] = current_fxid;
+		SET_VARSIZE(snap, PG_SNAPSHOT_SIZE(snap->nxip));
+
+		PG_RETURN_POINTER(snap);
+	}
+#endif
+	next_fxid = ReadNextFullTransactionId();
 
 	cur = GetActiveSnapshot();
 	if (cur == NULL)
@@ -529,7 +540,6 @@ pg_current_snapshot(PG_FUNCTION_ARGS)
 	SET_VARSIZE(snap, PG_SNAPSHOT_SIZE(snap->nxip));
 
 	PG_RETURN_POINTER(snap);
-#endif
 }
 
 /*
@@ -767,36 +777,39 @@ pg_xact_status(PG_FUNCTION_ARGS)
 #ifdef USE_FASTPG
 	FastPgXidState state;
 
-	if (U64FromFullTransactionId(fxid) > fastpg_next_fxid + 1000)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("transaction ID %" PRIu64 " is in the future",
-						U64FromFullTransactionId(fxid))));
-
-	xid = XidFromFullTransactionId(fxid);
-	if (xid == BootstrapTransactionId || xid == FrozenTransactionId)
-		PG_RETURN_TEXT_P(cstring_to_text("committed"));
-	if (xid == FirstNormalTransactionId)
-		PG_RETURN_NULL();
-	if (fastpg_xid_assigned && FullTransactionIdEquals(fxid, fastpg_xid_current))
-		PG_RETURN_TEXT_P(cstring_to_text("in progress"));
-	if (!fastpg_lookup_xid(fxid, &state))
-		PG_RETURN_NULL();
-
-	switch (state)
+	if (fastpg_use_rust_catalog())
 	{
-		case FASTPG_XID_COMMITTED:
-			status = "committed";
-			break;
-		case FASTPG_XID_ABORTED:
-			status = "aborted";
-			break;
-		case FASTPG_XID_IN_PROGRESS:
-			status = "in progress";
-			break;
-	}
+		if (U64FromFullTransactionId(fxid) > fastpg_next_fxid + 1000)
+			ereport(ERROR,
+					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+					 errmsg("transaction ID %" PRIu64 " is in the future",
+							U64FromFullTransactionId(fxid))));
 
-	PG_RETURN_TEXT_P(cstring_to_text(status));
+		xid = XidFromFullTransactionId(fxid);
+		if (xid == BootstrapTransactionId || xid == FrozenTransactionId)
+			PG_RETURN_TEXT_P(cstring_to_text("committed"));
+		if (xid == FirstNormalTransactionId)
+			PG_RETURN_NULL();
+		if (fastpg_xid_assigned && FullTransactionIdEquals(fxid, fastpg_xid_current))
+			PG_RETURN_TEXT_P(cstring_to_text("in progress"));
+		if (!fastpg_lookup_xid(fxid, &state))
+			PG_RETURN_NULL();
+
+		switch (state)
+		{
+			case FASTPG_XID_COMMITTED:
+				status = "committed";
+				break;
+			case FASTPG_XID_ABORTED:
+				status = "aborted";
+				break;
+			case FASTPG_XID_IN_PROGRESS:
+				status = "in progress";
+				break;
+		}
+
+		PG_RETURN_TEXT_P(cstring_to_text(status));
+	}
 #endif
 
 	/*

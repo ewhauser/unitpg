@@ -47,6 +47,9 @@
 
 #include <signal.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/subtrans.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -1404,7 +1407,7 @@ TransactionIdIsInProgress(TransactionId xid)
 	int			j;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return false;
 #endif
 
@@ -2137,7 +2140,7 @@ GetSnapshotData(Snapshot snapshot)
 	Assert(snapshot != NULL);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		snapshot->snapshot_type = SNAPSHOT_MVCC;
 		snapshot->xmin = FirstNormalTransactionId;

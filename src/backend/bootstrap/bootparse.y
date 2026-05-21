@@ -215,6 +215,7 @@ Boot_CreateStmt:
 												   shared_relation,
 												   mapped_relation,
 												   true,
+												   InvalidOid,
 												   &relfrozenxid,
 												   &relminmxid,
 												   true);

@@ -109,6 +109,9 @@ sigjmp_buf *PG_exception_stack = NULL;
  * library is loaded.
  */
 emit_log_hook_type emit_log_hook = NULL;
+#ifdef USE_FASTPG
+emit_log_hook_type fastpg_client_message_hook = NULL;
+#endif
 
 /* GUC parameters */
 int			Log_error_verbosity = PGERROR_DEFAULT;
@@ -269,6 +272,15 @@ should_output_to_client(int elevel)
 		else
 			return (elevel >= client_min_messages || elevel == INFO);
 	}
+#ifdef USE_FASTPG
+	if (fastpg_client_message_hook && elevel != LOG_SERVER_ONLY)
+	{
+		if (ClientAuthInProgress)
+			return (elevel >= ERROR);
+		else
+			return (elevel >= client_min_messages || elevel == INFO);
+	}
+#endif
 	return false;
 }
 
@@ -1922,6 +1934,11 @@ EmitErrorReport(void)
 	/* Send to server log, if enabled */
 	if (edata->output_to_server)
 		send_message_to_server_log(edata);
+
+#ifdef USE_FASTPG
+	if (edata->output_to_client && fastpg_client_message_hook)
+		(*fastpg_client_message_hook) (edata);
+#endif
 
 	/* Send to client, if enabled */
 	if (edata->output_to_client)

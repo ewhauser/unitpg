@@ -45,6 +45,21 @@ class UpstreamCase:
     group: int
 
 
+UPSTREAM_CASE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "multirangetypes": ("rangetypes",),
+    "geometry": ("point", "lseg", "line", "box", "path", "polygon", "circle"),
+    "horology": ("date", "time", "timetz", "timestamp", "timestamptz", "interval"),
+    "aggregates": ("create_aggregate",),
+    "join": ("create_misc",),
+    "amutils": ("geometry", "create_index_spgist", "hash_index", "brin"),
+    "select_parallel": ("create_misc",),
+    "psql": ("create_am",),
+    "select_views": ("create_view",),
+    "with": ("create_misc",),
+    "event_trigger": ("create_am",),
+}
+
+
 class UpstreamRegressionInventory:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -70,6 +85,14 @@ class UpstreamRegressionInventory:
             limit=args.limit,
             include_setup=not args.no_setup,
         )
+        self.all_cases = load_schedule_cases(
+            self.schedule,
+            self.input_dir,
+            selected=set(),
+            limit=None,
+            include_setup=True,
+        )
+        self.all_cases_by_name = {case.name: case for case in self.all_cases}
         self.results: dict[str, Any] = {
             "status": "running",
             "created_at": timestamp,
@@ -86,6 +109,8 @@ class UpstreamRegressionInventory:
                 "rust_build_profile": args.rust_build_profile,
                 "storage_engine": args.storage_engine,
                 "global_timeout": args.global_timeout,
+                "catalog_mode": args.catalog_mode,
+                "fastpg_isolation": args.fastpg_isolation,
                 "fastpg_case_timeout": args.fastpg_case_timeout,
             },
             "cases": [
@@ -271,6 +296,9 @@ class UpstreamRegressionInventory:
             self.write_results()
 
     def run_rust_server_suite(self, paths: dict[str, Path]) -> list[dict[str, Any]]:
+        if self.args.fastpg_isolation == "case":
+            return self.run_rust_server_cases_isolated(paths)
+
         variant_dir = self.result_root / "fastpg"
         run_dir = variant_dir / "run"
         run_dir.mkdir(parents=True, exist_ok=True)
@@ -314,7 +342,14 @@ class UpstreamRegressionInventory:
         self.write_results()
 
         case_results: list[dict[str, Any]] = []
+        catalog_pgdata: Path | None = None
         try:
+            server_env, catalog_pgdata = self.helper.prepare_rust_server_catalog(
+                "fastpg",
+                paths,
+                run_dir,
+                run_record,
+            )
             server = self.helper.start_rust_server(
                 "fastpg",
                 paths["server_binary"],
@@ -323,7 +358,7 @@ class UpstreamRegressionInventory:
                 host=host,
                 port=port,
                 socket_path=socket_path,
-                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
+                server_env=server_env,
             )
             run_record["commands"]["start"] = server["result"].as_json()
             prelude = self.install_regression_prelude("fastpg", paths["client_bindir"], host, port, env, run_dir)
@@ -353,9 +388,350 @@ class UpstreamRegressionInventory:
                 )
                 if stopped.returncode != 0 and not active_failure and not server_crash_recorded:
                     raise BenchmarkFailure("fastpg", "stop", stopped, run_dir)
+            if catalog_pgdata is not None:
+                shutil.rmtree(catalog_pgdata, ignore_errors=True)
+                run_record["pgdata_cleaned"] = True
             if socket_dir is not None:
                 shutil.rmtree(socket_dir, ignore_errors=True)
             self.write_results()
+
+    def run_rust_server_cases_isolated(self, paths: dict[str, Path]) -> list[dict[str, Any]]:
+        variant_dir = self.result_root / "fastpg"
+        variant_dir.mkdir(parents=True, exist_ok=True)
+        pgcore_build_dir = paths.get("pgcore_build_dir")
+        if pgcore_build_dir is None and self.helper.pgbench_client_paths is not None:
+            pgcore_build_dir = self.helper.pgbench_client_paths["build_dir"]
+        regress_lib_dir = Path(pgcore_build_dir) / "src/test/regress" if pgcore_build_dir else self.input_dir
+        env = regress_env(
+            rust_server_pgbench_env(paths["client_bindir"], paths["client_libdir"]),
+            self.input_dir,
+            regress_lib_dir,
+        )
+        case_results: list[dict[str, Any]] = []
+        runs: list[dict[str, Any]] = []
+        self.results["variants"]["fastpg"] = {
+            "engine": "rust-server",
+            "status": "running",
+            "server_binary": str(paths["server_binary"]),
+            "isolation": "case",
+            "runs": runs,
+            "cases": [],
+        }
+        self.write_results()
+
+        catalog_template_pgdata = self.prepare_fastpg_catalog_template(paths, variant_dir)
+        try:
+            for index, case in enumerate(self.cases, start=1):
+                self.run_rust_server_isolated_case(
+                    paths,
+                    env,
+                    variant_dir,
+                    runs,
+                    case_results,
+                    index,
+                    case,
+                    catalog_template_pgdata,
+                )
+        finally:
+            if catalog_template_pgdata is not None:
+                shutil.rmtree(catalog_template_pgdata, ignore_errors=True)
+                self.results["variants"]["fastpg"]["catalog_template"]["pgdata_cleaned"] = True
+                self.write_results()
+
+        self.results["variants"]["fastpg"]["status"] = "ok"
+        self.write_results()
+        return case_results
+
+    def prepare_fastpg_catalog_template(self, paths: dict[str, Path], variant_dir: Path) -> Path | None:
+        if self.args.catalog_mode != "postgres":
+            return None
+
+        template_dir = variant_dir / "catalog-template"
+        template_dir.mkdir(parents=True, exist_ok=True)
+        template_pgdata = short_temp_dir("fpgcat-template-")
+        template_record: dict[str, Any] = {
+            "pgdata": str(template_pgdata),
+            "pgdata_temporary": True,
+            "commands": {},
+        }
+        self.results["variants"]["fastpg"]["catalog_template"] = template_record
+        self.write_results()
+
+        try:
+            initdb = self.helper.checked_command(
+                "fastpg",
+                "initdb",
+                [
+                    str(paths["client_bindir"] / "initdb"),
+                    "-D",
+                    str(template_pgdata),
+                    "-U",
+                    "postgres",
+                    "-A",
+                    "trust",
+                    "--no-locale",
+                ],
+                template_dir,
+                "fastpg-catalog-template-initdb",
+                env=postgres_env(paths["client_bindir"], paths["client_libdir"]),
+            )
+        except Exception:
+            shutil.rmtree(template_pgdata, ignore_errors=True)
+            raise
+
+        template_record["commands"]["initdb"] = initdb.as_json()
+        self.write_results()
+        return template_pgdata
+
+    def rust_server_catalog_from_template(
+        self,
+        paths: dict[str, Path],
+        run_record: dict[str, Any],
+        catalog_template_pgdata: Path,
+    ) -> tuple[dict[str, str], Path]:
+        postgres_exec = paths["client_bindir"] / ("postgres.exe" if os.name == "nt" else "postgres")
+        server_env = {
+            "FASTPG_CATALOG_MODE": "postgres",
+            "FASTPG_EXEC_PATH": str(postgres_exec if postgres_exec.exists() else paths["server_binary"]),
+            "FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"])),
+        }
+        library_path = "DYLD_LIBRARY_PATH" if platform.system() == "Darwin" else "LD_LIBRARY_PATH"
+        server_env[library_path] = (
+            f"{paths.get('pgcore_libdir', paths['client_libdir'])}"
+            f"{os.pathsep}{os.environ.get(library_path, '')}"
+        )
+        pgdata = short_temp_dir("fpgcat-")
+        shutil.copytree(catalog_template_pgdata, pgdata, dirs_exist_ok=True)
+        run_record["catalog_mode"] = "postgres"
+        run_record["pgdata"] = str(pgdata)
+        run_record["pgdata_temporary"] = True
+        run_record["pgdata_template"] = str(catalog_template_pgdata)
+        server_env["FASTPG_PGDATA"] = str(pgdata)
+        return server_env, pgdata
+
+    def run_rust_server_isolated_case(
+        self,
+        paths: dict[str, Path],
+        env: dict[str, str],
+        variant_dir: Path,
+        runs: list[dict[str, Any]],
+        case_results: list[dict[str, Any]],
+        index: int,
+        case: UpstreamCase,
+        catalog_template_pgdata: Path | None,
+    ) -> None:
+            print(f"[fastpg] upstream regression isolated case {index}/{len(self.cases)} {case.name} start", flush=True)
+            run_dir = variant_dir / f"run-{index:03d}-{case.name}"
+            run_dir.mkdir(parents=True, exist_ok=True)
+            port = free_port()
+            socket_dir: Path | None = None
+            socket_path: Path | None = None
+            if os.name == "nt":
+                host = "127.0.0.1"
+                listen_address = f"{host}:{port}"
+            else:
+                socket_dir = short_temp_dir("fpru-fastpg-")
+                socket_path = socket_dir / f".s.PGSQL.{port}"
+                host = str(socket_dir)
+                listen_address = f"unix:{socket_path}"
+
+            run_record: dict[str, Any] = {
+                "case": case.name,
+                "host": host,
+                "port": port,
+                "commands": {},
+            }
+            if socket_dir is not None:
+                run_record["socket_dir"] = str(socket_dir)
+            runs.append(run_record)
+            self.write_results()
+
+            server: dict[str, Any] | None = None
+            stop_result: CommandResult | None = None
+            setup_seconds = 0.0
+            catalog_pgdata: Path | None = None
+            try:
+                if catalog_template_pgdata is not None:
+                    server_env, catalog_pgdata = self.rust_server_catalog_from_template(
+                        paths,
+                        run_record,
+                        catalog_template_pgdata,
+                    )
+                else:
+                    server_env, catalog_pgdata = self.helper.prepare_rust_server_catalog(
+                        "fastpg",
+                        paths,
+                        run_dir,
+                        run_record,
+                    )
+                server = self.helper.start_rust_server(
+                    "fastpg",
+                    paths["server_binary"],
+                    listen_address,
+                    run_dir,
+                    host=host,
+                    port=port,
+                    socket_path=socket_path,
+                    server_env=server_env,
+                )
+                run_record["commands"]["start"] = server["result"].as_json()
+                prelude = self.install_regression_prelude(
+                    "fastpg",
+                    paths["client_bindir"],
+                    host,
+                    port,
+                    env,
+                    run_dir,
+                )
+                run_record["commands"]["prelude"] = prelude.as_json()
+                for setup_case in self.isolated_setup_cases_for(case):
+                    setup_result, setup_transcript = run_psql_transcript(
+                        paths["client_bindir"],
+                        host,
+                        port,
+                        self.args.database,
+                        setup_case,
+                        run_dir / "setup-case" / setup_case.name,
+                        env,
+                        self.source_root,
+                        timeout=self.args.fastpg_case_timeout,
+                    )
+                    setup_seconds += setup_result.seconds
+                    run_record["commands"][f"setup-{setup_case.name}"] = setup_result.as_json()
+                    if setup_result.returncode != 0:
+                        timed_out = setup_result.returncode == TIMEOUT_RETURN_CODE
+                        case_result = {
+                            "case": case.name,
+                            "group": case.group,
+                            "path": str(case.path),
+                            "output_dir": str(run_dir / "setup-case" / setup_case.name),
+                            "transcript": str(setup_transcript),
+                            "status": "timeout" if timed_out else "failed",
+                            "returncode": setup_result.returncode,
+                            "seconds": setup_seconds,
+                            "command": setup_result.command,
+                            "tail": tail(read_text(setup_transcript)),
+                            "difference": {
+                                "kind": "setup-timeout" if timed_out else "setup-returncode",
+                                "fastpg": setup_result.returncode,
+                            },
+                        }
+                        case_results.append(case_result)
+                        self.results["variants"]["fastpg"]["cases"] = case_results
+                        self.write_results()
+                        continue
+
+                output_dir = run_dir / "cases" / case.name
+                result, transcript = run_psql_transcript(
+                    paths["client_bindir"],
+                    host,
+                    port,
+                    self.args.database,
+                    case,
+                    output_dir,
+                    env,
+                    self.source_root,
+                    timeout=self.args.fastpg_case_timeout,
+                )
+                timed_out = result.returncode == TIMEOUT_RETURN_CODE
+                case_result = {
+                    "case": case.name,
+                    "group": case.group,
+                    "path": str(case.path),
+                    "output_dir": str(output_dir),
+                    "transcript": str(transcript),
+                    "status": "ok" if result.returncode == 0 else ("timeout" if timed_out else "failed"),
+                    "returncode": result.returncode,
+                    "seconds": result.seconds + setup_seconds,
+                    "command": result.command,
+                    "tail": tail(read_text(transcript)),
+                }
+                if timed_out:
+                    case_result["difference"] = {
+                        "kind": "timeout",
+                        "seconds": result.seconds,
+                        "timeout": self.args.fastpg_case_timeout,
+                    }
+                case_results.append(case_result)
+                self.results["variants"]["fastpg"]["cases"] = case_results
+                self.write_results()
+            except BenchmarkFailure as failure:
+                case_result = {
+                    "case": case.name,
+                    "group": case.group,
+                    "path": str(case.path),
+                    "output_dir": str(failure.output_dir),
+                    "transcript": "",
+                    "status": "harness-failure",
+                    "returncode": failure.result.returncode,
+                    "seconds": failure.result.seconds,
+                    "command": failure.result.command,
+                    "tail": tail(failure.result.stdout + "\n" + failure.result.stderr),
+                    "difference": failure_as_json(failure),
+                }
+                case_results.append(case_result)
+                self.results["variants"]["fastpg"]["cases"] = case_results
+                self.write_results()
+            finally:
+                if server is not None:
+                    stop_result = self.helper.stop_rust_server(server, run_dir)
+                    run_record["commands"]["stop"] = stop_result.as_json()
+                    if (
+                        case_results
+                        and case_results[-1]["case"] == case.name
+                        and case_results[-1]["returncode"] != 0
+                        and stop_result.returncode != 0
+                        and case_results[-1]["status"] == "failed"
+                    ):
+                        case_results[-1]["status"] = "server-crash"
+                        case_results[-1]["difference"] = {
+                            "kind": "server-crash",
+                            "psql_returncode": case_results[-1]["returncode"],
+                            "server_returncode": stop_result.returncode,
+                        }
+                if catalog_pgdata is not None:
+                    shutil.rmtree(catalog_pgdata, ignore_errors=True)
+                    run_record["pgdata_cleaned"] = True
+                if socket_dir is not None:
+                    shutil.rmtree(socket_dir, ignore_errors=True)
+                self.results["variants"]["fastpg"]["cases"] = case_results
+                self.write_results()
+                if case_results and case_results[-1]["case"] == case.name:
+                    case_result = case_results[-1]
+                    print(
+                        f"[fastpg] upstream regression isolated case {index}/{len(self.cases)} {case.name} "
+                        f"{case_result['status']} ({case_result['seconds']:.3f}s)",
+                        flush=True,
+                    )
+
+    def isolated_setup_cases_for(self, case: UpstreamCase) -> list[UpstreamCase]:
+        """Return schedule prerequisites needed before running one isolated case."""
+        if case.name == "test_setup":
+            return []
+
+        required: set[str] = {"test_setup"}
+        create_index = self.all_cases_by_name.get("create_index")
+        if create_index is not None and case.group > create_index.group:
+            required.add("create_index")
+
+        def add_named_dependency(name: str) -> None:
+            for dependency in UPSTREAM_CASE_DEPENDENCIES.get(name, ()):
+                if dependency == case.name or dependency in required:
+                    continue
+                required.add(dependency)
+                add_named_dependency(dependency)
+
+        add_named_dependency(case.name)
+
+        if create_index is not None:
+            for dependency in list(required):
+                dependency_case = self.all_cases_by_name.get(dependency)
+                if dependency_case is not None and dependency_case.group > create_index.group:
+                    required.add("create_index")
+                    break
+
+        required.discard(case.name)
+        return [candidate for candidate in self.all_cases if candidate.name in required]
 
     def create_regression_database(
         self,
@@ -365,35 +741,38 @@ class UpstreamRegressionInventory:
         env: dict[str, str],
         run_dir: Path,
     ) -> CommandResult:
+        sql_commands = []
+        if self.args.database != "postgres":
+            sql_commands.append(f'CREATE DATABASE "{self.args.database}" TEMPLATE=template0')
+        sql_commands.append(
+            f"ALTER DATABASE \"{self.args.database}\" SET lc_messages TO 'C';"
+            f"ALTER DATABASE \"{self.args.database}\" SET lc_monetary TO 'C';"
+            f"ALTER DATABASE \"{self.args.database}\" SET lc_numeric TO 'C';"
+            f"ALTER DATABASE \"{self.args.database}\" SET lc_time TO 'C';"
+            f"ALTER DATABASE \"{self.args.database}\" SET bytea_output TO 'hex';"
+            f"ALTER DATABASE \"{self.args.database}\" SET timezone_abbreviations TO 'Default';"
+        )
+        command = [
+            str(bindir / "psql"),
+            "-h",
+            host,
+            "-p",
+            str(port),
+            "-U",
+            "postgres",
+            "-d",
+            "postgres",
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+        ]
+        for sql in sql_commands:
+            command.extend(["-c", sql])
         return self.helper.checked_command(
             "normal",
             "create-database",
-            [
-                str(bindir / "psql"),
-                "-h",
-                host,
-                "-p",
-                str(port),
-                "-U",
-                "postgres",
-                "-d",
-                "postgres",
-                "-X",
-                "-q",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                f'CREATE DATABASE "{self.args.database}" TEMPLATE=template0',
-                "-c",
-                (
-                    f"ALTER DATABASE \"{self.args.database}\" SET lc_messages TO 'C';"
-                    f"ALTER DATABASE \"{self.args.database}\" SET lc_monetary TO 'C';"
-                    f"ALTER DATABASE \"{self.args.database}\" SET lc_numeric TO 'C';"
-                    f"ALTER DATABASE \"{self.args.database}\" SET lc_time TO 'C';"
-                    f"ALTER DATABASE \"{self.args.database}\" SET bytea_output TO 'hex';"
-                    f"ALTER DATABASE \"{self.args.database}\" SET timezone_abbreviations TO 'Default';"
-                ),
-            ],
+            command,
             run_dir,
             "create-database",
             env=env,
@@ -408,32 +787,35 @@ class UpstreamRegressionInventory:
         env: dict[str, str],
         run_dir: Path,
     ) -> CommandResult:
+        prelude_sql = [
+            "CREATE FUNCTION pg_catalog.plpgsql_call_handler() RETURNS language_handler LANGUAGE c AS '$libdir/plpgsql'",
+            "CREATE FUNCTION pg_catalog.plpgsql_inline_handler(internal) RETURNS void STRICT LANGUAGE c AS '$libdir/plpgsql'",
+            "CREATE FUNCTION pg_catalog.plpgsql_validator(oid) RETURNS void STRICT LANGUAGE c AS '$libdir/plpgsql'",
+            "CREATE TRUSTED LANGUAGE plpgsql HANDLER pg_catalog.plpgsql_call_handler INLINE pg_catalog.plpgsql_inline_handler VALIDATOR pg_catalog.plpgsql_validator",
+        ]
+        if self.args.database == "postgres":
+            prelude_sql = ["SELECT 1 FROM pg_catalog.pg_language WHERE lanname = 'plpgsql'"]
+        command = [
+            str(bindir / "psql"),
+            "-h",
+            host,
+            "-p",
+            str(port),
+            "-U",
+            "postgres",
+            "-d",
+            self.args.database,
+            "-X",
+            "-q",
+            "-v",
+            "ON_ERROR_STOP=1",
+        ]
+        for sql in prelude_sql:
+            command.extend(["-c", sql])
         return self.helper.checked_command(
             variant,
             "prelude",
-            [
-                str(bindir / "psql"),
-                "-h",
-                host,
-                "-p",
-                str(port),
-                "-U",
-                "postgres",
-                "-d",
-                self.args.database,
-                "-X",
-                "-q",
-                "-v",
-                "ON_ERROR_STOP=1",
-                "-c",
-                "CREATE FUNCTION pg_catalog.plpgsql_call_handler() RETURNS language_handler LANGUAGE c AS '$libdir/plpgsql'",
-                "-c",
-                "CREATE FUNCTION pg_catalog.plpgsql_inline_handler(internal) RETURNS void STRICT LANGUAGE c AS '$libdir/plpgsql'",
-                "-c",
-                "CREATE FUNCTION pg_catalog.plpgsql_validator(oid) RETURNS void STRICT LANGUAGE c AS '$libdir/plpgsql'",
-                "-c",
-                "CREATE TRUSTED LANGUAGE plpgsql HANDLER pg_catalog.plpgsql_call_handler INLINE pg_catalog.plpgsql_inline_handler VALIDATOR pg_catalog.plpgsql_validator",
-            ],
+            command,
             run_dir,
             "regression-prelude",
             env=env,
@@ -716,6 +1098,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
         storage_engine=args.storage_engine,
+        catalog_mode=getattr(args, "catalog_mode", "rust"),
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
@@ -804,7 +1187,6 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
                 f"- fastpg timeouts: `{totals_data['fastpg_timeout']}`",
                 f"- fastpg server crashes: `{totals_data['fastpg_server_crash']}`",
                 f"- fastpg harness failures: `{totals_data['fastpg_harness_failure']}`",
-                f"- fastpg not run: `{totals_data['fastpg_not_run']}`",
                 f"- skipped by normal failure: `{totals_data['fastpg_normal_failed']}`",
             ]
         )
@@ -890,10 +1272,21 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
     )
     parser.add_argument(
+        "--catalog-mode",
+        choices=["rust", "postgres"],
+        default=os.environ.get("FASTPG_CATALOG_MODE", "rust"),
+    )
+    parser.add_argument(
         "--global-timeout",
         type=float,
         default=60.0,
         help="seconds before the whole upstream inventory run fails",
+    )
+    parser.add_argument(
+        "--fastpg-isolation",
+        choices=["suite", "case"],
+        default="suite",
+        help="run fastpg cases in one server or restart fastpg for each selected case",
     )
     parser.add_argument(
         "--fastpg-case-timeout",
@@ -913,6 +1306,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--global-timeout must be positive")
     if args.fastpg_case_timeout is not None and args.fastpg_case_timeout <= 0:
         parser.error("--fastpg-case-timeout must be positive")
+    if args.catalog_mode == "postgres" and args.storage_engine == "storage2":
+        parser.error("--catalog-mode=postgres currently supports --storage-engine=storage1 only")
     return args
 
 
