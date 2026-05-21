@@ -24,9 +24,16 @@
 static inline bool
 fastpg_catalog_mode_uses_postgres(void)
 {
-	const char *mode = getenv("FASTPG_CATALOG_MODE");
+	static PG_THREAD_LOCAL int cached_mode = -1;
 
-	return mode != NULL && strcmp(mode, "postgres") == 0;
+	if (cached_mode < 0)
+	{
+		const char *mode = getenv("FASTPG_CATALOG_MODE");
+
+		cached_mode = mode != NULL && strcmp(mode, "postgres") == 0;
+	}
+
+	return cached_mode != 0;
 }
 
 static inline bool

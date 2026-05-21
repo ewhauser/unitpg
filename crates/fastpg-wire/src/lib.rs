@@ -1792,9 +1792,13 @@ fn decode_parameters(
 }
 
 fn postgres_catalog_enabled() -> bool {
-    std::env::var("FASTPG_CATALOG_MODE")
-        .map(|value| value.eq_ignore_ascii_case("postgres"))
-        .unwrap_or(false)
+    static POSTGRES_CATALOG_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    *POSTGRES_CATALOG_ENABLED.get_or_init(|| {
+        std::env::var("FASTPG_CATALOG_MODE")
+            .map(|value| value.eq_ignore_ascii_case("postgres"))
+            .unwrap_or(false)
+    })
 }
 
 fn should_split_simple_query(statements: &[&str]) -> bool {
