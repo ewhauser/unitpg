@@ -54,6 +54,7 @@
 #include "storage/aio_internal.h"
 #include "storage/bufmgr.h"
 #include "storage/fd.h"
+#include "storage/proc.h"
 #include "storage/procnumber.h"
 #include "storage/smgr.h"
 #include "tcop/cmdtag.h"
@@ -712,6 +713,16 @@ fastpg_pgcore_reset_session_transaction_characteristics(void)
 #endif
 }
 
+void
+fastpg_pgcore_reset_session_authorization(void)
+{
+	fastpg_pgcore_enter();
+	SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
+	SetCurrentRoleId(InvalidOid, false);
+	if (MyProc != NULL)
+		MyProc->roleId = BOOTSTRAP_SUPERUSERID;
+}
+
 bool
 fastpg_pgcore_reset_temp_table_namespace(void)
 {
@@ -1280,7 +1291,15 @@ fastpg_pgcore_resets_session_authorization(Node *utility_stmt)
 	VariableSetStmt *stmt;
 
 	if (!IsA(utility_stmt, VariableSetStmt))
-		return false;
+	{
+		DiscardStmt *discard_stmt;
+
+		if (!IsA(utility_stmt, DiscardStmt))
+			return false;
+
+		discard_stmt = (DiscardStmt *) utility_stmt;
+		return discard_stmt->target == DISCARD_ALL;
+	}
 
 	stmt = (VariableSetStmt *) utility_stmt;
 	if (stmt->kind == VAR_RESET_ALL)
@@ -1294,12 +1313,10 @@ fastpg_pgcore_resets_session_authorization(Node *utility_stmt)
 static void
 fastpg_pgcore_repair_session_authorization_reset(Node *utility_stmt)
 {
-	if (IsUnderPostmaster ||
-		!fastpg_pgcore_resets_session_authorization(utility_stmt))
+	if (!fastpg_pgcore_resets_session_authorization(utility_stmt))
 		return;
 
-	SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
-	SetCurrentRoleId(InvalidOid, false);
+	fastpg_pgcore_reset_session_authorization();
 }
 
 static bool

@@ -418,6 +418,18 @@ toast_delete_datum(Relation rel, Datum value, bool is_speculative)
 	if (!VARATT_IS_EXTERNAL_ONDISK(attr))
 		return;
 
+#ifdef USE_FASTPG
+	/*
+	 * Standalone FastPG stores toast chunks through the table AM path above.
+	 * The regular toast deletion path bypasses table AM and enters heap
+	 * buffer deletion directly, which is not initialized in the embedded
+	 * server.  Leaving unreachable in-memory toast chunks is preferable to
+	 * crashing during regression inventory cleanup.
+	 */
+	if (!IsUnderPostmaster)
+		return;
+#endif
+
 	/* Must copy to access aligned fields */
 	VARATT_EXTERNAL_GET_POINTER(toast_pointer, attr);
 

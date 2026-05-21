@@ -1017,7 +1017,7 @@ struct CachedCatalogScan {
     region: Arc<StorageRegion>,
 }
 
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct CatalogScanFilterCacheKey {
     relation_oid: u32,
     filters: Vec<CatalogRowFilter>,
@@ -1027,7 +1027,7 @@ struct CatalogScanFilterCacheKey {
 struct CatalogScanCache {
     generation: u64,
     entries: HashMap<u32, Arc<CachedCatalogScan>>,
-    filtered_entries: HashMap<CatalogScanFilterCacheKey, Arc<CachedCatalogScan>>,
+    filtered_entries: Vec<(CatalogScanFilterCacheKey, Arc<CachedCatalogScan>)>,
 }
 
 impl Default for CatalogScanCache {
@@ -1035,7 +1035,7 @@ impl Default for CatalogScanCache {
         Self {
             generation: current_generation(),
             entries: HashMap::new(),
-            filtered_entries: HashMap::new(),
+            filtered_entries: Vec::new(),
         }
     }
 }
@@ -5869,7 +5869,12 @@ fn catalog_scan_state_filtered_cached(
         relation_oid: relation_oid.0,
         filters: filters.to_vec(),
     };
-    if let Some(cached) = cache.filtered_entries.get(&cache_key).map(Arc::clone) {
+    if let Some((_, cached)) = cache
+        .filtered_entries
+        .iter()
+        .find(|(key, _)| key == &cache_key)
+    {
+        let cached = Arc::clone(cached);
         return Some(scan_state_from_cached_catalog_scan(cached));
     }
     let scan = catalog_scan_state_filtered_uncached(relation_oid, filters)?;
@@ -5879,7 +5884,7 @@ fn catalog_scan_state_filtered_cached(
     });
     cache
         .filtered_entries
-        .insert(cache_key, Arc::clone(&cached));
+        .push((cache_key, Arc::clone(&cached)));
     Some(scan_state_from_cached_catalog_scan(cached))
 }
 

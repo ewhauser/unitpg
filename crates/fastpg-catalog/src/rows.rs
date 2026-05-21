@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use fastpg_types::Oid;
 
@@ -458,7 +458,7 @@ fn static_row_to_catalog_row_uncached(
     CatalogRow {
         relation_oid: table.oid,
         row_id: row.row_id,
-        values,
+        values: values.into(),
     }
 }
 
@@ -726,7 +726,7 @@ fn empty_catalog_row(table: &StaticCatalogTable, row_id: u64) -> CatalogRow {
     CatalogRow {
         relation_oid: table.oid,
         row_id,
-        values: vec![CatalogValue::Null; table.columns.len()],
+        values: vec![CatalogValue::Null; table.columns.len()].into(),
     }
 }
 
@@ -3165,7 +3165,7 @@ pub(crate) fn set_catalog_row_value(
         .columns
         .iter()
         .position(|column| column.name == column_name)
-        && let Some(slot) = row.values.get_mut(index)
+        && let Some(slot) = Arc::make_mut(&mut row.values).get_mut(index)
     {
         *slot = value;
     }
@@ -3282,7 +3282,7 @@ pub fn upsert_catalog_row(
     let row = CatalogRow {
         relation_oid,
         row_id,
-        values,
+        values: values.into(),
     };
     let visible_row = row.clone();
     with_catalog_session(|session| {

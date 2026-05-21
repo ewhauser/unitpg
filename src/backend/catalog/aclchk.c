@@ -38,6 +38,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -169,6 +172,43 @@ static void recordExtensionInitPriv(Oid objoid, Oid classoid, int objsubid,
 									Acl *new_acl);
 static void recordExtensionInitPrivWorker(Oid objoid, Oid classoid, int objsubid,
 										  Acl *new_acl);
+
+#ifdef USE_FASTPG
+static bool
+fastpg_virtual_catalog_allows_public_select(Oid table_oid)
+{
+	FastPgRustCatalogRelation relation;
+
+	if (fastpg_rust_catalog_policy_by_relation_oid((uint32_t) table_oid) == 0)
+		return false;
+	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) table_oid, &relation))
+		return false;
+
+	/*
+	 * FastPG virtual catalogs do not replay initdb's catalog ACL bootstrap.
+	 * Most system catalogs are publicly readable, but keep the upstream
+	 * private catalog/view exceptions private.
+	 */
+	if (strcmp(relation.name, "pg_authid") == 0 ||
+		strcmp(relation.name, "pg_statistic") == 0 ||
+		strcmp(relation.name, "pg_statistic_ext_data") == 0 ||
+		strcmp(relation.name, "pg_file_settings") == 0 ||
+		strcmp(relation.name, "pg_hba_file_rules") == 0 ||
+		strcmp(relation.name, "pg_ident_file_mappings") == 0 ||
+		strcmp(relation.name, "pg_config") == 0 ||
+		strcmp(relation.name, "pg_shmem_allocations") == 0 ||
+		strcmp(relation.name, "pg_shmem_allocations_numa") == 0 ||
+		strcmp(relation.name, "pg_dsm_registry_allocations") == 0 ||
+		strcmp(relation.name, "pg_backend_memory_contexts") == 0 ||
+		strcmp(relation.name, "pg_user_mapping") == 0 ||
+		strcmp(relation.name, "pg_replication_origin_status") == 0 ||
+		strcmp(relation.name, "pg_subscription") == 0 ||
+		strcmp(relation.name, "pg_aios") == 0)
+		return false;
+
+	return true;
+}
+#endif
 
 
 /*
@@ -3411,6 +3451,12 @@ pg_class_aclmask_ext(Oid table_oid, Oid roleid, AclMode mask,
 	if (mask & ACL_SELECT && !(result & ACL_SELECT) &&
 		has_privs_of_role(roleid, ROLE_PG_READ_ALL_DATA))
 		result |= ACL_SELECT;
+
+#ifdef USE_FASTPG
+	if (mask & ACL_SELECT && !(result & ACL_SELECT) &&
+		fastpg_virtual_catalog_allows_public_select(table_oid))
+		result |= ACL_SELECT;
+#endif
 
 	/*
 	 * Check if ACL_INSERT, ACL_UPDATE, or ACL_DELETE is being checked and, if

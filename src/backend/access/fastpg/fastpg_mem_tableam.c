@@ -596,7 +596,6 @@ fastpg_mem_toast_insert_slot(Relation rel, TupleTableSlot *slot, uint32 options)
 		rel->rd_rel->relkind != RELKIND_MATVIEW)
 		return NULL;
 
-	fastpg_mem_refresh_toast_metadata(rel);
 	tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
 	if (!HeapTupleHasExternal(tuple) && tuple->t_len <= TOAST_TUPLE_THRESHOLD)
 	{
@@ -605,6 +604,7 @@ fastpg_mem_toast_insert_slot(Relation rel, TupleTableSlot *slot, uint32 options)
 		return NULL;
 	}
 
+	fastpg_mem_refresh_toast_metadata(rel);
 	toasted_tuple = heap_toast_insert_or_update(rel, tuple, NULL, options);
 	if (toasted_tuple == tuple)
 	{
@@ -1756,6 +1756,8 @@ fastpg_mem_tuple_update(Relation rel,
 	CommandId	prior_cid;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
 	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+	TupleTableSlot *toast_slot;
+	TupleTableSlot *storage_slot = slot;
 
 	if (update_indexes != NULL)
 		*update_indexes = storage2 ? TU_All : TU_None;
@@ -1784,7 +1786,10 @@ fastpg_mem_tuple_update(Relation rel,
 		fastpg_mem_fill_self_modified_tmfd(otid, prior_cid, tmfd);
 		return TM_SelfModified;
 	}
-	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
+	toast_slot = fastpg_mem_toast_insert_slot(rel, slot, options);
+	if (toast_slot != NULL)
+		storage_slot = toast_slot;
+	fastpg_mem_prepare_slot_values(rel, storage_slot, &values, &isnull, &byval,
 								   &value_lens);
 	if (!(storage2 ?
 		  fastpg_storage2_relation_update_unchecked(relid,
@@ -1808,6 +1813,8 @@ fastpg_mem_tuple_update(Relation rel,
 		pfree(isnull);
 		pfree(byval);
 		pfree(value_lens);
+		if (toast_slot != NULL)
+			ExecDropSingleTupleTableSlot(toast_slot);
 		if (fastpg_mem_has_storage_error())
 			fastpg_mem_raise_storage_error("fastpg_mem failed to update row in Rust storage");
 		fastpg_mem_fill_deleted_tmfd(otid, tmfd);
@@ -1828,6 +1835,8 @@ fastpg_mem_tuple_update(Relation rel,
 	pfree(isnull);
 	pfree(byval);
 	pfree(value_lens);
+	if (toast_slot != NULL)
+		ExecDropSingleTupleTableSlot(toast_slot);
 
 	fastpg_mem_record_row_modified(relid, original_row_id, cid);
 	return TM_Ok;

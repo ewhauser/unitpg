@@ -1012,6 +1012,124 @@ fn visible_catalog_snapshot_cache_updates_after_overlay_changes() {
 }
 
 #[test]
+fn visible_catalog_snapshot_cache_rebases_after_implicit_commit() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+
+    let upsert_relation = |oid: u32, name: &str| {
+        let oid_text = oid.to_string();
+        let type_oid_text = (oid + 1).to_string();
+        upsert_named_catalog_row(
+            "pg_class",
+            oid as u64,
+            &[
+                ("oid", oid_text.as_str()),
+                ("relname", name),
+                ("relnamespace", "2200"),
+                ("reltype", type_oid_text.as_str()),
+                ("relowner", "10"),
+                ("relam", "2"),
+                ("relfilenode", oid_text.as_str()),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "r"),
+                ("relnatts", "0"),
+            ],
+        );
+    };
+
+    let first_relation_oid = Oid(50_020);
+    upsert_relation(first_relation_oid.0, "cached_snapshot_committed_first");
+
+    crate::state::reset_visible_catalog_snapshot_materializations_for_tests();
+    assert!(relation_oid_exists(first_relation_oid));
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    commit_implicit_transaction();
+
+    let second_relation_oid = Oid(50_030);
+    upsert_relation(second_relation_oid.0, "cached_snapshot_committed_second");
+    assert!(relation_oid_exists(second_relation_oid));
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    abort_implicit_transaction();
+}
+
+#[test]
+fn visible_catalog_snapshot_cache_updates_pg_inherits_indexes_after_overlay_changes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+    let pg_inherits = static_catalog_by_name("pg_inherits").expect("pg_inherits catalog");
+    let inhrelid_attnum = pg_inherits
+        .columns
+        .iter()
+        .position(|column| column.name == "inhrelid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_inherits.inhrelid attnum");
+    let filter = |oid| {
+        catalog_rows_matching_filters(
+            pg_inherits.oid,
+            &[CatalogRowFilter {
+                attnum: inhrelid_attnum,
+                value: CatalogFilterValue::Oid(Oid(oid)),
+            }],
+        )
+    };
+
+    upsert_named_catalog_row(
+        "pg_inherits",
+        65_001,
+        &[
+            ("inhrelid", "65001"),
+            ("inhparent", "65000"),
+            ("inhseqno", "1"),
+            ("inhdetachpending", "f"),
+        ],
+    );
+
+    crate::state::reset_visible_catalog_snapshot_materializations_for_tests();
+    assert_eq!(filter(65_001).len(), 1);
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    upsert_named_catalog_row(
+        "pg_inherits",
+        65_001,
+        &[
+            ("inhrelid", "65002"),
+            ("inhparent", "65000"),
+            ("inhseqno", "1"),
+            ("inhdetachpending", "f"),
+        ],
+    );
+    assert!(filter(65_001).is_empty());
+    assert_eq!(filter(65_002).len(), 1);
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    delete_catalog_row(pg_inherits.oid, 65_001).expect("delete pg_inherits row");
+    assert!(filter(65_002).is_empty());
+    assert_eq!(
+        crate::state::visible_catalog_snapshot_materializations_for_tests(),
+        1
+    );
+
+    abort_implicit_transaction();
+}
+
+#[test]
 fn generic_overlay_rows_drive_relation_views() {
     let _guard = catalog_test_lock();
     clear_for_tests();

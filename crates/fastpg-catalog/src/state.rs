@@ -172,96 +172,288 @@ impl CatalogSnapshot {
         }
     }
 
-    fn rebuild_indexes(&mut self) {
-        self.namespace_oids.clear();
-        self.namespace_names.clear();
-        for (row_id, namespace) in &self.namespaces {
-            self.namespace_oids.insert(namespace.oid.0, *row_id);
-            self.namespace_names
-                .insert(normalize_identifier(&namespace.name), *row_id);
+    fn insert_sorted_row_id(index: &mut BTreeMap<u32, Vec<u64>>, key: u32, row_id: u64) {
+        let row_ids = index.entry(key).or_default();
+        match row_ids.binary_search(&row_id) {
+            Ok(_) => {}
+            Err(position) => row_ids.insert(position, row_id),
         }
+    }
 
-        self.relation_oids.clear();
-        self.relation_names.clear();
-        for (row_id, relation) in &self.relations {
-            self.relation_oids.insert(relation.oid.0, *row_id);
-            self.relation_names.insert(
-                (relation.namespace.0, normalize_identifier(&relation.name)),
-                *row_id,
+    fn remove_sorted_row_id(index: &mut BTreeMap<u32, Vec<u64>>, key: u32, row_id: u64) {
+        let should_remove_key = if let Some(row_ids) = index.get_mut(&key) {
+            if let Ok(position) = row_ids.binary_search(&row_id) {
+                row_ids.remove(position);
+            }
+            row_ids.is_empty()
+        } else {
+            false
+        };
+        if should_remove_key {
+            index.remove(&key);
+        }
+    }
+
+    fn remove_namespace_indexes(&mut self, namespace: &NamespaceMeta) {
+        self.namespace_oids.remove(&namespace.oid.0);
+        self.namespace_names
+            .remove(&normalize_identifier(&namespace.name));
+    }
+
+    fn upsert_namespace(&mut self, row_id: u64, namespace: NamespaceMeta) {
+        if let Some(old_namespace) = self.namespaces.remove(&row_id) {
+            self.remove_namespace_indexes(&old_namespace);
+        }
+        self.namespace_oids.insert(namespace.oid.0, row_id);
+        self.namespace_names
+            .insert(normalize_identifier(&namespace.name), row_id);
+        self.namespaces.insert(row_id, namespace);
+    }
+
+    fn remove_namespace(&mut self, row_id: u64) {
+        if let Some(namespace) = self.namespaces.remove(&row_id) {
+            self.remove_namespace_indexes(&namespace);
+        }
+    }
+
+    fn remove_relation_indexes(&mut self, relation: &RelationMeta) {
+        self.relation_oids.remove(&relation.oid.0);
+        self.relation_names
+            .remove(&(relation.namespace.0, normalize_identifier(&relation.name)));
+    }
+
+    fn upsert_relation(&mut self, row_id: u64, relation: RelationMeta) {
+        if let Some(old_relation) = self.relations.remove(&row_id) {
+            self.remove_relation_indexes(&old_relation);
+        }
+        self.relation_oids.insert(relation.oid.0, row_id);
+        self.relation_names.insert(
+            (relation.namespace.0, normalize_identifier(&relation.name)),
+            row_id,
+        );
+        self.relations.insert(row_id, relation);
+    }
+
+    fn remove_relation(&mut self, row_id: u64) {
+        if let Some(relation) = self.relations.remove(&row_id) {
+            self.remove_relation_indexes(&relation);
+        }
+    }
+
+    fn remove_column_indexes(&mut self, column: &ColumnMeta) {
+        let relation_oid = column.relation_oid.0;
+        let should_remove_relation =
+            if let Some(columns) = self.columns_by_relation.get_mut(&relation_oid) {
+                columns.remove(&column.attnum);
+                columns.is_empty()
+            } else {
+                false
+            };
+        if should_remove_relation {
+            self.columns_by_relation.remove(&relation_oid);
+        }
+    }
+
+    fn upsert_column(&mut self, row_id: u64, column: ColumnMeta) {
+        if let Some(old_column) = self.columns.remove(&row_id) {
+            self.remove_column_indexes(&old_column);
+        }
+        self.columns_by_relation
+            .entry(column.relation_oid.0)
+            .or_default()
+            .insert(column.attnum, row_id);
+        self.columns.insert(row_id, column);
+    }
+
+    fn remove_column(&mut self, row_id: u64) {
+        if let Some(column) = self.columns.remove(&row_id) {
+            self.remove_column_indexes(&column);
+        }
+    }
+
+    fn remove_type_indexes(&mut self, pg_type: &TypeMeta) {
+        self.type_oids.remove(&pg_type.record.oid.0);
+        self.type_names.remove(&(
+            pg_type.record.namespace.0,
+            canonical_catalog_type_name(&pg_type.record.name),
+        ));
+    }
+
+    fn upsert_type(&mut self, row_id: u64, pg_type: TypeMeta) {
+        if let Some(old_type) = self.types.remove(&row_id) {
+            self.remove_type_indexes(&old_type);
+        }
+        self.type_oids.insert(pg_type.record.oid.0, row_id);
+        self.type_names.insert(
+            (
+                pg_type.record.namespace.0,
+                canonical_catalog_type_name(&pg_type.record.name),
+            ),
+            row_id,
+        );
+        self.types.insert(row_id, pg_type);
+    }
+
+    fn remove_type(&mut self, row_id: u64) {
+        if let Some(pg_type) = self.types.remove(&row_id) {
+            self.remove_type_indexes(&pg_type);
+        }
+    }
+
+    fn remove_index_indexes(&mut self, index: &IndexMeta) {
+        self.index_oids.remove(&index.record.index_oid.0);
+        Self::remove_sorted_row_id(
+            &mut self.indexes_by_relation,
+            index.record.relation_oid.0,
+            index.row_id,
+        );
+    }
+
+    fn upsert_index(&mut self, row_id: u64, index: IndexMeta) {
+        if let Some(old_index) = self.indexes.remove(&row_id) {
+            self.remove_index_indexes(&old_index);
+        }
+        self.index_oids.insert(index.record.index_oid.0, row_id);
+        Self::insert_sorted_row_id(
+            &mut self.indexes_by_relation,
+            index.record.relation_oid.0,
+            row_id,
+        );
+        self.indexes.insert(row_id, index);
+    }
+
+    fn remove_index(&mut self, row_id: u64) {
+        if let Some(index) = self.indexes.remove(&row_id) {
+            self.remove_index_indexes(&index);
+        }
+    }
+
+    fn remove_constraint_indexes(&mut self, constraint: &ConstraintMeta) {
+        self.constraint_oids.remove(&constraint.oid.0);
+        Self::remove_sorted_row_id(
+            &mut self.constraints_by_relation,
+            constraint.relation_oid.0,
+            constraint.row_id,
+        );
+        if constraint.index_oid != INVALID_OID {
+            Self::remove_sorted_row_id(
+                &mut self.constraints_by_index,
+                constraint.index_oid.0,
+                constraint.row_id,
             );
         }
+    }
 
-        self.columns_by_relation.clear();
-        for (row_id, column) in &self.columns {
-            self.columns_by_relation
-                .entry(column.relation_oid.0)
-                .or_default()
-                .insert(column.attnum, *row_id);
+    fn upsert_constraint(&mut self, row_id: u64, constraint: ConstraintMeta) {
+        if let Some(old_constraint) = self.constraints.remove(&row_id) {
+            self.remove_constraint_indexes(&old_constraint);
         }
-
-        self.type_oids.clear();
-        self.type_names.clear();
-        for (row_id, pg_type) in &self.types {
-            self.type_oids.insert(pg_type.record.oid.0, *row_id);
-            self.type_names.insert(
-                (
-                    pg_type.record.namespace.0,
-                    normalize_identifier(&pg_type.record.name),
-                ),
-                *row_id,
+        self.constraint_oids.insert(constraint.oid.0, row_id);
+        Self::insert_sorted_row_id(
+            &mut self.constraints_by_relation,
+            constraint.relation_oid.0,
+            row_id,
+        );
+        if constraint.index_oid != INVALID_OID {
+            Self::insert_sorted_row_id(
+                &mut self.constraints_by_index,
+                constraint.index_oid.0,
+                row_id,
             );
         }
+        self.constraints.insert(row_id, constraint);
+    }
 
-        self.index_oids.clear();
-        self.indexes_by_relation.clear();
-        for (row_id, index) in &self.indexes {
-            self.index_oids.insert(index.record.index_oid.0, *row_id);
-            self.indexes_by_relation
-                .entry(index.record.relation_oid.0)
-                .or_default()
-                .push(*row_id);
+    fn remove_constraint(&mut self, row_id: u64) {
+        if let Some(constraint) = self.constraints.remove(&row_id) {
+            self.remove_constraint_indexes(&constraint);
+        }
+    }
+
+    fn pg_inherits_child_parent(row: &CatalogRow) -> (Option<Oid>, Option<Oid>) {
+        let Some(table) = crate::rows::static_catalog_by_relation_oid(PG_INHERITS_RELATION_OID)
+        else {
+            return (None, None);
+        };
+        let child = catalog_row_value(table, row, "inhrelid").and_then(catalog_value_oid);
+        let parent = catalog_row_value(table, row, "inhparent").and_then(catalog_value_oid);
+        (child, parent)
+    }
+
+    fn remove_pg_inherits_indexes_for_row(&mut self, row_id: u64, row: &CatalogRow) {
+        if row.relation_oid != PG_INHERITS_RELATION_OID {
+            return;
+        }
+        let (child, parent) = Self::pg_inherits_child_parent(row);
+        if let Some(child) = child {
+            Self::remove_sorted_row_id(&mut self.pg_inherits_by_child, child.0, row_id);
+        }
+        if let Some(parent) = parent {
+            Self::remove_sorted_row_id(&mut self.pg_inherits_by_parent, parent.0, row_id);
+        }
+    }
+
+    fn insert_pg_inherits_indexes_for_row(&mut self, row_id: u64, row: &CatalogRow) {
+        if row.relation_oid != PG_INHERITS_RELATION_OID {
+            return;
+        }
+        let (child, parent) = Self::pg_inherits_child_parent(row);
+        if let Some(child) = child {
+            Self::insert_sorted_row_id(&mut self.pg_inherits_by_child, child.0, row_id);
+        }
+        if let Some(parent) = parent {
+            Self::insert_sorted_row_id(&mut self.pg_inherits_by_parent, parent.0, row_id);
+        }
+    }
+
+    fn upsert_compat_row(&mut self, row: CatalogRow) {
+        let relation_oid = row.relation_oid;
+        let row_id = row.row_id;
+        let old_row = self
+            .compat_rows
+            .rows
+            .get(&relation_oid.0)
+            .and_then(|rows| rows.get(&row_id))
+            .cloned();
+        if let Some(old_row) = old_row {
+            self.remove_pg_inherits_indexes_for_row(row_id, old_row.as_ref());
         }
 
-        self.pg_inherits_by_child.clear();
-        self.pg_inherits_by_parent.clear();
-        if let Some(table) = crate::rows::static_catalog_by_relation_oid(PG_INHERITS_RELATION_OID)
-            && let Some(rows) = self.compat_rows.rows.get(&PG_INHERITS_RELATION_OID.0)
-        {
-            for (row_id, row) in rows {
-                let row = row.as_ref();
-                if let Some(child) =
-                    catalog_row_value(table, row, "inhrelid").and_then(catalog_value_oid)
-                {
-                    self.pg_inherits_by_child
-                        .entry(child.0)
-                        .or_default()
-                        .push(*row_id);
-                }
-                if let Some(parent) =
-                    catalog_row_value(table, row, "inhparent").and_then(catalog_value_oid)
-                {
-                    self.pg_inherits_by_parent
-                        .entry(parent.0)
-                        .or_default()
-                        .push(*row_id);
-                }
+        self.compat_rows.insert(row);
+
+        let new_row = self
+            .compat_rows
+            .rows
+            .get(&relation_oid.0)
+            .and_then(|rows| rows.get(&row_id))
+            .cloned();
+        if let Some(new_row) = new_row {
+            self.insert_pg_inherits_indexes_for_row(row_id, new_row.as_ref());
+        }
+    }
+
+    fn delete_compat_row(&mut self, relation_oid: Oid, row_id: u64) {
+        let old_row = self
+            .compat_rows
+            .rows
+            .get(&relation_oid.0)
+            .and_then(|rows| rows.get(&row_id))
+            .cloned();
+        if let Some(old_row) = old_row {
+            self.remove_pg_inherits_indexes_for_row(row_id, old_row.as_ref());
+        }
+        self.compat_rows.delete(relation_oid, row_id);
+    }
+
+    fn apply_compat_rows(&mut self, rows: &CompatCatalogRows) {
+        for (relation_oid, tombstones) in &rows.tombstones {
+            for row_id in tombstones {
+                self.delete_compat_row(Oid(*relation_oid), *row_id);
             }
         }
-
-        self.constraint_oids.clear();
-        self.constraints_by_relation.clear();
-        self.constraints_by_index.clear();
-        for (row_id, constraint) in &self.constraints {
-            self.constraint_oids.insert(constraint.oid.0, *row_id);
-            self.constraints_by_relation
-                .entry(constraint.relation_oid.0)
-                .or_default()
-                .push(*row_id);
-            if constraint.index_oid != INVALID_OID {
-                self.constraints_by_index
-                    .entry(constraint.index_oid.0)
-                    .or_default()
-                    .push(*row_id);
+        for relation_rows in rows.rows.values() {
+            for row in relation_rows.values() {
+                self.upsert_compat_row(row.as_ref().clone());
             }
         }
     }
@@ -334,10 +526,6 @@ impl CatalogSnapshot {
             .filter_map(|row_id| self.constraints.get(row_id))
             .collect()
     }
-
-    fn remove_relation(&mut self, row_id: u64) {
-        self.relations.remove(&row_id);
-    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -409,10 +597,10 @@ impl CatalogDraft {
         for (row_id, mutation) in &self.namespaces {
             match mutation {
                 Some(namespace) => {
-                    snapshot.namespaces.insert(*row_id, namespace.clone());
+                    snapshot.upsert_namespace(*row_id, namespace.clone());
                 }
                 None => {
-                    snapshot.namespaces.remove(row_id);
+                    snapshot.remove_namespace(*row_id);
                 }
             }
         }
@@ -420,7 +608,7 @@ impl CatalogDraft {
         for (row_id, mutation) in &self.relations {
             match mutation {
                 Some(relation) => {
-                    snapshot.relations.insert(*row_id, relation.clone());
+                    snapshot.upsert_relation(*row_id, relation.clone());
                 }
                 None => {
                     snapshot.remove_relation(*row_id);
@@ -431,10 +619,10 @@ impl CatalogDraft {
         for (row_id, mutation) in &self.columns {
             match mutation {
                 Some(column) => {
-                    snapshot.columns.insert(*row_id, column.clone());
+                    snapshot.upsert_column(*row_id, column.clone());
                 }
                 None => {
-                    snapshot.columns.remove(row_id);
+                    snapshot.remove_column(*row_id);
                 }
             }
         }
@@ -442,10 +630,10 @@ impl CatalogDraft {
         for (row_id, mutation) in &self.types {
             match mutation {
                 Some(pg_type) => {
-                    snapshot.types.insert(*row_id, pg_type.clone());
+                    snapshot.upsert_type(*row_id, pg_type.clone());
                 }
                 None => {
-                    snapshot.types.remove(row_id);
+                    snapshot.remove_type(*row_id);
                 }
             }
         }
@@ -453,10 +641,10 @@ impl CatalogDraft {
         for (row_id, mutation) in &self.indexes {
             match mutation {
                 Some(index) => {
-                    snapshot.indexes.insert(*row_id, index.clone());
+                    snapshot.upsert_index(*row_id, index.clone());
                 }
                 None => {
-                    snapshot.indexes.remove(row_id);
+                    snapshot.remove_index(*row_id);
                 }
             }
         }
@@ -464,16 +652,15 @@ impl CatalogDraft {
         for (row_id, mutation) in &self.constraints {
             match mutation {
                 Some(constraint) => {
-                    snapshot.constraints.insert(*row_id, constraint.clone());
+                    snapshot.upsert_constraint(*row_id, constraint.clone());
                 }
                 None => {
-                    snapshot.constraints.remove(row_id);
+                    snapshot.remove_constraint(*row_id);
                 }
             }
         }
 
-        snapshot.compat_rows.merge(self.compat_rows.clone());
-        snapshot.rebuild_indexes();
+        snapshot.apply_compat_rows(&self.compat_rows);
     }
 
     pub(crate) fn upsert_catalog_row(&mut self, table: &StaticCatalogTable, row: CatalogRow) {
@@ -907,6 +1094,20 @@ pub(crate) fn invalidate_visible_catalog_snapshot(session: &mut CatalogSession) 
     session.visible_snapshot_cache = None;
 }
 
+fn rebase_visible_catalog_snapshot(session: &mut CatalogSession, previous_base_generation: u64) {
+    let current_base_generation = current_generation();
+    let Some(cache) = session.visible_snapshot_cache.as_mut() else {
+        return;
+    };
+    if cache.base_generation == previous_base_generation
+        && cache.revision == session.visible_snapshot_revision
+    {
+        cache.base_generation = current_base_generation;
+    } else {
+        session.visible_snapshot_cache = None;
+    }
+}
+
 pub(crate) fn update_visible_catalog_snapshot(
     session: &mut CatalogSession,
     apply: impl FnOnce(&mut CatalogSnapshot),
@@ -1038,7 +1239,6 @@ pub fn has_uncommitted_catalog_changes() -> bool {
 pub(crate) fn ensure_catalog_transaction(session: &mut CatalogSession) {
     if session.transaction_stack.is_empty() {
         session.transaction_stack.push(CatalogDraft::default());
-        invalidate_visible_catalog_snapshot(session);
     }
 }
 
@@ -1059,9 +1259,10 @@ fn commit_top_catalog_draft(session: &mut CatalogSession) {
     if let Some(parent) = session.transaction_stack.last_mut() {
         parent.merge(draft);
     } else {
+        let previous_base_generation = current_generation();
         commit_catalog_draft(draft);
+        rebase_visible_catalog_snapshot(session, previous_base_generation);
     }
-    invalidate_visible_catalog_snapshot(session);
 }
 
 pub(crate) fn bump_generation(state: &mut CatalogState) {
@@ -1130,7 +1331,6 @@ pub fn begin_subtransaction() {
     with_catalog_session(|session| {
         ensure_catalog_transaction(session);
         session.transaction_stack.push(CatalogDraft::default());
-        invalidate_visible_catalog_snapshot(session);
     });
 }
 

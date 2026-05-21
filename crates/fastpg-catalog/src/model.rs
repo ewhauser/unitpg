@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use fastpg_types::Oid;
 
 pub const BOOL_OID: Oid = Oid(16);
@@ -161,7 +163,7 @@ pub enum CatalogValue {
 pub struct CatalogRow {
     pub relation_oid: Oid,
     pub row_id: u64,
-    pub values: Vec<CatalogValue>,
+    pub values: Arc<Vec<CatalogValue>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

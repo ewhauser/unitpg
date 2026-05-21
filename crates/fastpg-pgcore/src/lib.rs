@@ -475,6 +475,7 @@ mod inner {
         fn fastpg_xid_rollback();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_reset_session_transaction_characteristics();
+        fn fastpg_pgcore_reset_session_authorization();
         fn fastpg_pgcore_reset_temp_table_namespace() -> bool;
         fn fastpg_pgcore_set_database(database_oid: u32);
         fn fastpg_pgcore_try_finish_explicit_transaction(
@@ -868,6 +869,7 @@ mod inner {
             let _ = fastpg_storage::fastpg_rust_relation_row_count(0);
             unsafe {
                 fastpg_pgcore_reset_session_transaction_characteristics();
+                fastpg_pgcore_reset_session_authorization();
             }
             Self { database_oid }
         }
@@ -876,6 +878,7 @@ mod inner {
             let _guard = enter_pgcore_lane("session_cleanup");
             self.set_database();
             unsafe {
+                fastpg_pgcore_reset_session_authorization();
                 let _ = fastpg_pgcore_reset_temp_table_namespace();
             }
         }
@@ -1567,6 +1570,91 @@ mod tests {
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("1".to_owned())]]
         );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn reset_session_authorization_restores_bootstrap_user() {
+        let session = PgCoreSession::new();
+        let role = unique_pg_name("fastpg_pgcore_reset_user");
+        session
+            .execute_with_params(&format!("create role {role}"), &[])
+            .unwrap();
+        session
+            .execute_with_params(&format!("set session authorization {role}"), &[])
+            .unwrap();
+        let result = session
+            .execute_with_params("select current_user", &[])
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text(role.clone())]]
+        );
+        session
+            .execute_with_params("reset session authorization", &[])
+            .unwrap();
+        let result = session
+            .execute_with_params("select current_user", &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("POSTGRES".to_owned())]]
+        );
+        session
+            .execute_with_params(&format!("drop role {role}"), &[])
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn session_cleanup_resets_session_authorization() {
+        let role = unique_pg_name("fastpg_pgcore_cleanup_user");
+        {
+            let session = PgCoreSession::new();
+            session
+                .execute_with_params(&format!("create role {role}"), &[])
+                .unwrap();
+            session
+                .execute_with_params(&format!("set session authorization {role}"), &[])
+                .unwrap();
+        }
+
+        let session = PgCoreSession::new();
+        let result = session
+            .execute_with_params("select current_user", &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("POSTGRES".to_owned())]]
+        );
+        session
+            .execute_with_params(&format!("drop role {role}"), &[])
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn discard_all_resets_session_authorization() {
+        let session = PgCoreSession::new();
+        let role = unique_pg_name("fastpg_pgcore_discard_user");
+        session
+            .execute_with_params(&format!("create role {role}"), &[])
+            .unwrap();
+        session
+            .execute_with_params(&format!("set session authorization {role}"), &[])
+            .unwrap();
+        session.execute_with_params("discard all", &[]).unwrap();
+        let result = session
+            .execute_with_params("select current_user", &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("POSTGRES".to_owned())]]
+        );
+        session
+            .execute_with_params(&format!("drop role {role}"), &[])
+            .unwrap();
     }
 
     #[cfg(feature = "postgres-execution")]
