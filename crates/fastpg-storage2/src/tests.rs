@@ -276,6 +276,73 @@ fn committed_small_transactions_pack_into_relation_pages() {
     );
 }
 
+#[test]
+fn ffi_index_specs_scan_storage_without_rust_catalog_metadata() {
+    let _guard = test_guard();
+    let relid = 49;
+    let index_relid = 490;
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 12);
+    let second_tid = insert_i32(relid, 13);
+    fastpg_storage2_xact_commit();
+
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let typlen = [4i16];
+    let values = [12usize];
+    let nulls = [0u8];
+    let mut tid = 0u64;
+
+    assert!(unsafe {
+        fastpg_storage2_primary_key_index_lookup_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            &mut tid,
+        )
+    });
+    assert_eq!(tid, first_tid);
+
+    assert!(unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            second_tid,
+            &mut tid,
+        )
+    });
+    assert_eq!(tid, first_tid);
+
+    fastpg_storage2_xact_begin();
+    insert_i32(relid, 12);
+    assert!(unsafe {
+        fastpg_storage2_unique_index_validate_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.len(),
+            0,
+            &mut tid,
+        )
+    });
+    assert_eq!(tid, first_tid);
+    fastpg_storage2_xact_abort();
+}
+
 fn fastpg_storage2_metrics_snapshot() -> FastPgStorage2Metrics {
     let mut metrics = FastPgStorage2Metrics::default();
     assert!(unsafe { fastpg_storage2_metrics(&mut metrics) });

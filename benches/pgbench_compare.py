@@ -404,6 +404,7 @@ class PgBenchCompare:
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
+            f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
             mem_index_arg,
         ]
         reconfigure_args = [
@@ -1502,7 +1503,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--storage-engine",
         choices=["storage1", "storage2"],
-        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
+        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage2"),
         help="select the fastpg in-memory storage engine for the fastpg variant",
     )
     parser.add_argument(
@@ -1582,8 +1583,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--profile-hyperfine-runs must be at least 1")
     if args.profile_hyperfine_warmup < 0:
         parser.error("--profile-hyperfine-warmup must be non-negative")
-    if args.catalog_mode == "postgres" and args.storage_engine == "storage2":
-        parser.error("--catalog-mode=postgres currently supports --storage-engine=storage1 only")
     return args
 
 

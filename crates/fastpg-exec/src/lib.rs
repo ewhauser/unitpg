@@ -859,7 +859,7 @@ fn storage2_enabled() -> bool {
     *STORAGE2_ENABLED.get_or_init(|| {
         std::env::var("FASTPG_STORAGE_ENGINE")
             .map(|value| value.eq_ignore_ascii_case("storage2"))
-            .unwrap_or(false)
+            .unwrap_or(true)
     })
 }
 

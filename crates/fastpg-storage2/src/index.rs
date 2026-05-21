@@ -161,6 +161,59 @@ pub(crate) fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<U
     primary_index_spec_for_index_oid(primary_index_oid)
 }
 
+pub(crate) struct UniqueIndexFfiSpecArgs {
+    pub(crate) index_relid: u32,
+    pub(crate) heap_relid: u32,
+    pub(crate) attnums: *const i16,
+    pub(crate) typbyval: *const u8,
+    pub(crate) typlen: *const i16,
+    pub(crate) nkeys: usize,
+    pub(crate) is_primary: bool,
+    pub(crate) nulls_not_distinct: bool,
+}
+
+pub(crate) unsafe fn unique_index_spec_from_ffi(
+    args: UniqueIndexFfiSpecArgs,
+) -> Option<UniqueIndexSpec> {
+    let UniqueIndexFfiSpecArgs {
+        index_relid,
+        heap_relid,
+        attnums,
+        typbyval,
+        typlen,
+        nkeys,
+        is_primary,
+        nulls_not_distinct,
+    } = args;
+
+    if nkeys == 0 || attnums.is_null() || typbyval.is_null() || typlen.is_null() {
+        return None;
+    }
+    let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let typbyval = unsafe { slice::from_raw_parts(typbyval, nkeys) };
+    let typlen = unsafe { slice::from_raw_parts(typlen, nkeys) };
+    let mut columns = Vec::with_capacity(nkeys);
+    for index in 0..nkeys {
+        let attnum = attnums[index];
+        if attnum <= 0 {
+            return None;
+        }
+        columns.push(IndexColumnSpec {
+            column_index: usize::try_from(attnum - 1).ok()?,
+            typbyval: typbyval[index] != 0,
+            typlen: typlen[index],
+        });
+    }
+
+    Some(UniqueIndexSpec {
+        index_oid: Oid(index_relid),
+        relation_oid: Oid(heap_relid),
+        is_primary,
+        nulls_not_distinct,
+        columns,
+    })
+}
+
 pub(crate) fn index_key_for_input(
     index_spec: &UniqueIndexSpec,
     input: &RowInput<'_>,

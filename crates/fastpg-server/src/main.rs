@@ -71,15 +71,6 @@ fn postgres_catalog_enabled() -> bool {
 }
 
 fn validate_postgres_catalog_mode() -> Result<(), Box<dyn Error>> {
-    if std::env::var("FASTPG_STORAGE_ENGINE")
-        .map(|value| value == "storage2")
-        .unwrap_or(false)
-    {
-        return Err(invalid_input(
-            "Postgres catalog mode currently supports FASTPG_STORAGE_ENGINE=storage1 only",
-        ));
-    }
-
     let pgdata = std::env::var("FASTPG_PGDATA").map_err(|_| {
         IoError::new(
             ErrorKind::InvalidInput,
