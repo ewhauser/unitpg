@@ -330,13 +330,16 @@ class PgBenchCompare:
             )
 
         pgcore_build_dir = self.ensure_fastpg_pgcore_build(variant.name, output_dir)
+        features = ["postgres-execution"]
+        if self.args.catalog_mode == "rust":
+            features.append("rust-catalog")
         build_command = [
             "cargo",
             "build",
             "-p",
             "fastpg-server",
             "--features",
-            "postgres-execution",
+            ",".join(features),
         ]
         build_env = os.environ.copy()
         build_env["FASTPG_POSTGRES_BUILD_DIR"] = str(pgcore_build_dir)
@@ -400,10 +403,28 @@ class PgBenchCompare:
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
+            f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+        ]
+        configure_args = [
+            "meson",
+            "configure",
+            str(build_dir),
+            f"--buildtype={self.args.meson_buildtype}",
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            "-Dfastpg=true",
+            f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
         ]
 
         if (build_dir / "build.ninja").exists():
-            self.checked_command(variant_name, "setup", reconfigure_args, output_dir, "meson-reconfigure-fastpg")
+            self.checked_command(variant_name, "setup", configure_args, output_dir, "meson-configure-fastpg")
+            self.checked_command(
+                variant_name,
+                "setup",
+                reconfigure_args,
+                output_dir,
+                "meson-reconfigure-fastpg",
+            )
         else:
             self.checked_command(variant_name, "setup", setup_args, output_dir, "meson-setup-fastpg")
 
@@ -470,7 +491,6 @@ class PgBenchCompare:
         catalog_mode = self.args.catalog_mode
         postgres_exec = paths["client_bindir"] / ("postgres.exe" if os.name == "nt" else "postgres")
         server_env = {
-            "FASTPG_CATALOG_MODE": catalog_mode,
             "FASTPG_EXEC_PATH": str(postgres_exec if postgres_exec.exists() else paths["server_binary"]),
             "FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"])),
         }
@@ -1474,7 +1494,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--catalog-mode",
         choices=["rust", "postgres"],
-        default=os.environ.get("FASTPG_CATALOG_MODE", "rust"),
+        default="postgres",
         help="select the fastpg catalog implementation for the Rust server variant",
     )
     parser.add_argument(

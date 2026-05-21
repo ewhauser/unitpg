@@ -506,6 +506,8 @@ meson_bin = find_program(meson_binpath, native: true)
 cdata.set('USE_ASSERT_CHECKING', get_option('cassert') ? 1 : false)
 cdata.set('USE_INJECTION_POINTS', get_option('injection_points') ? 1 : false)
 cdata.set('USE_FASTPG', get_option('fastpg') ? 1 : false)
+cdata.set('FASTPG_USE_RUST_CATALOG',
+  get_option('fastpg') and get_option('fastpg_catalog_mode') == 'rust' ? 1 : false)
 
 blocksize = get_option('blocksize').to_int() * 1024
 

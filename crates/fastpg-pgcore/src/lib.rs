@@ -283,7 +283,7 @@ impl PgCoreSession {
         let database_oid = if inner::postgres_catalog_enabled() {
             if !database.eq_ignore_ascii_case("postgres") {
                 panic!(
-                    "FASTPG_CATALOG_MODE=postgres only supports database \"postgres\" in this experiment"
+                    "Postgres catalog mode only supports database \"postgres\" in this experiment"
                 );
             }
             5
@@ -544,9 +544,7 @@ mod inner {
     }
 
     pub(super) fn postgres_catalog_enabled() -> bool {
-        std::env::var("FASTPG_CATALOG_MODE")
-            .map(|value| value.eq_ignore_ascii_case("postgres"))
-            .unwrap_or(false)
+        !cfg!(feature = "rust-catalog")
     }
 
     #[repr(C)]

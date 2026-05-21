@@ -57,7 +57,8 @@ jobs:
             --buildtype=release \
             --auto-features=disabled \
             -Dtap_tests=disabled \
-            -Dfastpg=true
+            -Dfastpg=true \
+            -Dfastpg_catalog_mode=rust
           meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
 
       - name: Run lint
@@ -139,15 +140,23 @@ jobs:
       - name: Run Rust unit tests
         run: cargo test --workspace
 
+      - name: Switch pgcore to Rust catalog for linked Rust tests
+        run: |
+          set -euo pipefail
+          meson configure "$PGCORE_BUILD_DIR" -Dfastpg_catalog_mode=rust
+          meson setup --reconfigure "$PGCORE_BUILD_DIR" -Dfastpg=true
+          meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
+
       - name: Run linked pgcore tests
         env:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
-        run: cargo test -p fastpg-pgcore --features postgres-execution
+          RUST_TEST_THREADS: 1
+        run: cargo test -p fastpg-pgcore --features postgres-execution,rust-catalog
 
       - name: Run Rust server integration tests
         env:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
-        run: cargo test -p fastpg-testkit --features postgres-execution
+        run: cargo test -p fastpg-testkit --features postgres-execution,rust-catalog
 
       - name: Package Rust server distribution
         run: |
@@ -174,36 +183,12 @@ jobs:
           workdir="$RUNNER_TEMP/server-smoke"
           rm -rf "$workdir"
           mkdir -p "$workdir"
-          export PGMAXPROTOCOLVERSION=3.0
-          export PGSSLMODE=disable
-          export PGGSSENCMODE=disable
-          port="$(python3 -c 'import socket; sock = socket.socket(); sock.bind(("127.0.0.1", 0)); print(sock.getsockname()[1]); sock.close()')"
-          "$dist/bin/fastpg-server" "127.0.0.1:$port" >"$workdir/fastpg-server.log" 2>&1 &
-          server_pid="$!"
-          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
-          ready=0
-          for _ in $(seq 1 100); do
-            if "$dist/bin/psql" -h 127.0.0.1 -p "$port" -d postgres -U postgres -Atqc "select 1" | grep -Fx 1; then
-              ready=1
-              break
-            fi
-            sleep 0.1
-          done
-          test "$ready" -eq 1
-          result="$(
-            "$dist/bin/psql" -h 127.0.0.1 -p "$port" -d postgres -U postgres -v ON_ERROR_STOP=1 -Atq <<'SQL'
-          create table ci_smoke(id int not null, value int not null);
-          insert into ci_smoke values (1, 10);
-          begin;
-          insert into ci_smoke values (2, 20);
-          rollback;
-          select count(*) from ci_smoke;
-          SQL
-          )"
-          test "$result" = "1"
-          kill "$server_pid"
-          wait "$server_pid" || true
-          trap - EXIT
+          unset FASTPG_PGDATA
+          if "$dist/bin/fastpg-server" "127.0.0.1:0" >"$workdir/fastpg-server.log" 2>&1; then
+            cat "$workdir/fastpg-server.log" >&2
+            exit 1
+          fi
+          grep -F "Postgres catalog mode requires FASTPG_PGDATA" "$workdir/fastpg-server.log"
 
       - name: Upload binary archive
         uses: actions/upload-artifact@v4
