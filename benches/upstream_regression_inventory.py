@@ -492,7 +492,6 @@ class UpstreamRegressionInventory:
     ) -> tuple[dict[str, str], Path]:
         postgres_exec = paths["client_bindir"] / ("postgres.exe" if os.name == "nt" else "postgres")
         server_env = {
-            "FASTPG_CATALOG_MODE": "postgres",
             "FASTPG_EXEC_PATH": str(postgres_exec if postgres_exec.exists() else paths["server_binary"]),
             "FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"])),
         }
@@ -1099,7 +1098,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
         storage_engine=args.storage_engine,
-        catalog_mode=getattr(args, "catalog_mode", "rust"),
+        catalog_mode=getattr(args, "catalog_mode", "postgres"),
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
@@ -1378,7 +1377,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--catalog-mode",
         choices=["rust", "postgres"],
-        default=os.environ.get("FASTPG_CATALOG_MODE", "rust"),
+        default="postgres",
     )
     parser.add_argument(
         "--global-timeout",

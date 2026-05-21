@@ -59,14 +59,15 @@ async fn serve_until_shutdown(addr: &str) -> Result<(), Box<dyn Error>> {
 }
 
 fn validate_catalog_mode() -> Result<(), Box<dyn Error>> {
-    let catalog_mode = std::env::var("FASTPG_CATALOG_MODE").unwrap_or_else(|_| "rust".to_owned());
-    match catalog_mode.as_str() {
-        "rust" => Ok(()),
-        "postgres" => validate_postgres_catalog_mode(),
-        other => Err(invalid_input(format!(
-            "FASTPG_CATALOG_MODE must be \"rust\" or \"postgres\", got {other:?}"
-        ))),
+    if postgres_catalog_enabled() {
+        validate_postgres_catalog_mode()
+    } else {
+        Ok(())
     }
+}
+
+fn postgres_catalog_enabled() -> bool {
+    !cfg!(feature = "rust-catalog")
 }
 
 fn validate_postgres_catalog_mode() -> Result<(), Box<dyn Error>> {
@@ -75,30 +76,30 @@ fn validate_postgres_catalog_mode() -> Result<(), Box<dyn Error>> {
         .unwrap_or(false)
     {
         return Err(invalid_input(
-            "FASTPG_CATALOG_MODE=postgres currently supports FASTPG_STORAGE_ENGINE=storage1 only",
+            "Postgres catalog mode currently supports FASTPG_STORAGE_ENGINE=storage1 only",
         ));
     }
 
     let pgdata = std::env::var("FASTPG_PGDATA").map_err(|_| {
         IoError::new(
             ErrorKind::InvalidInput,
-            "FASTPG_CATALOG_MODE=postgres requires FASTPG_PGDATA",
+            "Postgres catalog mode requires FASTPG_PGDATA",
         )
     })?;
     if pgdata.is_empty() {
         return Err(invalid_input(
-            "FASTPG_CATALOG_MODE=postgres requires non-empty FASTPG_PGDATA",
+            "Postgres catalog mode requires non-empty FASTPG_PGDATA",
         ));
     }
     let pgdata = Path::new(&pgdata);
     if !pgdata.is_absolute() {
         return Err(invalid_input(
-            "FASTPG_CATALOG_MODE=postgres requires absolute FASTPG_PGDATA",
+            "Postgres catalog mode requires absolute FASTPG_PGDATA",
         ));
     }
     if !pgdata.is_dir() {
         return Err(invalid_input(format!(
-            "FASTPG_CATALOG_MODE=postgres FASTPG_PGDATA does not exist or is not a directory: {}",
+            "Postgres catalog mode FASTPG_PGDATA does not exist or is not a directory: {}",
             pgdata.display()
         )));
     }

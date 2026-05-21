@@ -100,14 +100,47 @@ fn main() {
     } else {
         source_root.join(build_dir)
     };
+    println!(
+        "cargo:rerun-if-changed={}",
+        build_dir.join("src/include/pg_config.h").display()
+    );
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").unwrap());
 
+    validate_catalog_mode(&build_dir);
     compile_shim(&source_root, &build_dir);
 
     let archive = out_dir.join("libfastpg_pgcore_backend.a");
     build_backend_archive(&build_dir, &out_dir, &archive);
 
     link_backend_archive(&archive);
+}
+
+fn validate_catalog_mode(build_dir: &Path) {
+    let pg_config = build_dir.join("src/include/pg_config.h");
+    let config = fs::read_to_string(&pg_config).unwrap_or_else(|error| {
+        panic!("failed to read {}: {error}", pg_config.display());
+    });
+    let c_uses_rust_catalog = config.lines().any(|line| {
+        line.trim_start()
+            .starts_with("#define FASTPG_USE_RUST_CATALOG")
+    });
+    let rust_uses_rust_catalog = env::var_os("CARGO_FEATURE_RUST_CATALOG").is_some();
+    if c_uses_rust_catalog != rust_uses_rust_catalog {
+        let rust_mode = if rust_uses_rust_catalog {
+            "rust"
+        } else {
+            "postgres"
+        };
+        let c_mode = if c_uses_rust_catalog {
+            "rust"
+        } else {
+            "postgres"
+        };
+        panic!(
+            "fastpg catalog mode mismatch: Cargo features select {rust_mode}, but {} selects {c_mode}",
+            pg_config.display()
+        );
+    }
 }
 
 fn compile_shim(source_root: &Path, build_dir: &Path) {

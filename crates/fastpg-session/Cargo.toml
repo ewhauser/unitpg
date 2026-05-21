@@ -8,6 +8,7 @@ rust-version.workspace = true
 [features]
 default = []
 postgres-execution = ["fastpg-exec/postgres-execution"]
+rust-catalog = ["fastpg-exec/rust-catalog"]
 
 [dependencies]
 fastpg-compat.workspace = true

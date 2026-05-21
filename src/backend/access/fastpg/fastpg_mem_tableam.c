@@ -2322,9 +2322,10 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 	bool		found;
 	bool		heap_buffers = natts > FASTPG_MEM_STACK_NATTS;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
+	bool		postgres_catalog = fastpg_catalog_mode_uses_postgres();
 	bool		use_mvcc_snapshot =
 		!storage2 &&
-		fastpg_catalog_mode_uses_postgres() &&
+		postgres_catalog &&
 		snapshot != NULL &&
 		snapshot->snapshot_type == SNAPSHOT_MVCC;
 
@@ -2402,19 +2403,19 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 		ExecClearTuple(slot);
 		found = false;
 	}
-		if (found &&
-			snapshot != NULL &&
-			!storage2 &&
-			fastpg_catalog_mode_uses_postgres())
-		{
-			TransactionId predicate_xmin = use_mvcc_snapshot ?
-				(TransactionId) row_xmin :
+	if (found &&
+		snapshot != NULL &&
+		!storage2 &&
+		postgres_catalog)
+	{
+		TransactionId predicate_xmin = use_mvcc_snapshot ?
+			(TransactionId) row_xmin :
 			(TransactionId) fastpg_rust_relation_row_xmin((uint32_t) RelationGetRelid(rel),
 														  row_id);
 
 		PredicateLockTID(rel, &slot->tts_tid, snapshot, predicate_xmin);
 	}
-	if (found && fastpg_catalog_mode_uses_postgres())
+	if (found && postgres_catalog)
 	{
 		pgstat_count_heap_fetch(rel);
 		pgstat_count_buffer_hit(rel);

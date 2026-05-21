@@ -854,16 +854,18 @@ fn fast_transaction_command(sql: &str) -> Option<PgCoreTransactionCommand> {
 
 #[cfg(feature = "postgres-execution")]
 fn storage2_enabled() -> bool {
-    std::env::var("FASTPG_STORAGE_ENGINE")
-        .map(|value| value.eq_ignore_ascii_case("storage2"))
-        .unwrap_or(false)
+    static STORAGE2_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+    *STORAGE2_ENABLED.get_or_init(|| {
+        std::env::var("FASTPG_STORAGE_ENGINE")
+            .map(|value| value.eq_ignore_ascii_case("storage2"))
+            .unwrap_or(false)
+    })
 }
 
 #[cfg(feature = "postgres-execution")]
 fn postgres_catalog_enabled() -> bool {
-    std::env::var("FASTPG_CATALOG_MODE")
-        .map(|value| value.eq_ignore_ascii_case("postgres"))
-        .unwrap_or(false)
+    !cfg!(feature = "rust-catalog")
 }
 
 fn execution_error(sqlstate: impl Into<String>, message: impl Into<String>) -> QueryExecution {

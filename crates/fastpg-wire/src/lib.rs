@@ -1792,9 +1792,7 @@ fn decode_parameters(
 }
 
 fn postgres_catalog_enabled() -> bool {
-    std::env::var("FASTPG_CATALOG_MODE")
-        .map(|value| value.eq_ignore_ascii_case("postgres"))
-        .unwrap_or(false)
+    !cfg!(feature = "rust-catalog")
 }
 
 fn should_split_simple_query(statements: &[&str]) -> bool {

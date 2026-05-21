@@ -632,7 +632,7 @@ fastpg_pgcore_pgdata(void)
 	if (pgdata == NULL || pgdata[0] == '\0')
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				 errmsg("FASTPG_CATALOG_MODE=postgres requires FASTPG_PGDATA")));
+				 errmsg("Postgres catalog mode requires FASTPG_PGDATA")));
 	if (!is_absolute_path(pgdata))
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
