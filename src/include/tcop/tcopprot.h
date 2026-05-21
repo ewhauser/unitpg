@@ -23,7 +23,7 @@
 typedef struct ExplainState ExplainState;	/* defined in explain_state.h */
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local CommandDest whereToSendOutput;
+extern PGDLLIMPORT PG_THREAD_LOCAL CommandDest whereToSendOutput;
 #else
 extern PGDLLIMPORT CommandDest whereToSendOutput;
 #endif

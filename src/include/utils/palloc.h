@@ -57,7 +57,7 @@ typedef struct MemoryContextCallback
  * to change the setting.
  */
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local MemoryContext CurrentMemoryContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext CurrentMemoryContext;
 #else
 extern PGDLLIMPORT MemoryContext CurrentMemoryContext;
 #endif

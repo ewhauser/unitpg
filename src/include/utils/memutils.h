@@ -56,22 +56,22 @@
  * MemoryContextInit() itself.
  */
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local MemoryContext TopMemoryContext;
-extern PGDLLIMPORT _Thread_local MemoryContext ErrorContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext TopMemoryContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext ErrorContext;
 #else
 extern PGDLLIMPORT MemoryContext TopMemoryContext;
 extern PGDLLIMPORT MemoryContext ErrorContext;
 #endif
 extern PGDLLIMPORT MemoryContext PostmasterContext;
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local MemoryContext CacheMemoryContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext CacheMemoryContext;
 #else
 extern PGDLLIMPORT MemoryContext CacheMemoryContext;
 #endif
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local MemoryContext MessageContext;
-extern PGDLLIMPORT _Thread_local MemoryContext TopTransactionContext;
-extern PGDLLIMPORT _Thread_local MemoryContext CurTransactionContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext MessageContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext TopTransactionContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext CurTransactionContext;
 #else
 extern PGDLLIMPORT MemoryContext MessageContext;
 extern PGDLLIMPORT MemoryContext TopTransactionContext;
@@ -80,7 +80,7 @@ extern PGDLLIMPORT MemoryContext CurTransactionContext;
 
 /* This is a transient link to the active portal's memory context: */
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local MemoryContext PortalContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext PortalContext;
 #else
 extern PGDLLIMPORT MemoryContext PortalContext;
 #endif

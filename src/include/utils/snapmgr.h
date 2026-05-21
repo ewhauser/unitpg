@@ -20,14 +20,14 @@
 
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local bool FirstSnapshotSet;
+extern PGDLLIMPORT PG_THREAD_LOCAL bool FirstSnapshotSet;
 #else
 extern PGDLLIMPORT bool FirstSnapshotSet;
 #endif
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local TransactionId TransactionXmin;
-extern PGDLLIMPORT _Thread_local TransactionId RecentXmin;
+extern PGDLLIMPORT PG_THREAD_LOCAL TransactionId TransactionXmin;
+extern PGDLLIMPORT PG_THREAD_LOCAL TransactionId RecentXmin;
 #else
 extern PGDLLIMPORT TransactionId TransactionXmin;
 extern PGDLLIMPORT TransactionId RecentXmin;

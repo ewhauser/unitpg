@@ -208,11 +208,11 @@ extern PGDLLIMPORT char postgres_exec_path[];
 #endif
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local Oid MyDatabaseId;
+extern PGDLLIMPORT PG_THREAD_LOCAL Oid MyDatabaseId;
 
-extern PGDLLIMPORT _Thread_local Oid MyDatabaseTableSpace;
+extern PGDLLIMPORT PG_THREAD_LOCAL Oid MyDatabaseTableSpace;
 
-extern PGDLLIMPORT _Thread_local bool MyDatabaseHasLoginEventTriggers;
+extern PGDLLIMPORT PG_THREAD_LOCAL bool MyDatabaseHasLoginEventTriggers;
 #else
 extern PGDLLIMPORT Oid MyDatabaseId;
 
@@ -340,7 +340,7 @@ extern PGDLLIMPORT bool accessSharedCatalogsInDecoding;
 #define SECURITY_NOFORCE_RLS			0x0004
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local char *DatabasePath;
+extern PGDLLIMPORT PG_THREAD_LOCAL char *DatabasePath;
 #else
 extern PGDLLIMPORT char *DatabasePath;
 #endif

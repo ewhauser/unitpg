@@ -316,7 +316,7 @@ typedef struct ErrorContextCallback
 } ErrorContextCallback;
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local ErrorContextCallback *error_context_stack;
+extern PGDLLIMPORT PG_THREAD_LOCAL ErrorContextCallback *error_context_stack;
 #else
 extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
 #endif
@@ -426,7 +426,7 @@ extern PGDLLIMPORT ErrorContextCallback *error_context_stack;
 	pg_re_throw()
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local sigjmp_buf *PG_exception_stack;
+extern PGDLLIMPORT PG_THREAD_LOCAL sigjmp_buf *PG_exception_stack;
 #else
 extern PGDLLIMPORT sigjmp_buf *PG_exception_stack;
 #endif
@@ -495,7 +495,7 @@ extern PGDLLIMPORT emit_log_hook_type emit_log_hook;
  * state so it can forward PostgreSQL notices through its Rust pgwire layer.
  */
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local emit_log_hook_type fastpg_client_message_hook;
+extern PGDLLIMPORT PG_THREAD_LOCAL emit_log_hook_type fastpg_client_message_hook;
 #else
 extern PGDLLIMPORT emit_log_hook_type fastpg_client_message_hook;
 #endif

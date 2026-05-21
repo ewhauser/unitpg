@@ -2066,8 +2066,8 @@ mod inner {
 #[cfg(not(feature = "postgres-execution"))]
 mod inner {
     use super::{
-        ExecutionResult, PgCoreError, PgCoreInputDatum, PgCoreLaneMetrics, RawParseSummary,
-        StatementDescription,
+        ExecutionResult, PgCoreError, PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice,
+        RawParseSummary, StatementDescription,
     };
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {

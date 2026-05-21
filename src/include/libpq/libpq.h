@@ -44,7 +44,7 @@ typedef struct
 } PQcommMethods;
 
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local const PQcommMethods *PqCommMethods;
+extern PGDLLIMPORT PG_THREAD_LOCAL const PQcommMethods *PqCommMethods;
 #else
 extern const PGDLLIMPORT PQcommMethods *PqCommMethods;
 #endif

@@ -95,6 +95,12 @@ extern "C++"
  /* Pull in fundamental symbols that we also expose to applications */
 #include "postgres_ext.h"
 
+#ifdef __cplusplus
+#define PG_THREAD_LOCAL thread_local
+#else
+#define PG_THREAD_LOCAL _Thread_local
+#endif
+
 /* Define before including zlib.h to add const decorations to zlib API. */
 #ifdef HAVE_LIBZ
 #define ZLIB_CONST

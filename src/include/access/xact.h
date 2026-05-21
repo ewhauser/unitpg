@@ -85,7 +85,7 @@ extern PGDLLIMPORT int synchronous_commit;
 
 /* used during logical streaming of a transaction */
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local TransactionId CheckXidAlive;
+extern PGDLLIMPORT PG_THREAD_LOCAL TransactionId CheckXidAlive;
 #else
 extern PGDLLIMPORT TransactionId CheckXidAlive;
 #endif
@@ -99,7 +99,7 @@ extern PGDLLIMPORT bool bsysscan;
  * recording flags.
  */
 #ifdef USE_FASTPG
-extern PGDLLIMPORT _Thread_local int MyXactFlags;
+extern PGDLLIMPORT PG_THREAD_LOCAL int MyXactFlags;
 #else
 extern PGDLLIMPORT int MyXactFlags;
 #endif
