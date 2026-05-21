@@ -461,6 +461,7 @@ mod inner {
         fn fastpg_xid_begin();
         fn fastpg_xid_commit();
         fn fastpg_xid_rollback();
+        fn AtEOXact_Enum();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_set_database(database_oid: u32);
         fn fastpg_pgcore_notice_capture_begin();
@@ -914,6 +915,9 @@ mod inner {
                     }
                     fastpg_storage::commit_explicit_transaction();
                     fastpg_storage2::fastpg_storage2_xact_commit();
+                    unsafe {
+                        AtEOXact_Enum();
+                    }
                 }
                 PgCoreTransactionCommand::Rollback => {
                     unsafe {
@@ -921,6 +925,9 @@ mod inner {
                     }
                     fastpg_storage::abort_explicit_transaction();
                     fastpg_storage2::fastpg_storage2_xact_abort();
+                    unsafe {
+                        AtEOXact_Enum();
+                    }
                 }
             }
         }

@@ -670,6 +670,9 @@ fn pgcore_copy_error(error: fastpg_pgcore::PgCoreError) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "postgres-execution")]
+    static POSTGRES_ENUM_STATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[cfg(not(feature = "postgres-execution"))]
     #[test]
     fn default_build_has_no_postgres_execution() {
@@ -842,6 +845,7 @@ mod tests {
     #[cfg(feature = "postgres-execution")]
     #[test]
     fn range_index_scans_fall_back_to_heap_filtering() {
+        let _enum_guard = POSTGRES_ENUM_STATE_LOCK.lock().unwrap();
         let executor = QueryExecutor::new("17.0-fastpg");
         let suffix = std::process::id();
         let enum_type = format!("fastpg_exec_enum_range_{suffix}");
@@ -920,6 +924,42 @@ mod tests {
         executor.execute("reset enable_bitmapscan", &[]);
         executor.execute("reset enable_seqscan", &[]);
         executor.execute(&format!("drop table if exists {table}"), &[]);
+        executor.execute(&format!("drop type if exists {enum_type}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn alter_type_add_value_is_unsafe_until_commit() {
+        let _enum_guard = POSTGRES_ENUM_STATE_LOCK.lock().unwrap();
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let enum_type = format!("fastpg_exec_enum_unsafe_{}", std::process::id());
+
+        executor.execute(&format!("drop type if exists {enum_type}"), &[]);
+        executor.execute(&format!("create type {enum_type} as enum ('good')"), &[]);
+        executor.execute("begin", &[]);
+        executor.execute(&format!("alter type {enum_type} add value 'new'"), &[]);
+        executor.execute("savepoint x", &[]);
+        assert!(matches!(
+            executor.execute(&format!("select 'new'::{enum_type}"), &[]),
+            QueryExecution::Error {
+                ref sqlstate,
+                ref message,
+                ref hint,
+                ..
+            } if sqlstate == "55P04"
+                && message.contains("unsafe use of new value")
+                && hint.as_deref() == Some("New enum values must be committed before they can be used.")
+        ));
+        executor.execute("rollback to x", &[]);
+        executor.execute("commit", &[]);
+        assert_eq!(
+            executor.execute(&format!("select 'new'::{enum_type}::text as value"), &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("value", PgType::Varchar, 25)],
+                vec![vec![Value::Text("new".to_owned())]]
+            ))
+        );
+
         executor.execute(&format!("drop type if exists {enum_type}"), &[]);
     }
 

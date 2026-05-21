@@ -32,6 +32,7 @@
 
 static Oid	enum_endpoint(Oid enumtypoid, ScanDirection direction);
 static ArrayType *enum_range_internal(Oid enumtypoid, Oid lower, Oid upper);
+static void check_safe_enum_use_by_oid(Oid enum_oid);
 #ifdef USE_FASTPG
 static ArrayType *fastpg_enum_range_internal(Oid enumtypoid, Oid lower,
 											 Oid upper);
@@ -75,7 +76,16 @@ check_safe_enum_use(HeapTuple enumval_tup)
 
 #ifdef USE_FASTPG
 	if (!IsUnderPostmaster)
-		return;
+	{
+		if (!EnumUncommitted(en->oid))
+			return;
+		ereport(ERROR,
+				(errcode(ERRCODE_UNSAFE_NEW_ENUM_VALUE_USAGE),
+				 errmsg("unsafe use of new value \"%s\" of enum type %s",
+						NameStr(en->enumlabel),
+						format_type_be(en->enumtypid)),
+				 errhint("New enum values must be committed before they can be used.")));
+	}
 #endif
 
 	/*
@@ -113,6 +123,19 @@ check_safe_enum_use(HeapTuple enumval_tup)
 					NameStr(en->enumlabel),
 					format_type_be(en->enumtypid)),
 			 errhint("New enum values must be committed before they can be used.")));
+}
+
+static void
+check_safe_enum_use_by_oid(Oid enum_oid)
+{
+	HeapTuple	enum_tuple;
+
+	enum_tuple = SearchSysCache1(ENUMOID, ObjectIdGetDatum(enum_oid));
+	if (HeapTupleIsValid(enum_tuple))
+	{
+		check_safe_enum_use(enum_tuple);
+		ReleaseSysCache(enum_tuple);
+	}
 }
 
 
@@ -419,7 +442,10 @@ enum_endpoint(Oid enumtypoid, ScanDirection direction)
 		if (fastpg_rust_catalog_enum_endpoint((uint32_t) enumtypoid,
 											  ScanDirectionIsForward(direction) ? 1 : 0,
 											  &fastpg_enum_oid))
+		{
+			check_safe_enum_use_by_oid((Oid) fastpg_enum_oid);
 			return (Oid) fastpg_enum_oid;
+		}
 		return InvalidOid;
 	}
 #endif
@@ -681,7 +707,10 @@ fastpg_enum_range_internal(Oid enumtypoid, Oid lower, Oid upper)
 		if (!left_found && lower == enum_oid)
 			left_found = true;
 		if (left_found)
+		{
+			check_safe_enum_use_by_oid(enum_oid);
 			elems[cnt++] = ObjectIdGetDatum(enum_oid);
+		}
 		if (OidIsValid(upper) && upper == enum_oid)
 			break;
 	}

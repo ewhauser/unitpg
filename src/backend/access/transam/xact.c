@@ -1484,6 +1484,7 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	 * statement if control escaped after XLogBeginInsert().
 	 */
 	XLogResetInsertion();
+	AtEOXact_Enum();
 
 	if (TopTransactionResourceOwner != NULL)
 	{

@@ -26,6 +26,7 @@
 #include "catalog/pg_database.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_language.h"
+#include "catalog/pg_enum.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_tablespace.h"
 #include "catalog/pg_type.h"
@@ -700,6 +701,32 @@ fastpg_pgcore_release_error_resources(void)
 	CurrentResourceOwner = NULL;
 	fastpg_pgcore_ensure_execution_owner();
 }
+
+#ifdef USE_FASTPG
+static void
+fastpg_pgcore_commit_implicit_transaction(void)
+{
+	if (!fastpg_rust_xact_is_explicit())
+	{
+		fastpg_xid_commit();
+		fastpg_rust_xact_commit_if_implicit();
+		fastpg_storage2_xact_commit_if_implicit();
+		AtEOXact_Enum();
+	}
+}
+
+static void
+fastpg_pgcore_abort_implicit_transaction(void)
+{
+	if (!fastpg_rust_xact_is_explicit())
+	{
+		fastpg_xid_rollback();
+		fastpg_rust_xact_abort_if_implicit();
+		fastpg_storage2_xact_abort_if_implicit();
+		AtEOXact_Enum();
+	}
+}
+#endif
 
 static void
 fastpg_pgcore_start_statement_timestamp(void)
@@ -1971,12 +1998,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 											  summary,
 											  result->context);
 #ifdef USE_FASTPG
-				if (!fastpg_rust_xact_is_explicit())
-				{
-					fastpg_xid_commit();
-					fastpg_rust_xact_commit_if_implicit();
-					fastpg_storage2_xact_commit_if_implicit();
-				}
+				fastpg_pgcore_commit_implicit_transaction();
 #endif
 				continue;
 			}
@@ -2018,12 +2040,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 			PopActiveSnapshot();
 			snapshot_pushed = false;
 #ifdef USE_FASTPG
-			if (!fastpg_rust_xact_is_explicit())
-			{
-				fastpg_xid_commit();
-				fastpg_rust_xact_commit_if_implicit();
-				fastpg_storage2_xact_commit_if_implicit();
-			}
+			fastpg_pgcore_commit_implicit_transaction();
 #endif
 
 			dest->rDestroy(dest);
@@ -2049,12 +2066,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 			SetUserIdAndSecContext(statement_userid, statement_sec_context);
 #endif
 #ifdef USE_FASTPG
-		if (!fastpg_rust_xact_is_explicit())
-		{
-			fastpg_xid_rollback();
-			fastpg_rust_xact_abort_if_implicit();
-			fastpg_storage2_xact_abort_if_implicit();
-		}
+		fastpg_pgcore_abort_implicit_transaction();
 #endif
 		if (query_desc != NULL)
 		{
