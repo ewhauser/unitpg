@@ -1503,6 +1503,9 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 							 RESOURCE_RELEASE_BEFORE_LOCKS,
 							 isCommit,
 							 true);
+		AtEOXact_RelationCache(isCommit);
+		AtEOXact_TypeCache();
+		AtEOXact_Inval(isCommit);
 		ResourceOwnerRelease(TopTransactionResourceOwner,
 							 RESOURCE_RELEASE_LOCKS,
 							 isCommit,
