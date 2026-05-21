@@ -20,6 +20,7 @@ pub struct PgCoreError {
     pub message: String,
     pub detail: Option<String>,
     pub hint: Option<String>,
+    pub context: Option<String>,
     pub cursorpos: i32,
 }
 
@@ -30,6 +31,7 @@ impl PgCoreError {
             message: message.into(),
             detail: None,
             hint: None,
+            context: None,
             cursorpos,
         }
     }
@@ -39,6 +41,7 @@ impl PgCoreError {
         message: impl Into<String>,
         detail: Option<String>,
         hint: Option<String>,
+        context: Option<String>,
         cursorpos: i32,
     ) -> Self {
         Self {
@@ -46,6 +49,7 @@ impl PgCoreError {
             message: message.into(),
             detail,
             hint,
+            context,
             cursorpos,
         }
     }
@@ -494,6 +498,7 @@ mod inner {
         fn fastpg_pgcore_prepared_message(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_detail(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_hint(prepared: *const FastPgPgCorePrepared) -> *const c_char;
+        fn fastpg_pgcore_prepared_context(prepared: *const FastPgPgCorePrepared) -> *const c_char;
         fn fastpg_pgcore_prepared_cursorpos(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_count(prepared: *const FastPgPgCorePrepared) -> i32;
         fn fastpg_pgcore_prepared_parameter_type_oid(
@@ -536,6 +541,9 @@ mod inner {
             result: *const FastPgPgCoreExecuteResult,
         ) -> *const c_char;
         fn fastpg_pgcore_execute_result_hint(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_result_context(
             result: *const FastPgPgCoreExecuteResult,
         ) -> *const c_char;
         fn fastpg_pgcore_execute_result_cursorpos(result: *const FastPgPgCoreExecuteResult) -> i32;
@@ -684,6 +692,7 @@ mod inner {
                 unsafe { c_string(fastpg_pgcore_parse_result_message(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_parse_result_detail(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_parse_result_hint(result.as_ptr())) },
+                None,
                 unsafe { fastpg_pgcore_parse_result_cursorpos(result.as_ptr()) },
             ))
         }
@@ -845,6 +854,7 @@ mod inner {
                     unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr())) },
                     unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr())) },
+                    unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr())) },
                     unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
                 );
                 drop(_guard);
@@ -975,6 +985,7 @@ mod inner {
                     unsafe {
                         optional_c_string(fastpg_pgcore_input_datum_result_hint(result.as_ptr()))
                     },
+                    None,
                     unsafe { fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr()) },
                 ))
             }
@@ -1164,6 +1175,7 @@ mod inner {
             unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
             unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
+            unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared)) },
             unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
         )
     }
@@ -1187,6 +1199,7 @@ mod inner {
                 unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr())) },
                 unsafe { optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr())) },
+                unsafe { optional_c_string(fastpg_pgcore_execute_result_context(result.as_ptr())) },
                 unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
             ))
         }

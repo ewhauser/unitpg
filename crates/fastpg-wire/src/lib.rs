@@ -560,8 +560,11 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
             message,
             detail,
             hint,
+            context,
             cursorpos,
-        } => Ok(error_response(&sqlstate, &message, detail, hint, cursorpos)),
+        } => Ok(error_response(
+            &sqlstate, &message, detail, hint, context, cursorpos,
+        )),
     }
 }
 
@@ -686,11 +689,13 @@ fn error_response(
     message: &str,
     detail: Option<String>,
     hint: Option<String>,
+    context: Option<String>,
     cursorpos: i32,
 ) -> Response {
     let mut error = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
     error.detail = detail;
     error.hint = hint;
+    error.where_context = context;
     if cursorpos > 0 {
         error.position = Some(cursorpos.to_string());
     }

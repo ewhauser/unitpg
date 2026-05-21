@@ -104,6 +104,7 @@ pub enum QueryExecution {
         message: String,
         detail: Option<String>,
         hint: Option<String>,
+        context: Option<String>,
         cursorpos: i32,
     },
 }
@@ -463,6 +464,7 @@ fn execution_error(sqlstate: impl Into<String>, message: impl Into<String>) -> Q
         message: message.into(),
         detail: None,
         hint: None,
+        context: None,
         cursorpos: 0,
     }
 }
@@ -474,6 +476,7 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
         message: error.message,
         detail: error.detail,
         hint: error.hint,
+        context: error.context,
         cursorpos: error.cursorpos,
     }
 }
@@ -736,6 +739,34 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn set_local_observes_explicit_transaction_block() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        assert_eq!(
+            executor.execute("BEGIN", &[]),
+            QueryExecution::Command {
+                tag: "BEGIN".into(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute("SET LOCAL parallel_setup_cost = 0", &[]),
+            QueryExecution::Command {
+                tag: "SET".into(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute("ROLLBACK", &[]),
+            QueryExecution::Command {
+                tag: "ROLLBACK".into(),
+                rows: 0,
+            }
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn executes_create_table_through_pgcore() {
         let executor = QueryExecutor::new("17.0-fastpg");
         let table = format!("fastpg_exec_util_{}", std::process::id());
@@ -849,6 +880,17 @@ mod tests {
                 vec![Column::new("log", PgType::Int4)],
                 vec![vec![Value::Int4(2)]]
             ))
+        );
+        assert_eq!(
+            executor.execute("select log('-12.34'::numeric)", &[]),
+            QueryExecution::Error {
+                sqlstate: "2201E".to_owned(),
+                message: "cannot take logarithm of a negative number".to_owned(),
+                detail: None,
+                hint: None,
+                context: Some("SQL function \"log\" statement 1".to_owned()),
+                cursorpos: 0,
+            }
         );
     }
 

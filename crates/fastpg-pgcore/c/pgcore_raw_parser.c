@@ -108,6 +108,7 @@ typedef struct FastPgPgCorePrepared
 	char	   *message;
 	char	   *detail;
 	char	   *hint;
+	char	   *error_context;
 	int			cursorpos;
 	char	   *source_text;
 	List	   *raw_parsetrees;
@@ -166,6 +167,7 @@ typedef struct FastPgPgCoreExecuteResult
 	char	   *message;
 	char	   *detail;
 	char	   *hint;
+	char	   *error_context;
 	int			cursorpos;
 	int			statement_count;
 	FastPgPgCoreExecuteStatement *statements;
@@ -723,6 +725,8 @@ fastpg_pgcore_set_prepared_error(FastPgPgCorePrepared *result,
 							 &result->hint,
 							 &result->cursorpos,
 							 edata);
+	free(result->error_context);
+	result->error_context = fastpg_pgcore_strdup(edata->context);
 }
 
 static void
@@ -736,6 +740,8 @@ fastpg_pgcore_set_execute_error(FastPgPgCoreExecuteResult *result,
 							 &result->hint,
 							 &result->cursorpos,
 							 edata);
+	free(result->error_context);
+	result->error_context = fastpg_pgcore_strdup(edata->context);
 }
 
 static const char *
@@ -934,6 +940,18 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 	}
 }
 
+static ProcessUtilityContext
+fastpg_pgcore_utility_context(Node *utility_stmt)
+{
+#ifdef USE_FASTPG
+	if (fastpg_rust_xact_is_explicit() &&
+		IsA(utility_stmt, VariableSetStmt) &&
+		((VariableSetStmt *) utility_stmt)->is_local)
+		return PROCESS_UTILITY_QUERY;
+#endif
+	return PROCESS_UTILITY_TOPLEVEL;
+}
+
 static bool
 fastpg_pgcore_utility_is_copy_stdin_bridge(Node *utility_stmt)
 {
@@ -1106,6 +1124,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 	DestReceiver *dest = NULL;
 	QueryCompletion qc;
 	volatile bool snapshot_pushed = false;
+	ProcessUtilityContext utility_context;
 
 	if (fastpg_pgcore_utility_is_copy_stdin_bridge(utility_stmt))
 	{
@@ -1166,6 +1185,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 	InitializeQueryCompletion(&qc);
 	dest = fastpg_pgcore_create_capture_receiver(summary, result_context);
 	fastpg_pgcore_ensure_execution_owner();
+	utility_context = fastpg_pgcore_utility_context(utility_stmt);
 
 	if (PlannedStmtRequiresSnapshot(use_fastpg_statement ? &fastpg_statement : statement))
 	{
@@ -1178,7 +1198,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 		ProcessUtility(use_fastpg_statement ? &fastpg_statement : statement,
 					   source_text,
 					   false,
-					   PROCESS_UTILITY_TOPLEVEL,
+					   utility_context,
 					   params,
 					   NULL,
 					   dest,
@@ -1605,6 +1625,7 @@ fastpg_pgcore_prepared_free(FastPgPgCorePrepared *prepared)
 	free(prepared->message);
 	free(prepared->detail);
 	free(prepared->hint);
+	free(prepared->error_context);
 	free(prepared);
 }
 
@@ -1644,6 +1665,14 @@ fastpg_pgcore_prepared_hint(const FastPgPgCorePrepared *prepared)
 	if (prepared == NULL || prepared->hint == NULL)
 		return "";
 	return prepared->hint;
+}
+
+const char *
+fastpg_pgcore_prepared_context(const FastPgPgCorePrepared *prepared)
+{
+	if (prepared == NULL || prepared->error_context == NULL)
+		return "";
+	return prepared->error_context;
 }
 
 int
@@ -1828,6 +1857,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		result->message = fastpg_pgcore_strdup(fastpg_pgcore_prepared_message(prepared));
 		result->detail = fastpg_pgcore_strdup(fastpg_pgcore_prepared_detail(prepared));
 		result->hint = fastpg_pgcore_strdup(fastpg_pgcore_prepared_hint(prepared));
+		result->error_context = fastpg_pgcore_strdup(fastpg_pgcore_prepared_context(prepared));
 		result->cursorpos = fastpg_pgcore_prepared_cursorpos(prepared);
 		return result;
 	}
@@ -1991,6 +2021,7 @@ fastpg_pgcore_execute_result_free(FastPgPgCoreExecuteResult *result)
 	free(result->message);
 	free(result->detail);
 	free(result->hint);
+	free(result->error_context);
 	free(result);
 }
 
@@ -2236,6 +2267,14 @@ fastpg_pgcore_execute_result_hint(const FastPgPgCoreExecuteResult *result)
 	if (result == NULL || result->hint == NULL)
 		return "";
 	return result->hint;
+}
+
+const char *
+fastpg_pgcore_execute_result_context(const FastPgPgCoreExecuteResult *result)
+{
+	if (result == NULL || result->error_context == NULL)
+		return "";
+	return result->error_context;
 }
 
 int
