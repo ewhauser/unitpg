@@ -4386,6 +4386,7 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
     natts: usize,
     row_id_out: *mut u64,
 ) -> bool {
+    clear_last_storage_error();
     let result = (|| {
         let values = unsafe { nullable_c_str_array_to_strings(values, is_null, natts) }
             .map_err(invalid_ffi_argument)?;
@@ -4405,13 +4406,24 @@ pub unsafe extern "C" fn fastpg_rust_catalog_upsert_row(
         Ok::<(), CatalogError>(())
     })();
 
-    result.is_ok()
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            set_last_storage_error(error);
+            false
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64) -> bool {
+    clear_last_storage_error();
     let pending_primary_key_rebuild = pg_index_heap_relation_from_delete(relation_oid, row_id);
-    let ok = delete_catalog_row(Oid(relation_oid), row_id).is_ok();
+    let result = delete_catalog_row(Oid(relation_oid), row_id);
+    let ok = result.is_ok();
+    if let Err(error) = result {
+        set_last_storage_error(error);
+    }
     if ok && catalog_mutation_invalidates_primary_key_cache(relation_oid) {
         clear_primary_key_index_info_cache();
     }
@@ -4419,6 +4431,32 @@ pub extern "C" fn fastpg_rust_catalog_delete_row(relation_oid: u32, row_id: u64)
         mark_primary_key_rebuild(relid);
     }
     ok
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers when they are non-null.
+pub unsafe extern "C" fn fastpg_rust_catalog_last_error(
+    sqlstate_out: *mut c_char,
+    sqlstate_len: usize,
+    message_out: *mut c_char,
+    message_len: usize,
+) -> bool {
+    let Some(error) = last_storage_error() else {
+        return false;
+    };
+    unsafe {
+        write_catalog_error(
+            sqlstate_out,
+            sqlstate_len,
+            message_out,
+            message_len,
+            &error.sqlstate,
+            &error.message,
+        );
+    }
+    true
 }
 
 #[unsafe(no_mangle)]

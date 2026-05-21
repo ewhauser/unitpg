@@ -170,10 +170,17 @@ struct ResourceOwnerData
  *	  GLOBAL MEMORY															 *
  *****************************************************************************/
 
+#ifdef USE_FASTPG
+_Thread_local ResourceOwner CurrentResourceOwner = NULL;
+_Thread_local ResourceOwner CurTransactionResourceOwner = NULL;
+_Thread_local ResourceOwner TopTransactionResourceOwner = NULL;
+_Thread_local ResourceOwner AuxProcessResourceOwner = NULL;
+#else
 ResourceOwner CurrentResourceOwner = NULL;
 ResourceOwner CurTransactionResourceOwner = NULL;
 ResourceOwner TopTransactionResourceOwner = NULL;
 ResourceOwner AuxProcessResourceOwner = NULL;
+#endif
 
 /* #define RESOWNER_STATS */
 

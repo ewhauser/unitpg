@@ -207,11 +207,19 @@ extern PGDLLIMPORT char pkglib_path[];
 extern PGDLLIMPORT char postgres_exec_path[];
 #endif
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT _Thread_local Oid MyDatabaseId;
+
+extern PGDLLIMPORT _Thread_local Oid MyDatabaseTableSpace;
+
+extern PGDLLIMPORT _Thread_local bool MyDatabaseHasLoginEventTriggers;
+#else
 extern PGDLLIMPORT Oid MyDatabaseId;
 
 extern PGDLLIMPORT Oid MyDatabaseTableSpace;
 
 extern PGDLLIMPORT bool MyDatabaseHasLoginEventTriggers;
+#endif
 
 /*
  * Date/Time Configuration
@@ -331,7 +339,11 @@ extern PGDLLIMPORT bool accessSharedCatalogsInDecoding;
 #define SECURITY_RESTRICTED_OPERATION	0x0002
 #define SECURITY_NOFORCE_RLS			0x0004
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT _Thread_local char *DatabasePath;
+#else
 extern PGDLLIMPORT char *DatabasePath;
+#endif
 
 /* now in utils/init/miscinit.c */
 extern void InitPostmasterChild(void);

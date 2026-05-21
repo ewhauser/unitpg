@@ -19,10 +19,19 @@
 #include "utils/snapshot.h"
 
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT _Thread_local bool FirstSnapshotSet;
+#else
 extern PGDLLIMPORT bool FirstSnapshotSet;
+#endif
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT _Thread_local TransactionId TransactionXmin;
+extern PGDLLIMPORT _Thread_local TransactionId RecentXmin;
+#else
 extern PGDLLIMPORT TransactionId TransactionXmin;
 extern PGDLLIMPORT TransactionId RecentXmin;
+#endif
 
 /* Variables representing various special snapshot semantics */
 extern PGDLLIMPORT SnapshotData SnapshotSelfData;

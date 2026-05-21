@@ -136,36 +136,77 @@
 
 /* These variables define the actually active state: */
 
+#ifdef USE_FASTPG
+static _Thread_local List *activeSearchPath = NIL;
+#else
 static List *activeSearchPath = NIL;
+#endif
 
 /* default place to create stuff; if InvalidOid, no default */
+#ifdef USE_FASTPG
+static _Thread_local Oid activeCreationNamespace = InvalidOid;
+#else
 static Oid	activeCreationNamespace = InvalidOid;
+#endif
 
 /* if true, activeCreationNamespace is wrong, it should be temp namespace */
+#ifdef USE_FASTPG
+static _Thread_local bool activeTempCreationPending = false;
+#else
 static bool activeTempCreationPending = false;
+#endif
 
 /* current generation counter; make sure this is never zero */
+#ifdef USE_FASTPG
+static _Thread_local uint64 activePathGeneration = 1;
+#else
 static uint64 activePathGeneration = 1;
+#endif
 
 /* These variables are the values last derived from namespace_search_path: */
 
+#ifdef USE_FASTPG
+static _Thread_local List *baseSearchPath = NIL;
+#else
 static List *baseSearchPath = NIL;
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local Oid baseCreationNamespace = InvalidOid;
+#else
 static Oid	baseCreationNamespace = InvalidOid;
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local bool baseTempCreationPending = false;
+#else
 static bool baseTempCreationPending = false;
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local Oid namespaceUser = InvalidOid;
+#else
 static Oid	namespaceUser = InvalidOid;
+#endif
 
 /* The above four values are valid only if baseSearchPathValid */
+#ifdef USE_FASTPG
+static _Thread_local bool baseSearchPathValid = true;
+#else
 static bool baseSearchPathValid = true;
+#endif
 
 /*
  * Storage for search path cache.  Clear searchPathCacheValid as a simple
  * way to invalidate *all* the cache entries, not just the active one.
  */
+#ifdef USE_FASTPG
+static _Thread_local bool searchPathCacheValid = false;
+static _Thread_local MemoryContext SearchPathCacheContext = NULL;
+#else
 static bool searchPathCacheValid = false;
 static MemoryContext SearchPathCacheContext = NULL;
+#endif
 
 typedef struct SearchPathCacheKey
 {
@@ -201,14 +242,26 @@ typedef struct SearchPathCacheEntry
  * we either haven't made the TEMP namespace yet, or have successfully
  * committed its creation, depending on whether myTempNamespace is valid.
  */
+#ifdef USE_FASTPG
+static _Thread_local Oid myTempNamespace = InvalidOid;
+#else
 static Oid	myTempNamespace = InvalidOid;
-
-static Oid	myTempToastNamespace = InvalidOid;
-
-static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
+#endif
 
 #ifdef USE_FASTPG
-static bool fastpgTempNamespaceExitCallbackRegistered = false;
+static _Thread_local Oid myTempToastNamespace = InvalidOid;
+#else
+static Oid	myTempToastNamespace = InvalidOid;
+#endif
+
+#ifdef USE_FASTPG
+static _Thread_local SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
+#else
+static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
+#endif
+
+#ifdef USE_FASTPG
+static _Thread_local bool fastpgTempNamespaceExitCallbackRegistered = false;
 
 bool
 FastPgTempNamespaceCreatedInCurrentTransaction(void)
@@ -222,6 +275,34 @@ FastPgTempNamespaceCreatedInCurrentTransaction(void)
  * of the GUC variable 'search_path'.
  */
 char	   *namespace_search_path = NULL;
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadNamespaceState(void)
+{
+	if (baseSearchPath != NIL || baseSearchPathValid == false)
+		return;
+
+	if (namespace_search_path == NULL)
+		namespace_search_path =
+			MemoryContextStrdup(TopMemoryContext, "\"$user\", public");
+	activeSearchPath = NIL;
+	activeCreationNamespace = InvalidOid;
+	activeTempCreationPending = false;
+	activePathGeneration = 1;
+	baseSearchPath = NIL;
+	baseCreationNamespace = InvalidOid;
+	baseTempCreationPending = false;
+	namespaceUser = InvalidOid;
+	baseSearchPathValid = false;
+	searchPathCacheValid = false;
+	SearchPathCacheContext = NULL;
+	myTempNamespace = InvalidOid;
+	myTempToastNamespace = InvalidOid;
+	myTempNamespaceSubID = InvalidSubTransactionId;
+	fastpgTempNamespaceExitCallbackRegistered = false;
+}
+#endif
 
 
 /* Local functions */
@@ -328,8 +409,13 @@ spcachekey_equal(SearchPathCacheKey a, SearchPathCacheKey b)
  */
 #define SPCACHE_RESET_THRESHOLD		256
 
+#ifdef USE_FASTPG
+static _Thread_local nsphash_hash *SearchPathCache = NULL;
+static _Thread_local SearchPathCacheEntry *LastSearchPathCacheEntry = NULL;
+#else
 static nsphash_hash *SearchPathCache = NULL;
 static SearchPathCacheEntry *LastSearchPathCacheEntry = NULL;
+#endif
 
 /*
  * Create or reset search_path cache as necessary.

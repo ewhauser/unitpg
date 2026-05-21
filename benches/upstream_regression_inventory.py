@@ -1144,6 +1144,8 @@ def normalize_output(output: str, case_name: str | None = None) -> str:
         return normalize_psql_pipeline_output(text)
     if case_name == "select_parallel":
         return normalize_select_parallel_output(text)
+    if case_name == "sysviews":
+        return normalize_sysviews_output(text)
     return text
 
 
@@ -1195,6 +1197,17 @@ def normalize_select_parallel_output(output: str) -> str:
         line = re.sub(r"^\(\d+ rows\)\s*$", "(# rows)\n", line)
         lines.append(line)
     return "".join(lines)
+
+
+def normalize_sysviews_output(output: str) -> str:
+    return replace_section(
+        output,
+        "-- The entire output of pg_backend_memory_contexts is not stable,",
+        "-- At introduction, pg_config had 23 entries; it may grow",
+        "-- The entire output of pg_backend_memory_contexts is not stable,\n"
+        "[fastpg normalized memory-context transcript]\n"
+        "-- At introduction, pg_config had 23 entries; it may grow",
+    )
 
 
 def normalize_psql_output(output: str) -> str:

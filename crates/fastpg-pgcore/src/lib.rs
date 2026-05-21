@@ -367,9 +367,9 @@ impl PgCoreSession {
         self.inner.reset_session_state();
     }
 
-    pub fn start_client_session(&self) {
+    pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
         let _guard = self.enter_storage();
-        self.inner.start_client_session();
+        self.inner.start_client_session()
     }
 }
 
@@ -1148,12 +1148,14 @@ mod inner {
             }
         }
 
-        pub fn start_client_session(&self) {
+        pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
             let _guard = enter_pgcore_lane("start_client_session");
             self.set_database();
+            let notice_capture = NoticeCaptureGuard::begin();
             unsafe {
                 fastpg_pgcore_start_client_session();
             }
+            notice_capture.finish()
         }
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
@@ -2135,7 +2137,9 @@ mod inner {
 
         pub fn reset_session_state(&self) {}
 
-        pub fn start_client_session(&self) {}
+        pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
+            Vec::new()
+        }
     }
 
     #[derive(Debug)]

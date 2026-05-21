@@ -77,6 +77,7 @@
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
+#include "utils/relcache.h"
 #include "utils/syscache.h"
 
 
@@ -1138,28 +1139,28 @@ AddNewRelationType(const char *typeName,
  * Returns the OID of the new relation
  * --------------------------------
  */
-Oid
-heap_create_with_catalog(const char *relname,
-						 Oid relnamespace,
-						 Oid reltablespace,
-						 Oid relid,
-						 Oid reltypeid,
-						 Oid reloftypeid,
-						 Oid ownerid,
-						 Oid accessmtd,
-						 TupleDesc tupdesc,
-						 List *cooked_constraints,
-						 char relkind,
-						 char relpersistence,
-						 bool shared_relation,
-						 bool mapped_relation,
-						 OnCommitAction oncommit,
-						 Datum reloptions,
-						 bool use_user_acl,
-						 bool allow_system_table_mods,
-						 bool is_internal,
-						 Oid relrewrite,
-						 ObjectAddress *typaddress)
+static Oid
+heap_create_with_catalog_internal(const char *relname,
+								  Oid relnamespace,
+								  Oid reltablespace,
+								  Oid relid,
+								  Oid reltypeid,
+								  Oid reloftypeid,
+								  Oid ownerid,
+								  Oid accessmtd,
+								  TupleDesc tupdesc,
+								  List *cooked_constraints,
+								  char relkind,
+								  char relpersistence,
+								  bool shared_relation,
+								  bool mapped_relation,
+								  OnCommitAction oncommit,
+								  Datum reloptions,
+								  bool use_user_acl,
+								  bool allow_system_table_mods,
+								  bool is_internal,
+								  Oid relrewrite,
+								  ObjectAddress *typaddress)
 {
 	Relation	pg_class_desc;
 	Relation	new_rel_desc;
@@ -1551,6 +1552,70 @@ heap_create_with_catalog(const char *relname,
 	table_close(pg_class_desc, RowExclusiveLock);
 
 	return relid;
+}
+
+Oid
+heap_create_with_catalog(const char *relname,
+						 Oid relnamespace,
+						 Oid reltablespace,
+						 Oid relid,
+						 Oid reltypeid,
+						 Oid reloftypeid,
+						 Oid ownerid,
+						 Oid accessmtd,
+						 TupleDesc tupdesc,
+						 List *cooked_constraints,
+						 char relkind,
+						 char relpersistence,
+						 bool shared_relation,
+						 bool mapped_relation,
+						 OnCommitAction oncommit,
+						 Datum reloptions,
+						 bool use_user_acl,
+						 bool allow_system_table_mods,
+						 bool is_internal,
+						 Oid relrewrite,
+						 ObjectAddress *typaddress)
+{
+	Oid			result = InvalidOid;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = heap_create_with_catalog_internal(relname,
+												   relnamespace,
+												   reltablespace,
+												   relid,
+												   reltypeid,
+												   reloftypeid,
+												   ownerid,
+												   accessmtd,
+												   tupdesc,
+												   cooked_constraints,
+												   relkind,
+												   relpersistence,
+												   shared_relation,
+												   mapped_relation,
+												   oncommit,
+												   reloptions,
+												   use_user_acl,
+												   allow_system_table_mods,
+												   is_internal,
+												   relrewrite,
+												   typaddress);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 /*

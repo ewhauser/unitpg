@@ -22,6 +22,9 @@
 #include <signal.h>
 #include <unistd.h>
 #include <sys/stat.h>
+#ifdef USE_FASTPG
+#include <pthread.h>
+#endif
 
 #include "miscadmin.h"
 #ifdef PROFILE_PID_DIR
@@ -38,18 +41,30 @@
  * so that an ereport() from an on_proc_exit routine cannot get us out
  * of the exit procedure.  We do NOT want to go back to the idle loop...
  */
+#ifdef USE_FASTPG
+_Thread_local bool proc_exit_inprogress = false;
+#else
 bool		proc_exit_inprogress = false;
+#endif
 
 /*
  * Set when shmem_exit() is in progress.
  */
+#ifdef USE_FASTPG
+_Thread_local bool shmem_exit_inprogress = false;
+#else
 bool		shmem_exit_inprogress = false;
+#endif
 
 /*
  * This flag tracks whether we've called atexit() in the current process
  * (or in the parent postmaster).
  */
+#ifdef USE_FASTPG
+static pthread_once_t fastpg_atexit_callback_once = PTHREAD_ONCE_INIT;
+#else
 static bool atexit_callback_setup = false;
+#endif
 
 /* local functions */
 static void proc_exit_prepare(int code);
@@ -77,6 +92,15 @@ struct ONEXIT
 	Datum		arg;
 };
 
+#ifdef USE_FASTPG
+static _Thread_local struct ONEXIT on_proc_exit_list[MAX_ON_EXITS];
+static _Thread_local struct ONEXIT on_shmem_exit_list[MAX_ON_EXITS];
+static _Thread_local struct ONEXIT before_shmem_exit_list[MAX_ON_EXITS];
+
+static _Thread_local int on_proc_exit_index,
+			on_shmem_exit_index,
+			before_shmem_exit_index;
+#else
 static struct ONEXIT on_proc_exit_list[MAX_ON_EXITS];
 static struct ONEXIT on_shmem_exit_list[MAX_ON_EXITS];
 static struct ONEXIT before_shmem_exit_list[MAX_ON_EXITS];
@@ -84,6 +108,7 @@ static struct ONEXIT before_shmem_exit_list[MAX_ON_EXITS];
 static int	on_proc_exit_index,
 			on_shmem_exit_index,
 			before_shmem_exit_index;
+#endif
 
 
 /* ----------------------------------------------------------------
@@ -305,6 +330,28 @@ atexit_callback(void)
 	proc_exit_prepare(-1);
 }
 
+#ifdef USE_FASTPG
+static void
+fastpg_setup_atexit_callback(void)
+{
+	atexit(atexit_callback);
+}
+#endif
+
+static void
+ensure_atexit_callback_setup(void)
+{
+#ifdef USE_FASTPG
+	pthread_once(&fastpg_atexit_callback_once, fastpg_setup_atexit_callback);
+#else
+	if (!atexit_callback_setup)
+	{
+		atexit(atexit_callback);
+		atexit_callback_setup = true;
+	}
+#endif
+}
+
 /* ----------------------------------------------------------------
  *		on_proc_exit
  *
@@ -325,11 +372,7 @@ on_proc_exit(pg_on_exit_callback function, Datum arg)
 
 	++on_proc_exit_index;
 
-	if (!atexit_callback_setup)
-	{
-		atexit(atexit_callback);
-		atexit_callback_setup = true;
-	}
+	ensure_atexit_callback_setup();
 }
 
 /* ----------------------------------------------------------------
@@ -353,11 +396,7 @@ before_shmem_exit(pg_on_exit_callback function, Datum arg)
 
 	++before_shmem_exit_index;
 
-	if (!atexit_callback_setup)
-	{
-		atexit(atexit_callback);
-		atexit_callback_setup = true;
-	}
+	ensure_atexit_callback_setup();
 }
 
 /* ----------------------------------------------------------------
@@ -381,11 +420,7 @@ on_shmem_exit(pg_on_exit_callback function, Datum arg)
 
 	++on_shmem_exit_index;
 
-	if (!atexit_callback_setup)
-	{
-		atexit(atexit_callback);
-		atexit_callback_setup = true;
-	}
+	ensure_atexit_callback_setup();
 }
 
 /* ----------------------------------------------------------------

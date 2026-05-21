@@ -26,6 +26,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include <pthread.h>
+#endif
 #include <sys/file.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -142,6 +145,117 @@ typedef struct relidcacheent
 
 static HTAB *RelationIdCache;
 
+#ifdef USE_FASTPG
+static pthread_once_t fastpg_catalog_cache_lock_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t fastpg_catalog_cache_lock;
+
+typedef struct FastPgLocalRelRef
+{
+	Relation	rel;
+	int			count;
+	struct FastPgLocalRelRef *next;
+} FastPgLocalRelRef;
+
+static _Thread_local FastPgLocalRelRef *fastpg_local_relrefs = NULL;
+
+static void
+FastPgInitCatalogCacheLock(void)
+{
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&fastpg_catalog_cache_lock, &attr);
+	pthread_mutexattr_destroy(&attr);
+}
+
+void
+FastPgCatalogCacheLock(void)
+{
+	pthread_once(&fastpg_catalog_cache_lock_once, FastPgInitCatalogCacheLock);
+	pthread_mutex_lock(&fastpg_catalog_cache_lock);
+}
+
+void
+FastPgCatalogCacheUnlock(void)
+{
+	pthread_mutex_unlock(&fastpg_catalog_cache_lock);
+}
+
+static void
+FastPgRememberLocalRelationRef(Relation rel)
+{
+	FastPgLocalRelRef *entry;
+
+	for (entry = fastpg_local_relrefs; entry != NULL; entry = entry->next)
+	{
+		if (entry->rel == rel)
+		{
+			entry->count++;
+			return;
+		}
+	}
+
+	entry = malloc(sizeof(FastPgLocalRelRef));
+	if (entry == NULL)
+		elog(ERROR, "out of memory");
+	entry->rel = rel;
+	entry->count = 1;
+	entry->next = fastpg_local_relrefs;
+	fastpg_local_relrefs = entry;
+}
+
+static void
+FastPgForgetLocalRelationRef(Relation rel)
+{
+	FastPgLocalRelRef **link = &fastpg_local_relrefs;
+
+	while (*link != NULL)
+	{
+		FastPgLocalRelRef *entry = *link;
+
+		if (entry->rel == rel)
+		{
+			entry->count--;
+			if (entry->count <= 0)
+			{
+				*link = entry->next;
+				free(entry);
+			}
+			return;
+		}
+		link = &entry->next;
+	}
+}
+
+static int
+FastPgCurrentBackendRelationRefCount(Relation rel)
+{
+	FastPgLocalRelRef *entry;
+
+	for (entry = fastpg_local_relrefs; entry != NULL; entry = entry->next)
+	{
+		if (entry->rel == rel)
+			return entry->count;
+	}
+	return 0;
+}
+
+static bool
+FastPgCurrentBackendOwnsAllRelationRefs(Relation rel)
+{
+	int			local_refs = FastPgCurrentBackendRelationRefCount(rel);
+
+	return local_refs > 0 && rel->rd_refcnt == local_refs;
+}
+
+static void
+FastPgMarkSharedRelationInvalid(Relation relation)
+{
+	relation->rd_isvalid = false;
+}
+#endif
+
 /*
  * This flag is false until we have prepared the critical relcache entries
  * that are needed to do indexscans on the tables read by relcache building.
@@ -191,9 +305,15 @@ static int	in_progress_list_maxlen;
  * cleanup processing must be idempotent.
  */
 #define MAX_EOXACT_LIST 32
+#ifdef USE_FASTPG
+static _Thread_local Oid eoxact_list[MAX_EOXACT_LIST];
+static _Thread_local int eoxact_list_len = 0;
+static _Thread_local bool eoxact_list_overflowed = false;
+#else
 static Oid	eoxact_list[MAX_EOXACT_LIST];
 static int	eoxact_list_len = 0;
 static bool eoxact_list_overflowed = false;
+#endif
 
 #define EOXactListAdd(rel) \
 	do { \
@@ -208,9 +328,15 @@ static bool eoxact_list_overflowed = false;
  * cleanup work.  The array expands as needed; there is no hashtable because
  * we don't need to access individual items except at EOXact.
  */
+#ifdef USE_FASTPG
+static _Thread_local TupleDesc *EOXactTupleDescArray;
+static _Thread_local int NextEOXactTupleDescNum = 0;
+static _Thread_local int EOXactTupleDescArrayLen = 0;
+#else
 static TupleDesc *EOXactTupleDescArray;
 static int	NextEOXactTupleDescNum = 0;
 static int	EOXactTupleDescArrayLen = 0;
+#endif
 
 /*
  *		macros to manipulate the lookup hashtable
@@ -2760,8 +2886,8 @@ AssertCouldGetRelation(void)
  *		Caller should eventually decrement count.  (Usually,
  *		that happens by calling RelationClose().)
  */
-Relation
-RelationIdGetRelation(Oid relationId)
+static Relation
+RelationIdGetRelationInternal(Oid relationId)
 {
 	Relation	rd;
 
@@ -2785,7 +2911,25 @@ RelationIdGetRelation(Oid relationId)
 		/* revalidate cache entry if necessary */
 		if (!rd->rd_isvalid)
 		{
+#ifdef USE_FASTPG
+			if (!rd->rd_isnailed && !FastPgCurrentBackendOwnsAllRelationRefs(rd))
+			{
+				RelationDecrementReferenceCount(rd);
+				rd = RelationBuildDesc(relationId, true);
+				if (RelationIsValid(rd))
+					RelationIncrementReferenceCount(rd);
+				return rd;
+			}
+#endif
 			RelationRebuildRelation(rd);
+
+#ifdef USE_FASTPG
+			if (!rd->rd_isvalid)
+			{
+				RelationDecrementReferenceCount(rd);
+				return NULL;
+			}
+#endif
 
 			/*
 			 * Normally entries need to be valid here, but before the relcache
@@ -2808,6 +2952,30 @@ RelationIdGetRelation(Oid relationId)
 	if (RelationIsValid(rd))
 		RelationIncrementReferenceCount(rd);
 	return rd;
+}
+
+Relation
+RelationIdGetRelation(Oid relationId)
+{
+	Relation	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = RelationIdGetRelationInternal(relationId);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 /*
@@ -2861,10 +3029,28 @@ ResourceOwnerForgetRelationRef(ResourceOwner owner, Relation rel)
 void
 RelationIncrementReferenceCount(Relation rel)
 {
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 	rel->rd_refcnt += 1;
+#ifdef USE_FASTPG
+	FastPgRememberLocalRelationRef(rel);
+#endif
 	if (!IsBootstrapProcessingMode())
 		ResourceOwnerRememberRelationRef(CurrentResourceOwner, rel);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -2874,10 +3060,28 @@ RelationIncrementReferenceCount(Relation rel)
 void
 RelationDecrementReferenceCount(Relation rel)
 {
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	Assert(rel->rd_refcnt > 0);
 	rel->rd_refcnt -= 1;
+#ifdef USE_FASTPG
+	FastPgForgetLocalRelationRef(rel);
+#endif
 	if (!IsBootstrapProcessingMode())
 		ResourceOwnerForgetRelationRef(CurrentResourceOwner, rel);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -2894,10 +3098,25 @@ RelationDecrementReferenceCount(Relation rel)
 void
 RelationClose(Relation relation)
 {
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	/* Note: no locking manipulations needed */
 	RelationDecrementReferenceCount(relation);
 
 	RelationCloseCleanup(relation);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 static void
@@ -3354,6 +3573,12 @@ RelationRebuildRelation(Relation relation)
 			if (HistoricSnapshotActive())
 				return;
 
+#ifdef USE_FASTPG
+			relation->rd_droppedSubid = GetCurrentSubTransactionId();
+			RelationInvalidateRelation(relation);
+			return;
+#endif
+
 			/*
 			 * This shouldn't happen as dropping a relation is intended to be
 			 * impossible if still referenced (cf. CheckTableNotInUse()). But
@@ -3501,6 +3726,12 @@ RelationRebuildRelation(Relation relation)
 static void
 RelationFlushRelation(Relation relation)
 {
+	if (RelationIsMapped(relation))
+	{
+		RelationCloseSmgr(relation);
+		RelationInitPhysicalAddr(relation);
+	}
+
 	if (relation->rd_createSubid != InvalidSubTransactionId ||
 		relation->rd_firstRelfilelocatorSubid != InvalidSubTransactionId)
 	{
@@ -3509,6 +3740,13 @@ RelationFlushRelation(Relation relation)
 		 * forget the "new" status of the relation.  Ditto for the
 		 * new-relfilenumber status.
 		 */
+#ifdef USE_FASTPG
+		if (!FastPgCurrentBackendOwnsAllRelationRefs(relation))
+		{
+			FastPgMarkSharedRelationInvalid(relation);
+			return;
+		}
+#endif
 		if (IsTransactionState() && relation->rd_droppedSubid == InvalidSubTransactionId)
 		{
 			/*
@@ -3544,10 +3782,22 @@ RelationFlushRelation(Relation relation)
 		 * purposes; at worst we might be behind on statistics updates or the
 		 * like.  (See also CheckTableNotInUse() and its callers.)
 		 */
-		if (RelationHasReferenceCountZero(relation))
+		if (relation->rd_isnailed && relation->rd_refcnt <= 1)
+		{
+			/*
+			 * Nailed catalog descriptors must stay present; rebuilding them from
+			 * scratch can recurse while trying to scan pg_class.
+			 */
+			RelationInvalidateRelation(relation);
+		}
+		else if (RelationHasReferenceCountZero(relation))
 			RelationClearRelation(relation);
 		else if (!IsTransactionState())
 			RelationInvalidateRelation(relation);
+#ifdef USE_FASTPG
+		else if (!FastPgCurrentBackendOwnsAllRelationRefs(relation))
+			FastPgMarkSharedRelationInvalid(relation);
+#endif
 		else if (relation->rd_isnailed && relation->rd_refcnt == 1)
 		{
 			/*
@@ -3564,8 +3814,8 @@ RelationFlushRelation(Relation relation)
 /*
  * RelationForgetRelation - caller reports that it dropped the relation
  */
-void
-RelationForgetRelation(Oid rid)
+static void
+RelationForgetRelationInternal(Oid rid)
 {
 	Relation	relation;
 
@@ -3594,6 +3844,27 @@ RelationForgetRelation(Oid rid)
 		RelationClearRelation(relation);
 }
 
+void
+RelationForgetRelation(Oid rid)
+{
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		RelationForgetRelationInternal(rid);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+}
+
 /*
  *		RelationCacheInvalidateEntry
  *
@@ -3609,8 +3880,8 @@ RelationForgetRelation(Oid rid)
  * have the same effects during CommandCounterIncrement for both
  * local and nonlocal relations.
  */
-void
-RelationCacheInvalidateEntry(Oid relationId)
+static void
+RelationCacheInvalidateEntryInternal(Oid relationId)
 {
 	Relation	relation;
 
@@ -3629,6 +3900,27 @@ RelationCacheInvalidateEntry(Oid relationId)
 			if (in_progress_list[i].reloid == relationId)
 				in_progress_list[i].invalidated = true;
 	}
+}
+
+void
+RelationCacheInvalidateEntry(Oid relationId)
+{
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		RelationCacheInvalidateEntryInternal(relationId);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -3665,8 +3957,8 @@ RelationCacheInvalidateEntry(Oid relationId)
  *	 don't do this if called as part of debug_discard_caches.  Otherwise,
  *	 RelationBuildDesc() would become an infinite loop.
  */
-void
-RelationCacheInvalidate(bool debug_discard)
+static void
+RelationCacheInvalidateInternal(bool debug_discard)
 {
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
@@ -3764,6 +4056,10 @@ RelationCacheInvalidate(bool debug_discard)
 		relation = (Relation) lfirst(l);
 		if (!IsTransactionState() || (relation->rd_isnailed && relation->rd_refcnt == 1))
 			RelationInvalidateRelation(relation);
+#ifdef USE_FASTPG
+		else if (!FastPgCurrentBackendOwnsAllRelationRefs(relation))
+			FastPgMarkSharedRelationInvalid(relation);
+#endif
 		else
 			RelationRebuildRelation(relation);
 	}
@@ -3773,6 +4069,10 @@ RelationCacheInvalidate(bool debug_discard)
 		relation = (Relation) lfirst(l);
 		if (!IsTransactionState() || (relation->rd_isnailed && relation->rd_refcnt == 1))
 			RelationInvalidateRelation(relation);
+#ifdef USE_FASTPG
+		else if (!FastPgCurrentBackendOwnsAllRelationRefs(relation))
+			FastPgMarkSharedRelationInvalid(relation);
+#endif
 		else
 			RelationRebuildRelation(relation);
 	}
@@ -3906,8 +4206,8 @@ AssertPendingSyncs_RelationCache(void)
  * cleanup when the current transaction created any relations or made use
  * of forced index lists.
  */
-void
-AtEOXact_RelationCache(bool isCommit)
+static void
+AtEOXact_RelationCacheInternal(bool isCommit)
 {
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
@@ -3966,6 +4266,27 @@ AtEOXact_RelationCache(bool isCommit)
 	eoxact_list_overflowed = false;
 	NextEOXactTupleDescNum = 0;
 	EOXactTupleDescArrayLen = 0;
+}
+
+void
+AtEOXact_RelationCache(bool isCommit)
+{
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		AtEOXact_RelationCacheInternal(isCommit);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -4051,6 +4372,27 @@ AtEOXact_cleanup(Relation relation, bool isCommit)
 	}
 }
 
+void
+RelationCacheInvalidate(bool debug_discard)
+{
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		RelationCacheInvalidateInternal(debug_discard);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+}
+
 /*
  * AtEOSubXact_RelationCache
  *
@@ -4058,9 +4400,9 @@ AtEOXact_cleanup(Relation relation, bool isCommit)
  *
  * Note: this must be called *before* processing invalidation messages.
  */
-void
-AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
-						  SubTransactionId parentSubid)
+static void
+AtEOSubXact_RelationCacheInternal(bool isCommit, SubTransactionId mySubid,
+								  SubTransactionId parentSubid)
 {
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
@@ -4103,6 +4445,28 @@ AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
 	}
 
 	/* Don't reset the list; we still need more cleanup later */
+}
+
+void
+AtEOSubXact_RelationCache(bool isCommit, SubTransactionId mySubid,
+						  SubTransactionId parentSubid)
+{
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		AtEOSubXact_RelationCacheInternal(isCommit, mySubid, parentSubid);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -4203,6 +4567,9 @@ FastPgReconcileRelcacheAfterCatalogRollback(void)
 	HASH_SEQ_STATUS status;
 	RelIdCacheEnt *idhentry;
 
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
 	hash_seq_init(&status, RelationIdCache);
 	while ((idhentry = (RelIdCacheEnt *) hash_seq_search(&status)) != NULL)
 	{
@@ -4240,6 +4607,14 @@ FastPgReconcileRelcacheAfterCatalogRollback(void)
 			RelationClearRelation(relation);
 		}
 	}
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
 }
 #endif
 
@@ -4249,19 +4624,19 @@ FastPgReconcileRelcacheAfterCatalogRollback(void)
  *			Build a relcache entry for an about-to-be-created relation,
  *			and enter it into the relcache.
  */
-Relation
-RelationBuildLocalRelation(const char *relname,
-						   Oid relnamespace,
-						   TupleDesc tupDesc,
-						   Oid relid,
-						   Oid accessmtd,
-						   RelFileNumber relfilenumber,
-						   Oid reltablespace,
-						   bool shared_relation,
-						   bool mapped_relation,
-						   char relpersistence,
-						   char relkind,
-						   Oid relrewrite)
+static Relation
+RelationBuildLocalRelationInternal(const char *relname,
+								   Oid relnamespace,
+								   TupleDesc tupDesc,
+								   Oid relid,
+								   Oid accessmtd,
+								   RelFileNumber relfilenumber,
+								   Oid reltablespace,
+								   bool shared_relation,
+								   bool mapped_relation,
+								   char relpersistence,
+								   char relkind,
+								   Oid relrewrite)
 {
 	Relation	rel;
 	MemoryContext oldcxt;
@@ -4496,6 +4871,52 @@ RelationBuildLocalRelation(const char *relname,
 	return rel;
 }
 
+Relation
+RelationBuildLocalRelation(const char *relname,
+						   Oid relnamespace,
+						   TupleDesc tupDesc,
+						   Oid relid,
+						   Oid accessmtd,
+						   RelFileNumber relfilenumber,
+						   Oid reltablespace,
+						   bool shared_relation,
+						   bool mapped_relation,
+						   char relpersistence,
+						   char relkind,
+						   Oid relrewrite)
+{
+	Relation	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = RelationBuildLocalRelationInternal(relname,
+													relnamespace,
+													tupDesc,
+													relid,
+													accessmtd,
+													relfilenumber,
+													reltablespace,
+													shared_relation,
+													mapped_relation,
+													relpersistence,
+													relkind,
+													relrewrite);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
+}
+
 
 /*
  * RelationSetNewRelfilenumber
@@ -4698,6 +5119,25 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	 * cause the relcache entry to get updated, too.
 	 */
 	CommandCounterIncrement();
+
+#ifdef USE_FASTPG
+	/*
+	 * FastPG shares relcache entries across logical backends.  Its
+	 * invalidation path can leave new-relfilenumber entries invalid instead
+	 * of rebuilding them immediately, to avoid rebuilding another session's
+	 * in-transaction entry.  Here, however, we know this backend just changed
+	 * this Relation and will keep using the same descriptor (for example,
+	 * REINDEX builds immediately after assigning the index a new file).  Bring
+	 * this specific descriptor forward so later storage access uses the new
+	 * empty relfilenumber rather than the old file.
+	 */
+	if (!relation->rd_isvalid &&
+		relation->rd_droppedSubid == InvalidSubTransactionId &&
+		!RelationHasReferenceCountZero(relation) &&
+		IsTransactionState() &&
+		FastPgCurrentBackendOwnsAllRelationRefs(relation))
+		RelationRebuildRelation(relation);
+#endif
 
 	RelationAssumeNewRelfilelocator(relation);
 }
@@ -7810,6 +8250,11 @@ ResOwnerReleaseRelation(Datum res)
 {
 	Relation	rel = (Relation) DatumGetPointer(res);
 
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	/*
 	 * This reference has already been removed from the resource owner, so
 	 * just decrement reference count without calling
@@ -7817,6 +8262,19 @@ ResOwnerReleaseRelation(Datum res)
 	 */
 	Assert(rel->rd_refcnt > 0);
 	rel->rd_refcnt -= 1;
+#ifdef USE_FASTPG
+	FastPgForgetLocalRelationRef(rel);
+#endif
 
 	RelationCloseCleanup((Relation) DatumGetPointer(res));
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }

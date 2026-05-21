@@ -102,7 +102,11 @@ int			synchronous_commit = SYNCHRONOUS_COMMIT_ON;
  * directly access the tableam or heap APIs because we are checking for the
  * concurrent aborts only in systable_* APIs.
  */
+#ifdef USE_FASTPG
+_Thread_local TransactionId CheckXidAlive = InvalidTransactionId;
+#else
 TransactionId CheckXidAlive = InvalidTransactionId;
+#endif
 bool		bsysscan = false;
 
 /*
@@ -128,9 +132,15 @@ bool		bsysscan = false;
  * The XIDs are stored sorted in numerical order (not logical order) to make
  * lookups as fast as possible.
  */
+#ifdef USE_FASTPG
+static _Thread_local FullTransactionId XactTopFullTransactionId = {InvalidTransactionId};
+static _Thread_local int nParallelCurrentXids = 0;
+static _Thread_local TransactionId *ParallelCurrentXids;
+#else
 static FullTransactionId XactTopFullTransactionId = {InvalidTransactionId};
 static int	nParallelCurrentXids = 0;
 static TransactionId *ParallelCurrentXids;
+#endif
 
 /*
  * Miscellaneous flag bits to record events which occur on the top level
@@ -139,7 +149,11 @@ static TransactionId *ParallelCurrentXids;
  * globally accessible, so can be set from anywhere in the code that requires
  * recording flags.
  */
+#ifdef USE_FASTPG
+_Thread_local int MyXactFlags;
+#else
 int			MyXactFlags;
+#endif
 
 /*
  *	transaction states - transaction state from server perspective
@@ -250,11 +264,19 @@ typedef struct SerializedTransactionState
  * block.  It will point to TopTransactionStateData when not in a
  * transaction at all, or when in a top-level transaction.
  */
+#ifdef USE_FASTPG
+static _Thread_local TransactionStateData TopTransactionStateData = {
+	.state = TRANS_DEFAULT,
+	.blockState = TBLOCK_DEFAULT,
+	.topXidLogged = false,
+};
+#else
 static TransactionStateData TopTransactionStateData = {
 	.state = TRANS_DEFAULT,
 	.blockState = TBLOCK_DEFAULT,
 	.topXidLogged = false,
 };
+#endif
 
 #ifdef USE_FASTPG
 static PGPROC FastPgStandaloneProc;
@@ -349,18 +371,33 @@ FastPgEnsureStandaloneLocalTransactionId(void)
  * unreportedXids holds XIDs of all subtransactions that have not yet been
  * reported in an XLOG_XACT_ASSIGNMENT record.
  */
+#ifdef USE_FASTPG
+static _Thread_local int nUnreportedXids;
+static _Thread_local TransactionId unreportedXids[PGPROC_MAX_CACHED_SUBXIDS];
+#else
 static int	nUnreportedXids;
 static TransactionId unreportedXids[PGPROC_MAX_CACHED_SUBXIDS];
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local TransactionState CurrentTransactionState = NULL;
+#else
 static TransactionState CurrentTransactionState = &TopTransactionStateData;
+#endif
 
 /*
  * The subtransaction ID and command ID assignment counters are global
  * to a whole transaction, so we do not keep them in the state stack.
  */
+#ifdef USE_FASTPG
+static _Thread_local SubTransactionId currentSubTransactionId;
+static _Thread_local CommandId currentCommandId;
+static _Thread_local bool currentCommandIdUsed;
+#else
 static SubTransactionId currentSubTransactionId;
 static CommandId currentCommandId;
 static bool currentCommandIdUsed;
+#endif
 
 /*
  * xactStartTimestamp is the value of transaction_timestamp().
@@ -372,20 +409,34 @@ static bool currentCommandIdUsed;
  * These do not change as we enter and exit subtransactions, so we don't
  * keep them inside the TransactionState stack.
  */
+#ifdef USE_FASTPG
+static _Thread_local TimestampTz xactStartTimestamp;
+static _Thread_local TimestampTz stmtStartTimestamp;
+static _Thread_local TimestampTz xactStopTimestamp;
+#else
 static TimestampTz xactStartTimestamp;
 static TimestampTz stmtStartTimestamp;
 static TimestampTz xactStopTimestamp;
+#endif
 
 /*
  * GID to be used for preparing the current transaction.  This is also
  * global to a whole transaction, so we don't keep it in the state stack.
  */
+#ifdef USE_FASTPG
+static _Thread_local char *prepareGID;
+#else
 static char *prepareGID;
+#endif
 
 /*
  * Some commands want to force synchronous commit.
  */
+#ifdef USE_FASTPG
+static _Thread_local bool forceSyncCommit = false;
+#else
 static bool forceSyncCommit = false;
+#endif
 
 /* Flag for logging statements in a transaction. */
 bool		xact_is_sampled = false;
@@ -395,7 +446,11 @@ bool		xact_is_sampled = false;
  * at startup to ensure that AbortTransaction and AbortSubTransaction can work
  * when we've run out of memory.
  */
+#ifdef USE_FASTPG
+static _Thread_local MemoryContext TransactionAbortContext = NULL;
+#else
 static MemoryContext TransactionAbortContext = NULL;
+#endif
 
 /*
  * List of add-on start- and end-of-xact callbacks
@@ -465,6 +520,38 @@ static void ShowTransactionState(const char *str);
 static void ShowTransactionStateRec(const char *str, TransactionState s);
 static const char *BlockStateAsString(TBlockState blockState);
 static const char *TransStateAsString(TransState state);
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadTransactionState(void)
+{
+	if (CurrentTransactionState != NULL)
+		return;
+
+	memset(&TopTransactionStateData, 0, sizeof(TopTransactionStateData));
+	TopTransactionStateData.state = TRANS_DEFAULT;
+	TopTransactionStateData.blockState = TBLOCK_DEFAULT;
+	TopTransactionStateData.topXidLogged = false;
+	CurrentTransactionState = &TopTransactionStateData;
+	XactTopFullTransactionId = InvalidFullTransactionId;
+	nParallelCurrentXids = 0;
+	ParallelCurrentXids = NULL;
+	nUnreportedXids = 0;
+	currentSubTransactionId = InvalidSubTransactionId;
+	currentCommandId = FirstCommandId;
+	currentCommandIdUsed = false;
+	xactStartTimestamp = 0;
+	stmtStartTimestamp = 0;
+	xactStopTimestamp = 0;
+	prepareGID = NULL;
+	forceSyncCommit = false;
+	MyXactFlags = 0;
+	TransactionAbortContext = NULL;
+	CheckXidAlive = InvalidTransactionId;
+	FastPgStandaloneProcInitialized = false;
+	FastPgStandaloneNextLocalTransactionId = 1;
+}
+#endif
 
 
 /* ----------------------------------------------------------------
@@ -739,8 +826,13 @@ MarkSubxactTopXidLogged(void)
 TransactionId
 GetStableLatestTransactionId(void)
 {
+#ifdef USE_FASTPG
+	static _Thread_local LocalTransactionId lxid = InvalidLocalTransactionId;
+	static _Thread_local TransactionId stablexid = InvalidTransactionId;
+#else
 	static LocalTransactionId lxid = InvalidLocalTransactionId;
 	static TransactionId stablexid = InvalidTransactionId;
+#endif
 
 	if (lxid != MyProc->vxid.lxid)
 	{

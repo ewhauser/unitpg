@@ -31,6 +31,9 @@
 #include "common/hashfn.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
+#ifdef USE_FASTPG
+#include "utils/relcache.h"
+#endif
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 
@@ -622,8 +625,23 @@ IncrTupleDescRefCount(TupleDesc tupdesc)
 	Assert(tupdesc->tdrefcount >= 0);
 
 	ResourceOwnerEnlarge(CurrentResourceOwner);
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	tupdesc->tdrefcount++;
 	ResourceOwnerRememberTupleDesc(CurrentResourceOwner, tupdesc);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -639,9 +657,24 @@ DecrTupleDescRefCount(TupleDesc tupdesc)
 {
 	Assert(tupdesc->tdrefcount > 0);
 
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	ResourceOwnerForgetTupleDesc(CurrentResourceOwner, tupdesc);
 	if (--tupdesc->tdrefcount == 0)
 		FreeTupleDesc(tupdesc);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -1305,8 +1338,23 @@ ResOwnerReleaseTupleDesc(Datum res)
 
 	/* Like DecrTupleDescRefCount, but don't call ResourceOwnerForget() */
 	Assert(tupdesc->tdrefcount > 0);
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	if (--tupdesc->tdrefcount == 0)
 		FreeTupleDesc(tupdesc);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 static char *

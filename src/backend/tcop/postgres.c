@@ -94,7 +94,11 @@
 const char *debug_query_string; /* client-supplied query string */
 
 /* Note: whereToSendOutput is initialized for the bootstrap/standalone case */
+#ifdef USE_FASTPG
+_Thread_local CommandDest whereToSendOutput = DestDebug;
+#else
 CommandDest whereToSendOutput = DestDebug;
+#endif
 
 /* flag for logging end of session */
 bool		Log_disconnections = false;

@@ -21,6 +21,7 @@
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
+#include "access/tupdesc.h"
 #include "access/xact.h"
 #include "catalog/index.h"
 #include "catalog/indexing.h"
@@ -114,16 +115,64 @@ FastPgCatalogTypeOutputsOid(Oid type_oid)
 	}
 }
 
+static TupleDesc
+FastPgVirtualCatalogTupleDesc(Oid relation_oid)
+{
+	FastPgRustCatalogRelation relation;
+	TupleDesc	tupdesc;
+
+	if (!fastpg_rust_catalog_relation_by_oid((uint32_t) relation_oid,
+											 &relation))
+		return NULL;
+
+	tupdesc = CreateTemplateTupleDesc(relation.column_count);
+	for (uint16_t index = 0; index < relation.column_count; index++)
+	{
+		FastPgRustCatalogColumn column;
+
+		if (!fastpg_rust_catalog_relation_column_by_index((uint32_t) relation_oid,
+														  (size_t) index,
+														  &column))
+		{
+			FreeTupleDesc(tupdesc);
+			return NULL;
+		}
+
+		TupleDescInitBuiltinEntry(tupdesc,
+								  (AttrNumber) (index + 1),
+								  column.name,
+								  (Oid) column.type_oid,
+								  column.type_mod,
+								  0);
+		TupleDescAttr(tupdesc, index)->attnotnull = column.is_not_null != 0;
+	}
+
+	return tupdesc;
+}
+
 static void
 FastPgCatalogTupleToTextArrays(Relation heapRel,
 							   HeapTuple tup,
 							   const char ***values_out,
 							   uint8_t **is_null_out,
-							   uint64_t *row_id_out)
+							   uint64_t *row_id_out,
+							   size_t *column_count_out)
 {
 	TupleDesc	tupdesc = RelationGetDescr(heapRel);
+	TupleDesc	virtual_tupdesc = NULL;
 	const char **values;
 	uint8_t    *is_null;
+
+	if (tupdesc == NULL || tupdesc->natts == 0)
+	{
+		virtual_tupdesc = FastPgVirtualCatalogTupleDesc(RelationGetRelid(heapRel));
+		if (virtual_tupdesc != NULL)
+			tupdesc = virtual_tupdesc;
+	}
+
+	if (tupdesc == NULL || tupdesc->natts == 0)
+		elog(ERROR, "fastpg catalog relation %u has no tuple descriptor",
+			 RelationGetRelid(heapRel));
 
 	values = palloc0_array(const char *, tupdesc->natts);
 	is_null = palloc0_array(uint8_t, tupdesc->natts);
@@ -160,6 +209,10 @@ FastPgCatalogTupleToTextArrays(Relation heapRel,
 
 	*values_out = values;
 	*is_null_out = is_null;
+	if (column_count_out != NULL)
+		*column_count_out = (size_t) tupdesc->natts;
+	if (virtual_tupdesc != NULL)
+		FreeTupleDesc(virtual_tupdesc);
 }
 
 static void
@@ -169,16 +222,30 @@ FastPgCatalogUpsertTuple(Relation heapRel, HeapTuple tup, uint64_t row_id)
 	const char **values;
 	uint8_t    *is_null;
 	uint64_t	stored_row_id = row_id;
+	size_t		column_count = tupdesc != NULL ? (size_t) tupdesc->natts : 0;
 
-	FastPgCatalogTupleToTextArrays(heapRel, tup, &values, &is_null, &stored_row_id);
+	FastPgCatalogTupleToTextArrays(heapRel, tup, &values, &is_null,
+								   &stored_row_id, &column_count);
 	if (!fastpg_rust_catalog_upsert_row((uint32_t) RelationGetRelid(heapRel),
 										stored_row_id,
 										values,
 										is_null,
-										(size_t) tupdesc->natts,
+										column_count,
 										&stored_row_id))
+	{
+		char		sqlstate[6] = {0};
+		char		message[512] = {0};
+
+		if (fastpg_rust_catalog_last_error(sqlstate, sizeof(sqlstate),
+										   message, sizeof(message)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("fastpg failed to capture catalog row for relation %u",
+							RelationGetRelid(heapRel)),
+					 errdetail("%s", message)));
 		elog(ERROR, "fastpg failed to capture catalog row for relation %u",
 			 RelationGetRelid(heapRel));
+	}
 	if (!FastPgCatalogRowIdToTid(stored_row_id, &tup->t_self))
 		elog(ERROR, "fastpg catalog row id %llu cannot be represented as a CTID",
 			 (unsigned long long) stored_row_id);
@@ -197,9 +264,22 @@ FastPgCatalogDeleteTuple(Relation heapRel, const ItemPointerData *tid)
 			 ItemPointerGetOffsetNumberNoCheck(tid),
 			 RelationGetRelid(heapRel));
 	if (!fastpg_rust_catalog_delete_row((uint32_t) RelationGetRelid(heapRel), row_id))
+	{
+		char		sqlstate[6] = {0};
+		char		message[512] = {0};
+
+		if (fastpg_rust_catalog_last_error(sqlstate, sizeof(sqlstate),
+										   message, sizeof(message)))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("fastpg failed to delete catalog row %llu for relation %u",
+							(unsigned long long) row_id,
+							RelationGetRelid(heapRel)),
+					 errdetail("%s", message)));
 		elog(ERROR, "fastpg failed to delete catalog row %llu for relation %u",
 			 (unsigned long long) row_id,
 			 RelationGetRelid(heapRel));
+	}
 	FastPgInvalidateVirtualCatalog(heapRel);
 }
 #endif

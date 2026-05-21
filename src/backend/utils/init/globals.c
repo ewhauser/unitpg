@@ -93,17 +93,29 @@ ProcNumber	MyProcNumber = INVALID_PROC_NUMBER;
 
 ProcNumber	ParallelLeaderProcNumber = INVALID_PROC_NUMBER;
 
+#ifdef USE_FASTPG
+_Thread_local Oid MyDatabaseId = InvalidOid;
+
+_Thread_local Oid MyDatabaseTableSpace = InvalidOid;
+
+_Thread_local bool MyDatabaseHasLoginEventTriggers = false;
+#else
 Oid			MyDatabaseId = InvalidOid;
 
 Oid			MyDatabaseTableSpace = InvalidOid;
 
 bool		MyDatabaseHasLoginEventTriggers = false;
+#endif
 
 /*
  * DatabasePath is the path (relative to DataDir) of my database's
  * primary directory, ie, its directory in the default tablespace.
  */
+#ifdef USE_FASTPG
+_Thread_local char *DatabasePath = NULL;
+#else
 char	   *DatabasePath = NULL;
+#endif
 
 pid_t		PostmasterPid = 0;
 
