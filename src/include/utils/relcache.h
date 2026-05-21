@@ -160,6 +160,12 @@ extern void RelationCacheInitFilePreInvalidate(void);
 extern void RelationCacheInitFilePostInvalidate(void);
 extern void RelationCacheInitFileRemove(void);
 
+/* FastPG runs backend-local PostgreSQL cache code in one process. */
+#ifdef USE_FASTPG
+extern void FastPgCatalogCacheLock(void);
+extern void FastPgCatalogCacheUnlock(void);
+#endif
+
 /* should be used only by relcache.c and catcache.c */
 extern PGDLLIMPORT bool criticalRelcachesBuilt;
 

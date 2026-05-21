@@ -202,7 +202,7 @@ impl FastPgWireHandler {
         query: String,
     ) -> PgWireResult<Option<QueryDescription>> {
         self.execution
-            .run_blocking(move || session.describe(&query))
+            .run_session_blocking(session, move |session| session.describe(&query))
             .await
     }
 
@@ -213,7 +213,7 @@ impl FastPgWireHandler {
         parameters: Vec<Value>,
     ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
         self.execution
-            .run_blocking(move || {
+            .run_session_blocking(session, move |session| {
                 let execution = session.execute(&query, &parameters);
                 let notices = session.take_notices();
                 (execution, notices)
@@ -223,7 +223,7 @@ impl FastPgWireHandler {
 
     async fn push_copy_data(&self, session: Arc<SessionState>, data: Vec<u8>) -> PgWireResult<()> {
         self.execution
-            .run_blocking(move || session.push_copy_data(&data))
+            .run_session_blocking(session, move |session| session.push_copy_data(&data))
             .await?
             .map_err(copy_data_error)
     }
@@ -233,7 +233,7 @@ impl FastPgWireHandler {
         session: Arc<SessionState>,
     ) -> PgWireResult<(Result<usize, String>, Vec<QueryNotice>)> {
         self.execution
-            .run_blocking(move || {
+            .run_session_blocking(session, move |session| {
                 let result = session.finish_active_copy();
                 let notices = session.take_notices();
                 (result, notices)
@@ -276,7 +276,7 @@ impl FastPgWireHandler {
 
     async fn abort_copy(&self, session: Arc<SessionState>) -> PgWireResult<()> {
         self.execution
-            .run_blocking(move || session.abort_active_copy())
+            .run_session_blocking(session, move |session| session.abort_active_copy())
             .await
     }
 }
@@ -1625,6 +1625,7 @@ impl ExecutionDispatcher {
         }
     }
 
+    #[cfg(test)]
     async fn run_blocking<R>(
         &self,
         operation: impl FnOnce() -> R + Send + 'static,
@@ -1641,6 +1642,27 @@ impl ExecutionDispatcher {
         Ok(tokio::task::block_in_place(move || {
             let _permit = permit;
             operation()
+        }))
+    }
+
+    async fn run_session_blocking<R>(
+        &self,
+        session: Arc<SessionState>,
+        operation: impl FnOnce(Arc<SessionState>) -> R + Send + 'static,
+    ) -> PgWireResult<R>
+    where
+        R: Send + 'static,
+    {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(api_io_error)?;
+        Ok(tokio::task::block_in_place(move || {
+            let _permit = permit;
+            let operation_session = session.clone();
+            session.run_on_backend(move || operation(operation_session))
         }))
     }
 }

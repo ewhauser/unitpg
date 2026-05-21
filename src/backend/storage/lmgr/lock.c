@@ -334,13 +334,23 @@ const ShmemCallbacks LockManagerShmemCallbacks = {
  */
 static HTAB *LockMethodLockHash;
 static HTAB *LockMethodProcLockHash;
+#ifdef USE_FASTPG
+static _Thread_local HTAB *LockMethodLocalHash;
+#else
 static HTAB *LockMethodLocalHash;
+#endif
 
 
 /* private state for error cleanup */
+#ifdef USE_FASTPG
+static _Thread_local LOCALLOCK *StrongLockInProgress;
+static _Thread_local LOCALLOCK *awaitedLock;
+static _Thread_local ResourceOwner awaitedOwner;
+#else
 static LOCALLOCK *StrongLockInProgress;
 static LOCALLOCK *awaitedLock;
 static ResourceOwner awaitedOwner;
+#endif
 
 
 #ifdef LOCK_DEBUG
@@ -510,6 +520,11 @@ InitLockManagerAccess(void)
 	 */
 	HASHCTL		info;
 
+#ifdef USE_FASTPG
+	if (LockMethodLocalHash != NULL)
+		return;
+#endif
+
 	info.keysize = sizeof(LOCALLOCKTAG);
 	info.entrysize = sizeof(LOCALLOCK);
 
@@ -518,6 +533,15 @@ InitLockManagerAccess(void)
 									  &info,
 									  HASH_ELEM | HASH_BLOBS);
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadLockManagerAccess(void)
+{
+	if (LockMethodLocalHash == NULL)
+		InitLockManagerAccess();
+}
+#endif
 
 
 /*

@@ -178,7 +178,11 @@ typedef struct InvalMessageArray
 	int			maxmsgs;		/* current allocated size of array */
 } InvalMessageArray;
 
+#ifdef USE_FASTPG
+static _Thread_local InvalMessageArray InvalMessageArrays[2];
+#else
 static InvalMessageArray InvalMessageArrays[2];
+#endif
 
 /* Control information for one logical group of messages */
 typedef struct InvalidationMsgsGroup
@@ -252,9 +256,17 @@ typedef struct TransInvalidationInfo
 	int			my_level;
 } TransInvalidationInfo;
 
+#ifdef USE_FASTPG
+static _Thread_local TransInvalidationInfo *transInvalInfo = NULL;
+#else
 static TransInvalidationInfo *transInvalInfo = NULL;
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local InvalidationInfo *inplaceInvalInfo = NULL;
+#else
 static InvalidationInfo *inplaceInvalInfo = NULL;
+#endif
 
 /* GUC storage */
 int			debug_discard_caches = 0;

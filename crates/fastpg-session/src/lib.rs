@@ -5,10 +5,15 @@ pub use fastpg_exec::{
 };
 pub use fastpg_types::{Column, PgType, Value};
 
+use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
+use std::fmt;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 
 use fastpg_exec::{COPY_HEADER_MATCH, QueryExecutor, QueryExecutorShared};
 
@@ -97,11 +102,89 @@ impl Default for ServerState {
     }
 }
 
+type SessionBackendJob = Box<dyn FnOnce() + Send + 'static>;
+
+enum SessionBackendMessage {
+    Run(SessionBackendJob),
+    Shutdown,
+}
+
+struct SessionBackendExecutor {
+    sender: mpsc::Sender<SessionBackendMessage>,
+    handle: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl SessionBackendExecutor {
+    fn new(session_id: SessionId) -> Self {
+        let (sender, receiver) = mpsc::channel::<SessionBackendMessage>();
+        let handle = thread::Builder::new()
+            .name(format!("fastpg-session-{session_id}"))
+            .spawn(move || {
+                while let Ok(message) = receiver.recv() {
+                    match message {
+                        SessionBackendMessage::Run(job) => job(),
+                        SessionBackendMessage::Shutdown => break,
+                    }
+                }
+            })
+            .expect("failed to spawn fastpg session backend thread");
+
+        Self {
+            sender,
+            handle: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn run<R>(&self, operation: impl FnOnce() -> R + Send + 'static) -> R
+    where
+        R: Send + 'static,
+    {
+        let (sender, receiver) = mpsc::sync_channel::<Result<R, Box<dyn Any + Send + 'static>>>(1);
+        let job = Box::new(move || {
+            let result = catch_unwind(AssertUnwindSafe(operation));
+            let _ = sender.send(result);
+        });
+        self.sender
+            .send(SessionBackendMessage::Run(job))
+            .expect("fastpg session backend thread exited");
+        match receiver
+            .recv()
+            .expect("fastpg session backend dropped operation result")
+        {
+            Ok(result) => result,
+            Err(payload) => resume_unwind(payload),
+        }
+    }
+}
+
+impl fmt::Debug for SessionBackendExecutor {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SessionBackendExecutor")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for SessionBackendExecutor {
+    fn drop(&mut self) {
+        let _ = self.sender.send(SessionBackendMessage::Shutdown);
+        if let Some(handle) = self
+            .handle
+            .lock()
+            .expect("fastpg session backend handle mutex poisoned")
+            .take()
+        {
+            let _ = handle.join();
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct SessionState {
     id: SessionId,
     server: Arc<ServerState>,
     executor: QueryExecutor,
+    backend: SessionBackendExecutor,
     startup: StartupParameters,
     copy: Mutex<Option<SessionCopyState>>,
     pending_simple: Mutex<VecDeque<String>>,
@@ -116,6 +199,7 @@ impl SessionState {
             id,
             server,
             executor,
+            backend: SessionBackendExecutor::new(id),
             startup,
             copy: Mutex::new(None),
             pending_simple: Mutex::new(VecDeque::new()),
@@ -159,6 +243,13 @@ impl SessionState {
 
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
         self.executor.execute(sql, parameters)
+    }
+
+    pub fn run_on_backend<R>(&self, operation: impl FnOnce() -> R + Send + 'static) -> R
+    where
+        R: Send + 'static,
+    {
+        self.backend.run(operation)
     }
 
     pub fn take_notices(&self) -> Vec<QueryNotice> {
@@ -251,12 +342,32 @@ impl SessionState {
     pub fn abort_copy(&self) {
         self.executor.abort_copy(false);
     }
+
+    #[cfg(feature = "postgres-execution")]
+    fn take_active_copy_owned_transaction(&self) -> Option<bool> {
+        self.copy
+            .lock()
+            .expect("fastpg session COPY mutex poisoned")
+            .take()
+            .map(|copy| copy.owned_transaction)
+    }
 }
 
 impl Drop for SessionState {
     fn drop(&mut self) {
-        self.abort_active_copy();
-        self.executor.close();
+        #[cfg(feature = "postgres-execution")]
+        {
+            let active_copy_owned_transaction = self.take_active_copy_owned_transaction();
+            if let Some(close_work) = self.executor.close_work(active_copy_owned_transaction) {
+                self.backend.run(move || close_work.run());
+            }
+        }
+
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            self.abort_active_copy();
+            self.executor.close();
+        }
     }
 }
 

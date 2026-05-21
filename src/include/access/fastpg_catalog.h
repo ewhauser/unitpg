@@ -318,6 +318,10 @@ extern bool fastpg_rust_catalog_upsert_row(uint32_t relation_oid,
 										   uint64_t *row_id_out);
 extern bool fastpg_rust_catalog_delete_row(uint32_t relation_oid,
 										   uint64_t row_id);
+extern bool fastpg_rust_catalog_last_error(char *sqlstate_out,
+										   size_t sqlstate_len,
+										   char *message_out,
+										   size_t message_len);
 extern void fastpg_rust_xact_begin(void);
 extern void fastpg_rust_xact_begin_implicit(void);
 extern void fastpg_rust_xact_commit(void);

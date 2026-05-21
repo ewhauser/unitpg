@@ -99,6 +99,7 @@
 #include "utils/inval.h"
 #include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 
@@ -514,6 +515,8 @@ FastPgCatalogCacheInitializeCache(CatCache *cache)
 	if (!fastpg_use_rust_catalog())
 		return false;
 
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
 	Assert(CacheMemoryContext != NULL);
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 
@@ -673,6 +676,9 @@ FastPgCatalogCacheBuildEmptyList(CatCache *cache, int nkeys,
 	CatCList   *cl;
 	MemoryContext oldcxt;
 
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
+	Assert(CacheMemoryContext != NULL);
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 	cl = (CatCList *)
 		palloc(offsetof(CatCList, members));
@@ -873,6 +879,9 @@ FastPgCatalogCacheBuildList(CatCache *cache, int nkeys,
 	pfree(isnull);
 	ordered = FastPgCatalogCacheSortListForOrdering(cache, ctlist);
 
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
+	Assert(CacheMemoryContext != NULL);
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 	nmembers = list_length(ctlist);
 	cl = (CatCList *)
@@ -2042,6 +2051,11 @@ CatCacheInvalidate(CatCache *cache, uint32 hashValue)
 	Index		hashIndex;
 	dlist_mutable_iter iter;
 
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	CACHE_elog(DEBUG2, "CatCacheInvalidate: called");
 
 	/*
@@ -2104,6 +2118,16 @@ CatCacheInvalidate(CatCache *cache, uint32 hashValue)
 				e->dead = true;
 		}
 	}
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /* ----------------------------------------------------------------
@@ -2122,14 +2146,31 @@ CatCacheInvalidate(CatCache *cache, uint32 hashValue)
 void
 CreateCacheMemoryContext(void)
 {
+#ifdef USE_FASTPG
+	MemoryContext process_cache;
+
+	FastPgEnsureThreadMemoryContexts();
+	process_cache = FastPgGetProcessCacheMemoryContext();
+	if (!CacheMemoryContext && process_cache != NULL)
+	{
+		CacheMemoryContext = process_cache;
+		return;
+	}
+#endif
+
 	/*
 	 * Purely for paranoia, check that context doesn't exist; caller probably
 	 * did so already.
 	 */
 	if (!CacheMemoryContext)
+	{
 		CacheMemoryContext = AllocSetContextCreate(TopMemoryContext,
 												   "CacheMemoryContext",
 												   ALLOCSET_DEFAULT_SIZES);
+#ifdef USE_FASTPG
+		FastPgRememberProcessCacheMemoryContext(CacheMemoryContext);
+#endif
+	}
 }
 
 
@@ -2220,6 +2261,11 @@ ResetCatalogCachesExt(bool debug_discard)
 {
 	slist_iter	iter;
 
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	CACHE_elog(DEBUG2, "ResetCatalogCaches called");
 
 	slist_foreach(iter, &CacheHdr->ch_caches)
@@ -2230,6 +2276,16 @@ ResetCatalogCachesExt(bool debug_discard)
 	}
 
 	CACHE_elog(DEBUG2, "end of ResetCatalogCaches call");
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -2250,6 +2306,11 @@ CatalogCacheFlushCatalog(Oid catId)
 {
 	slist_iter	iter;
 
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	CACHE_elog(DEBUG2, "CatalogCacheFlushCatalog called for %u", catId);
 
 	slist_foreach(iter, &CacheHdr->ch_caches)
@@ -2268,6 +2329,16 @@ CatalogCacheFlushCatalog(Oid catId)
 	}
 
 	CACHE_elog(DEBUG2, "end of CatalogCacheFlushCatalog call");
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 /*
@@ -2408,6 +2479,9 @@ RehashCatCache(CatCache *cp)
 
 	/* Allocate a new, larger, hash table. */
 	newnbuckets = cp->cc_nbuckets * 2;
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
+	Assert(CacheMemoryContext != NULL);
 	newbucket = (dlist_head *) MemoryContextAllocZero(CacheMemoryContext, newnbuckets * sizeof(dlist_head));
 
 	/* Move all entries from old hash table to new. */
@@ -2453,6 +2527,9 @@ RehashCatCacheLists(CatCache *cp)
 
 	/* Allocate a new, larger, hash table. */
 	newnbuckets = cp->cc_nlbuckets * 2;
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
+	Assert(CacheMemoryContext != NULL);
 	newbucket = (dlist_head *) MemoryContextAllocZero(CacheMemoryContext, newnbuckets * sizeof(dlist_head));
 
 	/* Move all entries from old hash table to new. */
@@ -2576,6 +2653,8 @@ CatalogCacheInitializeCache(CatCache *cache)
 	 * switch to the cache context so our allocations do not vanish at the end
 	 * of a transaction
 	 */
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
 	Assert(CacheMemoryContext != NULL);
 
 	oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
@@ -2792,7 +2871,25 @@ SearchCatCache(CatCache *cache,
 			   Datum v3,
 			   Datum v4)
 {
-	return SearchCatCacheInternal(cache, cache->cc_nkeys, v1, v2, v3, v4);
+	HeapTuple	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = SearchCatCacheInternal(cache, cache->cc_nkeys, v1, v2, v3, v4);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 
@@ -2806,7 +2903,25 @@ HeapTuple
 SearchCatCache1(CatCache *cache,
 				Datum v1)
 {
-	return SearchCatCacheInternal(cache, 1, v1, 0, 0, 0);
+	HeapTuple	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = SearchCatCacheInternal(cache, 1, v1, 0, 0, 0);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 
@@ -2814,7 +2929,25 @@ HeapTuple
 SearchCatCache2(CatCache *cache,
 				Datum v1, Datum v2)
 {
-	return SearchCatCacheInternal(cache, 2, v1, v2, 0, 0);
+	HeapTuple	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = SearchCatCacheInternal(cache, 2, v1, v2, 0, 0);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 
@@ -2822,7 +2955,25 @@ HeapTuple
 SearchCatCache3(CatCache *cache,
 				Datum v1, Datum v2, Datum v3)
 {
-	return SearchCatCacheInternal(cache, 3, v1, v2, v3, 0);
+	HeapTuple	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = SearchCatCacheInternal(cache, 3, v1, v2, v3, 0);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 
@@ -2830,7 +2981,25 @@ HeapTuple
 SearchCatCache4(CatCache *cache,
 				Datum v1, Datum v2, Datum v3, Datum v4)
 {
-	return SearchCatCacheInternal(cache, 4, v1, v2, v3, v4);
+	HeapTuple	result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = SearchCatCacheInternal(cache, 4, v1, v2, v3, v4);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
 }
 
 /*
@@ -3121,7 +3290,22 @@ SearchCatCacheMiss(CatCache *cache,
 void
 ReleaseCatCache(HeapTuple tuple)
 {
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	ReleaseCatCacheWithOwner(tuple, CurrentResourceOwner);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 static void
@@ -3190,12 +3374,12 @@ GetCatCacheHashValue(CatCache *cache,
  *		The caller must not modify the list object or the pointed-to tuples,
  *		and must call ReleaseCatCacheList() when done with the list.
  */
-CatCList *
-SearchCatCacheList(CatCache *cache,
-				   int nkeys,
-				   Datum v1,
-				   Datum v2,
-				   Datum v3)
+static CatCList *
+SearchCatCacheListInternal(CatCache *cache,
+						   int nkeys,
+						   Datum v1,
+						   Datum v2,
+						   Datum v3)
 {
 	Datum		v4 = 0;			/* dummy last-column value */
 	Datum		arguments[CATCACHE_MAXKEYS];
@@ -3242,6 +3426,9 @@ SearchCatCacheList(CatCache *cache,
 		/* Arbitrary initial size --- must be a power of 2 */
 		int			nbuckets = 16;
 
+		if (!CacheMemoryContext)
+			CreateCacheMemoryContext();
+		Assert(CacheMemoryContext != NULL);
 		cache->cc_lbucket = (dlist_head *)
 			MemoryContextAllocZero(CacheMemoryContext,
 								   nbuckets * sizeof(dlist_head));
@@ -3481,6 +3668,9 @@ SearchCatCacheList(CatCache *cache,
 		ResourceOwnerEnlarge(CurrentResourceOwner);
 
 		/* Now we can build the CatCList entry. */
+		if (!CacheMemoryContext)
+			CreateCacheMemoryContext();
+		Assert(CacheMemoryContext != NULL);
 		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 		nmembers = list_length(ctlist);
 		cl = (CatCList *)
@@ -3566,6 +3756,34 @@ SearchCatCacheList(CatCache *cache,
 	return cl;
 }
 
+CatCList *
+SearchCatCacheList(CatCache *cache,
+				   int nkeys,
+				   Datum v1,
+				   Datum v2,
+				   Datum v3)
+{
+	CatCList  *result = NULL;
+
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
+		result = SearchCatCacheListInternal(cache, nkeys, v1, v2, v3);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
+	return result;
+}
+
 /*
  *	ReleaseCatCacheList
  *
@@ -3574,7 +3792,22 @@ SearchCatCacheList(CatCache *cache,
 void
 ReleaseCatCacheList(CatCList *list)
 {
+#ifdef USE_FASTPG
+	FastPgCatalogCacheLock();
+	PG_TRY();
+	{
+#endif
 	ReleaseCatCacheListWithOwner(list, CurrentResourceOwner);
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgCatalogCacheUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgCatalogCacheUnlock();
+#endif
 }
 
 static void
@@ -3682,6 +3915,9 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, Datum *arguments,
 			dtp = ntp;
 
 		/* Allocate memory for CatCTup and the cached tuple in one go */
+		if (!CacheMemoryContext)
+			CreateCacheMemoryContext();
+		Assert(CacheMemoryContext != NULL);
 		ct = (CatCTup *)
 			MemoryContextAlloc(CacheMemoryContext,
 							   MAXALIGN(sizeof(CatCTup)) + dtp->t_len);
@@ -3715,6 +3951,9 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, Datum *arguments,
 	else
 	{
 		/* Set up keys for a negative cache entry */
+		if (!CacheMemoryContext)
+			CreateCacheMemoryContext();
+		Assert(CacheMemoryContext != NULL);
 		oldcxt = MemoryContextSwitchTo(CacheMemoryContext);
 		ct = palloc_object(CatCTup);
 

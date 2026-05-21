@@ -191,7 +191,11 @@ typedef struct catcacheheader
 
 
 /* this extern duplicates utils/memutils.h... */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext CacheMemoryContext;
+#else
 extern PGDLLIMPORT MemoryContext CacheMemoryContext;
+#endif
 
 extern void CreateCacheMemoryContext(void);
 

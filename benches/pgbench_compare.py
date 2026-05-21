@@ -421,6 +421,14 @@ class PgBenchCompare:
             output_dir,
             "meson-compile-fastpg-pl",
         )
+        suffix = ".dylib" if platform.system() == "Darwin" else ".so"
+        self.checked_command(
+            variant_name,
+            "setup",
+            ["ninja", "-C", str(build_dir), f"src/test/regress/regress{suffix}"],
+            output_dir,
+            "ninja-fastpg-regress-lib",
+        )
         return build_dir
 
     def prepare_fastpg_pgcore_libdir(self, build_dir: Path) -> Path:

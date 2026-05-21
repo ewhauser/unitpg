@@ -84,7 +84,11 @@ typedef enum
 extern PGDLLIMPORT int synchronous_commit;
 
 /* used during logical streaming of a transaction */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL TransactionId CheckXidAlive;
+#else
 extern PGDLLIMPORT TransactionId CheckXidAlive;
+#endif
 extern PGDLLIMPORT bool bsysscan;
 
 /*
@@ -94,7 +98,11 @@ extern PGDLLIMPORT bool bsysscan;
  * globally accessible, so can be set from anywhere in the code which requires
  * recording flags.
  */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL int MyXactFlags;
+#else
 extern PGDLLIMPORT int MyXactFlags;
+#endif
 
 /*
  * XACT_FLAGS_ACCESSEDTEMPNAMESPACE - set when a temporary object is accessed.
@@ -460,6 +468,7 @@ extern void SetCurrentStatementStartTimestamp(void);
 #ifdef USE_FASTPG
 extern void FastPgSetCurrentTransactionStartTimestampToStatement(void);
 extern void FastPgStartStandaloneStatement(void);
+extern void FastPgEnsureThreadTransactionState(void);
 extern void FastPgEnsureStandaloneTransactionState(void);
 extern void FastPgReleaseStandaloneStatementResources(bool isCommit);
 #endif

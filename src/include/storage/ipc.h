@@ -62,8 +62,13 @@ typedef void (*shmem_startup_hook_type) (void);
 
 
 /* ipc.c */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL bool proc_exit_inprogress;
+extern PGDLLIMPORT PG_THREAD_LOCAL bool shmem_exit_inprogress;
+#else
 extern PGDLLIMPORT bool proc_exit_inprogress;
 extern PGDLLIMPORT bool shmem_exit_inprogress;
+#endif
 
 pg_noreturn extern void proc_exit(int code);
 extern void shmem_exit(int code);

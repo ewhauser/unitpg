@@ -97,9 +97,17 @@
 
 
 /* Global variables */
+#ifdef USE_FASTPG
+_Thread_local ErrorContextCallback *error_context_stack = NULL;
+#else
 ErrorContextCallback *error_context_stack = NULL;
+#endif
 
+#ifdef USE_FASTPG
+_Thread_local sigjmp_buf *PG_exception_stack = NULL;
+#else
 sigjmp_buf *PG_exception_stack = NULL;
+#endif
 
 /*
  * Hook for intercepting messages before they are sent to the server log.
@@ -110,7 +118,11 @@ sigjmp_buf *PG_exception_stack = NULL;
  */
 emit_log_hook_type emit_log_hook = NULL;
 #ifdef USE_FASTPG
+#ifdef USE_FASTPG
+_Thread_local emit_log_hook_type fastpg_client_message_hook = NULL;
+#else
 emit_log_hook_type fastpg_client_message_hook = NULL;
+#endif
 #endif
 
 /* GUC parameters */
@@ -156,11 +168,23 @@ static HANDLE backtrace_process = NULL;
 /* We provide a small stack of ErrorData records for re-entrant cases */
 #define ERRORDATA_STACK_SIZE  5
 
+#ifdef USE_FASTPG
+static _Thread_local ErrorData errordata[ERRORDATA_STACK_SIZE];
+#else
 static ErrorData errordata[ERRORDATA_STACK_SIZE];
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local int errordata_stack_depth = -1; /* index of topmost active frame */
+#else
 static int	errordata_stack_depth = -1; /* index of topmost active frame */
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local int recursion_depth = 0;	/* to detect actual recursion */
+#else
 static int	recursion_depth = 0;	/* to detect actual recursion */
+#endif
 
 /*
  * Saved timeval and buffers for formatted timestamps that might be used by

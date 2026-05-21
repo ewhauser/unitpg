@@ -254,7 +254,11 @@ typedef struct AllocSetFreeList
 } AllocSetFreeList;
 
 /* context_freelists[0] is for default params, [1] for small params */
+#ifdef USE_FASTPG
+static _Thread_local AllocSetFreeList context_freelists[2] =
+#else
 static AllocSetFreeList context_freelists[2] =
+#endif
 {
 	{
 		0, NULL

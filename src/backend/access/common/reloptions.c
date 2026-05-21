@@ -17,6 +17,10 @@
 
 #include <float.h>
 
+#ifdef USE_FASTPG
+#include <pthread.h>
+#endif
+
 #include "access/gist_private.h"
 #include "access/hash.h"
 #include "access/heaptoast.h"
@@ -600,6 +604,35 @@ static int	num_custom_options = 0;
 static relopt_gen **custom_options = NULL;
 static bool need_initialization = true;
 
+#ifdef USE_FASTPG
+static pthread_once_t fastpg_reloptions_lock_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t fastpg_reloptions_lock;
+
+static void
+FastPgInitRelOptionsLock(void)
+{
+	pthread_mutexattr_t attr;
+
+	pthread_mutexattr_init(&attr);
+	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+	pthread_mutex_init(&fastpg_reloptions_lock, &attr);
+	pthread_mutexattr_destroy(&attr);
+}
+
+static void
+FastPgRelOptionsLock(void)
+{
+	pthread_once(&fastpg_reloptions_lock_once, FastPgInitRelOptionsLock);
+	pthread_mutex_lock(&fastpg_reloptions_lock);
+}
+
+static void
+FastPgRelOptionsUnlock(void)
+{
+	pthread_mutex_unlock(&fastpg_reloptions_lock);
+}
+#endif
+
 static void initialize_reloptions(void);
 static void parse_one_reloption(relopt_value *option, char *text_str,
 								int text_len, bool validate);
@@ -740,13 +773,31 @@ initialize_reloptions(void)
 relopt_kind
 add_reloption_kind(void)
 {
+	relopt_kind result;
+
+#ifdef USE_FASTPG
+	FastPgRelOptionsLock();
+	PG_TRY();
+	{
+#endif
 	/* don't hand out the last bit so that the enum's behavior is portable */
 	if (last_assigned_kind >= RELOPT_KIND_MAX)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				 errmsg("user-defined relation parameter types limit exceeded")));
 	last_assigned_kind <<= 1;
-	return (relopt_kind) last_assigned_kind;
+	result = (relopt_kind) last_assigned_kind;
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgRelOptionsUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgRelOptionsUnlock();
+#endif
+	return result;
 }
 
 /*
@@ -759,6 +810,11 @@ add_reloption(relopt_gen *newoption)
 {
 	static int	max_custom_options = 0;
 
+#ifdef USE_FASTPG
+	FastPgRelOptionsLock();
+	PG_TRY();
+	{
+#endif
 	if (num_custom_options >= max_custom_options)
 	{
 		MemoryContext oldcxt;
@@ -781,6 +837,16 @@ add_reloption(relopt_gen *newoption)
 	custom_options[num_custom_options++] = newoption;
 
 	need_initialization = true;
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgRelOptionsUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgRelOptionsUnlock();
+#endif
 }
 
 /*
@@ -1623,6 +1689,11 @@ parseRelOptions(Datum options, bool validate, relopt_kind kind,
 	int			i;
 	int			j;
 
+#ifdef USE_FASTPG
+	FastPgRelOptionsLock();
+	PG_TRY();
+	{
+#endif
 	if (need_initialization)
 		initialize_reloptions();
 
@@ -1652,6 +1723,16 @@ parseRelOptions(Datum options, bool validate, relopt_kind kind,
 		parseRelOptionsInternal(options, validate, reloptions, numoptions);
 
 	*numrelopts = numoptions;
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgRelOptionsUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgRelOptionsUnlock();
+#endif
 	return reloptions;
 }
 
@@ -2258,6 +2339,11 @@ AlterTableGetRelOptionsLockLevel(List *defList)
 	if (defList == NIL)
 		return AccessExclusiveLock;
 
+#ifdef USE_FASTPG
+	FastPgRelOptionsLock();
+	PG_TRY();
+	{
+#endif
 	if (need_initialization)
 		initialize_reloptions();
 
@@ -2278,5 +2364,15 @@ AlterTableGetRelOptionsLockLevel(List *defList)
 		}
 	}
 
+#ifdef USE_FASTPG
+	}
+	PG_CATCH();
+	{
+		FastPgRelOptionsUnlock();
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+	FastPgRelOptionsUnlock();
+#endif
 	return lockmode;
 }

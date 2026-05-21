@@ -22,7 +22,11 @@
 
 typedef struct ExplainState ExplainState;	/* defined in explain_state.h */
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL CommandDest whereToSendOutput;
+#else
 extern PGDLLIMPORT CommandDest whereToSendOutput;
+#endif
 extern PGDLLIMPORT const char *debug_query_string;
 extern PGDLLIMPORT int PostAuthDelay;
 extern PGDLLIMPORT int client_connection_check_interval;

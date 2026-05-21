@@ -12,6 +12,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "pgstat.h"
@@ -362,7 +363,7 @@ void
 pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 
@@ -390,7 +391,7 @@ void
 pgstat_drop_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 

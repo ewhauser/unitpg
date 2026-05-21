@@ -270,7 +270,47 @@ pub struct QueryExecutor {
     storage_session: fastpg_storage::SessionStorageHandle,
     #[cfg(feature = "postgres-execution")]
     storage2_session: fastpg_storage2::SessionStorageHandle,
+    #[cfg(feature = "postgres-execution")]
+    pgcore_started: Mutex<bool>,
     notices: Mutex<Vec<QueryNotice>>,
+}
+
+#[cfg(feature = "postgres-execution")]
+#[derive(Debug)]
+pub struct QueryExecutorCloseWork {
+    pgcore_session: PgCoreSession,
+    storage_session: fastpg_storage::SessionStorageHandle,
+    storage2_session: fastpg_storage2::SessionStorageHandle,
+    active_copy_owned_transaction: Option<bool>,
+}
+
+#[cfg(feature = "postgres-execution")]
+impl QueryExecutorCloseWork {
+    pub fn run(self) {
+        let _guard = fastpg_storage::enter_session_storage(self.storage_session);
+        let _storage2_guard = fastpg_storage2::enter_session_storage(self.storage2_session);
+
+        if let Some(owned_transaction) = self.active_copy_owned_transaction {
+            fastpg_storage::fastpg_rust_subxact_abort();
+            fastpg_storage2::fastpg_storage2_subxact_abort();
+            if owned_transaction {
+                fastpg_storage::abort_implicit_transaction();
+                fastpg_storage2::fastpg_storage2_xact_abort_if_implicit();
+            } else if fastpg_storage::is_explicit_transaction() {
+                fastpg_storage::abort_explicit_transaction();
+                fastpg_storage2::fastpg_storage2_xact_abort();
+            }
+        }
+
+        if fastpg_storage::is_explicit_transaction() {
+            fastpg_storage::abort_explicit_transaction();
+            fastpg_storage2::fastpg_storage2_xact_abort();
+        } else {
+            fastpg_storage::abort_implicit_transaction();
+            fastpg_storage2::fastpg_storage2_xact_abort_if_implicit();
+        }
+        self.pgcore_session.reset_session_state();
+    }
 }
 
 impl QueryExecutor {
@@ -295,12 +335,12 @@ impl QueryExecutor {
                 storage2_session.clone(),
                 database,
             );
-            pgcore_session.start_client_session();
             Self {
                 shared,
                 pgcore_session,
                 storage_session,
                 storage2_session,
+                pgcore_started: Mutex::new(false),
                 notices: Mutex::new(Vec::new()),
             }
         }
@@ -352,10 +392,33 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn replace_notices(&self, notices: Vec<QueryNotice>) {
-        *self
+        let mut stored_notices = self
             .notices
             .lock()
-            .expect("fastpg executor notice mutex poisoned") = notices;
+            .expect("fastpg executor notice mutex poisoned");
+        if stored_notices.is_empty() {
+            *stored_notices = notices;
+        } else {
+            stored_notices.extend(notices);
+        }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn ensure_pgcore_session_started(&self) {
+        let mut started = self
+            .pgcore_started
+            .lock()
+            .expect("fastpg executor pgcore-start mutex poisoned");
+        if !*started {
+            let notices = self
+                .pgcore_session
+                .start_client_session()
+                .into_iter()
+                .map(pgcore_notice_to_query_notice)
+                .collect();
+            self.replace_notices(notices);
+            *started = true;
+        }
     }
 
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
@@ -387,6 +450,7 @@ impl QueryExecutor {
     pub fn copy_target_text_line(&self, target: &CopyTarget, line: &str) -> Result<bool, String> {
         #[cfg(feature = "postgres-execution")]
         {
+            self.ensure_pgcore_session_started();
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
             let _storage2_guard =
                 fastpg_storage2::enter_session_storage(self.storage2_session.clone());
@@ -413,6 +477,7 @@ impl QueryExecutor {
     ) -> Result<Option<usize>, String> {
         #[cfg(feature = "postgres-execution")]
         {
+            self.ensure_pgcore_session_started();
             let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
             let _storage2_guard =
                 fastpg_storage2::enter_session_storage(self.storage2_session.clone());
@@ -686,22 +751,36 @@ impl QueryExecutor {
     pub fn close(&self) {
         #[cfg(feature = "postgres-execution")]
         {
-            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
-            let _storage2_guard =
-                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
-            if fastpg_storage::is_explicit_transaction() {
-                fastpg_storage::abort_explicit_transaction();
-                fastpg_storage2::fastpg_storage2_xact_abort();
-            } else {
-                fastpg_storage::abort_implicit_transaction();
-                fastpg_storage2::fastpg_storage2_xact_abort_if_implicit();
+            if let Some(work) = self.close_work(None) {
+                work.run();
             }
-            self.pgcore_session.reset_session_state();
         }
     }
 
     #[cfg(feature = "postgres-execution")]
+    pub fn close_work(
+        &self,
+        active_copy_owned_transaction: Option<bool>,
+    ) -> Option<QueryExecutorCloseWork> {
+        if !*self
+            .pgcore_started
+            .lock()
+            .expect("fastpg executor pgcore-start mutex poisoned")
+        {
+            return None;
+        }
+
+        Some(QueryExecutorCloseWork {
+            pgcore_session: self.pgcore_session.clone(),
+            storage_session: self.storage_session.clone(),
+            storage2_session: self.storage2_session.clone(),
+            active_copy_owned_transaction,
+        })
+    }
+
+    #[cfg(feature = "postgres-execution")]
     fn describe_pgcore(&self, sql: &str) -> Option<QueryDescription> {
+        self.ensure_pgcore_session_started();
         self.prepare_pgcore(sql)
             .ok()
             .map(|statement| query_description_from_pgcore(&statement))
@@ -709,6 +788,7 @@ impl QueryExecutor {
 
     #[cfg(feature = "postgres-execution")]
     fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
+        self.ensure_pgcore_session_started();
         if !postgres_catalog_enabled()
             && parameters.is_empty()
             && let Some(command) = fast_transaction_command(sql)

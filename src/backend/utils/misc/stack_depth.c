@@ -32,7 +32,11 @@ static ssize_t max_stack_depth_bytes = 100 * (ssize_t) 1024;
  * Stack base pointer -- initialized by set_stack_base(), which
  * should be called from main().
  */
+#ifdef USE_FASTPG
+static _Thread_local char *stack_base_ptr = NULL;
+#else
 static char *stack_base_ptr = NULL;
+#endif
 
 
 /*

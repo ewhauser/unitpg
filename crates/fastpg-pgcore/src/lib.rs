@@ -367,9 +367,9 @@ impl PgCoreSession {
         self.inner.reset_session_state();
     }
 
-    pub fn start_client_session(&self) {
+    pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
         let _guard = self.enter_storage();
-        self.inner.start_client_session();
+        self.inner.start_client_session()
     }
 }
 
@@ -386,9 +386,9 @@ pub struct PreparedStatement {
     storage2_session: fastpg_storage2::SessionStorageHandle,
 }
 
-// pgcore is backed by PostgreSQL backend globals, so every public operation is
-// serialized by the pgcore lane. That lets session-level Rust caches hold
-// prepared handles behind Arcs without allowing concurrent C backend access.
+// pgcore-backed execution is intentionally allowed to overlap across client
+// tasks so the Rust server's concurrency tests exercise the real concurrent
+// path instead of a single global lane.
 unsafe impl Send for PreparedStatement {}
 unsafe impl Sync for PreparedStatement {}
 
@@ -452,7 +452,6 @@ mod inner {
     use std::ptr;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
     use std::time::Instant;
 
     use super::{
@@ -462,11 +461,9 @@ mod inner {
         StatementDescription,
     };
 
-    static PGCORE_LOCK: Mutex<()> = Mutex::new(());
     static PGCORE_OPERATIONS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static PGCORE_MAX_ACTIVE: AtomicU64 = AtomicU64::new(0);
-    static PGCORE_WAIT_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
     const STACK_SQL_BUFFER_LEN: usize = 1024;
@@ -476,34 +473,22 @@ mod inner {
             operations: PGCORE_OPERATIONS.load(Ordering::Relaxed),
             active: PGCORE_ACTIVE.load(Ordering::Relaxed),
             max_active: PGCORE_MAX_ACTIVE.load(Ordering::Relaxed),
-            wait_nanos: PGCORE_WAIT_NANOS.load(Ordering::Relaxed),
+            wait_nanos: 0,
             execution_nanos: PGCORE_EXECUTION_NANOS.load(Ordering::Relaxed),
         }
     }
 
     struct PgCoreLaneGuard {
-        _guard: MutexGuard<'static, ()>,
         started_at: Instant,
     }
 
-    fn enter_pgcore_lane(operation: &'static str) -> PgCoreLaneGuard {
-        let waiting_since = Instant::now();
-        let guard = PGCORE_LOCK
-            .lock()
-            .unwrap_or_else(|_| panic!("fastpg pgcore {operation} mutex poisoned"));
+    fn enter_pgcore_lane(_operation: &'static str) -> PgCoreLaneGuard {
         let started_at = Instant::now();
-        add_duration(
-            &PGCORE_WAIT_NANOS,
-            started_at.duration_since(waiting_since).as_nanos(),
-        );
         let active = PGCORE_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
         PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         update_max_active(active);
         refresh_pgcore_caches_if_catalog_changed();
-        PgCoreLaneGuard {
-            _guard: guard,
-            started_at,
-        }
+        PgCoreLaneGuard { started_at }
     }
 
     impl Drop for PgCoreLaneGuard {
@@ -1163,12 +1148,14 @@ mod inner {
             }
         }
 
-        pub fn start_client_session(&self) {
+        pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
             let _guard = enter_pgcore_lane("start_client_session");
             self.set_database();
+            let notice_capture = NoticeCaptureGuard::begin();
             unsafe {
                 fastpg_pgcore_start_client_session();
             }
+            notice_capture.finish()
         }
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
@@ -2079,8 +2066,8 @@ mod inner {
 #[cfg(not(feature = "postgres-execution"))]
 mod inner {
     use super::{
-        ExecutionResult, PgCoreError, PgCoreInputDatum, PgCoreLaneMetrics, RawParseSummary,
-        StatementDescription,
+        ExecutionResult, PgCoreError, PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice,
+        RawParseSummary, StatementDescription,
     };
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
@@ -2150,7 +2137,9 @@ mod inner {
 
         pub fn reset_session_state(&self) {}
 
-        pub fn start_client_session(&self) {}
+        pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
+            Vec::new()
+        }
     }
 
     #[derive(Debug)]

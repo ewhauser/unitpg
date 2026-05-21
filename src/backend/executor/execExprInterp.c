@@ -82,6 +82,10 @@
 #include "utils/typcache.h"
 #include "utils/xml.h"
 
+#ifdef USE_FASTPG
+#include <pthread.h>
+#endif
+
 /*
  * Use computed-goto-based opcode dispatch when computed gotos are available.
  * But use a separate symbol so that it's easy to adjust locally in this file
@@ -115,6 +119,10 @@ static const void **dispatch_table = NULL;
 
 /* jump target -> opcode lookup table */
 static ExprEvalOpLookup reverse_dispatch_table[EEOP_LAST];
+
+#ifdef USE_FASTPG
+static pthread_once_t fastpg_exec_interpreter_once = PTHREAD_ONCE_INIT;
+#endif
 
 #define EEO_SWITCH()
 #define EEO_CASE(name)		CASE_##name:
@@ -2934,29 +2942,42 @@ dispatch_compare_ptr(const void *a, const void *b)
 /*
  * Do one-time initialization of interpretation machinery.
  */
+#if defined(EEO_USE_COMPUTED_GOTO)
+static void
+ExecInitInterpreterComputedGoto(void)
+{
+	/* Set up externally-visible pointer to dispatch table */
+	dispatch_table = (const void **)
+		DatumGetPointer(ExecInterpExpr(NULL, NULL, NULL));
+
+	/* build reverse lookup table */
+	for (int i = 0; i < EEOP_LAST; i++)
+	{
+		reverse_dispatch_table[i].opcode = dispatch_table[i];
+		reverse_dispatch_table[i].op = (ExprEvalOp) i;
+	}
+
+	/* make it bsearch()able */
+	qsort(reverse_dispatch_table,
+		  EEOP_LAST /* nmembers */ ,
+		  sizeof(ExprEvalOpLookup),
+		  dispatch_compare_ptr);
+}
+#endif
+
 static void
 ExecInitInterpreter(void)
 {
 #if defined(EEO_USE_COMPUTED_GOTO)
+#ifdef USE_FASTPG
+	pthread_once(&fastpg_exec_interpreter_once, ExecInitInterpreterComputedGoto);
+#else
 	/* Set up externally-visible pointer to dispatch table */
 	if (dispatch_table == NULL)
 	{
-		dispatch_table = (const void **)
-			DatumGetPointer(ExecInterpExpr(NULL, NULL, NULL));
-
-		/* build reverse lookup table */
-		for (int i = 0; i < EEOP_LAST; i++)
-		{
-			reverse_dispatch_table[i].opcode = dispatch_table[i];
-			reverse_dispatch_table[i].op = (ExprEvalOp) i;
-		}
-
-		/* make it bsearch()able */
-		qsort(reverse_dispatch_table,
-			  EEOP_LAST /* nmembers */ ,
-			  sizeof(ExprEvalOpLookup),
-			  dispatch_compare_ptr);
+		ExecInitInterpreterComputedGoto();
 	}
+#endif
 #endif
 }
 

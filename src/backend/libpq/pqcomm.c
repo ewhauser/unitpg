@@ -162,7 +162,11 @@ static const PQcommMethods PqCommSocketMethods = {
 	.putmessage_noblock = socket_putmessage_noblock
 };
 
+#ifdef USE_FASTPG
+_Thread_local const PQcommMethods *PqCommMethods = &PqCommSocketMethods;
+#else
 const PQcommMethods *PqCommMethods = &PqCommSocketMethods;
+#endif
 
 WaitEventSet *FeBeWaitSet;
 

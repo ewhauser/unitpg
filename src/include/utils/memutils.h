@@ -55,22 +55,46 @@
  * Only TopMemoryContext and ErrorContext are initialized by
  * MemoryContextInit() itself.
  */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext TopMemoryContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext ErrorContext;
+#else
 extern PGDLLIMPORT MemoryContext TopMemoryContext;
 extern PGDLLIMPORT MemoryContext ErrorContext;
+#endif
 extern PGDLLIMPORT MemoryContext PostmasterContext;
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext CacheMemoryContext;
+#else
 extern PGDLLIMPORT MemoryContext CacheMemoryContext;
+#endif
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext MessageContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext TopTransactionContext;
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext CurTransactionContext;
+#else
 extern PGDLLIMPORT MemoryContext MessageContext;
 extern PGDLLIMPORT MemoryContext TopTransactionContext;
 extern PGDLLIMPORT MemoryContext CurTransactionContext;
+#endif
 
 /* This is a transient link to the active portal's memory context: */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL MemoryContext PortalContext;
+#else
 extern PGDLLIMPORT MemoryContext PortalContext;
+#endif
 
 
 /*
  * Memory-context-type-independent functions in mcxt.c
  */
 extern void MemoryContextInit(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadMemoryContexts(void);
+extern MemoryContext FastPgGetProcessCacheMemoryContext(void);
+extern void FastPgRememberProcessCacheMemoryContext(MemoryContext context);
+#endif
 extern void MemoryContextReset(MemoryContext context);
 extern void MemoryContextDelete(MemoryContext context);
 extern void MemoryContextResetOnly(MemoryContext context);

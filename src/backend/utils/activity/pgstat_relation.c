@@ -17,9 +17,7 @@
 
 #include "postgres.h"
 
-#ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
-#endif
 #include "access/twophase_rmgr.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
@@ -52,6 +50,15 @@ static void ensure_tabstat_xact_level(PgStat_TableStatus *pgstat_info);
 static void save_truncdrop_counters(PgStat_TableXactStatus *trans, bool is_drop);
 static void restore_truncdrop_counters(PgStat_TableXactStatus *trans);
 
+#ifdef USE_FASTPG
+static bool
+fastpg_skip_relation_stats(Relation rel)
+{
+	return !IsUnderPostmaster &&
+		(!fastpg_catalog_mode_uses_postgres() || IsCatalogRelation(rel));
+}
+#endif
+
 
 /*
  * Copy stats between relations. This is used for things like REINDEX
@@ -63,6 +70,11 @@ pgstat_copy_relation_stats(Relation dst, Relation src)
 	PgStat_StatTabEntry *srcstats;
 	PgStatShared_Relation *dstshstats;
 	PgStat_EntryRef *dst_ref;
+
+#ifdef USE_FASTPG
+	if (fastpg_skip_relation_stats(dst) || fastpg_skip_relation_stats(src))
+		return;
+#endif
 
 	srcstats = pgstat_fetch_stat_tabentry_ext(src->rd_rel->relisshared,
 											  RelationGetRelid(src),
@@ -98,7 +110,7 @@ pgstat_init_relation(Relation rel)
 	char		relkind = rel->rd_rel->relkind;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
+	if (fastpg_skip_relation_stats(rel))
 	{
 		rel->pgstat_enabled = false;
 		rel->pgstat_info = NULL;
@@ -145,7 +157,7 @@ void
 pgstat_assoc_relation(Relation rel)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
+	if (fastpg_skip_relation_stats(rel))
 		return;
 #endif
 
@@ -187,7 +199,7 @@ void
 pgstat_create_relation(Relation rel)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
+	if (fastpg_skip_relation_stats(rel))
 		return;
 #endif
 
@@ -206,7 +218,7 @@ pgstat_drop_relation(Relation rel)
 	PgStat_TableStatus *pgstat_info;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
+	if (fastpg_skip_relation_stats(rel))
 		return;
 #endif
 
@@ -248,6 +260,10 @@ pgstat_report_vacuum(Relation rel, PgStat_Counter livetuples,
 
 	if (!pgstat_track_counts)
 		return;
+#ifdef USE_FASTPG
+	if (fastpg_skip_relation_stats(rel))
+		return;
+#endif
 
 	/* Store the data in the table's hash table entry. */
 	ts = GetCurrentTimestamp();
@@ -320,6 +336,10 @@ pgstat_report_analyze(Relation rel,
 
 	if (!pgstat_track_counts)
 		return;
+#ifdef USE_FASTPG
+	if (fastpg_skip_relation_stats(rel))
+		return;
+#endif
 
 	/*
 	 * Unlike VACUUM, ANALYZE might be running inside a transaction that has

@@ -200,6 +200,9 @@ extern Oid	FindDefaultConversionProc(int32 for_encoding, int32 to_encoding);
 
 /* initialization & transaction cleanup code */
 extern void InitializeSearchPath(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadNamespaceState(void);
+#endif
 extern void AtEOXact_Namespace(bool isCommit, bool parallel);
 extern void AtEOSubXact_Namespace(bool isCommit, SubTransactionId mySubid,
 								  SubTransactionId parentSubid);

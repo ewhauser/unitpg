@@ -376,6 +376,9 @@ typedef enum
  * function prototypes
  */
 extern void InitLockManagerAccess(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadLockManagerAccess(void);
+#endif
 extern LockMethod GetLocksMethodTable(const LOCK *lock);
 extern LockMethod GetLockTagsMethodTable(const LOCKTAG *locktag);
 extern uint32 LockTagHashCode(const LOCKTAG *locktag);

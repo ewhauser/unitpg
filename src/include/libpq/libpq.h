@@ -43,7 +43,11 @@ typedef struct
 	void		(*putmessage_noblock) (char msgtype, const char *s, size_t len);
 } PQcommMethods;
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL const PQcommMethods *PqCommMethods;
+#else
 extern const PGDLLIMPORT PQcommMethods *PqCommMethods;
+#endif
 
 #define pq_comm_reset() (PqCommMethods->comm_reset())
 #define pq_flush() (PqCommMethods->flush())
