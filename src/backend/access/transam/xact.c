@@ -1488,7 +1488,12 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	if (TopTransactionResourceOwner != NULL)
 	{
 		if (!isCommit)
+		{
+			AfterTriggerEndXact(false);
 			AtAbort_Portals();
+		}
+		else
+			AfterTriggerEndXact(true);
 
 		CallXactCallbacks(isCommit ? XACT_EVENT_COMMIT : XACT_EVENT_ABORT);
 

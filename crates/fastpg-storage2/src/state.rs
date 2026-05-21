@@ -267,6 +267,17 @@ impl StorageState {
             .tuple_slice(tid, overlays_own_inserted_tid(overlays, relid, tid))
     }
 
+    pub(crate) fn snapshot_any_tuple_slice_in_overlays<'a>(
+        &'a self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        tid: Tid,
+    ) -> Option<&'a [u8]> {
+        self.relations
+            .get(&relid)?
+            .tuple_slice(tid, overlays_own_inserted_tid(overlays, relid, tid))
+    }
+
     pub(crate) fn visible_tids(&self, session: &SessionStorage, relid: u32) -> Vec<Tid> {
         let mut tids = Vec::new();
         if let Some(relation) = self.relations.get(&relid) {

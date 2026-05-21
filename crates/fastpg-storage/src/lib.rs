@@ -1419,6 +1419,27 @@ impl StorageState {
         self.find_committed_row(relid, row_id)
     }
 
+    fn find_snapshot_any_row(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        row_id: u64,
+    ) -> Option<Row> {
+        if row_id == 0 {
+            return None;
+        }
+
+        for overlay in self.visible_overlay_stack(session).iter().rev() {
+            if let Some(segment) = overlay.relations.get(&relid)
+                && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
+            {
+                return Some(row.clone());
+            }
+        }
+
+        self.find_committed_row(relid, row_id)
+    }
+
     fn visible_row_exists(&self, session: &SessionStorage, relid: u32, row_id: u64) -> bool {
         if row_id == 0 {
             return false;
@@ -5576,6 +5597,28 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row(
     }
 }
 
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output pointers where required; any C strings or
+/// arrays must be valid for reads of the specified length for the call.
+pub unsafe extern "C" fn fastpg_rust_fetch_row_snapshot_any(
+    relid: u32,
+    row_id: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+) -> bool {
+    let row = with_storage(|state, session| state.find_snapshot_any_row(session, relid, row_id));
+
+    match row {
+        Some(row) => unsafe {
+            copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
+        },
+        None => false,
+    }
+}
+
 unsafe fn copy_row_to_outputs(
     row: &Row,
     values_out: *mut usize,
@@ -5962,6 +6005,25 @@ mod tests {
         let mut nulls = vec![0u8; natts];
         let found = unsafe {
             fastpg_rust_fetch_row(
+                relid,
+                row_id,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                natts,
+            )
+        };
+        found.then_some((values, nulls))
+    }
+
+    unsafe fn fetch_byval_snapshot_any(
+        relid: u32,
+        row_id: u64,
+        natts: usize,
+    ) -> Option<(Vec<usize>, Vec<u8>)> {
+        let mut values = vec![0usize; natts];
+        let mut nulls = vec![0u8; natts];
+        let found = unsafe {
+            fastpg_rust_fetch_row_snapshot_any(
                 relid,
                 row_id,
                 values.as_mut_ptr(),
@@ -6549,6 +6611,10 @@ mod tests {
         assert!(fastpg_rust_relation_delete(relid, row_id));
         assert_eq!(fastpg_rust_relation_row_count(relid), 0);
         assert!(!fastpg_rust_relation_contains_row(relid, row_id));
+        assert_eq!(
+            unsafe { fetch_byval_snapshot_any(relid, row_id, 1) },
+            Some((vec![1], vec![0]))
+        );
         fastpg_rust_xact_abort();
 
         assert_eq!(fastpg_rust_relation_row_count(relid), 1);

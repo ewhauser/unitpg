@@ -388,6 +388,38 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
         )
     })
 }
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_tid_snapshot_any(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        let Some(tuple) =
+            state.snapshot_any_tuple_slice_in_overlays(&session.transaction_stack, relid, tid)
+        else {
+            return false;
+        };
+        copy_tuple_to_outputs(
+            tid,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            std::ptr::null_mut(),
+        )
+    })
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///

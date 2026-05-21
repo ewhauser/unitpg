@@ -114,6 +114,11 @@ extern bool fastpg_rust_fetch_row(uint32_t relid,
 								  uintptr_t *values,
 								  uint8_t *isnull,
 								  size_t natts);
+extern bool fastpg_rust_fetch_row_snapshot_any(uint32_t relid,
+											   uint64_t row_id,
+											   uintptr_t *values,
+											   uint8_t *isnull,
+											   size_t natts);
 extern bool fastpg_rust_primary_key_index_lookup(uint32_t index_relid,
 												 const uintptr_t *values,
 												 const uint8_t *isnull,
@@ -192,6 +197,11 @@ extern bool fastpg_storage2_fetch_tid(uint32_t relid,
 									  uintptr_t *values,
 									  uint8_t *isnull,
 									  size_t natts);
+extern bool fastpg_storage2_fetch_tid_snapshot_any(uint32_t relid,
+												  uint64_t tid,
+												  uintptr_t *values,
+												  uint8_t *isnull,
+												  size_t natts);
 extern bool fastpg_storage2_primary_key_index_lookup(uint32_t index_relid,
 													 const uintptr_t *values,
 													 const uint8_t *isnull,
@@ -999,17 +1009,30 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 	ExecClearTuple(slot);
 	values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
 	isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
-	found = storage2 ?
-		fastpg_storage2_fetch_tid(RelationGetRelid(rel),
+	if (snapshot == SnapshotAny)
+		found = storage2 ?
+			fastpg_storage2_fetch_tid_snapshot_any(RelationGetRelid(rel),
+												   row_id,
+												   values,
+												   isnull,
+												   natts) :
+			fastpg_rust_fetch_row_snapshot_any(RelationGetRelid(rel),
+											   row_id,
+											   values,
+											   isnull,
+											   natts);
+	else
+		found = storage2 ?
+			fastpg_storage2_fetch_tid(RelationGetRelid(rel),
+									  row_id,
+									  values,
+									  isnull,
+									  natts) :
+			fastpg_rust_fetch_row(RelationGetRelid(rel),
 								  row_id,
 								  values,
 								  isnull,
-								  natts) :
-		fastpg_rust_fetch_row(RelationGetRelid(rel),
-							  row_id,
-							  values,
-							  isnull,
-							  natts);
+								  natts);
 	if (found && storage2)
 	{
 		for (int index = 0; index < natts; index++)

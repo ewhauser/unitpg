@@ -1100,6 +1100,48 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn failed_foreign_key_delete_cleans_after_trigger_state() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let suffix = std::process::id();
+        let parent = format!("fastpg_exec_fk_parent_{suffix}");
+        let child = format!("fastpg_exec_fk_child_{suffix}");
+
+        executor.execute(&format!("drop table if exists {child}"), &[]);
+        executor.execute(&format!("drop table if exists {parent}"), &[]);
+        executor.execute(&format!("create table {parent}(id int primary key)"), &[]);
+        executor.execute(
+            &format!("create table {child}(parent int references {parent}(id))"),
+            &[],
+        );
+        executor.execute(&format!("insert into {parent} values (1)"), &[]);
+        executor.execute(&format!("insert into {child} values (1)"), &[]);
+
+        assert!(matches!(
+            executor.execute(&format!("delete from {parent}"), &[]),
+            QueryExecution::Error {
+                ref sqlstate,
+                ref message,
+                ..
+            } if sqlstate == "23503" && message.contains("violates foreign key constraint")
+        ));
+        assert_eq!(
+            executor.execute(&format!("drop table {child}"), &[]),
+            QueryExecution::Command {
+                tag: "DROP TABLE".into(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute(&format!("drop table {parent}"), &[]),
+            QueryExecution::Command {
+                tag: "DROP TABLE".into(),
+                rows: 0,
+            }
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn executes_parameterized_int4_through_pgcore() {
         let executor = QueryExecutor::new("17.0-fastpg");
 
