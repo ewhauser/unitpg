@@ -6,7 +6,7 @@ use std::fs;
 #[cfg(feature = "postgres-execution")]
 use std::io::Write;
 #[cfg(feature = "postgres-execution")]
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(feature = "postgres-execution")]
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -350,6 +350,7 @@ impl QueryExecutor {
         )
     }
 
+    #[cfg(feature = "postgres-execution")]
     fn replace_notices(&self, notices: Vec<QueryNotice>) {
         *self
             .notices
@@ -800,6 +801,7 @@ fn execution_error(sqlstate: impl Into<String>, message: impl Into<String>) -> Q
 
 #[cfg(feature = "postgres-execution")]
 fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
+    let error = error.into_fields();
     let error_execution = QueryExecution::Error {
         sqlstate: error.sqlstate,
         message: error.message,
@@ -1102,7 +1104,7 @@ fn write_copy_temp_file(lines: &[&str]) -> Result<PathBuf, String> {
 }
 
 #[cfg(feature = "postgres-execution")]
-fn copy_from_file_sql(target: &CopyTarget, path: &PathBuf) -> String {
+fn copy_from_file_sql(target: &CopyTarget, path: &Path) -> String {
     let columns = if target.column_names.is_empty() {
         String::new()
     } else {
@@ -1187,6 +1189,7 @@ fn decode_copy_text_field(field: &str) -> String {
 
 #[cfg(feature = "postgres-execution")]
 fn pgcore_copy_error(error: fastpg_pgcore::PgCoreError) -> String {
+    let error = error.into_fields();
     format!(
         "{}{}\n{}\n{}\n{}",
         COPY_ERROR_FIELDS_PREFIX,
@@ -1256,14 +1259,14 @@ mod tests {
             executor.execute("BEGIN;", &[]),
             QueryExecution::Command {
                 tag: "BEGIN".into(),
-                rows: 0,
+                rows: None,
             }
         );
         assert_eq!(
             executor.execute("ROLLBACK;", &[]),
             QueryExecution::Command {
                 tag: "ROLLBACK".into(),
-                rows: 0,
+                rows: None,
             }
         );
     }

@@ -1129,12 +1129,14 @@ impl FastPgWireHandler {
             } => Err(PgWireError::UserError(Box::new(error_info(
                 &sqlstate,
                 &message,
-                detail,
-                hint,
-                context,
-                cursorpos,
-                internal_query,
-                internalpos,
+                WireErrorFields {
+                    detail,
+                    hint,
+                    context,
+                    cursorpos,
+                    internal_query,
+                    internalpos,
+                },
             )))),
             other => Err(protocol_error(format!(
                 "fastpath function {} returned unexpected execution result {other:?}",
@@ -1427,16 +1429,15 @@ async fn send_function_call_response(
 }
 
 #[cfg(unix)]
-fn error_info(
-    sqlstate: &str,
-    message: &str,
-    detail: Option<String>,
-    hint: Option<String>,
-    context: Option<String>,
-    cursorpos: i32,
-    internal_query: Option<String>,
-    internalpos: i32,
-) -> ErrorInfo {
+fn error_info(sqlstate: &str, message: &str, fields: WireErrorFields) -> ErrorInfo {
+    let WireErrorFields {
+        detail,
+        hint,
+        context,
+        cursorpos,
+        internal_query,
+        internalpos,
+    } = fields;
     let mut error = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
     error.detail = detail;
     error.hint = hint;
@@ -1994,12 +1995,7 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
         QueryExecution::Batch(_) => Ok(error_response(
             "0A000",
             "fastpg cannot return a query batch in this protocol path",
-            None,
-            None,
-            None,
-            0,
-            None,
-            0,
+            WireErrorFields::default(),
         )),
         QueryExecution::Rows(result) => query_result_response(result, format),
         QueryExecution::Command { tag, rows } => Ok(command_response(tag.as_ref(), rows)),
@@ -2032,12 +2028,14 @@ fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWi
         } => Ok(error_response(
             &sqlstate,
             &message,
-            detail,
-            hint,
-            context,
-            cursorpos,
-            internal_query,
-            internalpos,
+            WireErrorFields {
+                detail,
+                hint,
+                context,
+                cursorpos,
+                internal_query,
+                internalpos,
+            },
         )),
     }
 }
@@ -2174,16 +2172,25 @@ fn invalid_parameter_response(message: &str) -> Response {
     )))
 }
 
-fn error_response(
-    sqlstate: &str,
-    message: &str,
+#[derive(Default)]
+struct WireErrorFields {
     detail: Option<String>,
     hint: Option<String>,
     context: Option<String>,
     cursorpos: i32,
     internal_query: Option<String>,
     internalpos: i32,
-) -> Response {
+}
+
+fn error_response(sqlstate: &str, message: &str, fields: WireErrorFields) -> Response {
+    let WireErrorFields {
+        detail,
+        hint,
+        context,
+        cursorpos,
+        internal_query,
+        internalpos,
+    } = fields;
     let mut error = ErrorInfo::new("ERROR".to_owned(), sqlstate.to_owned(), message.to_owned());
     error.detail = detail;
     error.hint = hint;
@@ -2309,15 +2316,15 @@ mod tests {
     #[test]
     fn transaction_commands_drive_pgwire_transaction_status() {
         assert!(matches!(
-            command_response("BEGIN", 0),
+            command_response("BEGIN", None),
             Response::TransactionStart(_)
         ));
         assert!(matches!(
-            command_response("COMMIT", 0),
+            command_response("COMMIT", None),
             Response::TransactionEnd(_)
         ));
         assert!(matches!(
-            command_response("ROLLBACK", 0),
+            command_response("ROLLBACK", None),
             Response::TransactionEnd(_)
         ));
     }

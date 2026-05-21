@@ -640,9 +640,13 @@ FastPgInitIndexAccessInfo(Relation relation)
 {
 	FastPgRustPrimaryKeyIndexInfo index_info;
 	HeapTuple	pg_index_tuple;
+	Datum		indclassDatum;
+	bool		isnull;
+	oidvector  *indclass;
 	MemoryContext indexcxt;
 	MemoryContext oldcontext;
 	int			indnkeyatts;
+	uint16		amsupport;
 
 	if (!fastpg_use_rust_catalog())
 		return false;
@@ -667,8 +671,21 @@ FastPgInitIndexAccessInfo(Relation relation)
 									  RelationGetRelationName(relation));
 	relation->rd_amhandler = InvalidOid;
 	relation->rd_indam = GetFastPgMemIndexAmRoutine();
-	relation->rd_support = NULL;
-	relation->rd_supportinfo = NULL;
+	amsupport = relation->rd_indam->amsupport;
+	if (amsupport > 0)
+	{
+		int			nsupport = RelationGetNumberOfAttributes(relation) * amsupport;
+
+		relation->rd_support = (RegProcedure *)
+			MemoryContextAllocZero(indexcxt, nsupport * sizeof(RegProcedure));
+		relation->rd_supportinfo = (FmgrInfo *)
+			MemoryContextAllocZero(indexcxt, nsupport * sizeof(FmgrInfo));
+	}
+	else
+	{
+		relation->rd_support = NULL;
+		relation->rd_supportinfo = NULL;
+	}
 	relation->rd_opfamily = (Oid *)
 		MemoryContextAllocZero(indexcxt, indnkeyatts * sizeof(Oid));
 	relation->rd_opcintype = (Oid *)
@@ -697,6 +714,18 @@ FastPgInitIndexAccessInfo(Relation relation)
 		relation->rd_indcollation[index] =
 			(Oid) index_info.collation_oids[index];
 		relation->rd_indoption[index] = 0;
+	}
+	if (amsupport > 0)
+	{
+		indclassDatum = fastgetattr(relation->rd_indextuple,
+									Anum_pg_index_indclass,
+									GetPgIndexDescriptor(),
+									&isnull);
+		Assert(!isnull);
+		indclass = (oidvector *) DatumGetPointer(indclassDatum);
+		IndexSupportInitialize(indclass, relation->rd_support,
+							   relation->rd_opfamily, relation->rd_opcintype,
+							   amsupport, indnkeyatts);
 	}
 
 	relation->rd_indexprs = NIL;

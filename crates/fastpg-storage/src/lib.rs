@@ -1598,10 +1598,9 @@ impl StorageState {
         for overlay in self.visible_overlay_stack(session).iter().rev() {
             if let Some(segment) = overlay.relations.get(&relid)
                 && let Some(row) = segment.rows.iter().find(|row| row.row_id == row_id)
+                && row_visible_to_snapshot(row, snapshot)
             {
-                if row_visible_to_snapshot(row, snapshot) {
-                    return Some(row.clone());
-                }
+                return Some(row.clone());
             }
             if overlay
                 .deleted_row_ids
@@ -4887,7 +4886,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict(
     true
 }
 
-unsafe fn unique_index_spec_from_ffi(
+struct UniqueIndexFfiSpecArgs {
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
@@ -4896,7 +4895,20 @@ unsafe fn unique_index_spec_from_ffi(
     nkeys: usize,
     is_primary: bool,
     nulls_not_distinct: bool,
-) -> Option<UniqueIndexSpec> {
+}
+
+unsafe fn unique_index_spec_from_ffi(args: UniqueIndexFfiSpecArgs) -> Option<UniqueIndexSpec> {
+    let UniqueIndexFfiSpecArgs {
+        index_relid,
+        heap_relid,
+        attnums,
+        typbyval,
+        typlen,
+        nkeys,
+        is_primary,
+        nulls_not_distinct,
+    } = args;
+
     if nkeys == 0
         || nkeys > FASTPG_MAX_INDEX_KEYS
         || attnums.is_null()
@@ -4952,7 +4964,7 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
     let is_primary = primary_key_relation_oid_for_index_oid(Oid(index_relid))
         .is_some_and(|relation_oid| relation_oid == Oid(heap_relid));
     let Some(index_spec) = (unsafe {
-        unique_index_spec_from_ffi(
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
             index_relid,
             heap_relid,
             attnums,
@@ -4960,8 +4972,8 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
             typlen,
             nkeys,
             is_primary,
-            false,
-        )
+            nulls_not_distinct: false,
+        })
     }) else {
         return false;
     };
@@ -5015,7 +5027,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
     let is_primary = primary_key_relation_oid_for_index_oid(Oid(index_relid))
         .is_some_and(|relation_oid| relation_oid == Oid(heap_relid));
     let Some(index_spec) = (unsafe {
-        unique_index_spec_from_ffi(
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
             index_relid,
             heap_relid,
             attnums,
@@ -5023,8 +5035,8 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
             typlen,
             nkeys,
             is_primary,
-            nulls_not_distinct != 0,
-        )
+            nulls_not_distinct: nulls_not_distinct != 0,
+        })
     }) else {
         return false;
     };
@@ -5078,7 +5090,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
     let is_primary = primary_key_relation_oid_for_index_oid(Oid(index_relid))
         .is_some_and(|relation_oid| relation_oid == Oid(heap_relid));
     let Some(index_spec) = (unsafe {
-        unique_index_spec_from_ffi(
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
             index_relid,
             heap_relid,
             attnums,
@@ -5086,8 +5098,8 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
             typlen,
             nkeys,
             is_primary,
-            nulls_not_distinct != 0,
-        )
+            nulls_not_distinct: nulls_not_distinct != 0,
+        })
     }) else {
         return false;
     };

@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::borrow::Cow;
+use std::ops::{Deref, DerefMut};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawParseSummary {
@@ -27,6 +28,11 @@ pub struct PgCoreNotice {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreError {
+    inner: Box<PgCoreErrorInfo>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreErrorInfo {
     pub sqlstate: String,
     pub message: String,
     pub detail: Option<String>,
@@ -39,60 +45,50 @@ pub struct PgCoreError {
     pub partial: Vec<ExecutionStatement>,
 }
 
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct PgCoreErrorFields {
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub context: Option<String>,
+    pub cursorpos: i32,
+    pub internal_query: Option<String>,
+    pub internalpos: i32,
+    pub notices: Vec<PgCoreNotice>,
+    pub partial: Vec<ExecutionStatement>,
+}
+
+impl Deref for PgCoreError {
+    type Target = PgCoreErrorInfo;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for PgCoreError {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
+    }
+}
+
 impl PgCoreError {
     pub fn new(sqlstate: impl Into<String>, message: impl Into<String>, cursorpos: i32) -> Self {
-        Self {
-            sqlstate: sqlstate.into(),
-            message: message.into(),
-            detail: None,
-            hint: None,
-            context: None,
-            cursorpos,
-            internal_query: None,
-            internalpos: 0,
-            notices: Vec::new(),
-            partial: Vec::new(),
-        }
+        Self::with_fields(
+            sqlstate,
+            message,
+            PgCoreErrorFields {
+                cursorpos,
+                ..Default::default()
+            },
+        )
     }
 
     pub fn with_fields(
         sqlstate: impl Into<String>,
         message: impl Into<String>,
-        detail: Option<String>,
-        hint: Option<String>,
-        context: Option<String>,
-        cursorpos: i32,
-        internal_query: Option<String>,
-        internalpos: i32,
+        fields: PgCoreErrorFields,
     ) -> Self {
-        Self {
-            sqlstate: sqlstate.into(),
-            message: message.into(),
-            detail,
-            hint,
-            context,
-            cursorpos,
-            internal_query,
-            internalpos,
-            notices: Vec::new(),
-            partial: Vec::new(),
-        }
-    }
-
-    pub fn with_fields_and_notices(
-        sqlstate: impl Into<String>,
-        message: impl Into<String>,
-        detail: Option<String>,
-        hint: Option<String>,
-        context: Option<String>,
-        cursorpos: i32,
-        internal_query: Option<String>,
-        internalpos: i32,
-        notices: Vec<PgCoreNotice>,
-    ) -> Self {
-        Self {
-            sqlstate: sqlstate.into(),
-            message: message.into(),
+        let PgCoreErrorFields {
             detail,
             hint,
             context,
@@ -100,8 +96,27 @@ impl PgCoreError {
             internal_query,
             internalpos,
             notices,
-            partial: Vec::new(),
+            partial,
+        } = fields;
+
+        Self {
+            inner: Box::new(PgCoreErrorInfo {
+                sqlstate: sqlstate.into(),
+                message: message.into(),
+                detail,
+                hint,
+                context,
+                cursorpos,
+                internal_query,
+                internalpos,
+                notices,
+                partial,
+            }),
         }
+    }
+
+    pub fn into_fields(self) -> PgCoreErrorInfo {
+        *self.inner
     }
 }
 
@@ -442,8 +457,9 @@ mod inner {
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyColumn, PgCoreCopyIn, PgCoreCopyOut,
-        PgCoreError, PgCoreField, PgCoreInputDatum, PgCoreLaneMetrics, PgCoreNotice, PgCoreParam,
-        PgCoreTransactionCommand, PgCoreValue, RawParseSummary, StatementDescription,
+        PgCoreError, PgCoreErrorFields, PgCoreField, PgCoreInputDatum, PgCoreLaneMetrics,
+        PgCoreNotice, PgCoreParam, PgCoreTransactionCommand, PgCoreValue, RawParseSummary,
+        StatementDescription,
     };
 
     static PGCORE_LOCK: Mutex<()> = Mutex::new(());
@@ -992,12 +1008,19 @@ mod inner {
             Err(PgCoreError::with_fields(
                 unsafe { c_string(fastpg_pgcore_parse_result_sqlstate(result.as_ptr())) },
                 unsafe { c_string(fastpg_pgcore_parse_result_message(result.as_ptr())) },
-                unsafe { optional_c_string(fastpg_pgcore_parse_result_detail(result.as_ptr())) },
-                unsafe { optional_c_string(fastpg_pgcore_parse_result_hint(result.as_ptr())) },
-                unsafe { optional_c_string(fastpg_pgcore_parse_result_context(result.as_ptr())) },
-                unsafe { fastpg_pgcore_parse_result_cursorpos(result.as_ptr()) },
-                None,
-                0,
+                PgCoreErrorFields {
+                    detail: unsafe {
+                        optional_c_string(fastpg_pgcore_parse_result_detail(result.as_ptr()))
+                    },
+                    hint: unsafe {
+                        optional_c_string(fastpg_pgcore_parse_result_hint(result.as_ptr()))
+                    },
+                    context: unsafe {
+                        optional_c_string(fastpg_pgcore_parse_result_context(result.as_ptr()))
+                    },
+                    cursorpos: unsafe { fastpg_pgcore_parse_result_cursorpos(result.as_ptr()) },
+                    ..Default::default()
+                },
             ))
         }
     }
@@ -1168,18 +1191,31 @@ mod inner {
                 drop(_guard);
                 Ok(prepared)
             } else {
-                let error = PgCoreError::with_fields_and_notices(
+                let error = PgCoreError::with_fields(
                     unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared.as_ptr())) },
                     unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
-                    unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr())) },
-                    unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr())) },
-                    unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr())) },
-                    unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_prepared_internal_query(prepared.as_ptr()))
+                    PgCoreErrorFields {
+                        detail: unsafe {
+                            optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr()))
+                        },
+                        hint: unsafe {
+                            optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr()))
+                        },
+                        context: unsafe {
+                            optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr()))
+                        },
+                        cursorpos: unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
+                        internal_query: unsafe {
+                            optional_c_string(fastpg_pgcore_prepared_internal_query(
+                                prepared.as_ptr(),
+                            ))
+                        },
+                        internalpos: unsafe {
+                            fastpg_pgcore_prepared_internalpos(prepared.as_ptr())
+                        },
+                        notices: prepared_notices_from_ptr(prepared.as_ptr()),
+                        ..Default::default()
                     },
-                    unsafe { fastpg_pgcore_prepared_internalpos(prepared.as_ptr()) },
-                    prepared_notices_from_ptr(prepared.as_ptr()),
                 );
                 drop(_guard);
                 Err(error)
@@ -1321,18 +1357,27 @@ mod inner {
                 Err(PgCoreError::with_fields(
                     unsafe { c_string(fastpg_pgcore_input_datum_result_sqlstate(result.as_ptr())) },
                     unsafe { c_string(fastpg_pgcore_input_datum_result_message(result.as_ptr())) },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_input_datum_result_detail(result.as_ptr()))
+                    PgCoreErrorFields {
+                        detail: unsafe {
+                            optional_c_string(fastpg_pgcore_input_datum_result_detail(
+                                result.as_ptr(),
+                            ))
+                        },
+                        hint: unsafe {
+                            optional_c_string(fastpg_pgcore_input_datum_result_hint(
+                                result.as_ptr(),
+                            ))
+                        },
+                        context: unsafe {
+                            optional_c_string(fastpg_pgcore_input_datum_result_context(
+                                result.as_ptr(),
+                            ))
+                        },
+                        cursorpos: unsafe {
+                            fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr())
+                        },
+                        ..Default::default()
                     },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_input_datum_result_hint(result.as_ptr()))
-                    },
-                    unsafe {
-                        optional_c_string(fastpg_pgcore_input_datum_result_context(result.as_ptr()))
-                    },
-                    unsafe { fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr()) },
-                    None,
-                    0,
                 ))
             }
         }
@@ -1523,7 +1568,7 @@ mod inner {
             }
             Err(mut error) => {
                 if !prepared_notices.is_empty() {
-                    prepared_notices.extend(error.notices);
+                    prepared_notices.extend(std::mem::take(&mut error.notices));
                     error.notices = prepared_notices;
                 }
                 Err(error)
@@ -1532,16 +1577,21 @@ mod inner {
     }
 
     fn prepared_error_from_ptr(prepared: *const FastPgPgCorePrepared) -> PgCoreError {
-        PgCoreError::with_fields_and_notices(
+        PgCoreError::with_fields(
             unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared)) },
             unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
-            unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
-            unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
-            unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared)) },
-            unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
-            unsafe { optional_c_string(fastpg_pgcore_prepared_internal_query(prepared)) },
-            unsafe { fastpg_pgcore_prepared_internalpos(prepared) },
-            prepared_notices_from_ptr(prepared),
+            PgCoreErrorFields {
+                detail: unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
+                hint: unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
+                context: unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared)) },
+                cursorpos: unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
+                internal_query: unsafe {
+                    optional_c_string(fastpg_pgcore_prepared_internal_query(prepared))
+                },
+                internalpos: unsafe { fastpg_pgcore_prepared_internalpos(prepared) },
+                notices: prepared_notices_from_ptr(prepared),
+                ..Default::default()
+            },
         )
     }
 
@@ -1603,18 +1653,31 @@ mod inner {
             Ok(result.to_execution_result())
         } else {
             let partial = result.to_execution_result().statements;
-            let mut error = PgCoreError::with_fields_and_notices(
+            let mut error = PgCoreError::with_fields(
                 unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
                 unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
-                unsafe { optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr())) },
-                unsafe { optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr())) },
-                unsafe { optional_c_string(fastpg_pgcore_execute_result_context(result.as_ptr())) },
-                unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
-                unsafe {
-                    optional_c_string(fastpg_pgcore_execute_result_internal_query(result.as_ptr()))
+                PgCoreErrorFields {
+                    detail: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr()))
+                    },
+                    hint: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr()))
+                    },
+                    context: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_context(result.as_ptr()))
+                    },
+                    cursorpos: unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
+                    internal_query: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_internal_query(
+                            result.as_ptr(),
+                        ))
+                    },
+                    internalpos: unsafe {
+                        fastpg_pgcore_execute_result_internalpos(result.as_ptr())
+                    },
+                    notices: result.to_notices(),
+                    ..Default::default()
                 },
-                unsafe { fastpg_pgcore_execute_result_internalpos(result.as_ptr()) },
-                result.to_notices(),
             );
             error.partial = partial;
             Err(error)
