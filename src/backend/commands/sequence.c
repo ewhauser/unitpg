@@ -100,6 +100,9 @@ fastpg_sequence_uses_virtual_state(void)
 {
 	return !fastpg_catalog_mode_uses_postgres();
 }
+
+static void fastpg_reset_virtual_sequence_cache(Oid relid, int64 last_value,
+												bool is_called);
 #endif
 
 static void fill_seq_with_data(Relation rel, HeapTuple tuple);
@@ -248,6 +251,10 @@ DefineSequence(ParseState *pstate, CreateSeqStmt *seq)
 
 	tuple = heap_form_tuple(tupDesc, pgs_values, pgs_nulls);
 	CatalogTupleInsert(rel, tuple);
+
+#ifdef USE_FASTPG
+	fastpg_reset_virtual_sequence_cache(seqoid, last_value, is_called);
+#endif
 
 	heap_freetuple(tuple);
 	table_close(rel, RowExclusiveLock);
@@ -1271,6 +1278,37 @@ create_seq_hashtable(void)
 	seqhashtab = hash_create("Sequence values", 16, &ctl,
 							 HASH_ELEM | HASH_BLOBS);
 }
+
+#ifdef USE_FASTPG
+static void
+fastpg_reset_virtual_sequence_cache(Oid relid, int64 last_value, bool is_called)
+{
+	SeqTable	elm;
+	bool		found;
+
+	if (!fastpg_sequence_uses_virtual_state())
+		return;
+
+	if (seqhashtab == NULL)
+		create_seq_hashtable();
+
+	elm = (SeqTable) hash_search(seqhashtab, &relid, HASH_ENTER, &found);
+	if (!found)
+	{
+		elm->filenumber = InvalidRelFileNumber;
+		elm->lxid = InvalidLocalTransactionId;
+	}
+
+	elm->last_valid = is_called;
+	elm->last = last_value;
+	elm->cached = last_value;
+	elm->increment = 0;
+	elm->reset_pending = !is_called;
+	elm->reset_value = last_value;
+	if (last_used_seq == elm && !is_called)
+		last_used_seq = NULL;
+}
+#endif
 
 /*
  * Given a relation OID, open and lock the sequence.  p_elm and p_rel are

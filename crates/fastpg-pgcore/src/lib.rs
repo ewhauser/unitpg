@@ -2574,6 +2574,68 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_recreated_serial_sequence_starts_at_beginning() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_serial_recreate_{}", std::process::id());
+        let sequence = format!("{table}_id_seq");
+
+        session
+            .prepare(&format!("drop table if exists {table} cascade"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("create table {table}(id serial)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} default values"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!(
+                "select setval('{sequence}'::regclass, 2147483647, true)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("drop table if exists {table} cascade"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        session
+            .prepare(&format!("create table {table}(id serial)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        session
+            .prepare(&format!("insert into {table} default values"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        let select = session
+            .prepare(&format!("select id from {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(
+            select.statements[0].rows[0][0],
+            PgCoreValue::Text("1".to_owned())
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table} cascade"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn repeated_executor_errors_keep_pgcore_session_alive() {
         let session = PgCoreSession::new();
 
