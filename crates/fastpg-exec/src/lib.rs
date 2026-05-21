@@ -809,6 +809,23 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn answers_pg_roles_queries_through_pgcore() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+
+        assert_eq!(
+            executor.execute(
+                "select rolname from pg_catalog.pg_roles where oid = 10 order by 1",
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("rolname", PgType::Varchar, 19)],
+                vec![vec![Value::Text("postgres".to_owned())]]
+            ))
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn copy_from_stdin_uses_pgcore_and_rust_storage() {
         let executor = QueryExecutor::new("17.0-fastpg");
         let table = format!("fastpg_exec_copy_{}", std::process::id());

@@ -287,6 +287,7 @@ fn classifies_pgbench_critical_virtual_catalogs() {
         ("pg_statistic_ext", VirtualCatalogPolicy::Static),
         ("pg_statistic_ext_data", VirtualCatalogPolicy::Static),
         ("pg_authid", VirtualCatalogPolicy::Static),
+        ("pg_roles", VirtualCatalogPolicy::Static),
         ("pg_auth_members", VirtualCatalogPolicy::Static),
         ("pg_parameter_acl", VirtualCatalogPolicy::Static),
     ];

@@ -96,11 +96,57 @@ fn main() {
     let bki = fs::read_to_string(generated_dir.join("postgres.bki")).expect("read postgres.bki");
     let schema =
         fs::read_to_string(generated_dir.join("schemapg.h")).expect("read generated schemapg.h");
-    let tables = parse_bki(&bki);
+    let mut tables = parse_bki(&bki);
+    add_system_view_catalogs(&mut tables);
     let schema_columns = parse_schema(&schema);
     let rust = emit_static_catalog(&tables, &schema_columns);
     fs::write(out_dir.join("generated_static_catalog.rs"), rust)
         .expect("write generated static catalog Rust source");
+}
+
+fn add_system_view_catalogs(tables: &mut Vec<BkiTable>) {
+    tables.push(BkiTable {
+        name: "pg_roles".to_owned(),
+        oid: 100_200,
+        rowtype_oid: 0,
+        columns: vec![
+            bki_column("rolname", "name"),
+            bki_column("rolsuper", "bool"),
+            bki_column("rolinherit", "bool"),
+            bki_column("rolcreaterole", "bool"),
+            bki_column("rolcreatedb", "bool"),
+            bki_column("rolcanlogin", "bool"),
+            bki_column("rolreplication", "bool"),
+            bki_column("rolconnlimit", "int4"),
+            bki_column("rolpassword", "text"),
+            bki_column("rolvaliduntil", "timestamptz"),
+            bki_column("rolbypassrls", "bool"),
+            bki_column("rolconfig", "_text"),
+            bki_column("oid", "oid"),
+        ],
+        rows: vec![vec![
+            Some("postgres".to_owned()),
+            Some("t".to_owned()),
+            Some("t".to_owned()),
+            Some("t".to_owned()),
+            Some("t".to_owned()),
+            Some("t".to_owned()),
+            Some("t".to_owned()),
+            Some("-1".to_owned()),
+            Some("********".to_owned()),
+            None,
+            Some("f".to_owned()),
+            None,
+            Some("10".to_owned()),
+        ]],
+    });
+}
+
+fn bki_column(name: &str, type_name: &str) -> BkiColumn {
+    BkiColumn {
+        name: name.to_owned(),
+        type_name: type_name.to_owned(),
+    }
 }
 
 fn parse_meson_string_list(contents: &str, name: &str) -> Vec<String> {
@@ -475,7 +521,7 @@ fn emit_raw_tables(
         ));
         out.push_str("        columns: &[\n");
         let schema = schema_columns.get(&table.name);
-        for column in &table.columns {
+        for (column_index, column) in table.columns.iter().enumerate() {
             let schema_column = schema.and_then(|columns| {
                 columns
                     .iter()
@@ -486,7 +532,12 @@ fn emit_raw_tables(
                 .or_else(|| type_oid_by_name.get(&column.type_name).copied())
                 .unwrap_or(0);
             let attlen = schema_column.map(|column| column.attlen).unwrap_or(0);
-            let attnum = schema_column.map(|column| column.attnum).unwrap_or(0);
+            let attnum = schema_column
+                .map(|column| column.attnum)
+                .unwrap_or_else(|| {
+                    i16::try_from(column_index + 1)
+                        .expect("synthetic catalog column attnum fits i16")
+                });
             let attndims = schema_column.map(|column| column.attndims).unwrap_or(0);
             let attbyval = schema_column
                 .map(|column| column.attbyval)
