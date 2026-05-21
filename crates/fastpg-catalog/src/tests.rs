@@ -156,6 +156,19 @@ fn generated_static_catalog_has_core_rows() {
 }
 
 #[test]
+fn catalog_rowtype_array_columns_use_record_array_type() {
+    let table = static_catalog_by_name("pg_statistic_ext_data").expect("pg_statistic_ext_data");
+    let column = table
+        .columns
+        .iter()
+        .find(|column| column.name == "stxdexpr")
+        .expect("stxdexpr column");
+
+    assert_eq!(column.type_name, "_pg_statistic");
+    assert_eq!(column.type_oid, RECORD_ARRAY_OID);
+}
+
+#[test]
 fn pg_init_privs_exposes_bootstrap_schema_privileges() {
     let table = static_catalog_by_name("pg_init_privs").expect("pg_init_privs");
     let rows = catalog_rows(table.oid);
@@ -356,6 +369,7 @@ fn classifies_pgbench_critical_virtual_catalogs() {
         ("pg_statistic_ext_data", VirtualCatalogPolicy::Static),
         ("pg_authid", VirtualCatalogPolicy::Static),
         ("pg_roles", VirtualCatalogPolicy::Static),
+        ("pg_indexes", VirtualCatalogPolicy::Dynamic),
         ("pg_auth_members", VirtualCatalogPolicy::Static),
         ("pg_parameter_acl", VirtualCatalogPolicy::Static),
     ];
@@ -1183,6 +1197,17 @@ fn generic_overlay_rows_drive_relation_views() {
             .iter()
             .any(|row| { value_oid(row_value("pg_index", row, "indrelid")) == Some(relation.oid) })
     );
+    assert!(catalog_rows(PG_INDEXES_RELATION_OID).iter().any(|row| {
+        value_name(row_value("pg_indexes", row, "schemaname")) == Some("public")
+            && value_name(row_value("pg_indexes", row, "tablename")) == Some("pgbench_accounts")
+            && value_name(row_value("pg_indexes", row, "indexname"))
+                == Some("pgbench_accounts_pkey")
+            && row_value("pg_indexes", row, "indexdef")
+                == &CatalogValue::Text(
+                    "CREATE UNIQUE INDEX pgbench_accounts_pkey ON public.pgbench_accounts USING btree (aid)"
+                        .to_owned(),
+                )
+    }));
     assert!(catalog_rows(PG_CONSTRAINT_RELATION_OID).iter().any(|row| {
         value_oid(row_value("pg_constraint", row, "conrelid")) == Some(relation.oid)
             && value_name(row_value("pg_constraint", row, "conname"))
@@ -1195,6 +1220,9 @@ fn generic_overlay_rows_drive_relation_views() {
     assert!(!relation_oid_exists(relation.oid));
     assert!(!catalog_rows(PG_CLASS_RELATION_OID).iter().any(|row| {
         value_name(row_value("pg_class", row, "relname")) == Some("pgbench_accounts")
+    }));
+    assert!(!catalog_rows(PG_INDEXES_RELATION_OID).iter().any(|row| {
+        value_name(row_value("pg_indexes", row, "tablename")) == Some("pgbench_accounts")
     }));
 }
 

@@ -7,10 +7,10 @@ use crate::generated_catalog;
 use crate::lookups::{lookup_builtin_type, relation_by_oid};
 use crate::model::*;
 use crate::state::{
-    CatalogDraft, CatalogState, apply_catalog_row_delete_to_snapshot,
-    apply_catalog_row_upsert_to_snapshot, commit_catalog_draft, ensure_catalog_transaction,
-    update_visible_catalog_snapshot, with_catalog, with_catalog_session,
-    with_visible_catalog_snapshot,
+    CatalogDraft, CatalogSnapshot, CatalogState, IndexMeta, RelationMeta,
+    apply_catalog_row_delete_to_snapshot, apply_catalog_row_upsert_to_snapshot,
+    commit_catalog_draft, ensure_catalog_transaction, update_visible_catalog_snapshot,
+    with_catalog, with_catalog_session, with_visible_catalog_snapshot,
 };
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -728,6 +728,161 @@ fn empty_catalog_row(table: &StaticCatalogTable, row_id: u64) -> CatalogRow {
         row_id,
         values: vec![CatalogValue::Null; table.columns.len()],
     }
+}
+
+fn quote_catalog_identifier(identifier: &str) -> String {
+    let mut chars = identifier.chars();
+    let simple = chars
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch == '_')
+        && chars.all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_');
+    if simple {
+        return identifier.to_owned();
+    }
+    format!("\"{}\"", identifier.replace('"', "\"\""))
+}
+
+fn snapshot_namespace_name(snapshot: &CatalogSnapshot, oid: Oid) -> Option<String> {
+    if let Some(row_id) = snapshot.namespace_oids.get(&oid.0)
+        && let Some(namespace) = snapshot.namespaces.get(row_id)
+    {
+        return Some(namespace.name.clone());
+    }
+    if oid == INFORMATION_SCHEMA_NAMESPACE.oid {
+        return Some(INFORMATION_SCHEMA_NAMESPACE.name.to_owned());
+    }
+    generated_catalog::STATIC_NAMESPACES
+        .iter()
+        .find(|namespace| namespace.oid == oid)
+        .map(|namespace| namespace.name.to_owned())
+}
+
+fn snapshot_access_method_name(snapshot: &CatalogSnapshot, oid: Oid) -> Option<String> {
+    let table = static_catalog_by_relation_oid(PG_AM_RELATION_OID)?;
+    let rows = catalog_rows_matching_static(
+        table.oid,
+        |table, row| static_row_column_oid(table, row, "oid").is_some_and(|row_oid| row_oid == oid),
+        |row| {
+            catalog_row_value(table, row, "oid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|row_oid| row_oid == oid)
+        },
+    );
+    rows.into_iter()
+        .find_map(|row| catalog_row_value(table, &row, "amname").and_then(catalog_value_string))
+        .or_else(|| {
+            snapshot
+                .compat_rows
+                .rows
+                .get(&PG_AM_RELATION_OID.0)
+                .and_then(|rows| {
+                    rows.values().find_map(|row| {
+                        let row = row.as_ref();
+                        (catalog_row_value(table, row, "oid").and_then(catalog_value_oid)
+                            == Some(oid))
+                        .then(|| {
+                            catalog_row_value(table, row, "amname").and_then(catalog_value_string)
+                        })
+                        .flatten()
+                    })
+                })
+        })
+}
+
+fn relation_access_method_oid(relation: &RelationMeta) -> Option<Oid> {
+    let table = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)?;
+    catalog_row_value(table, &relation.row, "relam").and_then(catalog_value_oid)
+}
+
+fn snapshot_relation_column_name(
+    snapshot: &CatalogSnapshot,
+    relation_oid: Oid,
+    attnum: i16,
+) -> Option<String> {
+    snapshot
+        .columns_by_relation
+        .get(&relation_oid.0)
+        .and_then(|columns| columns.get(&attnum))
+        .and_then(|row_id| snapshot.columns.get(row_id))
+        .map(|column| column.record.name.clone())
+}
+
+fn synthetic_pg_indexdef(
+    snapshot: &CatalogSnapshot,
+    relation: &RelationMeta,
+    index_relation: &RelationMeta,
+    index: &IndexMeta,
+) -> Option<String> {
+    let namespace = snapshot_namespace_name(snapshot, relation.namespace)?;
+    let method = relation_access_method_oid(index_relation)
+        .and_then(|oid| snapshot_access_method_name(snapshot, oid))
+        .unwrap_or_else(|| "btree".to_owned());
+    let columns = index
+        .record
+        .key_attnums
+        .iter()
+        .map(|attnum| {
+            if *attnum <= 0 {
+                return "<expression>".to_owned();
+            }
+            snapshot_relation_column_name(snapshot, relation.oid, *attnum)
+                .map(|name| quote_catalog_identifier(&name))
+                .unwrap_or_else(|| format!("att{attnum}"))
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    let unique = if index.record.is_unique {
+        "UNIQUE "
+    } else {
+        ""
+    };
+    let only = if relation.relkind == b'p' {
+        "ONLY "
+    } else {
+        ""
+    };
+
+    Some(format!(
+        "CREATE {unique}INDEX {} ON {only}{}.{} USING {} ({})",
+        quote_catalog_identifier(&index_relation.name),
+        quote_catalog_identifier(&namespace),
+        quote_catalog_identifier(&relation.name),
+        method,
+        columns
+    ))
+}
+
+fn synthetic_pg_indexes_row(
+    table: &StaticCatalogTable,
+    snapshot: &CatalogSnapshot,
+    index: &IndexMeta,
+) -> Option<CatalogRow> {
+    let relation = snapshot.relation_meta_by_oid(index.record.relation_oid)?;
+    let index_relation = snapshot.relation_meta_by_oid(index.record.index_oid)?;
+    if !matches!(relation.relkind, b'r' | b'm' | b'p')
+        || !matches!(index_relation.relkind, b'i' | b'I')
+    {
+        return None;
+    }
+    let namespace = snapshot_namespace_name(snapshot, relation.namespace)?;
+    let indexdef = synthetic_pg_indexdef(snapshot, relation, index_relation, index)?;
+    let mut row = empty_catalog_row(table, index.record.index_oid.0 as u64);
+    set_catalog_row_value(table, &mut row, "schemaname", CatalogValue::Name(namespace));
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "tablename",
+        CatalogValue::Name(relation.name.clone()),
+    );
+    set_catalog_row_value(
+        table,
+        &mut row,
+        "indexname",
+        CatalogValue::Name(index_relation.name.clone()),
+    );
+    set_catalog_row_value(table, &mut row, "tablespace", CatalogValue::Null);
+    set_catalog_row_value(table, &mut row, "indexdef", CatalogValue::Text(indexdef));
+    Some(row)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2072,6 +2227,15 @@ where
                     insert_matching_row(&mut rows, Some(index.row.clone()), &row_matches);
                 }
             }
+            PG_INDEXES_RELATION_OID => {
+                for index in snapshot.indexes.values() {
+                    insert_matching_row(
+                        &mut rows,
+                        synthetic_pg_indexes_row(table, snapshot, index),
+                        &row_matches,
+                    );
+                }
+            }
             PG_CONSTRAINT_RELATION_OID => {
                 for constraint in snapshot.constraints.values() {
                     insert_matching_row(&mut rows, Some(constraint.row.clone()), &row_matches);
@@ -2802,6 +2966,15 @@ pub fn catalog_row_count(relation_oid: Oid) -> Option<usize> {
                         .map(|spec| u64::from(spec.index_oid.0)),
                 );
                 row_ids.extend(snapshot.indexes.keys().copied());
+            }
+            PG_INDEXES_RELATION_OID => {
+                if let Some(table) = static_catalog_by_relation_oid(PG_INDEXES_RELATION_OID) {
+                    for index in snapshot.indexes.values() {
+                        if let Some(row) = synthetic_pg_indexes_row(table, snapshot, index) {
+                            row_ids.insert(row.row_id);
+                        }
+                    }
+                }
             }
             PG_CONSTRAINT_RELATION_OID => {
                 row_ids.extend(snapshot.constraints.keys().copied());

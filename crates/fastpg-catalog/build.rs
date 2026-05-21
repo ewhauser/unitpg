@@ -4,6 +4,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const RECORD_ARRAY_OID: u32 = 2287;
+
 #[derive(Clone, Debug)]
 struct BkiColumn {
     name: String,
@@ -139,6 +141,19 @@ fn add_system_view_catalogs(tables: &mut Vec<BkiTable>) {
             None,
             Some("10".to_owned()),
         ]],
+    });
+    tables.push(BkiTable {
+        name: "pg_indexes".to_owned(),
+        oid: 100_201,
+        rowtype_oid: 0,
+        columns: vec![
+            bki_column("schemaname", "name"),
+            bki_column("tablename", "name"),
+            bki_column("indexname", "name"),
+            bki_column("tablespace", "name"),
+            bki_column("indexdef", "text"),
+        ],
+        rows: vec![],
     });
 }
 
@@ -501,6 +516,14 @@ fn type_oid_by_name(tables: &[BkiTable]) -> BTreeMap<String, u32> {
     map
 }
 
+fn generated_catalog_rowtype_array_oid(type_name: &str, tables: &[BkiTable]) -> Option<u32> {
+    let relation_name = type_name.strip_prefix('_')?;
+    tables
+        .iter()
+        .any(|table| table.name == relation_name)
+        .then_some(RECORD_ARRAY_OID)
+}
+
 fn emit_raw_tables(
     out: &mut String,
     tables: &[BkiTable],
@@ -529,7 +552,9 @@ fn emit_raw_tables(
             });
             let type_oid = schema_column
                 .map(|column| column.type_oid)
+                .filter(|oid| *oid != 0)
                 .or_else(|| type_oid_by_name.get(&column.type_name).copied())
+                .or_else(|| generated_catalog_rowtype_array_oid(&column.type_name, tables))
                 .unwrap_or(0);
             let attlen = schema_column.map(|column| column.attlen).unwrap_or(0);
             let attnum = schema_column
@@ -625,6 +650,7 @@ fn emit_raw_tables(
                 | "pg_amop"
                 | "pg_amproc"
                 | "pg_rewrite"
+                | "pg_indexes"
         ) {
             "VirtualCatalogPolicy::Dynamic"
         } else {
