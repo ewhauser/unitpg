@@ -155,9 +155,12 @@ pub(crate) struct CatalogSnapshot {
     pub(crate) indexes: BTreeMap<u64, IndexMeta>,
     pub(crate) index_oids: BTreeMap<u32, u64>,
     pub(crate) indexes_by_relation: BTreeMap<u32, Vec<u64>>,
+    pub(crate) pg_inherits_by_child: BTreeMap<u32, Vec<u64>>,
+    pub(crate) pg_inherits_by_parent: BTreeMap<u32, Vec<u64>>,
     pub(crate) constraints: BTreeMap<u64, ConstraintMeta>,
     pub(crate) constraint_oids: BTreeMap<u32, u64>,
     pub(crate) constraints_by_relation: BTreeMap<u32, Vec<u64>>,
+    pub(crate) constraints_by_index: BTreeMap<u32, Vec<u64>>,
     pub(crate) compat_rows: CompatCatalogRows,
 }
 
@@ -219,14 +222,47 @@ impl CatalogSnapshot {
                 .push(*row_id);
         }
 
+        self.pg_inherits_by_child.clear();
+        self.pg_inherits_by_parent.clear();
+        if let Some(table) = crate::rows::static_catalog_by_relation_oid(PG_INHERITS_RELATION_OID)
+            && let Some(rows) = self.compat_rows.rows.get(&PG_INHERITS_RELATION_OID.0)
+        {
+            for (row_id, row) in rows {
+                let row = row.as_ref();
+                if let Some(child) =
+                    catalog_row_value(table, row, "inhrelid").and_then(catalog_value_oid)
+                {
+                    self.pg_inherits_by_child
+                        .entry(child.0)
+                        .or_default()
+                        .push(*row_id);
+                }
+                if let Some(parent) =
+                    catalog_row_value(table, row, "inhparent").and_then(catalog_value_oid)
+                {
+                    self.pg_inherits_by_parent
+                        .entry(parent.0)
+                        .or_default()
+                        .push(*row_id);
+                }
+            }
+        }
+
         self.constraint_oids.clear();
         self.constraints_by_relation.clear();
+        self.constraints_by_index.clear();
         for (row_id, constraint) in &self.constraints {
             self.constraint_oids.insert(constraint.oid.0, *row_id);
             self.constraints_by_relation
                 .entry(constraint.relation_oid.0)
                 .or_default()
                 .push(*row_id);
+            if constraint.index_oid != INVALID_OID {
+                self.constraints_by_index
+                    .entry(constraint.index_oid.0)
+                    .or_default()
+                    .push(*row_id);
+            }
         }
     }
 
@@ -278,6 +314,21 @@ impl CatalogSnapshot {
     pub(crate) fn constraint_metas_for_relation(&self, relation_oid: Oid) -> Vec<&ConstraintMeta> {
         self.constraints_by_relation
             .get(&relation_oid.0)
+            .into_iter()
+            .flat_map(|row_ids| row_ids.iter())
+            .filter_map(|row_id| self.constraints.get(row_id))
+            .collect()
+    }
+
+    pub(crate) fn constraint_meta_by_oid(&self, oid: Oid) -> Option<&ConstraintMeta> {
+        self.constraint_oids
+            .get(&oid.0)
+            .and_then(|row_id| self.constraints.get(row_id))
+    }
+
+    pub(crate) fn constraint_metas_for_index(&self, index_oid: Oid) -> Vec<&ConstraintMeta> {
+        self.constraints_by_index
+            .get(&index_oid.0)
             .into_iter()
             .flat_map(|row_ids| row_ids.iter())
             .filter_map(|row_id| self.constraints.get(row_id))

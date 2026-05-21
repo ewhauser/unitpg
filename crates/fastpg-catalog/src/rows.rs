@@ -2189,6 +2189,253 @@ fn catalog_rows_matching_pg_attribute_filters(
     })
 }
 
+fn remove_compat_tombstones(
+    relation_oid: Oid,
+    rows: &mut BTreeMap<u64, CatalogRow>,
+    compat_rows: &crate::state::CompatCatalogRows,
+) {
+    if let Some(tombstones) = compat_rows.tombstones.get(&relation_oid.0) {
+        for row_id in tombstones {
+            rows.remove(row_id);
+        }
+    }
+}
+
+fn apply_matching_compat_rows(
+    relation_oid: Oid,
+    rows: &mut BTreeMap<u64, CatalogRow>,
+    compat_rows: &crate::state::CompatCatalogRows,
+    row_matches: &impl Fn(&CatalogRow) -> bool,
+) {
+    remove_compat_tombstones(relation_oid, rows, compat_rows);
+    if let Some(overlay_rows) = compat_rows.rows.get(&relation_oid.0) {
+        for (row_id, row) in overlay_rows {
+            let row = row.as_ref();
+            if row_matches(row) {
+                rows.insert(*row_id, row.clone());
+            } else {
+                rows.remove(row_id);
+            }
+        }
+    }
+}
+
+fn insert_matching_compat_row_ids(
+    relation_oid: Oid,
+    rows: &mut BTreeMap<u64, CatalogRow>,
+    compat_rows: &crate::state::CompatCatalogRows,
+    row_ids: &[u64],
+    row_matches: &impl Fn(&CatalogRow) -> bool,
+) {
+    let Some(overlay_rows) = compat_rows.rows.get(&relation_oid.0) else {
+        return;
+    };
+    for row_id in row_ids {
+        if let Some(row) = overlay_rows.get(row_id) {
+            let row = row.as_ref();
+            if row_matches(row) {
+                rows.insert(*row_id, row.clone());
+            }
+        }
+    }
+}
+
+fn catalog_rows_matching_pg_class_filters(
+    table: &StaticCatalogTable,
+    filters: &[CatalogRowFilter],
+) -> Option<Vec<CatalogRow>> {
+    let oid_attnum = filter_attnum_for_column(table, "oid")?;
+    let relname_attnum = filter_attnum_for_column(table, "relname")?;
+    let relnamespace_attnum = filter_attnum_for_column(table, "relnamespace")?;
+    let oid = filter_oid(filters, oid_attnum);
+    let relname = filter_name(filters, relname_attnum);
+    let relnamespace = filter_oid(filters, relnamespace_attnum);
+    if oid.is_none() && !(relname.is_some() && relnamespace.is_some()) {
+        return None;
+    }
+
+    with_visible_catalog_snapshot(|snapshot| {
+        let row_matches = |row: &CatalogRow| catalog_row_matches_filters(table, row, filters);
+        let static_matches =
+            |static_row: &StaticCatalogRow| static_row_matches_filters(table, static_row, filters);
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+
+        for static_row in table.rows.iter().filter(|row| static_matches(row)) {
+            if let Some(row) = static_catalog_cached_row(table, static_row) {
+                rows.insert(row.row_id, row.clone());
+            }
+        }
+        for spec in SYNTHETIC_CATALOG_INDEX_SPECS {
+            insert_matching_row(
+                &mut rows,
+                Some(synthetic_catalog_index_class_row(table, spec)),
+                &row_matches,
+            );
+        }
+
+        if let Some(oid) = oid {
+            if let Some(relation) = snapshot.relation_meta_by_oid(oid) {
+                insert_matching_row(&mut rows, Some(relation.row.clone()), &row_matches);
+            }
+        } else if let (Some(relname), Some(relnamespace)) = (relname.as_deref(), relnamespace)
+            && let Some(relation) = snapshot.relation_meta_by_name(relname, relnamespace)
+        {
+            insert_matching_row(&mut rows, Some(relation.row.clone()), &row_matches);
+        }
+
+        apply_matching_compat_rows(
+            PG_CLASS_RELATION_OID,
+            &mut rows,
+            &snapshot.compat_rows,
+            &row_matches,
+        );
+        Some(rows.into_values().collect())
+    })
+}
+
+fn catalog_rows_matching_pg_index_filters(
+    table: &StaticCatalogTable,
+    filters: &[CatalogRowFilter],
+) -> Option<Vec<CatalogRow>> {
+    let indexrelid_attnum = filter_attnum_for_column(table, "indexrelid")?;
+    let indrelid_attnum = filter_attnum_for_column(table, "indrelid")?;
+    let index_oid = filter_oid(filters, indexrelid_attnum);
+    let relation_oid = filter_oid(filters, indrelid_attnum);
+    if index_oid.is_none() && relation_oid.is_none() {
+        return None;
+    }
+
+    with_visible_catalog_snapshot(|snapshot| {
+        let row_matches = |row: &CatalogRow| catalog_row_matches_filters(table, row, filters);
+        let static_matches =
+            |static_row: &StaticCatalogRow| static_row_matches_filters(table, static_row, filters);
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+
+        for static_row in table.rows.iter().filter(|row| static_matches(row)) {
+            if let Some(row) = static_catalog_cached_row(table, static_row) {
+                rows.insert(row.row_id, row.clone());
+            }
+        }
+        for spec in SYNTHETIC_CATALOG_INDEX_SPECS {
+            insert_matching_row(
+                &mut rows,
+                Some(synthetic_catalog_index_row(table, spec)),
+                &row_matches,
+            );
+        }
+
+        if let Some(index_oid) = index_oid {
+            if let Some(index) = snapshot.index_meta_by_oid(index_oid) {
+                insert_matching_row(&mut rows, Some(index.row.clone()), &row_matches);
+            }
+        } else if let Some(relation_oid) = relation_oid {
+            for index in snapshot.index_metas_for_relation(relation_oid) {
+                insert_matching_row(&mut rows, Some(index.row.clone()), &row_matches);
+            }
+        }
+
+        apply_matching_compat_rows(
+            PG_INDEX_RELATION_OID,
+            &mut rows,
+            &snapshot.compat_rows,
+            &row_matches,
+        );
+        Some(rows.into_values().collect())
+    })
+}
+
+fn catalog_rows_matching_pg_constraint_filters(
+    table: &StaticCatalogTable,
+    filters: &[CatalogRowFilter],
+) -> Option<Vec<CatalogRow>> {
+    let oid_attnum = filter_attnum_for_column(table, "oid")?;
+    let conrelid_attnum = filter_attnum_for_column(table, "conrelid")?;
+    let conindid_attnum = filter_attnum_for_column(table, "conindid")?;
+    let oid = filter_oid(filters, oid_attnum);
+    let relation_oid = filter_oid(filters, conrelid_attnum);
+    let index_oid = filter_oid(filters, conindid_attnum);
+    if oid.is_none() && relation_oid.is_none() && index_oid.is_none() {
+        return None;
+    }
+
+    with_visible_catalog_snapshot(|snapshot| {
+        let row_matches = |row: &CatalogRow| catalog_row_matches_filters(table, row, filters);
+        let static_matches =
+            |static_row: &StaticCatalogRow| static_row_matches_filters(table, static_row, filters);
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+
+        for static_row in table.rows.iter().filter(|row| static_matches(row)) {
+            if let Some(row) = static_catalog_cached_row(table, static_row) {
+                rows.insert(row.row_id, row.clone());
+            }
+        }
+
+        if let Some(oid) = oid {
+            if let Some(constraint) = snapshot.constraint_meta_by_oid(oid) {
+                insert_matching_row(&mut rows, Some(constraint.row.clone()), &row_matches);
+            }
+        } else if let Some(relation_oid) = relation_oid {
+            for constraint in snapshot.constraint_metas_for_relation(relation_oid) {
+                insert_matching_row(&mut rows, Some(constraint.row.clone()), &row_matches);
+            }
+        } else if let Some(index_oid) = index_oid {
+            for constraint in snapshot.constraint_metas_for_index(index_oid) {
+                insert_matching_row(&mut rows, Some(constraint.row.clone()), &row_matches);
+            }
+        }
+
+        apply_matching_compat_rows(
+            PG_CONSTRAINT_RELATION_OID,
+            &mut rows,
+            &snapshot.compat_rows,
+            &row_matches,
+        );
+        Some(rows.into_values().collect())
+    })
+}
+
+fn catalog_rows_matching_pg_inherits_filters(
+    table: &StaticCatalogTable,
+    filters: &[CatalogRowFilter],
+) -> Option<Vec<CatalogRow>> {
+    let child_attnum = filter_attnum_for_column(table, "inhrelid")?;
+    let parent_attnum = filter_attnum_for_column(table, "inhparent")?;
+    let child_oid = filter_oid(filters, child_attnum);
+    let parent_oid = filter_oid(filters, parent_attnum);
+    if child_oid.is_none() && parent_oid.is_none() {
+        return None;
+    }
+
+    with_visible_catalog_snapshot(|snapshot| {
+        let row_matches = |row: &CatalogRow| catalog_row_matches_filters(table, row, filters);
+        let static_matches =
+            |static_row: &StaticCatalogRow| static_row_matches_filters(table, static_row, filters);
+        let mut rows = BTreeMap::<u64, CatalogRow>::new();
+
+        for static_row in table.rows.iter().filter(|row| static_matches(row)) {
+            if let Some(row) = static_catalog_cached_row(table, static_row) {
+                rows.insert(row.row_id, row.clone());
+            }
+        }
+        remove_compat_tombstones(PG_INHERITS_RELATION_OID, &mut rows, &snapshot.compat_rows);
+
+        let candidate_row_ids = child_oid
+            .and_then(|oid| snapshot.pg_inherits_by_child.get(&oid.0))
+            .or_else(|| parent_oid.and_then(|oid| snapshot.pg_inherits_by_parent.get(&oid.0)));
+        if let Some(row_ids) = candidate_row_ids {
+            insert_matching_compat_row_ids(
+                PG_INHERITS_RELATION_OID,
+                &mut rows,
+                &snapshot.compat_rows,
+                row_ids,
+                &row_matches,
+            );
+        }
+
+        Some(rows.into_values().collect())
+    })
+}
+
 pub fn catalog_rows_matching_filters(
     relation_oid: Oid,
     filters: &[CatalogRowFilter],
@@ -2199,6 +2446,30 @@ pub fn catalog_rows_matching_filters(
     if relation_oid == PG_ATTRIBUTE_RELATION_OID
         && let Some(rows) = static_catalog_by_relation_oid(PG_ATTRIBUTE_RELATION_OID)
             .and_then(|table| catalog_rows_matching_pg_attribute_filters(table, filters))
+    {
+        return rows;
+    }
+    if relation_oid == PG_CLASS_RELATION_OID
+        && let Some(rows) = static_catalog_by_relation_oid(PG_CLASS_RELATION_OID)
+            .and_then(|table| catalog_rows_matching_pg_class_filters(table, filters))
+    {
+        return rows;
+    }
+    if relation_oid == PG_INDEX_RELATION_OID
+        && let Some(rows) = static_catalog_by_relation_oid(PG_INDEX_RELATION_OID)
+            .and_then(|table| catalog_rows_matching_pg_index_filters(table, filters))
+    {
+        return rows;
+    }
+    if relation_oid == PG_INHERITS_RELATION_OID
+        && let Some(rows) = static_catalog_by_relation_oid(PG_INHERITS_RELATION_OID)
+            .and_then(|table| catalog_rows_matching_pg_inherits_filters(table, filters))
+    {
+        return rows;
+    }
+    if relation_oid == PG_CONSTRAINT_RELATION_OID
+        && let Some(rows) = static_catalog_by_relation_oid(PG_CONSTRAINT_RELATION_OID)
+            .and_then(|table| catalog_rows_matching_pg_constraint_filters(table, filters))
     {
         return rows;
     }

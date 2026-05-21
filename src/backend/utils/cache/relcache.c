@@ -5514,9 +5514,10 @@ RelationGetIndexList(Relation relation)
 			{
 				FastPgRustPrimaryKeyIndexInfo fastpg_index_info;
 
-				if (fastpg_rust_catalog_primary_key_index_info(fastpg_index_oid,
-															   &fastpg_index_info) &&
-					fastpg_index_info.is_primary != 0)
+				if (!fastpg_rust_catalog_primary_key_index_info(fastpg_index_oid,
+																&fastpg_index_info))
+					continue;
+				if (fastpg_index_info.is_primary != 0)
 					pkeyIndex = (Oid) fastpg_index_oid;
 				if (!list_member_oid(result, (Oid) fastpg_index_oid))
 					result = lappend_oid(result, (Oid) fastpg_index_oid);

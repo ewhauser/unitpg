@@ -583,6 +583,194 @@ fn virtual_catalog_index_attributes_are_visible() {
 }
 
 #[test]
+fn filtered_pg_index_rows_use_dynamic_catalog_indexes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+
+    upsert_named_catalog_row(
+        "pg_index",
+        61_001,
+        &[
+            ("indexrelid", "61001"),
+            ("indrelid", "61000"),
+            ("indnatts", "1"),
+            ("indnkeyatts", "1"),
+            ("indisunique", "f"),
+            ("indisprimary", "f"),
+            ("indisvalid", "t"),
+            ("indisready", "t"),
+            ("indislive", "t"),
+            ("indkey", "1"),
+        ],
+    );
+    commit_implicit_transaction();
+
+    let pg_index = static_catalog_by_name("pg_index").expect("pg_index catalog");
+    let indrelid_attnum = pg_index
+        .columns
+        .iter()
+        .position(|column| column.name == "indrelid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_index.indrelid attnum");
+    let filtered = catalog_rows_matching_filters(
+        pg_index.oid,
+        &[CatalogRowFilter {
+            attnum: indrelid_attnum,
+            value: CatalogFilterValue::Oid(Oid(61_000)),
+        }],
+    );
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        catalog_row_value(pg_index, &filtered[0], "indexrelid").and_then(catalog_value_oid),
+        Some(Oid(61_001))
+    );
+
+    clear_for_tests();
+    abort_implicit_transaction();
+}
+
+#[test]
+fn filtered_pg_class_rows_use_dynamic_catalog_indexes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+
+    upsert_named_catalog_row(
+        "pg_class",
+        63_000,
+        &[
+            ("oid", "63000"),
+            ("relname", "filtered_relation"),
+            ("relnamespace", "2200"),
+            ("reltype", "63001"),
+            ("relowner", "10"),
+            ("relam", "2"),
+            ("relfilenode", "63000"),
+            ("relhasindex", "f"),
+            ("relpersistence", "p"),
+            ("relkind", "r"),
+            ("relnatts", "0"),
+        ],
+    );
+    commit_implicit_transaction();
+
+    let pg_class = static_catalog_by_name("pg_class").expect("pg_class catalog");
+    let oid_attnum = pg_class
+        .columns
+        .iter()
+        .position(|column| column.name == "oid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_class.oid attnum");
+    let filtered = catalog_rows_matching_filters(
+        pg_class.oid,
+        &[CatalogRowFilter {
+            attnum: oid_attnum,
+            value: CatalogFilterValue::Oid(Oid(63_000)),
+        }],
+    );
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        catalog_row_value(pg_class, &filtered[0], "relname").and_then(catalog_value_string),
+        Some("filtered_relation".to_owned())
+    );
+
+    clear_for_tests();
+    abort_implicit_transaction();
+}
+
+#[test]
+fn filtered_pg_constraint_rows_use_dynamic_catalog_indexes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+
+    upsert_named_catalog_row(
+        "pg_constraint",
+        64_002,
+        &[
+            ("oid", "64002"),
+            ("conname", "filtered_constraint"),
+            ("connamespace", "2200"),
+            ("contype", "p"),
+            ("conrelid", "64000"),
+            ("conindid", "64001"),
+            ("conkey", "1"),
+        ],
+    );
+    commit_implicit_transaction();
+
+    let pg_constraint = static_catalog_by_name("pg_constraint").expect("pg_constraint catalog");
+    let conrelid_attnum = pg_constraint
+        .columns
+        .iter()
+        .position(|column| column.name == "conrelid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_constraint.conrelid attnum");
+    let filtered = catalog_rows_matching_filters(
+        pg_constraint.oid,
+        &[CatalogRowFilter {
+            attnum: conrelid_attnum,
+            value: CatalogFilterValue::Oid(Oid(64_000)),
+        }],
+    );
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        catalog_row_value(pg_constraint, &filtered[0], "conindid").and_then(catalog_value_oid),
+        Some(Oid(64_001))
+    );
+
+    clear_for_tests();
+    abort_implicit_transaction();
+}
+
+#[test]
+fn filtered_pg_inherits_rows_use_compat_catalog_indexes() {
+    let _guard = catalog_test_lock();
+    clear_for_tests();
+    abort_implicit_transaction();
+
+    upsert_named_catalog_row(
+        "pg_inherits",
+        62_001,
+        &[
+            ("inhrelid", "62001"),
+            ("inhparent", "62000"),
+            ("inhseqno", "1"),
+            ("inhdetachpending", "f"),
+        ],
+    );
+    commit_implicit_transaction();
+
+    let pg_inherits = static_catalog_by_name("pg_inherits").expect("pg_inherits catalog");
+    let inhrelid_attnum = pg_inherits
+        .columns
+        .iter()
+        .position(|column| column.name == "inhrelid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_inherits.inhrelid attnum");
+    let filtered = catalog_rows_matching_filters(
+        pg_inherits.oid,
+        &[CatalogRowFilter {
+            attnum: inhrelid_attnum,
+            value: CatalogFilterValue::Oid(Oid(62_001)),
+        }],
+    );
+
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        catalog_row_value(pg_inherits, &filtered[0], "inhparent").and_then(catalog_value_oid),
+        Some(Oid(62_000))
+    );
+
+    clear_for_tests();
+    abort_implicit_transaction();
+}
+
+#[test]
 fn operator_implementation_proc_descriptions_are_synthesized() {
     let pg_description = static_catalog_by_name("pg_description").expect("pg_description catalog");
     let rows = catalog_rows(pg_description.oid);

@@ -53,6 +53,7 @@ pub(crate) const PG_OPERATOR_RELATION_OID: Oid = Oid(2617);
 pub(crate) const PG_DATABASE_RELATION_OID: Oid = Oid(1262);
 pub(crate) const PG_NAMESPACE_RELATION_OID: Oid = Oid(2615);
 pub(crate) const PG_INDEX_RELATION_OID: Oid = Oid(2610);
+pub(crate) const PG_INHERITS_RELATION_OID: Oid = Oid(2611);
 pub(crate) const PG_CONSTRAINT_RELATION_OID: Oid = Oid(2606);
 pub(crate) const PG_DESCRIPTION_RELATION_OID: Oid = Oid(2609);
 pub(crate) const PG_SEQUENCE_RELATION_OID: Oid = Oid(2224);

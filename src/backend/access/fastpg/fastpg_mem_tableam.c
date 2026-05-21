@@ -731,8 +731,7 @@ fastpg_mem_scan_begin_storage1(Relation rel, int nkeys, ScanKeyData *key)
 	uint64_t	scan_handle;
 	bool		heap_buffers;
 
-	if (nkeys <= 0 || key == NULL ||
-		fastpg_rust_catalog_policy_by_relation_oid(relid) == 0)
+	if (nkeys <= 0 || key == NULL)
 		return fastpg_rust_scan_begin(relid);
 
 	heap_buffers = nkeys > FASTPG_MEM_STACK_NATTS;

@@ -743,6 +743,12 @@ struct IndexColumnSpec {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+struct StorageScanFilter {
+    column: IndexColumnSpec,
+    value: IndexKeyPart,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 struct UniqueIndexSpec {
     index_oid: Oid,
     relation_oid: Oid,
@@ -1063,6 +1069,7 @@ pub struct SessionStorage {
     transaction_stack: Vec<TransactionOverlay>,
     explicit_transaction: bool,
     scans: HashMap<u64, ScanState>,
+    catalog_fetches: Vec<ScanState>,
     next_scan_handle: u64,
     catalog_session: fastpg_catalog::CatalogSessionHandle,
 }
@@ -1073,6 +1080,7 @@ impl Default for SessionStorage {
             transaction_stack: Vec::new(),
             explicit_transaction: false,
             scans: HashMap::new(),
+            catalog_fetches: Vec::new(),
             next_scan_handle: 1,
             catalog_session: fastpg_catalog::new_catalog_session(),
         }
@@ -1181,7 +1189,11 @@ impl SessionStorage {
     }
 
     fn scan_bytes(&self) -> usize {
-        self.scans.values().map(ScanState::bytes).sum()
+        self.scans
+            .values()
+            .map(ScanState::bytes)
+            .chain(self.catalog_fetches.iter().map(ScanState::bytes))
+            .sum()
     }
 }
 
@@ -1273,6 +1285,7 @@ impl StorageState {
         while !session.transaction_stack.is_empty() {
             pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
+        session.catalog_fetches.clear();
         fastpg_catalog::commit_explicit_transaction();
         session.explicit_transaction = false;
         self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
@@ -1280,6 +1293,7 @@ impl StorageState {
 
     fn abort_explicit_transaction(&mut self, session: &mut SessionStorage) {
         session.transaction_stack.clear();
+        session.catalog_fetches.clear();
         fastpg_catalog::abort_explicit_transaction();
         session.explicit_transaction = false;
     }
@@ -1292,6 +1306,7 @@ impl StorageState {
         while !session.transaction_stack.is_empty() {
             pending_primary_key_rebuilds.extend(self.commit_top_overlay(session));
         }
+        session.catalog_fetches.clear();
         fastpg_catalog::commit_implicit_transaction();
         self.rebuild_primary_key_indexes(&pending_primary_key_rebuilds);
     }
@@ -1299,6 +1314,7 @@ impl StorageState {
     fn abort_implicit_transaction(&mut self, session: &mut SessionStorage) {
         if !session.explicit_transaction {
             session.transaction_stack.clear();
+            session.catalog_fetches.clear();
             fastpg_catalog::abort_implicit_transaction();
         }
     }
@@ -1393,6 +1409,45 @@ impl StorageState {
             if let Some(segment) = overlay.relations.get(&relid) {
                 for row in &segment.rows {
                     rows.insert(row.row_id, row);
+                }
+            }
+        }
+        ScanState::materialize(rows.into_values())
+    }
+
+    fn visible_scan_state_filtered(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        filters: &[StorageScanFilter],
+    ) -> Result<ScanState, CatalogError> {
+        if filters.is_empty() {
+            return self.visible_scan_state(session, relid);
+        }
+
+        let mut rows = BTreeMap::new();
+        if let Some(relation) = self.relations.get(&relid) {
+            for row_id in &relation.committed_row_ids {
+                if let Some(row) = relation.committed_row_index.get(row_id)
+                    && row_matches_storage_filters(row, filters)
+                {
+                    rows.insert(*row_id, row);
+                }
+            }
+        }
+        for overlay in self.visible_overlay_stack(session) {
+            if let Some(deleted_row_ids) = overlay.deleted_row_ids.get(&relid) {
+                for row_id in deleted_row_ids {
+                    rows.remove(row_id);
+                }
+            }
+            if let Some(segment) = overlay.relations.get(&relid) {
+                for row in &segment.rows {
+                    if row_matches_storage_filters(row, filters) {
+                        rows.insert(row.row_id, row);
+                    } else {
+                        rows.remove(&row.row_id);
+                    }
                 }
             }
         }
@@ -2732,8 +2787,8 @@ fn invalid_ffi_argument(message: String) -> CatalogError {
     CatalogError::new("22023", message)
 }
 
-fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
-    if !record.is_unique || !record.is_valid || !record.is_ready || !record.is_live {
+fn index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
+    if !record.is_valid || !record.is_ready || !record.is_live {
         return None;
     }
     let mut columns = Vec::with_capacity(record.key_attnums.len());
@@ -2762,6 +2817,13 @@ fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<
         nulls_not_distinct: record.nulls_not_distinct,
         columns,
     })
+}
+
+fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<UniqueIndexSpec> {
+    if !record.is_unique {
+        return None;
+    }
+    index_spec_for_record(record)
 }
 
 fn unique_index_specs_for_relation_oid(relation_oid: Oid) -> Vec<UniqueIndexSpec> {
@@ -2825,7 +2887,7 @@ fn primary_key_index_cache_entry(
     index_oid: Oid,
 ) -> Option<CachedUniqueIndex> {
     let record = index_record_by_index_oid(index_oid)?;
-    let index_spec = unique_index_spec_for_record(&record)?;
+    let index_spec = index_spec_for_record(&record)?;
     let key_count = index_spec.columns.len();
     if key_count == 0 || key_count > FASTPG_MAX_INDEX_KEYS {
         return None;
@@ -2905,6 +2967,16 @@ fn index_key_for_datums(
     }
 
     Some(key)
+}
+
+fn row_matches_storage_filters(row: &Row, filters: &[StorageScanFilter]) -> bool {
+    filters.iter().all(|filter| {
+        row.cells
+            .get(filter.column.column_index)
+            .and_then(|cell| index_key_part(&filter.column, cell))
+            .as_ref()
+            == Some(&filter.value)
+    })
 }
 
 fn index_key_part(column: &IndexColumnSpec, cell: &Cell) -> Option<IndexKeyPart> {
@@ -5523,12 +5595,12 @@ fn catalog_scan_state_from_rows(
     })
 }
 
-fn catalog_row_state_by_row_id(relation_oid: Oid, row_id: u64) -> Option<Row> {
+fn catalog_row_scan_state_by_row_id(relation_oid: Oid, row_id: u64) -> Option<ScanState> {
     let scan = catalog_scan_state_from_rows(
         relation_oid,
         catalog_row_by_row_id(relation_oid, row_id).into_iter(),
     )?;
-    scan.rows.into_iter().next()
+    (!scan.rows().is_empty()).then_some(scan)
 }
 
 fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
@@ -5632,6 +5704,70 @@ unsafe fn catalog_scan_filters_from_datums(
     filters
 }
 
+unsafe fn storage_scan_filters_from_datums(
+    relation_oid: Oid,
+    attnums: *const i16,
+    values: *const usize,
+    nkeys: usize,
+) -> Vec<StorageScanFilter> {
+    if nkeys == 0 || attnums.is_null() || values.is_null() {
+        return Vec::new();
+    }
+    let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let values = unsafe { slice::from_raw_parts(values, nkeys) };
+    let mut filters = Vec::with_capacity(nkeys);
+    for (attnum, datum) in attnums.iter().copied().zip(values.iter().copied()) {
+        let Some(column_index) = attnum
+            .checked_sub(1)
+            .and_then(|attnum| usize::try_from(attnum).ok())
+        else {
+            continue;
+        };
+        let Some(column) = relation_column_by_attnum(relation_oid, attnum) else {
+            continue;
+        };
+        let Some(pg_type) = lookup_type(column.type_oid) else {
+            continue;
+        };
+        let column = IndexColumnSpec {
+            column_index,
+            typbyval: pg_type.typbyval,
+            typlen: pg_type.typlen,
+        };
+        let Some(value) = (unsafe { storage_scan_filter_value_from_datum(&column, datum) }) else {
+            continue;
+        };
+        filters.push(StorageScanFilter { column, value });
+    }
+    filters
+}
+
+unsafe fn storage_scan_filter_value_from_datum(
+    column: &IndexColumnSpec,
+    datum: usize,
+) -> Option<IndexKeyPart> {
+    if column.typbyval {
+        return Some(IndexKeyPart::ByValue(datum));
+    }
+    if datum == 0 {
+        return None;
+    }
+    let len = if column.typlen > 0 {
+        column.typlen as usize
+    } else if column.typlen == -1 {
+        varlena_payload_len(datum)?
+    } else if column.typlen == -2 {
+        c_string_payload_len(datum)?
+    } else {
+        return None;
+    };
+    Some(IndexKeyPart::Bytes(ValueRef {
+        region_id: StorageRegionId(0),
+        ptr: datum,
+        len,
+    }))
+}
+
 unsafe fn catalog_scan_filter_from_datum(
     table: &fastpg_catalog::StaticCatalogTable,
     attnum: i16,
@@ -5721,16 +5857,27 @@ pub unsafe extern "C" fn fastpg_rust_scan_begin_filtered(
 ) -> u64 {
     clear_last_storage_error();
     let relation_oid = Oid(relid);
-    let filters = unsafe { catalog_scan_filters_from_datums(relation_oid, attnums, values, nkeys) };
-    let virtual_scan = virtual_catalog_by_relation_oid(relation_oid)
-        .and_then(|_| catalog_scan_state_filtered(relation_oid, &filters));
+    let is_virtual_catalog = virtual_catalog_by_relation_oid(relation_oid).is_some();
+    let catalog_filters = if is_virtual_catalog {
+        unsafe { catalog_scan_filters_from_datums(relation_oid, attnums, values, nkeys) }
+    } else {
+        Vec::new()
+    };
+    let storage_filters = if is_virtual_catalog {
+        Vec::new()
+    } else {
+        unsafe { storage_scan_filters_from_datums(relation_oid, attnums, values, nkeys) }
+    };
+    let virtual_scan =
+        is_virtual_catalog.then(|| catalog_scan_state_filtered(relation_oid, &catalog_filters));
 
     let result = with_storage(|state, session| -> Result<u64, CatalogError> {
         let scan = match virtual_scan {
-            Some(scan) => scan,
+            Some(Some(scan)) => scan,
+            Some(None) => return Err(invalid_ffi_argument("invalid catalog scan".into())),
             None => {
                 state.relations.entry(relid).or_default();
-                state.visible_scan_state(session, relid)?
+                state.visible_scan_state_filtered(session, relid, &storage_filters)?
             }
         };
         state.check_scan_limit(scan.bytes())?;
@@ -5824,12 +5971,26 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row(
     natts: usize,
 ) -> bool {
     if virtual_catalog_by_relation_oid(Oid(relid)).is_some() {
-        let Some(row) = catalog_row_state_by_row_id(Oid(relid), row_id) else {
+        let Some(scan) = catalog_row_scan_state_by_row_id(Oid(relid), row_id) else {
             return false;
         };
-        return unsafe {
-            copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
-        };
+        return with_storage(|state, session| {
+            if let Err(error) = state.check_scan_limit(scan.bytes()) {
+                set_last_storage_error(error);
+                return false;
+            }
+            session.catalog_fetches.push(scan);
+            let Some(row) = session
+                .catalog_fetches
+                .last()
+                .and_then(|scan| scan.rows().first())
+            else {
+                return false;
+            };
+            unsafe {
+                copy_row_to_outputs(row, values_out, is_null_out, natts, std::ptr::null_mut())
+            }
+        });
     }
 
     let row = with_storage(|state, session| state.find_visible_row(session, relid, row_id));
@@ -5855,12 +6016,26 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row_snapshot_any(
     natts: usize,
 ) -> bool {
     if virtual_catalog_by_relation_oid(Oid(relid)).is_some() {
-        let Some(row) = catalog_row_state_by_row_id(Oid(relid), row_id) else {
+        let Some(scan) = catalog_row_scan_state_by_row_id(Oid(relid), row_id) else {
             return false;
         };
-        return unsafe {
-            copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
-        };
+        return with_storage(|state, session| {
+            if let Err(error) = state.check_scan_limit(scan.bytes()) {
+                set_last_storage_error(error);
+                return false;
+            }
+            session.catalog_fetches.push(scan);
+            let Some(row) = session
+                .catalog_fetches
+                .last()
+                .and_then(|scan| scan.rows().first())
+            else {
+                return false;
+            };
+            unsafe {
+                copy_row_to_outputs(row, values_out, is_null_out, natts, std::ptr::null_mut())
+            }
+        });
     }
 
     let row = with_storage(|state, session| state.find_snapshot_any_row(session, relid, row_id));
@@ -6103,6 +6278,134 @@ mod tests {
             ));
         }
         row_id_out
+    }
+
+    #[test]
+    fn virtual_catalog_fetch_retains_byref_values_until_xact_end() {
+        let _guard = test_guard();
+        let table = static_catalog_by_name("pg_attribute").expect("pg_attribute catalog");
+        let row_id = 60_002;
+        upsert_named_catalog_row(
+            "pg_attribute",
+            row_id,
+            &[
+                ("attrelid", "60002"),
+                ("attname", "retained_catalog_name"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attisdropped", "f"),
+                ("attislocal", "t"),
+                ("attinhcount", "0"),
+                ("attcollation", "0"),
+            ],
+        );
+
+        let mut values = vec![0; table.columns.len()];
+        let mut nulls = vec![0; table.columns.len()];
+        assert_eq!(fastpg_rust_storage_scan_bytes(), 0);
+
+        unsafe {
+            assert!(fastpg_rust_fetch_row(
+                table.oid.0,
+                row_id,
+                values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                values.len(),
+            ));
+        }
+
+        let attname_index = table
+            .columns
+            .iter()
+            .position(|column| column.name == "attname")
+            .expect("attname column");
+        assert_eq!(nulls[attname_index], 0);
+        let fetched_name = unsafe { CStr::from_ptr(values[attname_index] as *const c_char) }
+            .to_str()
+            .expect("valid catalog name");
+        assert_eq!(fetched_name, "retained_catalog_name");
+        assert!(fastpg_rust_storage_scan_bytes() >= NAMEDATALEN);
+
+        fastpg_rust_xact_abort();
+        assert_eq!(fastpg_rust_storage_scan_bytes(), 0);
+    }
+
+    #[test]
+    fn non_unique_simple_index_has_fastpg_index_info() {
+        let _guard = test_guard();
+        let (relid, _) = install_primary_key_test_catalog();
+        let index_oid = Oid(50_104);
+
+        upsert_named_catalog_row(
+            "pg_class",
+            index_oid.0 as u64,
+            &[
+                ("oid", "50104"),
+                ("relname", "pk_storage_value_idx"),
+                ("relnamespace", "2200"),
+                ("reltype", "0"),
+                ("relowner", "10"),
+                ("relam", "403"),
+                ("relfilenode", "50104"),
+                ("relhasindex", "f"),
+                ("relpersistence", "p"),
+                ("relkind", "i"),
+                ("relnatts", "1"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_attribute",
+            0,
+            &[
+                ("attrelid", "50104"),
+                ("attname", "value"),
+                ("atttypid", "23"),
+                ("attlen", "4"),
+                ("attnum", "1"),
+                ("atttypmod", "-1"),
+                ("attbyval", "t"),
+                ("attalign", "i"),
+                ("attstorage", "p"),
+                ("attisdropped", "f"),
+            ],
+        );
+        upsert_named_catalog_row(
+            "pg_index",
+            index_oid.0 as u64,
+            &[
+                ("indexrelid", "50104"),
+                ("indrelid", "50100"),
+                ("indnatts", "1"),
+                ("indnkeyatts", "1"),
+                ("indisunique", "f"),
+                ("indisprimary", "f"),
+                ("indisvalid", "t"),
+                ("indisready", "t"),
+                ("indislive", "t"),
+                ("indkey", "2"),
+            ],
+        );
+        fastpg_rust_xact_commit_if_implicit();
+        clear_primary_key_index_info_cache();
+
+        let mut info: FastPgRustPrimaryKeyIndexInfo = unsafe { std::mem::zeroed() };
+        unsafe {
+            assert!(fastpg_rust_catalog_primary_key_index_info(
+                index_oid.0,
+                &mut info,
+            ));
+        }
+        assert_eq!(info.index_oid, index_oid.0);
+        assert_eq!(info.heap_oid, relid);
+        assert_eq!(info.key_count, 1);
+        assert_eq!(info.is_unique, 0);
+        assert_eq!(info.is_primary, 0);
+        assert_eq!(info.attnums[0], 2);
     }
 
     fn relation_oid_by_name_via_ffi(name: &str, namespace_oid: u32) -> Option<u32> {
@@ -6612,6 +6915,56 @@ mod tests {
             ));
         }
         fastpg_rust_scan_end(scan);
+    }
+
+    #[test]
+    fn relation_scan_filters_simple_equality_keys() {
+        let _guard = test_guard();
+        let (relid, _) = install_primary_key_test_catalog();
+        let mut row_id = 0;
+
+        fastpg_rust_relation_clear(relid);
+        fastpg_rust_xact_begin();
+        unsafe {
+            assert!(insert_byval(relid, &[1, 10], &[0, 0], &mut row_id));
+            assert!(insert_byval(relid, &[2, 20], &[0, 0], &mut row_id));
+            assert!(insert_byval(relid, &[3, 20], &[0, 0], &mut row_id));
+        }
+        fastpg_rust_xact_commit();
+
+        let attnums = [2i16];
+        let values = [20usize];
+        let scan = unsafe {
+            fastpg_rust_scan_begin_filtered(relid, attnums.as_ptr(), values.as_ptr(), attnums.len())
+        };
+        assert_ne!(scan, 0);
+
+        let mut ids = Vec::new();
+        loop {
+            let mut tuple_values = [0usize; 2];
+            let mut nulls = [0u8; 2];
+            let mut row_id = 0;
+            let found = unsafe {
+                fastpg_rust_scan_next(
+                    scan,
+                    1,
+                    tuple_values.as_mut_ptr(),
+                    nulls.as_mut_ptr(),
+                    tuple_values.len(),
+                    &mut row_id,
+                )
+            };
+            if !found {
+                break;
+            }
+            assert_eq!(tuple_values[1], 20);
+            assert_eq!(nulls, [0, 0]);
+            ids.push(tuple_values[0]);
+        }
+        fastpg_rust_scan_end(scan);
+
+        assert_eq!(ids, vec![2, 3]);
+        fastpg_rust_relation_clear(relid);
     }
 
     #[test]
