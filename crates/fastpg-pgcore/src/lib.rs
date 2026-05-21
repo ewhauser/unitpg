@@ -18,9 +18,9 @@ pub const REGCLASS_OID: u32 = 2205;
 pub struct PgCoreError {
     pub sqlstate: String,
     pub message: String,
-    pub detail: Option<String>,
-    pub hint: Option<String>,
-    pub context: Option<String>,
+    pub detail: Option<Box<str>>,
+    pub hint: Option<Box<str>>,
+    pub context: Option<Box<str>>,
     pub cursorpos: i32,
 }
 
@@ -47,9 +47,9 @@ impl PgCoreError {
         Self {
             sqlstate: sqlstate.into(),
             message: message.into(),
-            detail,
-            hint,
-            context,
+            detail: detail.map(String::into_boxed_str),
+            hint: hint.map(String::into_boxed_str),
+            context: context.map(String::into_boxed_str),
             cursorpos,
         }
     }
@@ -463,6 +463,7 @@ mod inner {
         fn fastpg_xid_rollback();
         fn AtEOXact_Enum();
         fn fastpg_pgcore_invalidate_system_caches();
+        fn fastpg_pgcore_reset_session_transaction_characteristics();
         fn fastpg_pgcore_set_database(database_oid: u32);
         fn fastpg_pgcore_notice_capture_begin();
         fn fastpg_pgcore_notice_capture_end();
@@ -821,6 +822,9 @@ mod inner {
     impl PgCoreSession {
         pub fn new(database_oid: u32) -> Self {
             let _ = fastpg_storage::fastpg_rust_relation_row_count(0);
+            unsafe {
+                fastpg_pgcore_reset_session_transaction_characteristics();
+            }
             Self { database_oid }
         }
 
@@ -2744,6 +2748,38 @@ mod tests {
 
         let commit = session.prepare("commit").unwrap().execute().unwrap();
         assert_eq!(commit.statements[0].command_tag, "COMMIT");
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn new_session_resets_transaction_read_only_characteristics() {
+        let first = PgCoreSession::new();
+
+        first
+            .prepare("set session characteristics as transaction read only")
+            .unwrap()
+            .execute()
+            .unwrap();
+        first.prepare("begin").unwrap().execute().unwrap();
+        first
+            .prepare("set transaction read only")
+            .unwrap()
+            .execute()
+            .unwrap();
+        first.prepare("commit").unwrap().execute().unwrap();
+
+        let second = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_session_reset_{}", std::process::id());
+        second
+            .prepare(&format!("create table {table}(id int)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        second
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
     }
 
     #[cfg(feature = "postgres-execution")]

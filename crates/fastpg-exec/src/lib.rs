@@ -474,9 +474,9 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
     QueryExecution::Error {
         sqlstate: error.sqlstate,
         message: error.message,
-        detail: error.detail,
-        hint: error.hint,
-        context: error.context,
+        detail: error.detail.map(String::from),
+        hint: error.hint.map(String::from),
+        context: error.context.map(String::from),
         cursorpos: error.cursorpos,
     }
 }

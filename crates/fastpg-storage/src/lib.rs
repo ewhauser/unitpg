@@ -4696,7 +4696,10 @@ pub unsafe extern "C" fn fastpg_rust_relation_update_unchecked(
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn fastpg_rust_relation_modified_cid(
+/// # Safety
+///
+/// C callers must pass a valid output pointer when `cid_out` is non-null.
+pub unsafe extern "C" fn fastpg_rust_relation_modified_cid(
     relid: u32,
     row_id: u64,
     cid_out: *mut u32,
@@ -5903,25 +5906,25 @@ mod tests {
 
         fastpg_rust_xact_begin();
         fastpg_rust_relation_record_modified_cid(60_100, 7, 11);
-        assert!(fastpg_rust_relation_modified_cid(60_100, 7, &mut cid));
+        assert!(unsafe { fastpg_rust_relation_modified_cid(60_100, 7, &mut cid) });
         assert_eq!(cid, 11);
 
         fastpg_rust_subxact_begin();
         fastpg_rust_relation_record_modified_cid(60_100, 8, 12);
-        assert!(fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+        assert!(unsafe { fastpg_rust_relation_modified_cid(60_100, 8, &mut cid) });
         assert_eq!(cid, 12);
         fastpg_rust_subxact_abort();
-        assert!(!fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+        assert!(!unsafe { fastpg_rust_relation_modified_cid(60_100, 8, &mut cid) });
 
         fastpg_rust_subxact_begin();
         fastpg_rust_relation_record_modified_cid(60_100, 8, 13);
         fastpg_rust_subxact_commit();
-        assert!(fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+        assert!(unsafe { fastpg_rust_relation_modified_cid(60_100, 8, &mut cid) });
         assert_eq!(cid, 13);
 
         fastpg_rust_xact_abort();
-        assert!(!fastpg_rust_relation_modified_cid(60_100, 7, &mut cid));
-        assert!(!fastpg_rust_relation_modified_cid(60_100, 8, &mut cid));
+        assert!(!unsafe { fastpg_rust_relation_modified_cid(60_100, 7, &mut cid) });
+        assert!(!unsafe { fastpg_rust_relation_modified_cid(60_100, 8, &mut cid) });
     }
 
     #[test]

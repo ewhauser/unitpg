@@ -261,6 +261,7 @@ static TransactionId FastPgStandaloneNextTransactionId = FirstNormalTransactionI
 static bool FastPgStandaloneProcInitialized = false;
 
 static void FastPgEnsureStandaloneProc(void);
+static void FastPgResetStandaloneTransactionCharacteristics(TransactionState s);
 
 static LocalTransactionId
 FastPgNextStandaloneLocalTransactionId(void)
@@ -340,6 +341,7 @@ FastPgEnsureStandaloneLocalTransactionId(void)
 		!LocalTransactionIdIsValid(MyProc->vxid.lxid))
 		MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
 }
+
 #endif
 
 /*
@@ -383,6 +385,19 @@ static char *prepareGID;
  * Some commands want to force synchronous commit.
  */
 static bool forceSyncCommit = false;
+
+#ifdef USE_FASTPG
+static void
+FastPgResetStandaloneTransactionCharacteristics(TransactionState s)
+{
+	s->startedInRecovery = false;
+	XactReadOnly = DefaultXactReadOnly;
+	XactDeferrable = DefaultXactDeferrable;
+	XactIsoLevel = DefaultXactIsoLevel;
+	forceSyncCommit = false;
+	MyXactFlags = 0;
+}
+#endif
 
 /* Flag for logging statements in a transaction. */
 bool		xact_is_sampled = false;
@@ -1444,12 +1459,7 @@ FastPgEnsureStandaloneTransactionState(void)
 	s->nChildXids = 0;
 	s->maxChildXids = 0;
 	GetUserIdAndSecContext(&s->prevUser, &s->prevSecContext);
-	s->startedInRecovery = false;
-	XactReadOnly = DefaultXactReadOnly;
-	XactDeferrable = DefaultXactDeferrable;
-	XactIsoLevel = DefaultXactIsoLevel;
-	forceSyncCommit = false;
-	MyXactFlags = 0;
+	FastPgResetStandaloneTransactionCharacteristics(s);
 	s->subTransactionId = TopSubTransactionId;
 	currentSubTransactionId = TopSubTransactionId;
 	currentCommandId = FirstCommandId;
@@ -1526,6 +1536,25 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	CurrentResourceOwner = NULL;
 	s->curTransactionOwner = NULL;
 	AtStart_ResourceOwner();
+}
+
+void
+FastPgResetStandaloneSessionTransactionCharacteristics(void)
+{
+	TransactionState s = CurrentTransactionState;
+
+	if (IsUnderPostmaster)
+		return;
+
+	DefaultXactReadOnly = false;
+	XactReadOnly = false;
+	DefaultXactDeferrable = false;
+	XactDeferrable = false;
+	DefaultXactIsoLevel = XACT_READ_COMMITTED;
+	XactIsoLevel = XACT_READ_COMMITTED;
+	forceSyncCommit = false;
+	MyXactFlags = 0;
+	s->startedInRecovery = false;
 }
 #endif
 

@@ -462,6 +462,7 @@ extern void FastPgSetCurrentTransactionStartTimestampToStatement(void);
 extern void FastPgStartStandaloneStatement(void);
 extern void FastPgEnsureStandaloneTransactionState(void);
 extern void FastPgReleaseStandaloneStatementResources(bool isCommit);
+extern void FastPgResetStandaloneSessionTransactionCharacteristics(void);
 #endif
 extern int	GetCurrentTransactionNestLevel(void);
 extern bool TransactionIdIsCurrentTransactionId(TransactionId xid);

@@ -650,6 +650,15 @@ fastpg_pgcore_invalidate_system_caches(void)
 	InvalidateSystemCaches();
 }
 
+void
+fastpg_pgcore_reset_session_transaction_characteristics(void)
+{
+	fastpg_pgcore_enter();
+#ifdef USE_FASTPG
+	FastPgResetStandaloneSessionTransactionCharacteristics();
+#endif
+}
+
 static void
 fastpg_pgcore_ensure_execution_owner(void)
 {
