@@ -20,6 +20,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/xact.h"
 #include "access/htup_details.h"
 #include "catalog/pg_authid.h"
@@ -33,14 +36,12 @@
  * the status of the last requested roleid.  The cache can be flushed
  * at need by watching for cache update events on pg_authid.
  */
-#ifndef USE_FASTPG
 static Oid	last_roleid = InvalidOid;	/* InvalidOid == cache not valid */
 static bool last_roleid_is_super = false;
 static bool roleid_callback_registered = false;
 
 static void RoleidCallback(Datum arg, SysCacheIdentifier cacheid,
 						   uint32 hashvalue);
-#endif
 
 
 /*
@@ -59,27 +60,24 @@ superuser(void)
 bool
 superuser_arg(Oid roleid)
 {
-#ifdef USE_FASTPG
-	HeapTuple	rtup;
 	bool		result;
+	HeapTuple	rtup;
+
+#if defined(USE_FASTPG)
+	/*
+	 * The Rust virtual catalog has no pg_authid backing store.  Normal
+	 * postgres-catalog mode does, so let PostgreSQL enforce role metadata
+	 * there instead of granting the single-user escape hatch to every role.
+	 */
+	if (fastpg_use_rust_catalog())
+		return true;
 
 	if (!IsUnderPostmaster && roleid == BOOTSTRAP_SUPERUSERID)
 		return true;
 
 	if (!IsTransactionState())
 		return false;
-
-	rtup = SearchSysCache1(AUTHOID, ObjectIdGetDatum(roleid));
-	if (!HeapTupleIsValid(rtup))
-		return false;
-
-	result = ((Form_pg_authid) GETSTRUCT(rtup))->rolsuper;
-	ReleaseSysCache(rtup);
-
-	return result;
-#else
-	bool		result;
-	HeapTuple	rtup;
+#endif
 
 	/* Quick out for cache hit */
 	if (OidIsValid(last_roleid) && last_roleid == roleid)
@@ -116,10 +114,8 @@ superuser_arg(Oid roleid)
 	last_roleid_is_super = result;
 
 	return result;
-#endif
 }
 
-#ifndef USE_FASTPG
 /*
  * RoleidCallback
  *		Syscache inval callback function
@@ -130,4 +126,3 @@ RoleidCallback(Datum arg, SysCacheIdentifier cacheid, uint32 hashvalue)
 	/* Invalidate our local cache in case role's superuserness changed */
 	last_roleid = InvalidOid;
 }
-#endif

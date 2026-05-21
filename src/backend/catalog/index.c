@@ -25,6 +25,10 @@
 
 #include "access/amapi.h"
 #include "access/attmap.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/heapam.h"
 #include "access/multixact.h"
 #include "access/relscan.h"
@@ -990,6 +994,7 @@ index_create(Relation heapRelation,
 								shared_relation,
 								mapped_relation,
 								allow_system_table_mods,
+								InvalidOid,
 								&relfrozenxid,
 								&relminmxid,
 								create_storage);
@@ -1241,7 +1246,10 @@ index_create(Relation heapRelation,
 	if (IsBootstrapProcessingMode())
 		RelationInitIndexAccessInfo(indexRelation);
 #ifdef USE_FASTPG
-	else if (!IsUnderPostmaster && indexRelation->rd_index == NULL)
+	else if (indexRelation->rd_indexcxt == NULL ||
+			  indexRelation->rd_indam == NULL ||
+			  (indexRelation->rd_indam->amsupport > 0 &&
+			   indexRelation->rd_support == NULL))
 		RelationInitIndexAccessInfo(indexRelation);
 #endif
 	else
@@ -2885,7 +2893,7 @@ index_update_stats(Relation rel,
 	}
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		update_stats = false;
 #endif
 
@@ -2898,14 +2906,26 @@ index_update_stats(Relation rel,
 	 */
 	if (update_stats)
 	{
-		relpages = RelationGetNumberOfBlocks(rel);
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres() &&
+			RELKIND_HAS_TABLE_AM(rel->rd_rel->relkind) &&
+			rel->rd_tableam == GetFastPgMemTableAmRoutine())
+		{
+			relpages = FastPgMemRelationPages(rel);
+			relallvisible = FastPgMemRelationAllVisiblePages(rel);
+		}
+		else
+#endif
+		{
+			relpages = RelationGetNumberOfBlocks(rel);
 
-		if (rel->rd_rel->relkind != RELKIND_INDEX)
-			visibilitymap_count(rel, &relallvisible, &relallfrozen);
+			if (rel->rd_rel->relkind != RELKIND_INDEX)
+				visibilitymap_count(rel, &relallvisible, &relallfrozen);
+		}
 	}
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		pg_class = table_open(RelationRelationId, RowExclusiveLock);
 		tuple = SearchSysCacheCopy1(RELOID, ObjectIdGetDatum(relid));

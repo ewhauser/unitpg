@@ -70,12 +70,18 @@ get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
 static bool
 fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_type_by_oid((uint32_t) typid, type);
 }
 
 static bool
 fastpg_lookup_relation(Oid relid, FastPgRustCatalogRelation *relation)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_relation_by_oid((uint32_t) relid, relation);
 }
 
@@ -2352,7 +2358,8 @@ get_relname_relid(const char *relname, Oid relnamespace)
 #ifdef USE_FASTPG
 	uint32_t	fastpg_oid;
 
-	if (fastpg_rust_catalog_relation_oid_by_name(relname,
+	if (fastpg_use_rust_catalog() &&
+		fastpg_rust_catalog_relation_oid_by_name(relname,
 												 (uint32_t) relnamespace,
 												 &fastpg_oid))
 		return (Oid) fastpg_oid;
@@ -2363,7 +2370,7 @@ get_relname_relid(const char *relname, Oid relnamespace)
 	 * to later schemas such as public without touching storage-managed
 	 * catalogs.
 	 */
-	if (!IsUnderPostmaster)
+	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 		return InvalidOid;
 #endif
 

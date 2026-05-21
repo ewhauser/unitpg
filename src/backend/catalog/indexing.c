@@ -71,6 +71,9 @@ FastPgCatalogTidToRowId(const ItemPointerData *tid, uint64_t *row_id)
 static bool
 FastPgIsVirtualCatalog(Relation heapRel)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_policy_by_relation_oid((uint32_t) RelationGetRelid(heapRel)) != 0;
 }
 

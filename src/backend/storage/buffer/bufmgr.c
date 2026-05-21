@@ -4667,7 +4667,7 @@ RelationGetNumberOfBlocksInFork(Relation relation, ForkNumber forkNum)
 
 		return (szbytes + (BLCKSZ - 1)) / BLCKSZ;
 	}
-	else if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
+	if (RELKIND_HAS_STORAGE(relation->rd_rel->relkind))
 	{
 		return smgrnblocks(RelationGetSmgr(relation), forkNum);
 	}

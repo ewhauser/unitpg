@@ -479,10 +479,9 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				if (info->indpred == NIL)
 				{
 #ifdef USE_FASTPG
-					FastPgRustPrimaryKeyIndexInfo fastpg_index_info;
-
-					if (fastpg_rust_catalog_primary_key_index_info((uint32_t) RelationGetRelid(indexRelation),
-																	&fastpg_index_info))
+					if (!IsUnderPostmaster &&
+						fastpg_use_rust_catalog() &&
+						RelationGetRelid(indexRelation) >= (Oid) FirstNormalObjectId)
 					{
 						info->pages = 1;
 						info->tuples = rel->tuples;
@@ -490,8 +489,8 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					else
 #endif
 					{
-					info->pages = RelationGetNumberOfBlocks(indexRelation);
-					info->tuples = rel->tuples;
+						info->pages = RelationGetNumberOfBlocks(indexRelation);
+						info->tuples = rel->tuples;
 					}
 				}
 				else
@@ -1334,6 +1333,18 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	}
 	else if (rel->rd_rel->relkind == RELKIND_INDEX)
 	{
+#ifdef USE_FASTPG
+		if (!IsUnderPostmaster &&
+			fastpg_use_rust_catalog() &&
+			RelationGetRelid(rel) >= (Oid) FirstNormalObjectId)
+		{
+			*pages = 1;
+			*tuples = rel->rd_rel->reltuples >= 0 ?
+				(double) rel->rd_rel->reltuples : 1.0;
+			*allvisfrac = 0;
+			return;
+		}
+#endif
 		/*
 		 * XXX: It'd probably be good to move this into a callback, individual
 		 * index types e.g. know if they have a metapage.

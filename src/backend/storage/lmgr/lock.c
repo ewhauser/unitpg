@@ -32,6 +32,9 @@
 #include <signal.h>
 #include <unistd.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/twophase_rmgr.h"
@@ -853,7 +856,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	bool		log_lock = false;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		if (locallockp != NULL)
 			*locallockp = NULL;
@@ -2128,7 +2131,7 @@ LockRelease(const LOCKTAG *locktag, LOCKMODE lockmode, bool sessionLock)
 	bool		wakeupNeeded;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return true;
 #endif
 

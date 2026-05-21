@@ -166,6 +166,9 @@ SendPostmasterSignal(PMSignalReason reason)
 	/* If called in a standalone backend, do nothing */
 	if (!IsUnderPostmaster)
 		return;
+	/* fastpg's postgres-catalog harness has no real postmaster to signal. */
+	if (PostmasterPid == 0 || PostmasterPid == MyProcPid)
+		return;
 	/* Atomically set the proper flag */
 	PMSignalState->PMSignalFlags[reason] = true;
 	/* Send signal to postmaster */

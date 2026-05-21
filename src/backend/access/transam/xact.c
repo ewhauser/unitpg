@@ -20,6 +20,9 @@
 #include <time.h>
 #include <unistd.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/commit_ts.h"
 #include "access/multixact.h"
 #include "access/parallel.h"
@@ -336,6 +339,7 @@ FastPgEnsureStandaloneLocalTransactionId(void)
 {
 	FastPgEnsureStandaloneProc();
 	if (!IsUnderPostmaster &&
+		fastpg_use_rust_catalog() &&
 		!LocalTransactionIdIsValid(MyProc->vxid.lxid))
 		MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
 }
@@ -517,7 +521,7 @@ TransactionId
 GetTopTransactionId(void)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		FastPgEnsureStandaloneTransactionState();
 		if (!FullTransactionIdIsValid(XactTopFullTransactionId))
@@ -556,7 +560,7 @@ GetCurrentTransactionId(void)
 	TransactionState s = CurrentTransactionState;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		FastPgEnsureStandaloneTransactionState();
 		s = CurrentTransactionState;
@@ -593,7 +597,7 @@ FullTransactionId
 GetTopFullTransactionId(void)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		FastPgEnsureStandaloneTransactionState();
 		if (!FullTransactionIdIsValid(XactTopFullTransactionId))
@@ -633,7 +637,7 @@ GetCurrentFullTransactionId(void)
 	TransactionState s = CurrentTransactionState;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 	{
 		FastPgEnsureStandaloneTransactionState();
 		s = CurrentTransactionState;
@@ -1064,7 +1068,7 @@ FastPgSetCurrentTransactionStartTimestampToStatement(void)
 void
 FastPgStartStandaloneStatement(void)
 {
-	if (IsUnderPostmaster)
+	if (IsUnderPostmaster || !fastpg_use_rust_catalog())
 		return;
 
 	FastPgEnsureStandaloneProc();
@@ -1429,7 +1433,7 @@ FastPgEnsureStandaloneTransactionState(void)
 {
 	TransactionState s = CurrentTransactionState;
 
-	if (IsUnderPostmaster)
+	if (IsUnderPostmaster || !fastpg_use_rust_catalog())
 		return;
 	FastPgEnsureStandaloneLocalTransactionId();
 	if (s->blockState != TBLOCK_DEFAULT || s->state != TRANS_DEFAULT)
@@ -1471,7 +1475,7 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 {
 	TransactionState s = CurrentTransactionState;
 
-	if (IsUnderPostmaster)
+	if (IsUnderPostmaster || !fastpg_use_rust_catalog())
 		return;
 
 	FastPgEnsureStandaloneTransactionState();
@@ -2888,6 +2892,16 @@ PrepareTransaction(void)
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 				 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		if (FastPgTempNamespaceCreatedInCurrentTransaction())
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
+	}
+#endif
 
 	/*
 	 * Likewise, don't allow PREPARE after pg_export_snapshot.  This could be
@@ -4993,8 +5007,11 @@ BeginInternalSubTransaction(const char *name)
 	 * AssignTransactionId() and CommandCounterIncrement().
 	 */
 #ifdef USE_FASTPG
-	FastPgEnsureStandaloneTransactionState();
-	s = CurrentTransactionState;
+	if (fastpg_use_rust_catalog())
+	{
+		FastPgEnsureStandaloneTransactionState();
+		s = CurrentTransactionState;
+	}
 #endif
 
 	switch (s->blockState)

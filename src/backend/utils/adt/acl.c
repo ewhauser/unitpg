@@ -5112,6 +5112,16 @@ RoleMembershipCacheCallback(Datum arg, SysCacheIdentifier cacheid,
 	cached_role[ROLERECURSE_SETROLE] = InvalidOid;
 }
 
+#ifdef USE_FASTPG
+void
+FastPgResetRoleMembershipCache(void)
+{
+	cached_role[ROLERECURSE_MEMBERS] = InvalidOid;
+	cached_role[ROLERECURSE_PRIVS] = InvalidOid;
+	cached_role[ROLERECURSE_SETROLE] = InvalidOid;
+}
+#endif
+
 /*
  * A helper function for roles_is_member_of() that provides an optimized
  * implementation of list_append_unique_oid() via a Bloom filter.  The caller

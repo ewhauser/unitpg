@@ -192,6 +192,7 @@ extern PGDLLIMPORT char *BufferBlocks;
 extern PGDLLIMPORT int NLocBuffer;
 extern PGDLLIMPORT Block *LocalBufferBlockPointers;
 extern PGDLLIMPORT int32 *LocalRefCount;
+extern void FastPgResetLocalBuffers(void);
 
 /* upper limit for effective_io_concurrency */
 #define MAX_IO_CONCURRENCY 1000

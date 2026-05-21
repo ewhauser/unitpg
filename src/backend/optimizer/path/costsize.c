@@ -82,6 +82,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include <limits.h>
 #include <math.h>
 
@@ -1445,6 +1448,10 @@ cost_tidrangescan(Path *path, PlannerInfo *root,
 
 		/* The CPU cost is divided among all the workers. */
 		cpu_run_cost /= parallel_divisor;
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres())
+			disk_run_cost /= parallel_divisor;
+#endif
 
 		/*
 		 * In the case of a parallel plan, the row count needs to represent

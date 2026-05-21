@@ -19,6 +19,9 @@
 #include "access/brin_page.h"
 #include "access/brin_pageops.h"
 #include "access/brin_xlog.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/relation.h"
 #include "access/reloptions.h"
 #include "access/relscan.h"
@@ -1371,6 +1374,16 @@ Datum
 brin_summarize_new_values(PG_FUNCTION_ARGS)
 {
 	Datum		relation = PG_GETARG_DATUM(0);
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		(void) DirectFunctionCall2(brin_summarize_range,
+								   relation,
+								   Int64GetDatum((int64) BRIN_ALL_BLOCKRANGES));
+		PG_RETURN_INT32(0);
+	}
+#endif
 
 	return DirectFunctionCall2(brin_summarize_range,
 							   relation,

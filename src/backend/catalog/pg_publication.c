@@ -14,6 +14,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/htup_details.h"
@@ -1005,7 +1008,8 @@ GetAllTablesPublications(void)
 	HeapTuple	tup;
 
 #ifdef USE_FASTPG
-	return NIL;
+	if (fastpg_use_rust_catalog())
+		return NIL;
 #endif
 
 	/* Find all publications that are marked as for all tables. */

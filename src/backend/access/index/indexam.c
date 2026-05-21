@@ -68,6 +68,9 @@ fastpg_is_primary_key_index(Oid relationId)
 {
 	FastPgRustPrimaryKeyIndexInfo index_info;
 
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_primary_key_index_info((uint32_t) relationId,
 													  &index_info);
 }

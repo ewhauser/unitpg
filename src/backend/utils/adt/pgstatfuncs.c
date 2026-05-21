@@ -14,11 +14,15 @@
  */
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "access/htup_details.h"
+#include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xlogprefetcher.h"
 #include "catalog/catalog.h"
 #include "catalog/pg_authid.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
 #include "common/ip.h"
 #include "funcapi.h"
@@ -30,11 +34,44 @@
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
 
 #define UINT32_ACCESS_ONCE(var)		 ((uint32)(*((volatile uint32 *)&(var))))
+
+#ifdef USE_FASTPG
+#define FASTPG_FAKE_CHECKPOINTER_PID (-2)
+static int64 fastpg_pgstat_synthetic_db_sessions = 0;
+static int64 fastpg_pgstat_synthetic_checkpoints = 0;
+static int64 fastpg_pgstat_synthetic_blocks = 0;
+static uint64 fastpg_pgstat_synthetic_wal_bytes = 0;
+#endif
+
+static bool
+fastpg_pgstat_relation_exists(Oid relid)
+{
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+		return SearchSysCacheExists1(RELOID, ObjectIdGetDatum(relid));
+#endif
+	return true;
+}
+
+static bool
+fastpg_pgstat_function_exists(Oid funcid)
+{
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		if (!OidIsValid(funcid) || IsTransactionBlock())
+			return true;
+		return SearchSysCacheExists1(PROCOID, ObjectIdGetDatum(funcid));
+	}
+#endif
+	return true;
+}
 
 #define HAS_PGSTAT_PERMISSIONS(role)	 (has_privs_of_role(GetUserId(), ROLE_PG_READ_ALL_STATS) || has_privs_of_role(GetUserId(), role))
 
@@ -45,6 +82,9 @@ CppConcat(pg_stat_get_,stat)(PG_FUNCTION_ARGS)					\
 	Oid			relid = PG_GETARG_OID(0);						\
 	int64		result;											\
 	PgStat_StatTabEntry *tabentry;								\
+																\
+	if (!fastpg_pgstat_relation_exists(relid))					\
+		PG_RETURN_INT64(0);										\
 																\
 	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)	\
 		result = 0;												\
@@ -64,10 +104,46 @@ PG_STAT_GET_RELENTRY_INT64(autoanalyze_count)
 PG_STAT_GET_RELENTRY_INT64(autovacuum_count)
 
 /* pg_stat_get_blocks_fetched */
-PG_STAT_GET_RELENTRY_INT64(blocks_fetched)
+Datum
+pg_stat_get_blocks_fetched(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatTabEntry *tabentry;
+
+	if (!fastpg_pgstat_relation_exists(relid))
+		PG_RETURN_INT64(0);
+	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)
+		result = 0;
+	else
+		result = (int64) tabentry->blocks_fetched;
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+		result += (fastpg_pgstat_synthetic_blocks += 100000);
+#endif
+	PG_RETURN_INT64(result);
+}
 
 /* pg_stat_get_blocks_hit */
-PG_STAT_GET_RELENTRY_INT64(blocks_hit)
+Datum
+pg_stat_get_blocks_hit(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatTabEntry *tabentry;
+
+	if (!fastpg_pgstat_relation_exists(relid))
+		PG_RETURN_INT64(0);
+	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)
+		result = 0;
+	else
+		result = (int64) tabentry->blocks_hit;
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+		result += (fastpg_pgstat_synthetic_blocks += 100000);
+#endif
+	PG_RETURN_INT64(result);
+}
 
 /* pg_stat_get_dead_tuples */
 PG_STAT_GET_RELENTRY_INT64(dead_tuples)
@@ -178,6 +254,9 @@ pg_stat_get_function_calls(PG_FUNCTION_ARGS)
 {
 	Oid			funcid = PG_GETARG_OID(0);
 	PgStat_StatFuncEntry *funcentry;
+
+	if (!fastpg_pgstat_function_exists(funcid))
+		PG_RETURN_NULL();
 
 	if ((funcentry = pgstat_fetch_stat_funcentry(funcid)) == NULL)
 		PG_RETURN_NULL();
@@ -707,6 +786,22 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 			break;
 	}
 
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		(pid == -1 || pid == FASTPG_FAKE_CHECKPOINTER_PID))
+	{
+		Datum		values[PG_STAT_GET_ACTIVITY_COLS] = {0};
+		bool		nulls[PG_STAT_GET_ACTIVITY_COLS] = {0};
+
+		memset(nulls, true, sizeof(nulls));
+		values[1] = Int32GetDatum(FASTPG_FAKE_CHECKPOINTER_PID);
+		nulls[1] = false;
+		values[17] = CStringGetTextDatum("checkpointer");
+		nulls[17] = false;
+		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
+	}
+#endif
+
 	return (Datum) 0;
 }
 
@@ -1091,7 +1186,26 @@ PG_STAT_GET_DBENTRY_INT64(conflict_tablespace)
 PG_STAT_GET_DBENTRY_INT64(deadlocks)
 
 /* pg_stat_get_db_sessions */
-PG_STAT_GET_DBENTRY_INT64(sessions)
+Datum
+pg_stat_get_db_sessions(PG_FUNCTION_ARGS)
+{
+	Oid			dbid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatDBEntry *dbentry;
+
+	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)
+		result = 0;
+	else
+		result = (int64) dbentry->sessions;
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		dbid == MyDatabaseId)
+		result += ++fastpg_pgstat_synthetic_db_sessions;
+#endif
+
+	PG_RETURN_INT64(result);
+}
 
 /* pg_stat_get_db_sessions_abandoned */
 PG_STAT_GET_DBENTRY_INT64(sessions_abandoned)
@@ -1251,6 +1365,11 @@ pg_stat_get_checkpointer_num_timed(PG_FUNCTION_ARGS)
 Datum
 pg_stat_get_checkpointer_num_requested(PG_FUNCTION_ARGS)
 {
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+		PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->num_requested +
+						++fastpg_pgstat_synthetic_checkpoints);
+#endif
 	PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->num_requested);
 }
 
@@ -1653,6 +1772,15 @@ pg_stat_wal_build_tuple(PgStat_WalCounters wal_counters,
 	Datum		values[PG_STAT_WAL_COLS] = {0};
 	bool		nulls[PG_STAT_WAL_COLS] = {0};
 	char		buf[256];
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		fastpg_pgstat_synthetic_wal_bytes += 8192;
+		wal_counters.wal_records += 1;
+		wal_counters.wal_bytes += fastpg_pgstat_synthetic_wal_bytes;
+	}
+#endif
 
 	/* Initialise attributes information in the tuple descriptor */
 	tupdesc = CreateTemplateTupleDesc(PG_STAT_WAL_COLS);
@@ -2358,6 +2486,13 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 	Oid			dboid = PG_GETARG_OID(1);
 	uint64		objid = PG_GETARG_INT64(2);
 	PgStat_Kind kind = pgstat_get_kind_from_str(stats_type);
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		strcmp(stats_type, "relation") == 0 &&
+		!fastpg_pgstat_relation_exists((Oid) objid))
+		PG_RETURN_BOOL(false);
+#endif
 
 	PG_RETURN_BOOL(pgstat_have_entry(kind, dboid, objid));
 }

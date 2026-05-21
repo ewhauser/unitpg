@@ -17,6 +17,9 @@
 #include <signal.h>
 #include <unistd.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/parallel.h"
 #include "commands/async.h"
 #include "commands/repack.h"
@@ -124,6 +127,7 @@ static ProcSignalSlot *MyProcSignalSlot = NULL;
 static bool CheckProcSignal(ProcSignalReason reason);
 static void CleanupProcSignalState(int status, Datum arg);
 static void ResetProcSignalBarrierBits(uint32 flags);
+static int	SendProcSignalInterrupt(pid_t pid);
 
 /*
  * ProcSignalShmemRequest
@@ -141,6 +145,20 @@ ProcSignalShmemRequest(void *arg)
 					   .size = size,
 					   .ptr = (void **) &ProcSignal,
 		);
+}
+
+static int
+SendProcSignalInterrupt(pid_t pid)
+{
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() && pid == MyProcPid)
+	{
+		procsignal_sigusr1_handler(SIGUSR1, NULL);
+		return 0;
+	}
+#endif
+
+	return kill(pid, SIGUSR1);
 }
 
 static void
@@ -301,7 +319,7 @@ SendProcSignal(pid_t pid, ProcSignalReason reason, ProcNumber procNumber)
 			slot->pss_signalFlags[reason] = true;
 			SpinLockRelease(&slot->pss_mutex);
 			/* Send signal */
-			return kill(pid, SIGUSR1);
+			return SendProcSignalInterrupt(pid);
 		}
 		SpinLockRelease(&slot->pss_mutex);
 	}
@@ -329,7 +347,7 @@ SendProcSignal(pid_t pid, ProcSignalReason reason, ProcNumber procNumber)
 					slot->pss_signalFlags[reason] = true;
 					SpinLockRelease(&slot->pss_mutex);
 					/* Send signal */
-					return kill(pid, SIGUSR1);
+					return SendProcSignalInterrupt(pid);
 				}
 				SpinLockRelease(&slot->pss_mutex);
 			}
@@ -410,7 +428,7 @@ EmitProcSignalBarrier(ProcSignalBarrierType type)
 				/* see SendProcSignal for details */
 				slot->pss_signalFlags[PROCSIG_BARRIER] = true;
 				SpinLockRelease(&slot->pss_mutex);
-				kill(pid, SIGUSR1);
+				SendProcSignalInterrupt(pid);
 			}
 			else
 				SpinLockRelease(&slot->pss_mutex);

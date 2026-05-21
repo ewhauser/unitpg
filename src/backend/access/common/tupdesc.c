@@ -956,7 +956,8 @@ TupleDescInitEntry(TupleDesc desc,
 	{
 		FastPgRustCatalogType fastpg_type;
 
-		if (fastpg_rust_catalog_type_by_oid((uint32_t) oidtypeid,
+		if (fastpg_use_rust_catalog() &&
+			fastpg_rust_catalog_type_by_oid((uint32_t) oidtypeid,
 											&fastpg_type))
 		{
 			att->atttypid = oidtypeid;
@@ -1042,7 +1043,8 @@ TupleDescInitBuiltinEntry(TupleDesc desc,
 	{
 		FastPgRustCatalogType fastpg_type;
 
-		if (fastpg_rust_catalog_type_by_oid((uint32_t) oidtypeid,
+		if (fastpg_use_rust_catalog() &&
+			fastpg_rust_catalog_type_by_oid((uint32_t) oidtypeid,
 											&fastpg_type))
 		{
 			att->attlen = fastpg_type.typlen;

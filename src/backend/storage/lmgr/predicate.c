@@ -193,6 +193,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "access/parallel.h"
 #include "access/slru.h"
 #include "access/transam.h"
@@ -530,7 +531,7 @@ static inline bool
 SerializationNeededForRead(Relation relation, Snapshot snapshot)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return false;
 #endif
 
@@ -579,7 +580,7 @@ static inline bool
 SerializationNeededForWrite(Relation relation)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return false;
 #endif
 
@@ -1621,7 +1622,7 @@ Snapshot
 GetSerializableTransactionSnapshot(Snapshot snapshot)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return snapshot;
 #endif
 
@@ -1668,7 +1669,7 @@ SetSerializableTransactionSnapshot(Snapshot snapshot,
 								   int sourcepid)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 
@@ -3072,7 +3073,7 @@ void
 TransferPredicateLocksToHeapRelation(Relation relation)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 
@@ -3272,7 +3273,7 @@ ReleasePredicateLocks(bool isCommit, bool isReadOnlySafe)
 	bool		topLevelIsDeclaredReadOnly;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 
@@ -4384,7 +4385,7 @@ CheckTableForSerializableConflictIn(Relation relation)
 	int			i;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 
@@ -4669,7 +4670,7 @@ PreCommit_CheckForSerializationFailure(void)
 	dlist_iter	near_iter;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 		return;
 #endif
 

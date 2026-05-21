@@ -20,6 +20,9 @@
 #include "postgres.h"
 
 #include "access/visibilitymap.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
@@ -150,7 +153,9 @@ RelationCreateStorage(RelFileLocator rlocator, char relpersistence,
 	srel = smgropen(rlocator, procNumber);
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster &&
+		!fastpg_catalog_mode_uses_postgres() &&
+		rlocator.relNumber >= (RelFileNumber) FirstNormalObjectId)
 		return srel;
 #endif
 
@@ -215,7 +220,9 @@ RelationDropStorage(Relation rel)
 	PendingRelDelete *pending;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster &&
+		!fastpg_catalog_mode_uses_postgres() &&
+		rel->rd_locator.relNumber >= (RelFileNumber) FirstNormalObjectId)
 		return;
 #endif
 

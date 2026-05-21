@@ -60,6 +60,7 @@ extern Relation heap_create(const char *relname,
 							bool shared_relation,
 							bool mapped_relation,
 							bool allow_system_table_mods,
+							Oid relrewrite,
 							TransactionId *relfrozenxid,
 							MultiXactId *relminmxid,
 							bool create_storage);

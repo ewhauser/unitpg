@@ -17,6 +17,9 @@
 #include <math.h>
 
 #include "access/detoast.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/genam.h"
 #include "access/multixact.h"
 #include "access/relation.h"
@@ -645,7 +648,14 @@ do_analyze_rel(Relation onerel, const VacuumParams *params,
 		BlockNumber relallfrozen = 0;
 
 		if (RELKIND_HAS_STORAGE(onerel->rd_rel->relkind))
+		{
+#ifdef USE_FASTPG
+			if (onerel->rd_tableam == GetFastPgMemTableAmRoutine())
+				relallvisible = FastPgMemRelationAllVisiblePages(onerel);
+			else
+#endif
 			visibilitymap_count(onerel, &relallvisible, &relallfrozen);
+		}
 
 		/*
 		 * Update pg_class for table relation.  CCI first, in case acquirefunc

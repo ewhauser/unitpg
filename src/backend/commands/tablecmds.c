@@ -2305,13 +2305,14 @@ ExecuteTruncateGuts(List *explicit_rels,
 			 * Reconstruct the indexes to match, and we're done.
 			 */
 #ifdef USE_FASTPG
-			{
-				FastPgRustCatalogRelation fastpg_relation;
+				{
+					FastPgRustCatalogRelation fastpg_relation;
 
-				if (!fastpg_rust_catalog_relation_by_oid((uint32_t) heap_relid,
-														 &fastpg_relation))
-					reindex_relation(NULL, heap_relid, REINDEX_REL_PROCESS_TOAST,
-									 &reindex_params);
+					if (!fastpg_use_rust_catalog() ||
+						!fastpg_rust_catalog_relation_by_oid((uint32_t) heap_relid,
+															 &fastpg_relation))
+						reindex_relation(NULL, heap_relid, REINDEX_REL_PROCESS_TOAST,
+										 &reindex_params);
 			}
 #else
 			reindex_relation(NULL, heap_relid, REINDEX_REL_PROCESS_TOAST,

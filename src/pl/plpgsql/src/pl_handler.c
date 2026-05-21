@@ -15,6 +15,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup_details.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
@@ -151,7 +154,13 @@ _PG_init(void)
 	static bool inited = false;
 
 	if (inited)
+	{
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres())
+			MarkGUCPrefixReserved("plpgsql");
+#endif
 		return;
+	}
 
 	pg_bindtextdomain(TEXTDOMAIN);
 

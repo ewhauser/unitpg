@@ -13,8 +13,13 @@
 
 #include <sys/stat.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#include "access/tableam.h"
+#endif
 #include "access/htup_details.h"
 #include "access/relation.h"
+#include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_database.h"
@@ -366,6 +371,7 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	Oid			relOid = PG_GETARG_OID(0);
 	text	   *forkName = PG_GETARG_TEXT_PP(1);
 	Relation	rel;
+	ForkNumber	forknum;
 	int64		size;
 
 	rel = try_relation_open(relOid, AccessShareLock);
@@ -380,8 +386,33 @@ pg_relation_size(PG_FUNCTION_ARGS)
 	if (rel == NULL)
 		PG_RETURN_NULL();
 
-	size = calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
-								   forkname_to_number(text_to_cstring(forkName)));
+	forknum = forkname_to_number(text_to_cstring(forkName));
+
+#ifdef USE_FASTPG
+	if (rel->rd_tableam != NULL &&
+		rel->rd_tableam == GetFastPgMemTableAmRoutine())
+		size = table_relation_size(rel, forknum);
+	else if (rel->rd_rel->relkind == RELKIND_INDEX)
+	{
+		Oid			heapOid = IndexGetRelation(relOid, true);
+		Relation	heapRel = NULL;
+
+		if (OidIsValid(heapOid))
+			heapRel = try_relation_open(heapOid, AccessShareLock);
+		if (heapRel != NULL &&
+			heapRel->rd_tableam != NULL &&
+			heapRel->rd_tableam == GetFastPgMemTableAmRoutine())
+			size = (int64) Max(rel->rd_rel->relpages, 0) * BLCKSZ;
+		else
+			size = calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
+										   forknum);
+		if (heapRel != NULL)
+			relation_close(heapRel, AccessShareLock);
+	}
+	else
+#endif
+		size = calculate_relation_size(&(rel->rd_locator), rel->rd_backend,
+									   forknum);
 
 	relation_close(rel, AccessShareLock);
 

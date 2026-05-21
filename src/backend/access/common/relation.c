@@ -36,6 +36,9 @@
 static bool
 FastPgRelationOidExists(Oid relationId)
 {
+	if (!fastpg_use_rust_catalog())
+		return false;
+
 	return fastpg_rust_catalog_relation_exists_by_oid((uint32_t) relationId);
 }
 #endif

@@ -21,6 +21,20 @@
 #define FASTPG_VIRTUAL_CATALOG_DYNAMIC 2
 #define FASTPG_VIRTUAL_CATALOG_EMPTY 3
 
+static inline bool
+fastpg_catalog_mode_uses_postgres(void)
+{
+	const char *mode = getenv("FASTPG_CATALOG_MODE");
+
+	return mode != NULL && strcmp(mode, "postgres") == 0;
+}
+
+static inline bool
+fastpg_use_rust_catalog(void)
+{
+	return !fastpg_catalog_mode_uses_postgres();
+}
+
 #ifndef INTEGER_BTREE_FAM_OID
 #define INTEGER_BTREE_FAM_OID 1976
 #endif
@@ -314,6 +328,20 @@ extern bool fastpg_rust_xact_is_explicit(void);
 extern void fastpg_rust_subxact_begin(void);
 extern void fastpg_rust_subxact_commit(void);
 extern void fastpg_rust_subxact_abort(void);
+
+#else							/* USE_FASTPG */
+
+static inline bool
+fastpg_catalog_mode_uses_postgres(void)
+{
+	return false;
+}
+
+static inline bool
+fastpg_use_rust_catalog(void)
+{
+	return false;
+}
 
 #endif							/* USE_FASTPG */
 

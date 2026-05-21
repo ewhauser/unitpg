@@ -5194,6 +5194,8 @@ MarkGUCPrefixReserved(const char *className)
 	HASH_SEQ_STATUS status;
 	GUCHashEntry *hentry;
 	MemoryContext oldcontext;
+	ListCell   *lc;
+	bool		already_reserved = false;
 
 	/*
 	 * Check for existing placeholders.  We must actually remove invalid
@@ -5227,10 +5229,62 @@ MarkGUCPrefixReserved(const char *className)
 	}
 
 	/* And remember the name so we can prevent future mistakes. */
+	foreach(lc, reserved_class_prefix)
+	{
+		if (strcmp((const char *) lfirst(lc), className) == 0)
+		{
+			already_reserved = true;
+			break;
+		}
+	}
+	if (already_reserved)
+		return;
+
 	oldcontext = MemoryContextSwitchTo(GUCMemoryContext);
 	reserved_class_prefix = lappend(reserved_class_prefix, pstrdup(className));
 	MemoryContextSwitchTo(oldcontext);
 }
+
+#ifdef USE_FASTPG
+void
+FastPgUnreserveGUCPrefixForSession(const char *className)
+{
+	int			classLen = strlen(className);
+	HASH_SEQ_STATUS status;
+	GUCHashEntry *hentry;
+	ListCell   *lc;
+
+	foreach(lc, reserved_class_prefix)
+	{
+		char	   *reserved = (char *) lfirst(lc);
+
+		if (strcmp(reserved, className) == 0)
+		{
+			reserved_class_prefix =
+				foreach_delete_current(reserved_class_prefix, lc);
+			pfree(reserved);
+		}
+	}
+
+	hash_seq_init(&status, guc_hashtab);
+	while ((hentry = (GUCHashEntry *) hash_seq_search(&status)) != NULL)
+	{
+		struct config_generic *var = hentry->gucvar;
+
+		if ((var->flags & GUC_CUSTOM_PLACEHOLDER) != 0 &&
+			strncmp(className, var->name, classLen) == 0 &&
+			var->name[classLen] == GUC_QUALIFIER_SEPARATOR)
+		{
+			hash_search(guc_hashtab,
+						&var->name,
+						HASH_REMOVE,
+						NULL);
+			RemoveGUCFromLists(var);
+			free_placeholder(var);
+		}
+	}
+}
+#endif
 
 
 /*

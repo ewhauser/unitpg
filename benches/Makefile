@@ -13,6 +13,7 @@ PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage1
+CATALOG_MODE ?= rust
 UPSTREAM_REGRESSION_CASES ?=
 UPSTREAM_REGRESSION_LIMIT ?=
 REGRESSION_GLOBAL_TIMEOUT ?= 60
@@ -46,6 +47,7 @@ PGBENCH_COMMON_ARGS = \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
+	--catalog-mode "$(CATALOG_MODE)" \
 	--rust-build-profile "$(RUST_BUILD_PROFILE)"
 
 PGBENCH_PROFILE_ARGS = \
@@ -57,6 +59,7 @@ PGBENCH_PROFILE_ARGS = \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
+	--catalog-mode "$(CATALOG_MODE)" \
 	--rust-build-profile "release" \
 	--profile-fastpg-rust-server \
 	--profile-tool "$(PROFILE_TOOL)" \
@@ -113,6 +116,7 @@ profile-side-by-side:
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
 		--storage-engine "$(STORAGE_ENGINE)" \
+		--catalog-mode "$(CATALOG_MODE)" \
 		--rust-build-profile "release" \
 		--profile-normal-postgres \
 		--profile-fastpg-rust-server \
@@ -133,11 +137,12 @@ regression:
 		$(UPSTREAM_REGRESSION_CASE_ARGS) \
 		$(UPSTREAM_REGRESSION_LIMIT_ARG) \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
-		--rust-build-profile "$(RUST_BUILD_PROFILE)" \
-		--storage-engine "$(STORAGE_ENGINE)" \
-		--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \
-		--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
-		$(REGRESSION_FAIL_ON_DIFFERENCES_ARG)
+	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
+	--storage-engine "$(STORAGE_ENGINE)" \
+	--catalog-mode "$(CATALOG_MODE)" \
+	--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \
+	--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
+	$(REGRESSION_FAIL_ON_DIFFERENCES_ARG)
 
 bench:
 	cargo bench -p fastpg-storage --bench storage_engine -- $(CRITERION_ARGS)

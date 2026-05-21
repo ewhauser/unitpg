@@ -27,6 +27,7 @@
 #include "access/xact.h"
 #include "access/xlog.h"
 #include "access/xloginsert.h"
+#include "access/fastpg_catalog.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_collation.h"
@@ -912,14 +913,25 @@ InitPostgres(const char *in_dbname, Oid dboid,
 	}
 	else if (!IsUnderPostmaster)
 	{
-		InitializeSessionUserIdStandalone();
-		am_superuser = true;
-		if (!ThereIsAtLeastOneRole())
-			ereport(WARNING,
-					(errcode(ERRCODE_UNDEFINED_OBJECT),
-					 errmsg("no roles are defined in this database system"),
-					 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
-							 username != NULL ? username : "postgres")));
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres() &&
+			(username != NULL || OidIsValid(useroid)))
+		{
+			InitializeSessionUserId(username, useroid, true);
+			am_superuser = superuser();
+		}
+		else
+#endif
+		{
+			InitializeSessionUserIdStandalone();
+			am_superuser = true;
+			if (!ThereIsAtLeastOneRole())
+				ereport(WARNING,
+						(errcode(ERRCODE_UNDEFINED_OBJECT),
+						 errmsg("no roles are defined in this database system"),
+						 errhint("You should immediately run CREATE USER \"%s\" SUPERUSER;.",
+								 username != NULL ? username : "postgres")));
+		}
 	}
 	else if (AmBackgroundWorkerProcess() || AmDataChecksumsWorkerProcess())
 	{

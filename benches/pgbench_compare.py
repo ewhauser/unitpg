@@ -15,6 +15,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -200,6 +201,7 @@ class PgBenchCompare:
                 "runs": args.runs,
                 "protocol": args.protocol,
                 "storage_engine": args.storage_engine,
+                "catalog_mode": args.catalog_mode,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
@@ -426,7 +428,13 @@ class PgBenchCompare:
         libdir = build_dir / "fastpg-pgcore-libdir"
         libdir.mkdir(parents=True, exist_ok=True)
 
-        candidates = [build_dir / "src/pl/plpgsql/src" / f"plpgsql{suffix}"]
+        candidates = [
+            build_dir / "src/pl/plpgsql/src" / f"plpgsql{suffix}",
+            build_dir / "src/backend/snowball" / f"dict_snowball{suffix}",
+            build_dir / "src/backend/replication/libpqwalreceiver" / f"libpqwalreceiver{suffix}",
+            build_dir / "src/interfaces/libpq" / f"libpq.5{suffix}",
+            build_dir / "src/interfaces/libpq" / f"libpq{suffix}",
+        ]
         conversion_dir = build_dir / "src/backend/utils/mb/conversion_procs"
         if conversion_dir.exists():
             candidates.extend(sorted(conversion_dir.glob(f"*{suffix}")))
@@ -444,22 +452,89 @@ class PgBenchCompare:
 
         return libdir
 
+    def prepare_rust_server_catalog(
+        self,
+        variant: str,
+        paths: dict[str, Path],
+        run_dir: Path,
+        run_record: dict[str, Any],
+    ) -> tuple[dict[str, str], Path | None]:
+        catalog_mode = self.args.catalog_mode
+        postgres_exec = paths["client_bindir"] / ("postgres.exe" if os.name == "nt" else "postgres")
+        server_env = {
+            "FASTPG_CATALOG_MODE": catalog_mode,
+            "FASTPG_EXEC_PATH": str(postgres_exec if postgres_exec.exists() else paths["server_binary"]),
+            "FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"])),
+        }
+        library_path = "DYLD_LIBRARY_PATH" if platform.system() == "Darwin" else "LD_LIBRARY_PATH"
+        server_env[library_path] = (
+            f"{paths.get('pgcore_libdir', paths['client_libdir'])}"
+            f"{os.pathsep}{os.environ.get(library_path, '')}"
+        )
+        run_record["catalog_mode"] = catalog_mode
+
+        if catalog_mode == "rust":
+            return server_env, None
+
+        pgdata = short_temp_dir("fpgcat-")
+        run_record["pgdata"] = str(pgdata)
+        run_record["pgdata_temporary"] = True
+        try:
+            initdb = self.checked_command(
+                variant,
+                "initdb",
+                [
+                    str(paths["client_bindir"] / "initdb"),
+                    "-D",
+                    str(pgdata),
+                    "-U",
+                    "postgres",
+                    "-A",
+                    "trust",
+                    "--no-locale",
+                ],
+                run_dir,
+                "fastpg-catalog-initdb",
+                env=postgres_env(paths["client_bindir"], paths["client_libdir"]),
+            )
+        except Exception:
+            shutil.rmtree(pgdata, ignore_errors=True)
+            raise
+        run_record["commands"]["catalog_initdb"] = initdb.as_json()
+        server_env["FASTPG_PGDATA"] = str(pgdata)
+        return server_env, pgdata
+
     def repair_macos_libpq_names(self, variant: str, bindir: Path, libdir: Path, output_dir: Path) -> None:
         if platform.system() != "Darwin":
             return
 
         old_name = "/usr/local/pgsql/lib/libpq.5.dylib"
         new_name = str(libdir / "libpq.5.dylib")
-        for binary_name in ("psql", "pgbench"):
-            binary = bindir / binary_name
-            otool = self.command(["otool", "-L", str(binary)], output_dir, f"otool-{binary_name}")
+        targets = [bindir / "psql", bindir / "pgbench"]
+        targets.extend(sorted(libdir.glob("*.dylib")))
+
+        for target in targets:
+            target_label = target.relative_to(libdir if target.parent == libdir else bindir)
+            command_label = str(target_label).replace(os.sep, "-").replace(".", "-")
+            otool = self.command(["otool", "-L", str(target)], output_dir, f"otool-{command_label}")
             if otool.returncode != 0:
                 raise BenchmarkFailure(variant, "setup", otool, output_dir)
+
+            if target.name == "libpq.5.dylib" and old_name in otool.stdout:
+                changed = self.command(
+                    ["install_name_tool", "-id", new_name, str(target)],
+                    output_dir,
+                    f"install-name-id-{command_label}",
+                )
+                if changed.returncode != 0:
+                    raise BenchmarkFailure(variant, "setup", changed, output_dir)
+                continue
+
             if old_name in otool.stdout:
                 changed = self.command(
-                    ["install_name_tool", "-change", old_name, new_name, str(binary)],
+                    ["install_name_tool", "-change", old_name, new_name, str(target)],
                     output_dir,
-                    f"install-name-{binary_name}",
+                    f"install-name-{command_label}",
                 )
                 if changed.returncode != 0:
                     raise BenchmarkFailure(variant, "setup", changed, output_dir)
@@ -477,8 +552,7 @@ class PgBenchCompare:
         run_dir = variant_dir / f"run-{run_index}"
         run_dir.mkdir(parents=True, exist_ok=True)
         data_dir = run_dir / "data"
-        socket_dir = Path(f"/private/tmp/fpgb-{os.getpid()}-{variant.name}-{run_index}")
-        socket_dir.mkdir(parents=True, exist_ok=True)
+        socket_dir = short_temp_dir(f"fpgb-{os.getpid()}-{variant.name}-{run_index}-")
         port = free_port()
         env = postgres_env(paths["bindir"], paths["libdir"])
         env["FASTPG_STORAGE_ENGINE"] = self.args.storage_engine
@@ -631,8 +705,7 @@ class PgBenchCompare:
             host = "127.0.0.1"
             listen_address = f"{host}:{port}"
         else:
-            socket_dir = Path(f"/private/tmp/fpgb-{os.getpid()}-{variant.name}-{run_index}")
-            socket_dir.mkdir(parents=True, exist_ok=True)
+            socket_dir = short_temp_dir(f"fpgb-{os.getpid()}-{variant.name}-{run_index}-")
             socket_path = socket_dir / f".s.PGSQL.{port}"
             host = str(socket_dir)
             listen_address = f"unix:{socket_path}"
@@ -641,6 +714,7 @@ class PgBenchCompare:
         server: dict[str, Any] | None = None
         profiler: dict[str, Any] | None = None
         stop_failure: BenchmarkFailure | None = None
+        catalog_pgdata: Path | None = None
 
         run_record: dict[str, Any] = {
             "run": run_index,
@@ -652,6 +726,12 @@ class PgBenchCompare:
             run_record["socket_dir"] = str(socket_dir)
 
         try:
+            server_env, catalog_pgdata = self.prepare_rust_server_catalog(
+                variant.name,
+                paths,
+                run_dir,
+                run_record,
+            )
             server = self.start_rust_server(
                 variant.name,
                 paths["server_binary"],
@@ -660,7 +740,7 @@ class PgBenchCompare:
                 host=host,
                 port=port,
                 socket_path=socket_path,
-                server_env={"FASTPG_PGLIBDIR": str(paths.get("pgcore_libdir", paths["client_libdir"]))},
+                server_env=server_env,
             )
             run_record["commands"]["start"] = server["result"].as_json()
             if "profiler" in server:
@@ -737,6 +817,10 @@ class PgBenchCompare:
             self.write_results()
             if socket_dir is not None:
                 shutil.rmtree(socket_dir, ignore_errors=True)
+            if catalog_pgdata is not None:
+                shutil.rmtree(catalog_pgdata, ignore_errors=True)
+                run_record["pgdata_cleaned"] = True
+                self.write_results()
             if stop_failure is not None:
                 raise stop_failure
 
@@ -1380,6 +1464,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="select the fastpg in-memory storage engine for the fastpg variant",
     )
     parser.add_argument(
+        "--catalog-mode",
+        choices=["rust", "postgres"],
+        default=os.environ.get("FASTPG_CATALOG_MODE", "rust"),
+        help="select the fastpg catalog implementation for the Rust server variant",
+    )
+    parser.add_argument(
         "--profile-fastpg-rust-server",
         action="store_true",
         help="profile the fastpg Rust server during the pgbench run",
@@ -1445,6 +1535,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--profile-hyperfine-runs must be at least 1")
     if args.profile_hyperfine_warmup < 0:
         parser.error("--profile-hyperfine-warmup must be non-negative")
+    if args.catalog_mode == "postgres" and args.storage_engine == "storage2":
+        parser.error("--catalog-mode=postgres currently supports --storage-engine=storage1 only")
     return args
 
 
@@ -1471,6 +1563,15 @@ def rust_server_pgbench_env(bindir: Path, libdir: Path) -> dict[str, str]:
     env["PGSSLMODE"] = "disable"
     env["PGGSSENCMODE"] = "disable"
     return env
+
+
+def short_temp_dir(prefix: str) -> Path:
+    base = (
+        Path("/private/tmp")
+        if platform.system() == "Darwin" and Path("/private/tmp").is_dir()
+        else Path(tempfile.gettempdir())
+    )
+    return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
 
 
 def free_port() -> int:

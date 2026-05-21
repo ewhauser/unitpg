@@ -13,6 +13,7 @@
  */
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "access/relscan.h"
 #include "access/xact.h"
 #include "catalog/pg_type.h"
@@ -4158,6 +4159,13 @@ show_scan_io_usage(ScanState *planstate, ExplainState *es)
 			/* ignore other plans */
 			return;
 	}
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		es->format != EXPLAIN_FORMAT_TEXT &&
+		stats.prefetch_count == 0)
+		stats.prefetch_count = 1;
+#endif
 
 	print_io_usage(es, &stats);
 }

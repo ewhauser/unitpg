@@ -17,6 +17,9 @@
 
 #include <limits.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/xact.h"
 #include "commands/prepare.h"
 #include "executor/executor.h"
@@ -1773,7 +1776,16 @@ EnsurePortalSnapshotExists(void)
 	/* Otherwise, we'd better have an active Portal */
 	portal = ActivePortal;
 	if (unlikely(portal == NULL))
+	{
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			PushActiveSnapshot(GetTransactionSnapshot());
+			return;
+		}
+#endif
 		elog(ERROR, "cannot execute SQL without an outer snapshot or portal");
+	}
 	Assert(portal->portalSnapshot == NULL);
 
 	/*

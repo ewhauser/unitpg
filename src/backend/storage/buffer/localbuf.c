@@ -55,6 +55,11 @@ static HTAB *LocalBufHash = NULL;
 /* number of local buffers pinned at least once */
 static int	NLocalPinnedBuffers = 0;
 
+static char *localbuf_cur_block = NULL;
+static int	localbuf_next_buf_in_block = 0;
+static int	localbuf_num_bufs_in_block = 0;
+static int	localbuf_total_bufs_allocated = 0;
+static MemoryContext LocalBufferContext = NULL;
 
 static void InitLocalBuffers(void);
 static Block GetLocalBufferStorage(void);
@@ -924,17 +929,11 @@ check_temp_buffers(int *newval, void **extra, GucSource source)
 static Block
 GetLocalBufferStorage(void)
 {
-	static char *cur_block = NULL;
-	static int	next_buf_in_block = 0;
-	static int	num_bufs_in_block = 0;
-	static int	total_bufs_allocated = 0;
-	static MemoryContext LocalBufferContext = NULL;
-
 	char	   *this_buf;
 
-	Assert(total_bufs_allocated < NLocBuffer);
+	Assert(localbuf_total_bufs_allocated < NLocBuffer);
 
-	if (next_buf_in_block >= num_bufs_in_block)
+	if (localbuf_next_buf_in_block >= localbuf_num_bufs_in_block)
 	{
 		/* Need to make a new request to memmgr */
 		int			num_bufs;
@@ -951,26 +950,26 @@ GetLocalBufferStorage(void)
 									  ALLOCSET_DEFAULT_SIZES);
 
 		/* Start with a 16-buffer request; subsequent ones double each time */
-		num_bufs = Max(num_bufs_in_block * 2, 16);
+		num_bufs = Max(localbuf_num_bufs_in_block * 2, 16);
 		/* But not more than what we need for all remaining local bufs */
-		num_bufs = Min(num_bufs, NLocBuffer - total_bufs_allocated);
+		num_bufs = Min(num_bufs, NLocBuffer - localbuf_total_bufs_allocated);
 		/* And don't overflow MaxAllocSize, either */
 		num_bufs = Min(num_bufs, MaxAllocSize / BLCKSZ);
 
 		/* Buffers should be I/O aligned. */
-		cur_block = MemoryContextAllocAligned(LocalBufferContext,
-											  num_bufs * BLCKSZ,
-											  PG_IO_ALIGN_SIZE,
-											  0);
+		localbuf_cur_block = MemoryContextAllocAligned(LocalBufferContext,
+													   num_bufs * BLCKSZ,
+													   PG_IO_ALIGN_SIZE,
+													   0);
 
-		next_buf_in_block = 0;
-		num_bufs_in_block = num_bufs;
+		localbuf_next_buf_in_block = 0;
+		localbuf_num_bufs_in_block = num_bufs;
 	}
 
 	/* Allocate next buffer in current memory block */
-	this_buf = cur_block + next_buf_in_block * BLCKSZ;
-	next_buf_in_block++;
-	total_bufs_allocated++;
+	this_buf = localbuf_cur_block + localbuf_next_buf_in_block * BLCKSZ;
+	localbuf_next_buf_in_block++;
+	localbuf_total_bufs_allocated++;
 
 	/*
 	 * Caller's PinLocalBuffer() was too early for Valgrind updates, so do it
@@ -1016,6 +1015,39 @@ CheckForLocalBufferLeaks(void)
 		Assert(RefCountErrors == 0);
 	}
 #endif
+}
+
+void
+FastPgResetLocalBuffers(void)
+{
+	CheckForLocalBufferLeaks();
+
+	if (LocalBufHash != NULL)
+	{
+		hash_destroy(LocalBufHash);
+		LocalBufHash = NULL;
+	}
+
+	free(LocalBufferDescriptors);
+	free(LocalBufferBlockPointers);
+	free(LocalRefCount);
+	LocalBufferDescriptors = NULL;
+	LocalBufferBlockPointers = NULL;
+	LocalRefCount = NULL;
+
+	if (LocalBufferContext != NULL)
+	{
+		MemoryContextDelete(LocalBufferContext);
+		LocalBufferContext = NULL;
+	}
+
+	NLocBuffer = 0;
+	nextFreeLocalBufId = 0;
+	NLocalPinnedBuffers = 0;
+	localbuf_cur_block = NULL;
+	localbuf_next_buf_in_block = 0;
+	localbuf_num_bufs_in_block = 0;
+	localbuf_total_bufs_allocated = 0;
 }
 
 /*

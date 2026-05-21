@@ -38,6 +38,9 @@
 
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "lib/ilist.h"
 #include "miscadmin.h"
 #include "port/atomics.h"
@@ -1175,7 +1178,8 @@ void
 pgaio_error_cleanup(void)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster || pgaio_my_backend == NULL)
+	if ((!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres()) ||
+		pgaio_my_backend == NULL)
 		return;
 #endif
 	/*
@@ -1207,7 +1211,8 @@ void
 AtEOXact_Aio(bool is_commit)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster || pgaio_my_backend == NULL)
+	if ((!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres()) ||
+		pgaio_my_backend == NULL)
 		return;
 #endif
 	/*

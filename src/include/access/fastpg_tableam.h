@@ -18,6 +18,9 @@
 
 extern const TableAmRoutine *GetFastPgMemTableAmRoutine(void);
 extern const IndexAmRoutine *GetFastPgMemIndexAmRoutine(void);
+extern BlockNumber FastPgMemRelationPages(Relation rel);
+extern BlockNumber FastPgMemRelationAllVisiblePages(Relation rel);
+extern void FastPgMemResetCommandTouchedRows(void);
 extern bool FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 											  Relation indexRelation,
 											  const Datum *values,

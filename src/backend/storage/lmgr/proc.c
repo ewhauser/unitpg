@@ -33,6 +33,9 @@
 #include <unistd.h>
 #include <sys/time.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/clog.h"
 #include "access/transam.h"
 #include "access/twophase.h"
@@ -896,7 +899,7 @@ void
 ProcReleaseLocks(bool isCommit)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && fastpg_use_rust_catalog())
 		return;
 #endif
 	if (!MyProc)

@@ -19,6 +19,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/heapam.h"
 #include "access/heaptoast.h"
@@ -498,7 +501,7 @@ heapam_relation_set_new_filelocator(Relation rel,
 	SMgrRelation srel;
 
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
 	{
 		*freezeXid = FirstNormalTransactionId;
 		*minmulti = FirstMultiXactId;
