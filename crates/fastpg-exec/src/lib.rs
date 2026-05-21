@@ -925,6 +925,181 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn oversized_varlena_values_use_heap_toast_tables() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_toast_{}", std::process::id());
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+        assert_eq!(
+            executor.execute(&format!("create table {table}(f1 text, f2 text)"), &[]),
+            QueryExecution::Command {
+                tag: "CREATE TABLE".into(),
+                rows: 0,
+            }
+        );
+        executor.execute(
+            &format!("alter table {table} set (toast_tuple_target = 128)"),
+            &[],
+        );
+        executor.execute(
+            &format!("alter table {table} alter column f1 set storage external"),
+            &[],
+        );
+        executor.execute(
+            &format!("alter table {table} alter column f2 set storage external"),
+            &[],
+        );
+        assert!(matches!(
+            executor.execute(
+                &format!("insert into {table} values(repeat('1234', 1000), repeat('5678', 30))"),
+                &[]
+            ),
+            QueryExecution::Command { ref tag, .. } if tag == "INSERT"
+        ));
+
+        let toast_name = match executor.execute(
+            &format!(
+                "select reltoastrelid::regclass::text as reltoastname from pg_class where oid = '{table}'::regclass"
+            ),
+            &[],
+        ) {
+            QueryExecution::Rows(result) => match &result.rows[..] {
+                [row] => match &row[..] {
+                    [Value::Text(name)] => name.clone(),
+                    other => panic!("expected toast relation name, got {other:?}"),
+                },
+                other => panic!("expected one toast relation row, got {other:?}"),
+            },
+            other => panic!("expected toast relation row, got {other:?}"),
+        };
+        assert_ne!(toast_name, "-");
+
+        assert_eq!(
+            executor.execute(
+                &format!("select count(*)::int4 as count from {toast_name} where chunk_seq = 0"),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::new("count", PgType::Int4)],
+                vec![vec![Value::Int4(2)]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "select case when pg_relation_size('{toast_name}'::regclass) > 0 then 't' else 'f' end as nonempty"
+                ),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("nonempty", PgType::Varchar, 25)],
+                vec![vec![Value::Text("t".to_owned())]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "select pg_column_compression(f1) as f1_comp, pg_column_compression(f2) as f2_comp from {table}"
+                ),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![
+                    Column::with_type_oid("f1_comp", PgType::Varchar, 25),
+                    Column::with_type_oid("f2_comp", PgType::Varchar, 25),
+                ],
+                vec![vec![Value::Null, Value::Null]]
+            ))
+        );
+
+        executor.execute(&format!("truncate {table}"), &[]);
+        executor.execute("set default_toast_compression = 'pglz'", &[]);
+        executor.execute(
+            &format!("alter table {table} alter column f1 set storage main"),
+            &[],
+        );
+        executor.execute(
+            &format!("alter table {table} alter column f2 set storage main"),
+            &[],
+        );
+        executor.execute(
+            &format!("insert into {table} values(repeat('1234', 1024), repeat('5678', 1024))"),
+            &[],
+        );
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "select pg_column_compression(f1) as f1_comp, pg_column_compression(f2) as f2_comp from {table}"
+                ),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![
+                    Column::with_type_oid("f1_comp", PgType::Varchar, 25),
+                    Column::with_type_oid("f2_comp", PgType::Varchar, 25),
+                ],
+                vec![vec![
+                    Value::Text("pglz".to_owned()),
+                    Value::Text("pglz".to_owned()),
+                ]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                &format!("select count(*)::int4 as count from {toast_name}"),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::new("count", PgType::Int4)],
+                vec![vec![Value::Int4(0)]]
+            ))
+        );
+
+        executor.execute(&format!("truncate {table}"), &[]);
+        executor.execute(
+            &format!("alter table {table} alter column f1 set storage extended"),
+            &[],
+        );
+        executor.execute(
+            &format!("alter table {table} alter column f2 set storage extended"),
+            &[],
+        );
+        executor.execute(
+            &format!("insert into {table} values(repeat('1234', 10240), NULL)"),
+            &[],
+        );
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "select pg_column_compression(f1) as f1_comp, pg_column_compression(f2) as f2_comp from {table}"
+                ),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![
+                    Column::with_type_oid("f1_comp", PgType::Varchar, 25),
+                    Column::with_type_oid("f2_comp", PgType::Varchar, 25),
+                ],
+                vec![vec![Value::Text("pglz".to_owned()), Value::Null]]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                &format!("select count(*)::int4 as count from {toast_name} where chunk_seq = 0"),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::new("count", PgType::Int4)],
+                vec![vec![Value::Int4(1)]]
+            ))
+        );
+
+        executor.execute("reset default_toast_compression", &[]);
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn executes_parameterized_int4_through_pgcore() {
         let executor = QueryExecutor::new("17.0-fastpg");
 

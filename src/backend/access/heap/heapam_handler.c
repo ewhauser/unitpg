@@ -502,6 +502,15 @@ heapam_relation_set_new_filelocator(Relation rel,
 	{
 		*freezeXid = FirstNormalTransactionId;
 		*minmulti = FirstMultiXactId;
+		if (rel->rd_rel->relkind == RELKIND_TOASTVALUE)
+		{
+			SMgrRelation fastpg_srel;
+
+			fastpg_srel = RelationGetSmgr(rel);
+			smgrcreate(fastpg_srel, MAIN_FORKNUM, false);
+			if (persistence == RELPERSISTENCE_UNLOGGED)
+				smgrcreate(fastpg_srel, INIT_FORKNUM, false);
+		}
 		return;
 	}
 #endif

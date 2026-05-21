@@ -49,7 +49,12 @@
 #include "parser/parser.h"
 #include "pgtime.h"
 #include "postmaster/postmaster.h"
+#include "storage/aio.h"
+#include "storage/aio_internal.h"
+#include "storage/bufmgr.h"
 #include "storage/fd.h"
+#include "storage/procnumber.h"
+#include "storage/smgr.h"
 #include "tcop/cmdtag.h"
 #include "tcop/dest.h"
 #include "tcop/pquery.h"
@@ -200,6 +205,70 @@ static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteSt
 static char *fastpg_pgcore_strdup(const char *value);
 
 static bool fastpg_pgcore_initialized = false;
+
+#ifdef USE_FASTPG
+static void
+fastpg_pgcore_init_standalone_aio(void)
+{
+	uint32		iovec_off = 0;
+	uint32		handle_count;
+	uint32		iovec_count;
+	PgAioBackend *backend;
+
+	if (pgaio_my_backend != NULL)
+		return;
+
+	io_method = IOMETHOD_SYNC;
+	pgaio_method_ops = &pgaio_sync_ops;
+	if (io_max_concurrency <= 0)
+		io_max_concurrency = 1;
+	if (io_max_combine_limit <= 0)
+		io_max_combine_limit = 1;
+
+	MyProcNumber = 0;
+	handle_count = (uint32) io_max_concurrency;
+	iovec_count = handle_count * (uint32) io_max_combine_limit;
+
+	pgaio_ctl = (PgAioCtl *)
+		MemoryContextAllocZero(TopMemoryContext, sizeof(PgAioCtl));
+	backend = (PgAioBackend *)
+		MemoryContextAllocZero(TopMemoryContext, sizeof(PgAioBackend));
+
+	pgaio_ctl->backend_state_count = 1;
+	pgaio_ctl->backend_state = backend;
+	pgaio_ctl->io_handle_count = handle_count;
+	pgaio_ctl->io_handles = (PgAioHandle *)
+		MemoryContextAllocZero(TopMemoryContext,
+							   sizeof(PgAioHandle) * handle_count);
+	pgaio_ctl->iovec_count = iovec_count;
+	pgaio_ctl->iovecs = (struct iovec *)
+		MemoryContextAllocZero(TopMemoryContext,
+							   sizeof(struct iovec) * iovec_count);
+	pgaio_ctl->handle_data = (uint64 *)
+		MemoryContextAllocZero(TopMemoryContext,
+							   sizeof(uint64) * iovec_count);
+
+	backend->io_handle_off = 0;
+	dclist_init(&backend->idle_ios);
+	dclist_init(&backend->in_flight_ios);
+
+	for (uint32 index = 0; index < handle_count; index++)
+	{
+		PgAioHandle *ioh = &pgaio_ctl->io_handles[index];
+
+		ioh->state = PGAIO_HS_IDLE;
+		ioh->generation = 1;
+		ioh->owner_procno = MyProcNumber;
+		ioh->iovec_off = iovec_off;
+		ioh->distilled_result.status = PGAIO_RS_UNKNOWN;
+		ConditionVariableInit(&ioh->cv);
+		dclist_push_tail(&backend->idle_ios, &ioh->node);
+		iovec_off += (uint32) io_max_combine_limit;
+	}
+
+	pgaio_my_backend = backend;
+}
+#endif
 
 static struct
 {
@@ -393,6 +462,10 @@ fastpg_pgcore_init_once(void)
 	DatabasePath = pstrdup("base/5");
 	InitializeGUCOptions();
 	SetConfigOption("track_counts", "off", PGC_SUSET, PGC_S_OVERRIDE);
+#ifdef USE_FASTPG
+	fastpg_pgcore_init_standalone_aio();
+#endif
+	smgrinit();
 	fastpg_pgcore_configure_library_paths();
 	pg_timezone_initialize();
 	RelationCacheInitialize();

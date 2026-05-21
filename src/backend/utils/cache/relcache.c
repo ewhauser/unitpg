@@ -365,9 +365,12 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 	Snapshot	snapshot = NULL;
 
 #ifdef USE_FASTPG
-	pg_class_tuple = FastPgBuildPgClassTuple(targetRelId);
-	if (HeapTupleIsValid(pg_class_tuple))
-		return pg_class_tuple;
+	if (targetRelId < (Oid) FirstNormalObjectId)
+	{
+		pg_class_tuple = FastPgBuildPgClassTuple(targetRelId);
+		if (HeapTupleIsValid(pg_class_tuple))
+			return pg_class_tuple;
+	}
 #endif
 
 	/*
@@ -424,6 +427,11 @@ ScanPgRelation(Oid targetRelId, bool indexOK, bool force_non_historic)
 		UnregisterSnapshot(snapshot);
 
 	table_close(pg_class_desc, AccessShareLock);
+
+#ifdef USE_FASTPG
+	if (!HeapTupleIsValid(pg_class_tuple))
+		pg_class_tuple = FastPgBuildPgClassTuple(targetRelId);
+#endif
 
 	return pg_class_tuple;
 }
@@ -2357,23 +2365,17 @@ IsFastPgVirtualCatalogRelation(Relation relation)
 static bool
 UseFastPgMemTableAm(Relation relation)
 {
-	Oid			relnamespace = RelationGetNamespace(relation);
-
 	return RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) &&
 		relation->rd_rel->relam == HEAP_TABLE_AM_OID &&
-		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
-		!IsToastNamespace(relnamespace);
+		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId;
 }
 
 static bool
 UseFastPgMemTableAmForHandler(Relation relation, Oid amhandler)
 {
-	Oid			relnamespace = RelationGetNamespace(relation);
-
 	return RELKIND_HAS_TABLE_AM(relation->rd_rel->relkind) &&
 		amhandler == F_HEAP_TABLEAM_HANDLER &&
-		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId &&
-		!IsToastNamespace(relnamespace);
+		RelationGetRelid(relation) >= (Oid) FirstNormalObjectId;
 }
 #endif
 

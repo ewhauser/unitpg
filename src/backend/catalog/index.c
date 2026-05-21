@@ -998,6 +998,11 @@ index_create(Relation heapRelation,
 	Assert(relminmxid == InvalidMultiXactId);
 	Assert(indexRelationId == RelationGetRelid(indexRelation));
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && heapRelation->rd_rel->relkind == RELKIND_TOASTVALUE)
+		smgrcreate(RelationGetSmgr(indexRelation), MAIN_FORKNUM, false);
+#endif
+
 	/*
 	 * Obtain exclusive lock on it.  Although no other transactions can see it
 	 * until we commit, this prevents deadlock-risk complaints from lock

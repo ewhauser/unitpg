@@ -16,23 +16,33 @@
 #include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
 #include "access/genam.h"
+#include "access/heaptoast.h"
 #include "access/multixact.h"
 #include "access/nbtree.h"
+#include "access/reloptions.h"
 #include "access/relscan.h"
 #include "access/skey.h"
+#include "access/table.h"
 #include "access/tableam.h"
 #include "access/xact.h"
+#include "catalog/pg_am_d.h"
+#include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
 #include "executor/tuptable.h"
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "nodes/pathnodes.h"
 #include "nodes/primnodes.h"
 #include "storage/off.h"
+#include "utils/catcache.h"
+#include "utils/builtins.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
 #include "utils/snapmgr.h"
+#include "utils/syscache.h"
 
 #include <stdint.h>
 #include <stdlib.h>
@@ -495,6 +505,99 @@ fastpg_mem_prepare_slot_values(Relation rel,
 	*isnull_out = isnull;
 	*byval_out = byval;
 	*value_lens_out = value_lens;
+}
+
+static void
+fastpg_mem_refresh_toast_metadata(Relation rel)
+{
+	HeapTuple	reltup;
+	Relation	class_rel;
+	bytea	   *options;
+	TupleDesc	tupdesc = RelationGetDescr(rel);
+
+	/*
+	 * FastPG standalone DDL updates the Rust-backed catalogs, but a relation
+	 * descriptor opened earlier in the session can still carry old TOAST
+	 * options and column storage flags.
+	 */
+	reltup = SearchSysCacheCopy1(RELOID,
+								 ObjectIdGetDatum(RelationGetRelid(rel)));
+	if (HeapTupleIsValid(reltup))
+	{
+		Form_pg_class class_form = (Form_pg_class) GETSTRUCT(reltup);
+
+		rel->rd_rel->reltoastrelid = class_form->reltoastrelid;
+		class_rel = table_open(RelationRelationId, AccessShareLock);
+		options = extractRelOptions(reltup, RelationGetDescr(class_rel), NULL);
+		if (rel->rd_options != NULL)
+			pfree(rel->rd_options);
+		rel->rd_options = NULL;
+		if (options != NULL)
+		{
+			rel->rd_options = MemoryContextAlloc(CacheMemoryContext,
+												 VARSIZE(options));
+			memcpy(rel->rd_options, options, VARSIZE(options));
+			pfree(options);
+		}
+		table_close(class_rel, AccessShareLock);
+		heap_freetuple(reltup);
+	}
+
+	for (int index = 0; index < tupdesc->natts; index++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, index);
+		HeapTuple	atttup;
+
+		if (attr->attisdropped)
+			continue;
+		atttup = SearchSysCache2(ATTNUM,
+								 ObjectIdGetDatum(RelationGetRelid(rel)),
+								 Int16GetDatum(attr->attnum));
+		if (HeapTupleIsValid(atttup))
+		{
+			Form_pg_attribute attr_form = (Form_pg_attribute) GETSTRUCT(atttup);
+
+			attr->attstorage = attr_form->attstorage;
+			ReleaseSysCache(atttup);
+		}
+	}
+}
+
+static TupleTableSlot *
+fastpg_mem_toast_insert_slot(Relation rel, TupleTableSlot *slot, uint32 options)
+{
+	HeapTuple	tuple;
+	HeapTuple	toasted_tuple;
+	TupleTableSlot *toast_slot;
+	bool		should_free = false;
+
+	if (rel->rd_rel->relkind != RELKIND_RELATION &&
+		rel->rd_rel->relkind != RELKIND_MATVIEW)
+		return NULL;
+
+	fastpg_mem_refresh_toast_metadata(rel);
+	tuple = ExecFetchSlotHeapTuple(slot, true, &should_free);
+	if (!HeapTupleHasExternal(tuple) && tuple->t_len <= TOAST_TUPLE_THRESHOLD)
+	{
+		if (should_free)
+			heap_freetuple(tuple);
+		return NULL;
+	}
+
+	toasted_tuple = heap_toast_insert_or_update(rel, tuple, NULL, options);
+	if (toasted_tuple == tuple)
+	{
+		if (should_free)
+			heap_freetuple(tuple);
+		return NULL;
+	}
+
+	toast_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
+										  &TTSOpsHeapTuple);
+	ExecForceStoreHeapTuple(toasted_tuple, toast_slot, true);
+	if (should_free)
+		heap_freetuple(tuple);
+	return toast_slot;
 }
 
 static void
@@ -1411,9 +1514,14 @@ fastpg_mem_tuple_insert(Relation rel,
 	size_t	   *value_lens;
 	uint64_t	row_id = 0;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
+	TupleTableSlot *toast_slot;
+	TupleTableSlot *storage_slot = slot;
 
 	fastpg_mem_ensure_write_xact();
-	fastpg_mem_prepare_slot_values(rel, slot, &values, &isnull, &byval,
+	toast_slot = fastpg_mem_toast_insert_slot(rel, slot, options);
+	if (toast_slot != NULL)
+		storage_slot = toast_slot;
+	fastpg_mem_prepare_slot_values(rel, storage_slot, &values, &isnull, &byval,
 								   &value_lens);
 	if (!(storage2 ?
 		  fastpg_storage2_relation_insert_unchecked(RelationGetRelid(rel),
@@ -1435,6 +1543,8 @@ fastpg_mem_tuple_insert(Relation rel,
 		pfree(isnull);
 		pfree(byval);
 		pfree(value_lens);
+		if (toast_slot != NULL)
+			ExecDropSingleTupleTableSlot(toast_slot);
 		fastpg_mem_raise_storage_error("fastpg_mem failed to insert row into Rust storage");
 	}
 
@@ -1452,6 +1562,8 @@ fastpg_mem_tuple_insert(Relation rel,
 	pfree(isnull);
 	pfree(byval);
 	pfree(value_lens);
+	if (toast_slot != NULL)
+		ExecDropSingleTupleTableSlot(toast_slot);
 }
 
 static void
@@ -1735,12 +1847,25 @@ fastpg_mem_relation_size(Relation rel, ForkNumber forkNumber)
 {
 	int32_t		relpages = 0;
 	float4		reltuples = 0;
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+	size_t		row_count;
 
 	if (forkNumber == MAIN_FORKNUM &&
-		fastpg_rust_catalog_relation_planner_stats_by_oid((uint32_t) RelationGetRelid(rel),
+		fastpg_rust_catalog_relation_planner_stats_by_oid(relid,
 														  &relpages,
 														  &reltuples))
 		return (uint64) relpages * BLCKSZ;
+	if (forkNumber != MAIN_FORKNUM)
+		return 0;
+
+	if (fastpg_rust_catalog_policy_by_relation_oid(relid) != 0)
+		row_count = fastpg_rust_catalog_row_count(relid);
+	else
+		row_count = fastpg_mem_use_storage2_for_relid(relid) ?
+			fastpg_storage2_relation_row_count(relid) :
+			fastpg_rust_relation_row_count(relid);
+	if (row_count > 0)
+		return BLCKSZ;
 
 	return 0;
 }
@@ -1748,13 +1873,49 @@ fastpg_mem_relation_size(Relation rel, ForkNumber forkNumber)
 static bool
 fastpg_mem_relation_needs_toast_table(Relation rel)
 {
-	return false;
+	int32		data_length = 0;
+	bool		maxlength_unknown = false;
+	bool		has_toastable_attrs = false;
+	TupleDesc	tupdesc = rel->rd_att;
+
+	for (int index = 0; index < tupdesc->natts; index++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, index);
+
+		if (attr->attisdropped)
+			continue;
+		if (attr->attgenerated == ATTRIBUTE_GENERATED_VIRTUAL)
+			continue;
+		data_length = att_align_nominal(data_length, attr->attalign);
+		if (attr->attlen > 0)
+			data_length += attr->attlen;
+		else
+		{
+			int32		maxlen = type_maximum_size(attr->atttypid,
+												   attr->atttypmod);
+
+			if (maxlen < 0)
+				maxlength_unknown = true;
+			else
+				data_length += maxlen;
+			if (attr->attstorage != TYPSTORAGE_PLAIN)
+				has_toastable_attrs = true;
+		}
+	}
+
+	if (!has_toastable_attrs)
+		return false;
+	if (maxlength_unknown)
+		return true;
+
+	return MAXALIGN(SizeofHeapTupleHeader + BITMAPLEN(tupdesc->natts)) +
+		MAXALIGN(data_length) > TOAST_TUPLE_THRESHOLD;
 }
 
 static Oid
 fastpg_mem_relation_toast_am(Relation rel)
 {
-	return InvalidOid;
+	return HEAP_TABLE_AM_OID;
 }
 
 static void
@@ -1765,7 +1926,63 @@ fastpg_mem_relation_fetch_toast_slice(Relation toastrel,
 									  int32 slicelength,
 									  varlena *result)
 {
-	fastpg_mem_unsupported("TOAST fetch");
+	TableScanDesc scan;
+	TupleTableSlot *slot;
+	int32		slice_end = sliceoffset + slicelength;
+	int32		copied = 0;
+
+	slot = MakeSingleTupleTableSlot(RelationGetDescr(toastrel),
+									&TTSOpsVirtual);
+	scan = fastpg_mem_scan_begin(toastrel, SnapshotAny, 0, NULL, NULL, 0);
+	while (fastpg_mem_scan_getnextslot(scan, ForwardScanDirection, slot))
+	{
+		Oid			chunk_id;
+		int32		chunk_seq;
+		varlena    *chunk;
+		int32		chunk_size;
+		int32		chunk_start;
+		int32		chunk_end;
+		int32		copy_start;
+		int32		copy_end;
+
+		slot_getallattrs(slot);
+		if (slot->tts_isnull[0] || slot->tts_isnull[1] ||
+			slot->tts_isnull[2])
+			continue;
+
+		chunk_id = DatumGetObjectId(slot->tts_values[0]);
+		if (chunk_id != valueid)
+			continue;
+
+		chunk_seq = DatumGetInt32(slot->tts_values[1]);
+		chunk = (varlena *) DatumGetPointer(slot->tts_values[2]);
+		if (VARATT_IS_EXTERNAL(chunk) || VARATT_IS_COMPRESSED(chunk))
+			elog(ERROR, "found toasted toast chunk for toast value %u in %s",
+				 valueid,
+				 RelationGetRelationName(toastrel));
+		chunk_size = VARSIZE_ANY_EXHDR(chunk);
+		chunk_start = chunk_seq * TOAST_MAX_CHUNK_SIZE;
+		chunk_end = chunk_start + chunk_size;
+		copy_start = Max(chunk_start, sliceoffset);
+		copy_end = Min(chunk_end, slice_end);
+		if (copy_start >= copy_end)
+			continue;
+
+		memcpy(VARDATA(result) + (copy_start - sliceoffset),
+			   VARDATA_ANY(chunk) + (copy_start - chunk_start),
+			   copy_end - copy_start);
+		copied += copy_end - copy_start;
+		if (copied >= slicelength)
+			break;
+	}
+	fastpg_mem_scan_end(scan);
+	ExecDropSingleTupleTableSlot(slot);
+
+	if (copied != slicelength)
+		elog(ERROR, "missing chunk number %d for toast value %u in %s",
+			 (int) (copied / (int32) TOAST_MAX_CHUNK_SIZE),
+			 valueid,
+			 RelationGetRelationName(toastrel));
 }
 
 static void

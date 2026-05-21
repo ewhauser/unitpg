@@ -373,6 +373,11 @@ create_toast_table(Relation rel, Oid toastOid, Oid toastIndexOid,
 		systable_inplace_update_finish(state, reltup);
 	}
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+		rel->rd_rel->reltoastrelid = toast_relid;
+#endif
+
 	heap_freetuple(reltup);
 
 	table_close(class_rel, RowExclusiveLock);

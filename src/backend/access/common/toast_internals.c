@@ -21,6 +21,7 @@
 #include "access/toast_internals.h"
 #include "access/xact.h"
 #include "catalog/catalog.h"
+#include "executor/tuptable.h"
 #include "miscadmin.h"
 #include "utils/fmgroids.h"
 #include "utils/rel.h"
@@ -311,29 +312,58 @@ toast_save_datum(Relation rel, Datum value,
 
 		toasttup = heap_form_tuple(toasttupDesc, t_values, t_isnull);
 
-		heap_insert(toastrel, toasttup, mycid, options, NULL);
-
-		/*
-		 * Create the index entry.  We cheat a little here by not using
-		 * FormIndexDatum: this relies on the knowledge that the index columns
-		 * are the same as the initial columns of the table for all the
-		 * indexes.  We also cheat by not providing an IndexInfo: this is okay
-		 * for now because btree doesn't need one, but we might have to be
-		 * more honest someday.
-		 *
-		 * Note also that there had better not be any user-created index on
-		 * the TOAST table, since we don't bother to update anything else.
-		 */
-		for (int i = 0; i < num_indexes; i++)
+#ifdef USE_FASTPG
+		if (!IsUnderPostmaster)
 		{
-			/* Only index relations marked as ready can be updated */
-			if (toastidxs[i]->rd_index->indisready)
-				index_insert(toastidxs[i], t_values, t_isnull,
-							 &(toasttup->t_self),
-							 toastrel,
-							 toastidxs[i]->rd_index->indisunique ?
-							 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
-							 false, NULL);
+			TupleTableSlot *toastslot;
+			ItemPointerData toast_tid;
+
+			toastslot = MakeSingleTupleTableSlot(toasttupDesc,
+												  &TTSOpsHeapTuple);
+			ExecForceStoreHeapTuple(toasttup, toastslot, false);
+			table_tuple_insert(toastrel, toastslot, mycid, options, NULL);
+			toast_tid = toastslot->tts_tid;
+			ExecDropSingleTupleTableSlot(toastslot);
+
+			for (int i = 0; i < num_indexes; i++)
+			{
+				/* Only index relations marked as ready can be updated */
+				if (toastidxs[i]->rd_index->indisready)
+					index_insert(toastidxs[i], t_values, t_isnull,
+								 &toast_tid,
+								 toastrel,
+								 toastidxs[i]->rd_index->indisunique ?
+								 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
+								 false, NULL);
+			}
+		}
+		else
+#endif
+		{
+			heap_insert(toastrel, toasttup, mycid, options, NULL);
+
+			/*
+			 * Create the index entry.  We cheat a little here by not using
+			 * FormIndexDatum: this relies on the knowledge that the index columns
+			 * are the same as the initial columns of the table for all the
+			 * indexes.  We also cheat by not providing an IndexInfo: this is okay
+			 * for now because btree doesn't need one, but we might have to be
+			 * more honest someday.
+			 *
+			 * Note also that there had better not be any user-created index on
+			 * the TOAST table, since we don't bother to update anything else.
+			 */
+			for (int i = 0; i < num_indexes; i++)
+			{
+				/* Only index relations marked as ready can be updated */
+				if (toastidxs[i]->rd_index->indisready)
+					index_insert(toastidxs[i], t_values, t_isnull,
+								 &(toasttup->t_self),
+								 toastrel,
+								 toastidxs[i]->rd_index->indisunique ?
+								 UNIQUE_CHECK_YES : UNIQUE_CHECK_NO,
+								 false, NULL);
+			}
 		}
 
 		/*
