@@ -221,7 +221,7 @@ impl QueryExecutor {
             if storage2_enabled() {
                 self.copy_text_line_storage2(target, line)
             } else {
-                fastpg_storage::copy_text_line(&target.table, line)
+                self.copy_text_line_storage1(target, line)
             }
         }
         #[cfg(not(feature = "postgres-execution"))]
@@ -229,6 +229,71 @@ impl QueryExecutor {
             let _ = (target, line);
             Err("fastpg-exec was built without PostgreSQL execution".to_owned())
         }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn copy_text_line_storage1(&self, target: &CopyTarget, line: &str) -> Result<bool, String> {
+        let line = line.trim_end_matches('\n').trim_end_matches('\r');
+        if line == "\\." {
+            return Ok(false);
+        }
+
+        let relation = relation_by_name(&target.table)
+            .ok_or_else(|| format!("relation \"{}\" does not exist", target.table.trim()))?;
+        let copy_columns = if target.column_names.is_empty() {
+            relation.columns.iter().enumerate().collect::<Vec<_>>()
+        } else {
+            target
+                .column_names
+                .iter()
+                .map(|name| {
+                    let normalized = name.to_ascii_lowercase();
+                    relation
+                        .columns
+                        .iter()
+                        .enumerate()
+                        .find(|(_, column)| column.name == normalized)
+                        .ok_or_else(|| {
+                            format!(
+                                "column \"{}\" of relation \"{}\" does not exist",
+                                name, relation.name
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>, String>>()?
+        };
+        let fields = line.split('\t').collect::<Vec<_>>();
+        if fields.len() != copy_columns.len() {
+            return Err(format!(
+                "COPY row for relation \"{}\" has {} fields but {} columns",
+                relation.name,
+                fields.len(),
+                copy_columns.len()
+            ));
+        }
+
+        let mut datums = (0..relation.columns.len())
+            .map(|_| None)
+            .collect::<Vec<Option<fastpg_storage::CopyDatum>>>();
+        for (field, (column_index, column)) in fields.iter().zip(copy_columns) {
+            let datum = if *field == "\\N" {
+                None
+            } else {
+                let decoded = decode_copy_text_field(field);
+                let datum = self
+                    .pgcore_session
+                    .input_text_datum(column.type_oid.0, column.type_mod, &decoded)
+                    .map_err(pgcore_copy_error)?;
+                Some(if datum.typbyval {
+                    fastpg_storage::CopyDatum::by_value(datum.value)
+                } else {
+                    fastpg_storage::CopyDatum::by_reference(datum.payload.unwrap_or_default())
+                })
+            };
+            datums[column_index] = datum;
+        }
+
+        fastpg_storage::insert_copy_datums(&target.table, datums)
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -762,6 +827,67 @@ mod tests {
         );
         assert!(executor.copy_text_line(&table, "1\t").unwrap());
         assert!(!executor.copy_text_line(&table, "\\.").unwrap());
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn copy_from_stdin_honors_column_list() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_copy_columns_{}", std::process::id());
+        executor.execute(&format!("create table {table}(id int, filler text)"), &[]);
+
+        let copy = executor.execute(&format!("copy {table} (id) from stdin"), &[]);
+        assert_eq!(
+            copy,
+            QueryExecution::CopyIn(CopyTarget {
+                table: table.clone(),
+                columns: 1,
+                column_names: vec!["id".to_owned()],
+            })
+        );
+        let QueryExecution::CopyIn(target) = copy else {
+            unreachable!("assertion above verified COPY target");
+        };
+        assert!(executor.copy_target_text_line(&target, "42").unwrap());
+        assert!(!executor.copy_target_text_line(&target, "\\.").unwrap());
+
+        assert_eq!(
+            executor.execute(&format!("select id, filler is null from {table}"), &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![
+                    Column::with_type_oid("id", PgType::Int4, 23),
+                    Column::with_type_oid("?column?", PgType::Varchar, 16),
+                ],
+                vec![vec![Value::Int4(42), Value::Text("t".to_owned())]]
+            ))
+        );
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn copy_from_stdin_uses_postgres_type_input() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let table = format!("fastpg_exec_copy_varbit_{}", std::process::id());
+        executor.execute(&format!("create table {table}(bits bit varying(8))"), &[]);
+
+        let copy = executor.execute(&format!("copy {table} from stdin"), &[]);
+        let QueryExecution::CopyIn(target) = copy else {
+            panic!("expected COPY target, got {copy:?}");
+        };
+        assert!(executor.copy_target_text_line(&target, "101").unwrap());
+        assert!(!executor.copy_target_text_line(&target, "\\.").unwrap());
+
+        assert_eq!(
+            executor.execute(&format!("select bits from {table}"), &[]),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_metadata("bits", PgType::Varchar, 1562, 8)],
+                vec![vec![Value::Text("101".to_owned())]]
+            ))
+        );
 
         executor.execute(&format!("drop table if exists {table}"), &[]);
     }

@@ -2949,32 +2949,97 @@ pub fn copy_text_line(table: &str, line: &str) -> Result<bool, String> {
         ));
     }
 
+    let datums = fields
+        .iter()
+        .zip(&relation.columns)
+        .map(|(field, column)| {
+            if *field == "\\N" {
+                Ok(None)
+            } else {
+                copy_text_field_to_datum(field, column.type_oid).map(Some)
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    insert_copy_datums_for_relation(&relation, datums)
+}
+
+pub struct CopyDatum {
+    value: usize,
+    byval: bool,
+    value_len: usize,
+    payload: Option<Box<[u8]>>,
+}
+
+impl CopyDatum {
+    pub fn by_value(value: usize) -> Self {
+        Self {
+            value,
+            byval: true,
+            value_len: 0,
+            payload: None,
+        }
+    }
+
+    pub fn by_reference(payload: Vec<u8>) -> Self {
+        let payload = payload.into_boxed_slice();
+        Self {
+            value: 0,
+            byval: false,
+            value_len: payload.len(),
+            payload: Some(payload),
+        }
+    }
+}
+
+pub fn insert_copy_datums(table: &str, datums: Vec<Option<CopyDatum>>) -> Result<bool, String> {
+    let relation = relation_by_name(table)
+        .ok_or_else(|| format!("relation \"{}\" does not exist", table.trim()))?;
+    insert_copy_datums_for_relation(&relation, datums)
+}
+
+fn insert_copy_datums_for_relation(
+    relation: &fastpg_catalog::RelationRecord,
+    datums: Vec<Option<CopyDatum>>,
+) -> Result<bool, String> {
+    if datums.len() != relation.columns.len() {
+        return Err(format!(
+            "COPY row for relation \"{}\" has {} fields but {} columns",
+            relation.name,
+            datums.len(),
+            relation.columns.len()
+        ));
+    }
+
     let mut values = Vec::with_capacity(relation.columns.len());
     let mut is_null = Vec::with_capacity(relation.columns.len());
     let mut byval = Vec::with_capacity(relation.columns.len());
     let mut value_lens = Vec::with_capacity(relation.columns.len());
-    let mut varlena_payloads = Vec::<Box<[u8]>>::new();
+    let mut byref_payloads = Vec::<Box<[u8]>>::new();
 
-    for (field, column) in fields.iter().zip(&relation.columns) {
-        if *field == "\\N" {
+    for datum in datums {
+        let Some(copy_value) = datum else {
             values.push(0);
             is_null.push(1);
             byval.push(0);
             value_lens.push(0);
             continue;
-        }
+        };
 
-        let copy_value = copy_text_field_to_datum(field, column.type_oid)?;
-        values.push(copy_value.value);
-        is_null.push(0);
-        byval.push(u8::from(copy_value.byval));
-        value_lens.push(copy_value.value_len);
-        if let Some(payload) = copy_value.payload {
-            let pointer = payload.as_ptr() as usize;
-            values.pop();
-            values.push(pointer);
-            varlena_payloads.push(payload);
+        let CopyDatum {
+            mut value,
+            byval: datum_byval,
+            value_len,
+            payload,
+        } = copy_value;
+        if let Some(payload) = payload {
+            value = payload.as_ptr() as usize;
+            byref_payloads.push(payload);
         }
+        values.push(value);
+        is_null.push(0);
+        byval.push(u8::from(datum_byval));
+        value_lens.push(value_len);
     }
 
     let mut row_id = 0u64;
@@ -2997,13 +3062,6 @@ pub fn copy_text_line(table: &str, line: &str) -> Result<bool, String> {
             relation.name
         ))
     }
-}
-
-struct CopyDatum {
-    value: usize,
-    byval: bool,
-    value_len: usize,
-    payload: Option<Box<[u8]>>,
 }
 
 fn copy_text_field_to_datum(field: &str, type_oid: Oid) -> Result<CopyDatum, String> {
