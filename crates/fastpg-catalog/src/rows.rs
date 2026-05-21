@@ -723,19 +723,98 @@ fn empty_catalog_row(table: &StaticCatalogTable, row_id: u64) -> CatalogRow {
     }
 }
 
-fn synthetic_pg_aggregate_fnoid_index_class_row(pg_class_table: &StaticCatalogTable) -> CatalogRow {
-    let mut row = empty_catalog_row(pg_class_table, u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SyntheticCatalogIndexSpec {
+    pub(crate) index_oid: Oid,
+    pub(crate) relation_oid: Oid,
+    pub(crate) name: &'static str,
+    pub(crate) key_attnums: &'static [i16],
+    pub(crate) is_primary: bool,
+}
+
+pub(crate) const SYNTHETIC_CATALOG_INDEX_SPECS: &[SyntheticCatalogIndexSpec] = &[
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_AGGREGATE_FNOID_INDEX_OID,
+        relation_oid: PG_AGGREGATE_RELATION_OID,
+        name: "pg_aggregate_fnoid_index",
+        key_attnums: &[1],
+        is_primary: true,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_ATTRIBUTE_RELID_NAME_INDEX_OID,
+        relation_oid: PG_ATTRIBUTE_RELATION_OID,
+        name: "pg_attribute_relid_attnam_index",
+        key_attnums: &[1, 2],
+        is_primary: false,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_ATTRIBUTE_RELID_NUM_INDEX_OID,
+        relation_oid: PG_ATTRIBUTE_RELATION_OID,
+        name: "pg_attribute_relid_attnum_index",
+        key_attnums: &[1, 6],
+        is_primary: true,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_CLASS_OID_INDEX_OID,
+        relation_oid: PG_CLASS_RELATION_OID,
+        name: "pg_class_oid_index",
+        key_attnums: &[1],
+        is_primary: true,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_CLASS_NAME_NSP_INDEX_OID,
+        relation_oid: PG_CLASS_RELATION_OID,
+        name: "pg_class_relname_nsp_index",
+        key_attnums: &[2, 3],
+        is_primary: false,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_NAMESPACE_NAME_INDEX_OID,
+        relation_oid: PG_NAMESPACE_RELATION_OID,
+        name: "pg_namespace_nspname_index",
+        key_attnums: &[2],
+        is_primary: false,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_NAMESPACE_OID_INDEX_OID,
+        relation_oid: PG_NAMESPACE_RELATION_OID,
+        name: "pg_namespace_oid_index",
+        key_attnums: &[1],
+        is_primary: true,
+    },
+    SyntheticCatalogIndexSpec {
+        index_oid: PG_SEQUENCE_RELID_INDEX_OID,
+        relation_oid: PG_SEQUENCE_RELATION_OID,
+        name: "pg_sequence_seqrelid_index",
+        key_attnums: &[1],
+        is_primary: true,
+    },
+];
+
+pub(crate) fn synthetic_catalog_index_spec_by_oid(
+    index_oid: Oid,
+) -> Option<&'static SyntheticCatalogIndexSpec> {
+    SYNTHETIC_CATALOG_INDEX_SPECS
+        .iter()
+        .find(|spec| spec.index_oid == index_oid)
+}
+
+fn synthetic_catalog_index_class_row(
+    pg_class_table: &StaticCatalogTable,
+    spec: &SyntheticCatalogIndexSpec,
+) -> CatalogRow {
+    let mut row = empty_catalog_row(pg_class_table, u64::from(spec.index_oid.0));
     set_catalog_row_value(
         pg_class_table,
         &mut row,
         "oid",
-        CatalogValue::Oid(PG_AGGREGATE_FNOID_INDEX_OID),
+        CatalogValue::Oid(spec.index_oid),
     );
     set_catalog_row_value(
         pg_class_table,
         &mut row,
         "relname",
-        CatalogValue::Name("pg_aggregate_fnoid_index".to_owned()),
+        CatalogValue::Name(spec.name.to_owned()),
     );
     set_catalog_row_value(
         pg_class_table,
@@ -771,7 +850,7 @@ fn synthetic_pg_aggregate_fnoid_index_class_row(pg_class_table: &StaticCatalogTa
         pg_class_table,
         &mut row,
         "relfilenode",
-        CatalogValue::Oid(PG_AGGREGATE_FNOID_INDEX_OID),
+        CatalogValue::Oid(spec.index_oid),
     );
     set_catalog_row_value(
         pg_class_table,
@@ -828,7 +907,12 @@ fn synthetic_pg_aggregate_fnoid_index_class_row(pg_class_table: &StaticCatalogTa
         "relkind",
         CatalogValue::Char(b'i'),
     );
-    set_catalog_row_value(pg_class_table, &mut row, "relnatts", CatalogValue::Int16(1));
+    set_catalog_row_value(
+        pg_class_table,
+        &mut row,
+        "relnatts",
+        CatalogValue::Int16(spec.key_attnums.len().min(i16::MAX as usize) as i16),
+    );
     set_catalog_row_value(
         pg_class_table,
         &mut row,
@@ -907,26 +991,36 @@ fn synthetic_pg_aggregate_fnoid_index_class_row(pg_class_table: &StaticCatalogTa
     row
 }
 
-fn synthetic_pg_aggregate_fnoid_index_row(pg_index_table: &StaticCatalogTable) -> CatalogRow {
-    let mut row = empty_catalog_row(pg_index_table, u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+fn synthetic_catalog_index_row(
+    pg_index_table: &StaticCatalogTable,
+    spec: &SyntheticCatalogIndexSpec,
+) -> CatalogRow {
+    let mut row = empty_catalog_row(pg_index_table, u64::from(spec.index_oid.0));
+    let key_attnums = spec.key_attnums.to_vec();
+    let key_count = key_attnums.len().min(i16::MAX as usize) as i16;
     set_catalog_row_value(
         pg_index_table,
         &mut row,
         "indexrelid",
-        CatalogValue::Oid(PG_AGGREGATE_FNOID_INDEX_OID),
+        CatalogValue::Oid(spec.index_oid),
     );
     set_catalog_row_value(
         pg_index_table,
         &mut row,
         "indrelid",
-        CatalogValue::Oid(PG_AGGREGATE_RELATION_OID),
+        CatalogValue::Oid(spec.relation_oid),
     );
-    set_catalog_row_value(pg_index_table, &mut row, "indnatts", CatalogValue::Int16(1));
+    set_catalog_row_value(
+        pg_index_table,
+        &mut row,
+        "indnatts",
+        CatalogValue::Int16(key_count),
+    );
     set_catalog_row_value(
         pg_index_table,
         &mut row,
         "indnkeyatts",
-        CatalogValue::Int16(1),
+        CatalogValue::Int16(key_count),
     );
     set_catalog_row_value(
         pg_index_table,
@@ -944,7 +1038,7 @@ fn synthetic_pg_aggregate_fnoid_index_row(pg_index_table: &StaticCatalogTable) -
         pg_index_table,
         &mut row,
         "indisprimary",
-        CatalogValue::Bool(true),
+        CatalogValue::Bool(spec.is_primary),
     );
     set_catalog_row_value(
         pg_index_table,
@@ -998,25 +1092,25 @@ fn synthetic_pg_aggregate_fnoid_index_row(pg_index_table: &StaticCatalogTable) -
         pg_index_table,
         &mut row,
         "indkey",
-        CatalogValue::Int2Vector(vec![1]),
+        CatalogValue::Int2Vector(key_attnums.clone()),
     );
     set_catalog_row_value(
         pg_index_table,
         &mut row,
         "indcollation",
-        CatalogValue::OidVector(vec![INVALID_OID]),
+        CatalogValue::OidVector(vec![INVALID_OID; key_attnums.len()]),
     );
     set_catalog_row_value(
         pg_index_table,
         &mut row,
         "indclass",
-        CatalogValue::OidVector(vec![OID_BTREE_OPCLASS_OID]),
+        CatalogValue::OidVector(vec![OID_BTREE_OPCLASS_OID; key_attnums.len()]),
     );
     set_catalog_row_value(
         pg_index_table,
         &mut row,
         "indoption",
-        CatalogValue::Int2Vector(vec![0]),
+        CatalogValue::Int2Vector(vec![0; key_attnums.len()]),
     );
     set_catalog_row_value(pg_index_table, &mut row, "indexprs", CatalogValue::Null);
     set_catalog_row_value(pg_index_table, &mut row, "indpred", CatalogValue::Null);
@@ -1185,6 +1279,31 @@ fn synthetic_static_attribute_row(
         &mut row,
         "attmissingval",
         CatalogValue::Null,
+    );
+    Some(row)
+}
+
+fn synthetic_catalog_index_attribute_row(
+    pg_attribute_table: &StaticCatalogTable,
+    spec: &SyntheticCatalogIndexSpec,
+    key_position: usize,
+) -> Option<CatalogRow> {
+    let relation_table = static_catalog_by_relation_oid(spec.relation_oid)?;
+    let source_attnum = *spec.key_attnums.get(key_position)?;
+    if source_attnum <= 0 {
+        return None;
+    }
+    let source_index = usize::try_from(source_attnum - 1).ok()?;
+    let column = relation_table.columns.get(source_index)?;
+    let index_attnum = i16::try_from(key_position + 1).ok()?;
+    let mut row =
+        synthetic_static_attribute_row(pg_attribute_table, relation_table, column, index_attnum)?;
+    row.row_id = synthetic_static_attribute_row_id(spec.index_oid, index_attnum);
+    set_catalog_row_value(
+        pg_attribute_table,
+        &mut row,
+        "attrelid",
+        CatalogValue::Oid(spec.index_oid),
     );
     Some(row)
 }
@@ -1696,11 +1815,13 @@ where
                 }
             }
             PG_CLASS_RELATION_OID => {
-                insert_matching_row(
-                    &mut rows,
-                    Some(synthetic_pg_aggregate_fnoid_index_class_row(table)),
-                    &row_matches,
-                );
+                for spec in SYNTHETIC_CATALOG_INDEX_SPECS {
+                    insert_matching_row(
+                        &mut rows,
+                        Some(synthetic_catalog_index_class_row(table, spec)),
+                        &row_matches,
+                    );
+                }
                 for relation in snapshot.relations.values() {
                     insert_matching_row(&mut rows, Some(relation.row.clone()), &row_matches);
                 }
@@ -1741,6 +1862,22 @@ where
                         }
                     }
                 }
+                for spec in SYNTHETIC_CATALOG_INDEX_SPECS {
+                    for key_position in 0..spec.key_attnums.len() {
+                        let Some(attnum) = i16::try_from(key_position + 1).ok() else {
+                            continue;
+                        };
+                        if existing_attributes.contains(&(spec.index_oid, attnum)) {
+                            continue;
+                        }
+                        if let Some(row) =
+                            synthetic_catalog_index_attribute_row(table, spec, key_position)
+                        {
+                            existing_attributes.insert((spec.index_oid, attnum));
+                            insert_matching_row(&mut rows, Some(row), &row_matches);
+                        }
+                    }
+                }
             }
             PG_TYPE_RELATION_OID => {
                 for pg_type in snapshot.types.values() {
@@ -1762,11 +1899,13 @@ where
                 }
             }
             PG_INDEX_RELATION_OID => {
-                insert_matching_row(
-                    &mut rows,
-                    Some(synthetic_pg_aggregate_fnoid_index_row(table)),
-                    &row_matches,
-                );
+                for spec in SYNTHETIC_CATALOG_INDEX_SPECS {
+                    insert_matching_row(
+                        &mut rows,
+                        Some(synthetic_catalog_index_row(table, spec)),
+                        &row_matches,
+                    );
+                }
                 for index in snapshot.indexes.values() {
                     insert_matching_row(&mut rows, Some(index.row.clone()), &row_matches);
                 }
@@ -2013,6 +2152,30 @@ fn catalog_rows_matching_pg_attribute_filters(
                     insert_matching_row(&mut rows, Some(row), &row_matches);
                 }
             }
+        } else if let Some(spec) = synthetic_catalog_index_spec_by_oid(relation_oid) {
+            for key_position in 0..spec.key_attnums.len() {
+                let Some(attnum) = i16::try_from(key_position + 1).ok() else {
+                    continue;
+                };
+                if !attnum_matches(attnum) {
+                    continue;
+                }
+                if existing_attributes.contains(&(spec.index_oid, attnum)) {
+                    continue;
+                }
+                let Some(row) = synthetic_catalog_index_attribute_row(table, spec, key_position)
+                else {
+                    continue;
+                };
+                if let Some(attribute_name) =
+                    catalog_row_value(table, &row, "attname").and_then(catalog_value_string)
+                    && !name_matches(&attribute_name)
+                {
+                    continue;
+                }
+                existing_attributes.insert((spec.index_oid, attnum));
+                insert_matching_row(&mut rows, Some(row), &row_matches);
+            }
         }
 
         snapshot
@@ -2121,7 +2284,11 @@ pub fn catalog_row_count(relation_oid: Oid) -> Option<usize> {
                 row_ids.extend(snapshot.namespaces.keys().copied());
             }
             PG_CLASS_RELATION_OID => {
-                row_ids.insert(u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+                row_ids.extend(
+                    SYNTHETIC_CATALOG_INDEX_SPECS
+                        .iter()
+                        .map(|spec| u64::from(spec.index_oid.0)),
+                );
                 row_ids.extend(snapshot.relations.keys().copied());
             }
             PG_ATTRIBUTE_RELATION_OID => {
@@ -2158,6 +2325,17 @@ pub fn catalog_row_count(relation_oid: Oid) -> Option<usize> {
                         }
                     }
                 }
+                for spec in SYNTHETIC_CATALOG_INDEX_SPECS {
+                    for key_position in 0..spec.key_attnums.len() {
+                        let Some(attnum) = i16::try_from(key_position + 1).ok() else {
+                            continue;
+                        };
+                        if existing_attributes.insert((spec.index_oid.0, attnum)) {
+                            row_ids
+                                .insert(synthetic_static_attribute_row_id(spec.index_oid, attnum));
+                        }
+                    }
+                }
             }
             PG_TYPE_RELATION_OID => {
                 row_ids.extend(snapshot.types.keys().copied());
@@ -2173,7 +2351,11 @@ pub fn catalog_row_count(relation_oid: Oid) -> Option<usize> {
                 );
             }
             PG_INDEX_RELATION_OID => {
-                row_ids.insert(u64::from(PG_AGGREGATE_FNOID_INDEX_OID.0));
+                row_ids.extend(
+                    SYNTHETIC_CATALOG_INDEX_SPECS
+                        .iter()
+                        .map(|spec| u64::from(spec.index_oid.0)),
+                );
                 row_ids.extend(snapshot.indexes.keys().copied());
             }
             PG_CONSTRAINT_RELATION_OID => {
@@ -2218,6 +2400,12 @@ fn insert_matching_row(
 
 pub fn catalog_rows(relation_oid: Oid) -> Vec<CatalogRow> {
     catalog_rows_matching_static(relation_oid, |_, _| true, |_| true)
+}
+
+pub fn catalog_row_by_row_id(relation_oid: Oid, row_id: u64) -> Option<CatalogRow> {
+    catalog_rows(relation_oid)
+        .into_iter()
+        .find(|row| row.row_id == row_id)
 }
 
 pub fn relation_rowtype_oid_by_oid(relation_oid: Oid) -> Option<Oid> {

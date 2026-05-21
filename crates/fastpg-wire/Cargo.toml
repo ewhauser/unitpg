@@ -19,3 +19,4 @@ futures.workspace = true
 pgwire.workspace = true
 postgres-types.workspace = true
 tokio.workspace = true
+tokio-util = "0.7"

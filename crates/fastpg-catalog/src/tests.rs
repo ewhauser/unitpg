@@ -454,36 +454,132 @@ fn information_schema_domains_mark_domain_input() {
     );
 }
 
-#[test]
-fn pg_aggregate_fnoid_index_metadata_is_visible() {
-    let pg_class = static_catalog_by_name("pg_class").expect("pg_class catalog");
+fn assert_catalog_index_metadata(
+    pg_class: &StaticCatalogTable,
+    pg_index: &StaticCatalogTable,
+    index_oid: Oid,
+    index_name: &str,
+    relation_oid: Oid,
+    key_attnums: Vec<i16>,
+) {
     let class_rows = catalog_rows(pg_class.oid);
     assert!(class_rows.iter().any(|row| {
-        catalog_row_value(pg_class, row, "oid").and_then(catalog_value_oid)
-            == Some(PG_AGGREGATE_FNOID_INDEX_OID)
+        catalog_row_value(pg_class, row, "oid").and_then(catalog_value_oid) == Some(index_oid)
             && catalog_row_value(pg_class, row, "relname").and_then(catalog_value_string)
-                == Some("pg_aggregate_fnoid_index".to_owned())
+                == Some(index_name.to_owned())
             && catalog_row_value(pg_class, row, "relkind").and_then(catalog_value_u8) == Some(b'i')
     }));
 
-    let pg_index = static_catalog_by_name("pg_index").expect("pg_index catalog");
     let index_rows = catalog_rows(pg_index.oid);
     let row = index_rows
         .iter()
         .find(|row| {
             catalog_row_value(pg_index, row, "indexrelid").and_then(catalog_value_oid)
-                == Some(PG_AGGREGATE_FNOID_INDEX_OID)
+                == Some(index_oid)
         })
-        .expect("pg_aggregate_fnoid_index row");
+        .unwrap_or_else(|| panic!("{index_name} row"));
 
     assert_eq!(
         catalog_row_value(pg_index, row, "indrelid").and_then(catalog_value_oid),
-        Some(PG_AGGREGATE_RELATION_OID)
+        Some(relation_oid)
     );
     assert_eq!(
         catalog_row_value(pg_index, row, "indkey").and_then(catalog_value_int2_vector),
-        Some(vec![1])
+        Some(key_attnums)
     );
+}
+
+#[test]
+fn virtual_catalog_index_metadata_is_visible() {
+    let pg_class = static_catalog_by_name("pg_class").expect("pg_class catalog");
+    let pg_index = static_catalog_by_name("pg_index").expect("pg_index catalog");
+    for (index_oid, index_name, relation_oid, key_attnums) in [
+        (
+            PG_AGGREGATE_FNOID_INDEX_OID,
+            "pg_aggregate_fnoid_index",
+            PG_AGGREGATE_RELATION_OID,
+            vec![1],
+        ),
+        (
+            PG_CLASS_OID_INDEX_OID,
+            "pg_class_oid_index",
+            PG_CLASS_RELATION_OID,
+            vec![1],
+        ),
+        (
+            PG_ATTRIBUTE_RELID_NUM_INDEX_OID,
+            "pg_attribute_relid_attnum_index",
+            PG_ATTRIBUTE_RELATION_OID,
+            vec![1, 6],
+        ),
+        (
+            PG_NAMESPACE_OID_INDEX_OID,
+            "pg_namespace_oid_index",
+            PG_NAMESPACE_RELATION_OID,
+            vec![1],
+        ),
+    ] {
+        assert_catalog_index_metadata(
+            pg_class,
+            pg_index,
+            index_oid,
+            index_name,
+            relation_oid,
+            key_attnums,
+        );
+    }
+}
+
+#[test]
+fn virtual_catalog_index_attributes_are_visible() {
+    let pg_attribute = static_catalog_by_name("pg_attribute").expect("pg_attribute catalog");
+    let rows = catalog_rows(pg_attribute.oid);
+    let relname = rows.iter().find(|row| {
+        catalog_row_value(pg_attribute, row, "attrelid").and_then(catalog_value_oid)
+            == Some(PG_CLASS_NAME_NSP_INDEX_OID)
+            && catalog_row_value(pg_attribute, row, "attnum").and_then(catalog_value_i16) == Some(1)
+    });
+    assert_eq!(
+        relname
+            .and_then(|row| catalog_row_value(pg_attribute, row, "attname"))
+            .and_then(catalog_value_string),
+        Some("relname".to_owned())
+    );
+
+    let attrelid_attnum = pg_attribute
+        .columns
+        .iter()
+        .position(|column| column.name == "attrelid")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_attribute.attrelid attnum");
+    let attnum_attnum = pg_attribute
+        .columns
+        .iter()
+        .position(|column| column.name == "attnum")
+        .and_then(|index| i16::try_from(index + 1).ok())
+        .expect("pg_attribute.attnum attnum");
+    let filtered = catalog_rows_matching_filters(
+        pg_attribute.oid,
+        &[
+            CatalogRowFilter {
+                attnum: attrelid_attnum,
+                value: CatalogFilterValue::Oid(PG_CLASS_NAME_NSP_INDEX_OID),
+            },
+            CatalogRowFilter {
+                attnum: attnum_attnum,
+                value: CatalogFilterValue::Int16(2),
+            },
+        ],
+    );
+    assert_eq!(filtered.len(), 1);
+    assert_eq!(
+        catalog_row_value(pg_attribute, &filtered[0], "attname").and_then(catalog_value_string),
+        Some("relnamespace".to_owned())
+    );
+
+    let physical_column = relation_physical_column_by_attnum(PG_CLASS_NAME_NSP_INDEX_OID, 1)
+        .expect("index physical column");
+    assert_eq!(physical_column.name, "relname");
 }
 
 #[test]

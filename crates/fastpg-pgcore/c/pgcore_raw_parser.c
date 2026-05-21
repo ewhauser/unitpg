@@ -654,6 +654,7 @@ void
 fastpg_pgcore_reset_session_transaction_characteristics(void)
 {
 	fastpg_pgcore_enter();
+	ResetAllOptions();
 #ifdef USE_FASTPG
 	FastPgResetStandaloneSessionTransactionCharacteristics();
 #endif

@@ -245,6 +245,9 @@ extern bool fastpg_rust_catalog_primary_key_index_oid(uint32_t relation_oid,
 extern bool fastpg_rust_catalog_relation_unique_index_oid(uint32_t relation_oid,
 														 size_t index_position,
 														 uint32_t *oid_out);
+extern bool fastpg_rust_catalog_relation_index_oid(uint32_t relation_oid,
+												   size_t index_position,
+												   uint32_t *oid_out);
 extern bool fastpg_rust_catalog_relation_exclusion_index_oid(uint32_t relation_oid,
 															 size_t index_position,
 															 uint32_t *oid_out);

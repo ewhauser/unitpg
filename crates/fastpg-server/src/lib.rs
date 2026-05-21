@@ -6,10 +6,9 @@ use std::num::NonZeroUsize;
 use std::path::Path;
 use std::sync::Arc;
 
-use fastpg_wire::FastPgServerHandlers;
-use pgwire::tokio::process_socket;
 #[cfg(unix)]
-use pgwire::tokio::process_socket_unix;
+use fastpg_wire::process_socket_unix;
+use fastpg_wire::{FastPgServerHandlers, process_socket};
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
@@ -40,7 +39,7 @@ pub async fn serve_listener_with_handlers(
         let handlers = handlers.clone();
 
         tokio::spawn(async move {
-            if let Err(error) = process_socket(socket, None, handlers).await {
+            if let Err(error) = process_socket(socket, handlers).await {
                 eprintln!("fastpg connection {peer_addr} closed with error: {error}");
             }
         });

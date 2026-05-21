@@ -18,8 +18,8 @@ use fastpg_catalog::{
     btree_opclass_for_type as catalog_btree_opclass_for_type, builtin_aggregate_by_proc_oid,
     builtin_cast_by_source_target, builtin_namespace_by_name, builtin_namespace_by_oid,
     builtin_operator_by_oid, builtin_operator_by_signature, builtin_operators_by_name,
-    catalog_row_count, catalog_row_value, catalog_rows, catalog_rows_matching_filters,
-    current_generation, delete_catalog_row, enum_oids_by_sort_order,
+    catalog_row_by_row_id, catalog_row_count, catalog_row_value, catalog_rows,
+    catalog_rows_matching_filters, current_generation, delete_catalog_row, enum_oids_by_sort_order,
     has_uncommitted_catalog_changes, index_record_by_index_oid, index_records_for_relation_oid,
     lookup_type, primary_key_index_oid_for_relation_oid, primary_key_relation_oid_for_index_oid,
     relation_by_name, relation_by_name_in_namespace, relation_by_oid, relation_column_by_attnum,
@@ -3547,6 +3547,32 @@ pub unsafe extern "C" fn fastpg_rust_catalog_relation_unique_index_oid(
 /// # Safety
 ///
 /// C callers must pass a valid output pointer.
+pub unsafe extern "C" fn fastpg_rust_catalog_relation_index_oid(
+    relation_oid: u32,
+    index_position: usize,
+    oid_out: *mut u32,
+) -> bool {
+    if oid_out.is_null() {
+        return false;
+    }
+    let Some(index_oid) = index_records_for_relation_oid(Oid(relation_oid))
+        .into_iter()
+        .filter(|index| index.is_live)
+        .map(|index| index.index_oid)
+        .nth(index_position)
+    else {
+        return false;
+    };
+    unsafe {
+        *oid_out = index_oid.0;
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer.
 pub unsafe extern "C" fn fastpg_rust_catalog_relation_exclusion_index_oid(
     relation_oid: u32,
     index_position: usize,
@@ -4377,6 +4403,25 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup(
     } else {
         unsafe { slice::from_raw_parts(is_null, nkeys) }
     };
+    if virtual_catalog_by_relation_oid(index_spec.relation_oid).is_some() {
+        let Some(filters) =
+            (unsafe { catalog_index_filters_from_datums(&index_spec, values, is_null) })
+        else {
+            return false;
+        };
+        let Some(row) = catalog_rows_matching_filters(index_spec.relation_oid, &filters)
+            .into_iter()
+            .next()
+        else {
+            return false;
+        };
+        if !row_id_out.is_null() {
+            unsafe {
+                *row_id_out = row.row_id;
+            }
+        }
+        return true;
+    }
     let row = with_storage(|state, session| {
         let key = index_key_for_datums(&index_spec, values, is_null)?;
         Some(state.find_visible_row_by_index_key(
@@ -5478,6 +5523,14 @@ fn catalog_scan_state_from_rows(
     })
 }
 
+fn catalog_row_state_by_row_id(relation_oid: Oid, row_id: u64) -> Option<Row> {
+    let scan = catalog_scan_state_from_rows(
+        relation_oid,
+        catalog_row_by_row_id(relation_oid, row_id).into_iter(),
+    )?;
+    scan.rows.into_iter().next()
+}
+
 fn catalog_scan_state_uncached(relation_oid: Oid) -> Option<ScanState> {
     catalog_scan_state_from_rows(relation_oid, catalog_rows(relation_oid))
 }
@@ -5572,32 +5625,57 @@ unsafe fn catalog_scan_filters_from_datums(
     let values = unsafe { slice::from_raw_parts(values, nkeys) };
     let mut filters = Vec::with_capacity(nkeys);
     for (attnum, datum) in attnums.iter().copied().zip(values.iter().copied()) {
-        let Some(column_index) = attnum
-            .checked_sub(1)
-            .and_then(|attnum| usize::try_from(attnum).ok())
-        else {
-            continue;
-        };
-        let Some(column) = table.columns.get(column_index) else {
-            continue;
-        };
-        let value = match column.type_oid {
-            BOOL_OID => CatalogFilterValue::Bool(datum != 0),
-            CHAR_OID => CatalogFilterValue::Char(datum as u8),
-            INT2_OID => CatalogFilterValue::Int16(datum as i16),
-            INT4_OID => CatalogFilterValue::Int32(datum as i32),
-            OID_OID | REGCLASS_OID => CatalogFilterValue::Oid(Oid(datum as u32)),
-            NAME_OID => {
-                let Some(value) = (unsafe { catalog_name_filter_value(datum) }) else {
-                    continue;
-                };
-                CatalogFilterValue::Name(value)
-            }
-            _ => continue,
-        };
-        filters.push(CatalogRowFilter { attnum, value });
+        if let Some(filter) = unsafe { catalog_scan_filter_from_datum(table, attnum, datum) } {
+            filters.push(filter);
+        }
     }
     filters
+}
+
+unsafe fn catalog_scan_filter_from_datum(
+    table: &fastpg_catalog::StaticCatalogTable,
+    attnum: i16,
+    datum: usize,
+) -> Option<CatalogRowFilter> {
+    let column_index = attnum
+        .checked_sub(1)
+        .and_then(|attnum| usize::try_from(attnum).ok())?;
+    let column = table.columns.get(column_index)?;
+    let value = match column.type_oid {
+        BOOL_OID => CatalogFilterValue::Bool(datum != 0),
+        CHAR_OID => CatalogFilterValue::Char(datum as u8),
+        INT2_OID => CatalogFilterValue::Int16(datum as i16),
+        INT4_OID => CatalogFilterValue::Int32(datum as i32),
+        OID_OID | REGCLASS_OID => CatalogFilterValue::Oid(Oid(datum as u32)),
+        NAME_OID => CatalogFilterValue::Name(unsafe { catalog_name_filter_value(datum) }?),
+        _ => return None,
+    };
+    Some(CatalogRowFilter { attnum, value })
+}
+
+unsafe fn catalog_index_filters_from_datums(
+    index_spec: &UniqueIndexSpec,
+    values: &[usize],
+    is_null: &[u8],
+) -> Option<Vec<CatalogRowFilter>> {
+    if values.len() != index_spec.columns.len() || is_null.len() != index_spec.columns.len() {
+        return None;
+    }
+    let table = static_catalog_by_relation_oid(index_spec.relation_oid)?;
+    let mut filters = Vec::with_capacity(index_spec.columns.len());
+    for ((column, datum), null) in index_spec
+        .columns
+        .iter()
+        .zip(values.iter().copied())
+        .zip(is_null.iter().copied())
+    {
+        if null != 0 {
+            return None;
+        }
+        let attnum = i16::try_from(column.column_index + 1).ok()?;
+        filters.push(unsafe { catalog_scan_filter_from_datum(table, attnum, datum) }?);
+    }
+    Some(filters)
 }
 
 #[unsafe(no_mangle)]
@@ -5745,6 +5823,15 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row(
     is_null_out: *mut u8,
     natts: usize,
 ) -> bool {
+    if virtual_catalog_by_relation_oid(Oid(relid)).is_some() {
+        let Some(row) = catalog_row_state_by_row_id(Oid(relid), row_id) else {
+            return false;
+        };
+        return unsafe {
+            copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
+        };
+    }
+
     let row = with_storage(|state, session| state.find_visible_row(session, relid, row_id));
 
     match row {
@@ -5767,6 +5854,15 @@ pub unsafe extern "C" fn fastpg_rust_fetch_row_snapshot_any(
     is_null_out: *mut u8,
     natts: usize,
 ) -> bool {
+    if virtual_catalog_by_relation_oid(Oid(relid)).is_some() {
+        let Some(row) = catalog_row_state_by_row_id(Oid(relid), row_id) else {
+            return false;
+        };
+        return unsafe {
+            copy_row_to_outputs(&row, values_out, is_null_out, natts, std::ptr::null_mut())
+        };
+    }
+
     let row = with_storage(|state, session| state.find_snapshot_any_row(session, relid, row_id));
 
     match row {

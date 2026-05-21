@@ -13,6 +13,7 @@ use crate::rows::{
     catalog_value_string, catalog_value_u8, parse_int2_vector, static_catalog_by_name,
     static_catalog_by_relation_oid, static_row_column_bool, static_row_column_i16,
     static_row_column_identifier_matches, static_row_column_oid, static_row_to_catalog_row,
+    synthetic_catalog_index_spec_by_oid,
 };
 #[cfg(test)]
 use crate::state::{
@@ -728,8 +729,30 @@ fn relation_physical_column_by_attnum_uncached(
     {
         return Some(column);
     }
-
-    None
+    catalog_rows_matching_static(
+        table.oid,
+        |table, row| {
+            static_row_column_oid(table, row, "attrelid")
+                .is_some_and(|attrelid| attrelid == relation_oid)
+                && static_row_column_i16(table, row, "attnum")
+                    .is_some_and(|row_attnum| row_attnum == attnum)
+        },
+        |row| {
+            let relation_matches = catalog_row_value(table, row, "attrelid")
+                .and_then(catalog_value_oid)
+                .is_some_and(|attrelid| attrelid == relation_oid);
+            let attnum_matches = catalog_row_value(table, row, "attnum")
+                .and_then(catalog_value_i16)
+                .is_some_and(|row_attnum| row_attnum == attnum);
+            relation_matches && attnum_matches
+        },
+    )
+    .into_iter()
+    .find_map(|row| {
+        let (row_attnum, column) =
+            physical_column_record_from_pg_attribute_row(table, &row, relation_oid)?;
+        (row_attnum == attnum).then_some(column)
+    })
 }
 
 pub(crate) fn pg_index_record_from_row(row: &CatalogRow) -> Option<IndexRecord> {
@@ -1434,7 +1457,7 @@ pub fn relation_by_oid(oid: Oid) -> Option<RelationRecord> {
 pub fn relation_oid_exists(oid: Oid) -> bool {
     if static_catalog_by_relation_oid(oid).is_some()
         || virtual_catalog_by_relation_oid(oid).is_some()
-        || oid == PG_AGGREGATE_FNOID_INDEX_OID
+        || synthetic_catalog_index_spec_by_oid(oid).is_some()
     {
         return true;
     }

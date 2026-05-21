@@ -229,6 +229,10 @@ static bool TSDictionaryIsVisibleExt(Oid dictId, bool *is_missing);
 static bool TSTemplateIsVisibleExt(Oid tmplId, bool *is_missing);
 static bool TSConfigIsVisibleExt(Oid cfgid, bool *is_missing);
 static void recomputeNamespacePath(void);
+#ifdef USE_FASTPG
+static bool FastPgRelationIsVisibleInPath(Oid relnamespace, const char *relname);
+static bool FastPgCatalogPrecedesFunctionNamespaces(void);
+#endif
 static void AccessTempTableNamespace(bool force);
 static void InitTempTableNamespace(void);
 static void RemoveTempRelations(Oid tempNamespaceId);
@@ -914,6 +918,68 @@ RelnameGetRelid(const char *relname)
 	return InvalidOid;
 }
 
+#ifdef USE_FASTPG
+/*
+ * FastPG standalone catalog scans are backed by the Rust catalog, not shared
+ * buffers.  The SQL-visible visibility helpers are called repeatedly by psql
+ * describe queries, so avoid syscache scans when the Rust catalog already has
+ * the object metadata we need.
+ */
+static bool
+FastPgRelationIsVisibleInPath(Oid relnamespace, const char *relname)
+{
+	ListCell   *l;
+
+	recomputeNamespacePath();
+
+	if (relnamespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, relnamespace))
+		return false;
+
+	foreach(l, activeSearchPath)
+	{
+		Oid			namespaceId = lfirst_oid(l);
+		uint32_t	foundOid;
+
+		if (namespaceId == relnamespace)
+			return true;
+		if (fastpg_rust_catalog_relation_oid_by_name(relname,
+													 (uint32_t) namespaceId,
+													 &foundOid))
+			return false;
+	}
+
+	return false;
+}
+
+static bool
+FastPgCatalogPrecedesFunctionNamespaces(void)
+{
+	ListCell   *l;
+
+	recomputeNamespacePath();
+
+	foreach(l, activeSearchPath)
+	{
+		Oid			namespaceId = lfirst_oid(l);
+
+		if (namespaceId == PG_CATALOG_NAMESPACE)
+			return true;
+
+		/*
+		 * Temporary schemas are ignored for function lookup, so they cannot
+		 * hide pg_catalog functions.
+		 */
+		if (namespaceId == myTempNamespace)
+			continue;
+
+		return false;
+	}
+
+	return false;
+}
+#endif
+
 
 /*
  * RelationIsVisible
@@ -936,10 +1002,28 @@ RelationIsVisible(Oid relid)
 static bool
 RelationIsVisibleExt(Oid relid, bool *is_missing)
 {
+#ifdef USE_FASTPG
+	FastPgRustCatalogRelation fastpg_rel;
+#endif
 	HeapTuple	reltup;
 	Form_pg_class relform;
 	Oid			relnamespace;
 	bool		visible;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (fastpg_rust_catalog_relation_by_oid((uint32_t) relid,
+												&fastpg_rel))
+			return FastPgRelationIsVisibleInPath((Oid) fastpg_rel.namespace_oid,
+												 fastpg_rel.name);
+		if (is_missing != NULL)
+		{
+			*is_missing = true;
+			return false;
+		}
+	}
+#endif
 
 	reltup = SearchSysCache1(RELOID, ObjectIdGetDatum(relid));
 	if (!HeapTupleIsValid(reltup))
@@ -1765,10 +1849,31 @@ FunctionIsVisible(Oid funcid)
 static bool
 FunctionIsVisibleExt(Oid funcid, bool *is_missing)
 {
+#ifdef USE_FASTPG
+	FastPgRustCatalogProc fastpg_proc;
+#endif
 	HeapTuple	proctup;
 	Form_pg_proc procform;
 	Oid			pronamespace;
 	bool		visible;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster)
+	{
+		if (fastpg_rust_catalog_proc_by_oid((uint32_t) funcid,
+											&fastpg_proc))
+		{
+			if ((Oid) fastpg_proc.namespace_oid == PG_CATALOG_NAMESPACE &&
+				FastPgCatalogPrecedesFunctionNamespaces())
+				return true;
+		}
+		else if (is_missing != NULL)
+		{
+			*is_missing = true;
+			return false;
+		}
+	}
+#endif
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))

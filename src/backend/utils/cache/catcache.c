@@ -1031,11 +1031,15 @@ FastPgBuildIndexTuple(TupleDesc tupdesc,
 		ObjectIdGetDatum((Oid) index_info->heap_oid);
 	values[Anum_pg_index_indnatts - 1] = Int16GetDatum((int16) key_count);
 	values[Anum_pg_index_indnkeyatts - 1] = Int16GetDatum((int16) key_count);
-	values[Anum_pg_index_indisunique - 1] = BoolGetDatum(true);
-	values[Anum_pg_index_indnullsnotdistinct - 1] = BoolGetDatum(false);
-	values[Anum_pg_index_indisprimary - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indisunique - 1] =
+		BoolGetDatum(index_info->is_unique != 0);
+	values[Anum_pg_index_indnullsnotdistinct - 1] =
+		BoolGetDatum(index_info->nulls_not_distinct != 0);
+	values[Anum_pg_index_indisprimary - 1] =
+		BoolGetDatum(index_info->is_primary != 0);
 	values[Anum_pg_index_indisexclusion - 1] = BoolGetDatum(false);
-	values[Anum_pg_index_indimmediate - 1] = BoolGetDatum(true);
+	values[Anum_pg_index_indimmediate - 1] =
+		BoolGetDatum(index_info->is_immediate != 0);
 	values[Anum_pg_index_indisclustered - 1] = BoolGetDatum(false);
 	values[Anum_pg_index_indisvalid - 1] = BoolGetDatum(true);
 	values[Anum_pg_index_indcheckxmin - 1] = BoolGetDatum(false);

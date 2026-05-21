@@ -1491,6 +1491,8 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 			break;
 		}
 	}
+	if (exact_lookup && !scan->indexRelation->rd_index->indisunique)
+		exact_lookup = false;
 
 	if (!exact_lookup)
 		fastpg_mem_index_begin_fallback_scan(scan, keys, nkeys);

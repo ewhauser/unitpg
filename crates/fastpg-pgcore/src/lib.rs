@@ -1550,6 +1550,24 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn new_session_resets_search_path() {
+        let first = PgCoreSession::new();
+        first
+            .execute_with_params("set search_path = pg_catalog", &[])
+            .unwrap();
+
+        let second = PgCoreSession::new();
+        let result = second
+            .execute_with_params("select current_schema", &[])
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("public".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn prepared_statements_restore_their_session_database() {
         let first = PgCoreSession::with_database("fastpg_db_a");
         let second = PgCoreSession::with_database("fastpg_db_b");

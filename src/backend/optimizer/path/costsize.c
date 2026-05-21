@@ -3389,8 +3389,22 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	disabled_nodes += inner_path->disabled_nodes;
 	disabled_nodes += outer_path->disabled_nodes;
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && inner_path->pathtype == T_SeqScan)
-		disabled_nodes++;
+	if (!IsUnderPostmaster)
+	{
+		if (inner_path->pathtype == T_SeqScan)
+		{
+			disabled_nodes++;
+			run_cost += disable_cost;
+		}
+		else if (inner_path->disabled_nodes > 0)
+		{
+			/*
+			 * A nested loop that repeatedly rescans an already discouraged
+			 * inner plan is the same timeout shape one level higher.
+			 */
+			run_cost += disable_cost;
+		}
+	}
 #endif
 
 	/* estimate costs to rescan the inner relation */
