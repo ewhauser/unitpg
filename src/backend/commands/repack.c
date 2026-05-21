@@ -339,6 +339,14 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 						   "REPACK (CONCURRENTLY)"));
 	}
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && rel == NULL)
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("fastpg pgcore does not support database-wide %s",
+					   RepackCommandAsString(stmt->command)));
+#endif
+
 	/*
 	 * In order to avoid holding locks for too long, we want to process each
 	 * table in its own transaction.  This forces us to disallow running
