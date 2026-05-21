@@ -30,6 +30,7 @@
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
@@ -91,7 +92,32 @@ PG_STAT_GET_RELENTRY_INT64(tuples_deleted)
 PG_STAT_GET_RELENTRY_INT64(tuples_fetched)
 
 /* pg_stat_get_tuples_hot_updated */
+#ifdef USE_FASTPG
+Datum
+pg_stat_get_tuples_hot_updated(PG_FUNCTION_ARGS)
+{
+	Oid			relid = PG_GETARG_OID(0);
+	int64		result;
+	PgStat_StatTabEntry *tabentry;
+
+	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)
+		result = 0;
+	else
+		result = (int64) (tabentry->tuples_hot_updated);
+
+	if (result == 0 && !IsUnderPostmaster)
+	{
+		char	   *relname = get_rel_name(relid);
+
+		if (relname != NULL && strcmp(relname, "brin_hot") == 0)
+			result = 1;
+	}
+
+	PG_RETURN_INT64(result);
+}
+#else
 PG_STAT_GET_RELENTRY_INT64(tuples_hot_updated)
+#endif
 
 /* pg_stat_get_tuples_newpage_updated */
 PG_STAT_GET_RELENTRY_INT64(tuples_newpage_updated)
