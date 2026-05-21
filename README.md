@@ -54,6 +54,58 @@ Long-lived database state belongs to Rust:
 The boundary is not "Rust versus C". The boundary is "reuse Postgres semantics,
 replace Postgres physical storage".
 
+## Architecture
+
+Normal PostgreSQL is a production database server. It accepts client
+connections through the Postgres wire protocol, runs each client session in a
+backend process, and stores durable catalog and table state through the normal
+filesystem-backed storage stack.
+
+```mermaid
+flowchart LR
+    socket["TCP or Unix socket"]
+    postmaster["PostgreSQL postmaster"]
+    backend["Forked backend process"]
+    sql["Parser, analyzer, rewriter, planner"]
+    executor["PostgreSQL executor"]
+    shared["Shared buffers and WAL"]
+    files["Filesystem heap, index, and catalog files"]
+
+    socket --> postmaster
+    postmaster --> backend
+    backend --> sql
+    sql --> executor
+    executor --> shared
+    shared --> files
+```
+
+fastpg keeps the client-facing Postgres shape, but swaps the production storage
+system for a disposable Rust runtime. A single Rust process accepts pgwire
+connections, schedules work on Tokio, reuses PostgreSQL executor machinery for
+SQL semantics, and answers catalog and table access through in-memory Rust
+state instead of filesystem-backed `pg_catalog`, heap, index, and WAL files.
+
+```mermaid
+flowchart LR
+    socket["TCP or Unix socket"]
+    server["Rust Tokio server"]
+    pgwire["pgwire protocol handlers"]
+    workers["Multithreaded execution workers"]
+    pgcore["PostgreSQL parser, planner, and executor"]
+    catalog["Rust in-memory catalog"]
+    storage["Rust in-memory storage and transactions"]
+    reset["Test fixture and reset hooks"]
+
+    socket --> server
+    server --> pgwire
+    pgwire --> workers
+    workers --> pgcore
+    pgcore --> catalog
+    pgcore --> storage
+    storage --> reset
+    catalog --> reset
+```
+
 ## Feature Matrix
 
 Status legend: `[x]` implemented, `[ ]` planned, `Not supported` intentionally
