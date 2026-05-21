@@ -47,6 +47,10 @@ static StringInfo tablespace_map = NULL;
 /* Session-level context for the SQL-callable backup functions */
 static MemoryContext backupcontext = NULL;
 
+#ifdef USE_FASTPG
+#define FASTPG_STANDALONE_WAL_TIMELINE_ID 1
+#endif
+
 
 /*
  * Return a string constant representing the recovery pause state. This is
@@ -429,6 +433,7 @@ pg_walfile_name_offset(PG_FUNCTION_ARGS)
 	TupleDesc	resultTupleDesc;
 	HeapTuple	resultHeapTuple;
 	Datum		result;
+	TimeLineID	timeline;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -436,6 +441,12 @@ pg_walfile_name_offset(PG_FUNCTION_ARGS)
 				 errmsg("recovery is in progress"),
 				 errhint("%s cannot be executed during recovery.",
 						 "pg_walfile_name_offset()")));
+
+#ifdef USE_FASTPG
+	timeline = FASTPG_STANDALONE_WAL_TIMELINE_ID;
+#else
+	timeline = GetWALInsertionTimeLine();
+#endif
 
 	/*
 	 * Construct a tuple descriptor for the result row.  This must match this
@@ -454,8 +465,7 @@ pg_walfile_name_offset(PG_FUNCTION_ARGS)
 	 * xlogfilename
 	 */
 	XLByteToSeg(locationpoint, xlogsegno, wal_segment_size);
-	XLogFileName(xlogfilename, GetWALInsertionTimeLine(), xlogsegno,
-				 wal_segment_size);
+	XLogFileName(xlogfilename, timeline, xlogsegno, wal_segment_size);
 
 	values[0] = CStringGetTextDatum(xlogfilename);
 	isnull[0] = false;
@@ -488,6 +498,7 @@ pg_walfile_name(PG_FUNCTION_ARGS)
 	XLogSegNo	xlogsegno;
 	XLogRecPtr	locationpoint = PG_GETARG_LSN(0);
 	char		xlogfilename[MAXFNAMELEN];
+	TimeLineID	timeline;
 
 	if (RecoveryInProgress())
 		ereport(ERROR,
@@ -496,9 +507,14 @@ pg_walfile_name(PG_FUNCTION_ARGS)
 				 errhint("%s cannot be executed during recovery.",
 						 "pg_walfile_name()")));
 
+#ifdef USE_FASTPG
+	timeline = FASTPG_STANDALONE_WAL_TIMELINE_ID;
+#else
+	timeline = GetWALInsertionTimeLine();
+#endif
+
 	XLByteToSeg(locationpoint, xlogsegno, wal_segment_size);
-	XLogFileName(xlogfilename, GetWALInsertionTimeLine(), xlogsegno,
-				 wal_segment_size);
+	XLogFileName(xlogfilename, timeline, xlogsegno, wal_segment_size);
 
 	PG_RETURN_TEXT_P(cstring_to_text(xlogfilename));
 }

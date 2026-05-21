@@ -370,6 +370,7 @@ fn classifies_pgbench_critical_virtual_catalogs() {
         ("pg_authid", VirtualCatalogPolicy::Static),
         ("pg_roles", VirtualCatalogPolicy::Static),
         ("pg_indexes", VirtualCatalogPolicy::Dynamic),
+        ("pg_settings", VirtualCatalogPolicy::Static),
         ("pg_auth_members", VirtualCatalogPolicy::Static),
         ("pg_parameter_acl", VirtualCatalogPolicy::Static),
     ];
@@ -381,6 +382,25 @@ fn classifies_pgbench_critical_virtual_catalogs() {
             .unwrap_or_else(|| panic!("{name} should have virtual catalog policy"));
         assert_eq!(record.policy, policy, "{name}");
     }
+}
+
+#[test]
+fn pg_settings_exposes_regression_support_rows() {
+    let table = static_catalog_by_name("pg_settings").expect("pg_settings");
+    let rows = catalog_rows(table.oid);
+
+    assert!(rows.iter().any(|row| {
+        catalog_value_string(row_value("pg_settings", row, "name")).as_deref()
+            == Some("wal_segment_size")
+            && row_value("pg_settings", row, "setting")
+                == &CatalogValue::Text("16777216".to_owned())
+    }));
+    assert!(rows.iter().any(|row| {
+        catalog_value_string(row_value("pg_settings", row, "name")).as_deref()
+            == Some("default_toast_compression")
+            && row_value("pg_settings", row, "enumvals") == &CatalogValue::Raw("{pglz}".to_owned())
+    }));
+    assert_eq!(table.columns.len(), 17);
 }
 
 #[test]

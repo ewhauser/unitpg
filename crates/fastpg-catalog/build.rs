@@ -107,6 +107,41 @@ fn main() {
 }
 
 fn add_system_view_catalogs(tables: &mut Vec<BkiTable>) {
+    let mut pg_settings_rows = vec![
+        pg_settings_row("default_toast_compression", "pglz", "enum", Some("{pglz}")),
+        pg_settings_row("max_locks_per_transaction", "64", "integer", None),
+        pg_settings_row("wal_segment_size", "16777216", "integer", None),
+    ];
+    for (name, setting) in [
+        ("enable_async_append", "on"),
+        ("enable_bitmapscan", "on"),
+        ("enable_distinct_reordering", "on"),
+        ("enable_eager_aggregate", "on"),
+        ("enable_gathermerge", "on"),
+        ("enable_group_by_reordering", "on"),
+        ("enable_hashagg", "on"),
+        ("enable_hashjoin", "on"),
+        ("enable_incremental_sort", "on"),
+        ("enable_indexonlyscan", "on"),
+        ("enable_indexscan", "on"),
+        ("enable_material", "on"),
+        ("enable_memoize", "on"),
+        ("enable_mergejoin", "on"),
+        ("enable_nestloop", "on"),
+        ("enable_parallel_append", "on"),
+        ("enable_parallel_hash", "on"),
+        ("enable_partition_pruning", "on"),
+        ("enable_partitionwise_aggregate", "off"),
+        ("enable_partitionwise_join", "off"),
+        ("enable_presorted_aggregate", "on"),
+        ("enable_self_join_elimination", "on"),
+        ("enable_seqscan", "on"),
+        ("enable_sort", "on"),
+        ("enable_tidscan", "on"),
+    ] {
+        pg_settings_rows.push(pg_settings_row(name, setting, "bool", None));
+    }
+
     tables.push(BkiTable {
         name: "pg_roles".to_owned(),
         oid: 100_200,
@@ -155,6 +190,58 @@ fn add_system_view_catalogs(tables: &mut Vec<BkiTable>) {
         ],
         rows: vec![],
     });
+    tables.push(BkiTable {
+        name: "pg_settings".to_owned(),
+        oid: 100_202,
+        rowtype_oid: 0,
+        columns: vec![
+            bki_column("name", "text"),
+            bki_column("setting", "text"),
+            bki_column("unit", "text"),
+            bki_column("category", "text"),
+            bki_column("short_desc", "text"),
+            bki_column("extra_desc", "text"),
+            bki_column("context", "text"),
+            bki_column("vartype", "text"),
+            bki_column("source", "text"),
+            bki_column("min_val", "text"),
+            bki_column("max_val", "text"),
+            bki_column("enumvals", "_text"),
+            bki_column("boot_val", "text"),
+            bki_column("reset_val", "text"),
+            bki_column("sourcefile", "text"),
+            bki_column("sourceline", "int4"),
+            bki_column("pending_restart", "bool"),
+        ],
+        rows: pg_settings_rows,
+    });
+}
+
+fn pg_settings_row(
+    name: &str,
+    setting: &str,
+    vartype: &str,
+    enumvals: Option<&str>,
+) -> Vec<Option<String>> {
+    vec![
+        Some(name.to_owned()),
+        Some(setting.to_owned()),
+        None,
+        Some("FastPG".to_owned()),
+        Some(name.replace('_', " ")),
+        None,
+        Some("user".to_owned()),
+        Some(vartype.to_owned()),
+        Some("default".to_owned()),
+        None,
+        None,
+        enumvals.map(str::to_owned),
+        Some(setting.to_owned()),
+        Some(setting.to_owned()),
+        None,
+        None,
+        Some("f".to_owned()),
+    ]
 }
 
 fn bki_column(name: &str, type_name: &str) -> BkiColumn {
