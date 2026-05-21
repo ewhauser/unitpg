@@ -270,6 +270,7 @@ fn constvalue_bytes_for_default(type_oid: Oid, default: &str) -> Option<Vec<u8>>
             bytes.extend_from_slice(default.as_bytes());
             Some(bytes)
         }
+        JSONB_OID if default == "{}" => Some(vec![32, 0, 0, 0, 0, 0, 0, 32]),
         _ => None,
     }
 }
@@ -279,6 +280,11 @@ fn const_node_for_default(type_oid: Oid, default: Option<&str>) -> Option<String
     let is_null = default.is_none();
     let constvalue = if let Some(default) = default {
         let mut bytes = constvalue_bytes_for_default(type_oid, default)?;
+        let constvalue_len = if type_record.typbyval {
+            type_record.typlen
+        } else {
+            i16::try_from(bytes.len()).ok()?
+        };
         if type_record.typbyval {
             bytes.resize(8, 0);
         }
@@ -287,7 +293,7 @@ fn const_node_for_default(type_oid: Oid, default: Option<&str>) -> Option<String
             .map(|byte| (*byte as i8).to_string())
             .collect::<Vec<_>>()
             .join(" ");
-        format!("{} [ {bytes} ]", type_record.typlen)
+        format!("{constvalue_len} [ {bytes} ]")
     } else {
         "<>".to_owned()
     };

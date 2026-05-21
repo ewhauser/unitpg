@@ -298,6 +298,17 @@ fn pg_proc_bootstrap_default_count_is_normalized_for_unhandled_nodes() {
         value_i16(row_value("pg_proc", &row, "pronargdefaults")),
         Some(2)
     );
+    let defaults = catalog_row_value(
+        static_catalog_by_name("pg_proc").expect("pg_proc"),
+        &row,
+        "proargdefaults",
+    )
+    .and_then(catalog_value_string)
+    .expect("proargdefaults");
+    assert!(defaults.starts_with("({CONST :consttype 3802"));
+    assert!(defaults.contains(":constvalue 8 [ 32 0 0 0 0 0 0 32 ]"));
+    assert!(defaults.contains("{CONST :consttype 16"));
+    assert!(defaults.contains(":constvalue 1 [ 0 0 0 0 0 0 0 0 ]"));
 }
 
 #[test]

@@ -36,6 +36,7 @@ pub const INTERNAL_OID: Oid = Oid(2281);
 pub const RECORD_OID: Oid = Oid(2249);
 pub const LSN_OID: Oid = Oid(3220);
 pub const ANYENUM_OID: Oid = Oid(3500);
+pub const JSONB_OID: Oid = Oid(3802);
 pub const ANYRANGE_OID: Oid = Oid(3831);
 pub const ANYMULTIRANGE_OID: Oid = Oid(4537);
 pub const ARRAY_SUBSCRIPT_HANDLER_OID: Oid = Oid(6179);
