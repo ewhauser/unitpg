@@ -841,6 +841,90 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn range_index_scans_fall_back_to_heap_filtering() {
+        let executor = QueryExecutor::new("17.0-fastpg");
+        let suffix = std::process::id();
+        let enum_type = format!("fastpg_exec_enum_range_{suffix}");
+        let table = format!("fastpg_exec_enum_range_table_{suffix}");
+        let index = format!("{table}_idx");
+
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+        executor.execute(&format!("drop type if exists {enum_type}"), &[]);
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "create type {enum_type} as enum ('red', 'orange', 'yellow', 'green', 'blue', 'purple')"
+                ),
+                &[]
+            ),
+            QueryExecution::Command {
+                tag: "CREATE TYPE".into(),
+                rows: 0,
+            }
+        );
+        assert_eq!(
+            executor.execute(&format!("create table {table}(col {enum_type})"), &[]),
+            QueryExecution::Command {
+                tag: "CREATE TABLE".into(),
+                rows: 0,
+            }
+        );
+        assert!(matches!(
+            executor.execute(
+                &format!(
+                    "insert into {table} values ('red'), ('orange'), ('yellow'), ('green'), ('blue'), ('purple')"
+                ),
+                &[]
+            ),
+            QueryExecution::Command { ref tag, .. } if tag == "INSERT"
+        ));
+        assert_eq!(
+            executor.execute(&format!("create unique index {index} on {table}(col)"), &[]),
+            QueryExecution::Command {
+                tag: "CREATE INDEX".into(),
+                rows: 0,
+            }
+        );
+        executor.execute("set enable_seqscan = off", &[]);
+        executor.execute("set enable_bitmapscan = off", &[]);
+
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "select col::text as value from {table} where col > 'yellow'::{enum_type} order by {table}.col"
+                ),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("value", PgType::Varchar, 25)],
+                vec![
+                    vec![Value::Text("green".to_owned())],
+                    vec![Value::Text("blue".to_owned())],
+                    vec![Value::Text("purple".to_owned())],
+                ]
+            ))
+        );
+        assert_eq!(
+            executor.execute(
+                &format!(
+                    "select max(col)::text as max from {table} where col < 'green'::{enum_type}"
+                ),
+                &[]
+            ),
+            QueryExecution::Rows(QueryResult::new(
+                vec![Column::with_type_oid("max", PgType::Varchar, 25)],
+                vec![vec![Value::Text("yellow".to_owned())]]
+            ))
+        );
+
+        executor.execute("reset enable_bitmapscan", &[]);
+        executor.execute("reset enable_seqscan", &[]);
+        executor.execute(&format!("drop table if exists {table}"), &[]);
+        executor.execute(&format!("drop type if exists {enum_type}"), &[]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn executes_parameterized_int4_through_pgcore() {
         let executor = QueryExecutor::new("17.0-fastpg");
 

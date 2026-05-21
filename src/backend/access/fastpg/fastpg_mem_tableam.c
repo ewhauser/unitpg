@@ -207,6 +207,8 @@ typedef struct FastPgMemIndexScan
 {
 	bool		done;
 	bool		unsupported;
+	TableScanDesc fallback_scan;
+	TupleTableSlot *fallback_slot;
 	uintptr_t	values[FASTPG_MAX_INDEX_KEYS];
 	uint8_t		isnull[FASTPG_MAX_INDEX_KEYS];
 	uint8_t		key_seen[FASTPG_MAX_INDEX_KEYS];
@@ -755,6 +757,78 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 	return found;
 }
 
+static void
+fastpg_mem_index_clear_fallback_scan(FastPgMemIndexScan *opaque)
+{
+	if (opaque->fallback_scan != NULL)
+	{
+		fastpg_mem_scan_end(opaque->fallback_scan);
+		opaque->fallback_scan = NULL;
+	}
+	if (opaque->fallback_slot != NULL)
+	{
+		ExecDropSingleTupleTableSlot(opaque->fallback_slot);
+		opaque->fallback_slot = NULL;
+	}
+}
+
+static void
+fastpg_mem_index_begin_fallback_scan(IndexScanDesc scan,
+									 ScanKey keys,
+									 int nkeys)
+{
+	FastPgMemIndexScan *opaque = (FastPgMemIndexScan *) scan->opaque;
+	Relation	heap_relation = scan->heapRelation;
+	Relation	index_relation = scan->indexRelation;
+	ScanKeyData *heap_keys = NULL;
+	int			index_key_count =
+		IndexRelationGetNumberOfKeyAttributes(index_relation);
+
+	if (heap_relation == NULL)
+		fastpg_mem_index_unsupported("index scans without a heap relation");
+	if (nkeys > 0 && keys == NULL)
+		fastpg_mem_index_unsupported("rescans without scan keys");
+
+	if (nkeys > 0)
+	{
+		heap_keys = palloc_array(ScanKeyData, nkeys);
+		for (int index = 0; index < nkeys; index++)
+		{
+			ScanKey		key = &keys[index];
+			ScanKey		heap_key = &heap_keys[index];
+			int			index_attno = key->sk_attno;
+			AttrNumber	heap_attno;
+
+			if (key->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL |
+								 SK_SEARCHNOTNULL | SK_ORDER_BY |
+								 SK_ROW_HEADER | SK_ROW_MEMBER))
+				fastpg_mem_index_unsupported("non-scalar scan keys");
+			if (index_attno <= 0 || index_attno > index_key_count)
+				fastpg_mem_index_unsupported("scan keys outside the primary-key prefix");
+
+			heap_attno = index_relation->rd_index->indkey.values[index_attno - 1];
+			if (heap_attno <= 0)
+				fastpg_mem_index_unsupported("expression index scan keys");
+
+			memcpy(heap_key, key, sizeof(ScanKeyData));
+			heap_key->sk_attno = heap_attno;
+		}
+	}
+
+	opaque->fallback_scan = fastpg_mem_scan_begin(heap_relation,
+												  scan->xs_snapshot,
+												  nkeys,
+												  heap_keys,
+												  NULL,
+												  0);
+	opaque->fallback_slot =
+		MakeSingleTupleTableSlot(RelationGetDescr(heap_relation),
+								 fastpg_mem_slot_callbacks(heap_relation));
+
+	if (heap_keys != NULL)
+		pfree(heap_keys);
+}
+
 static Size
 fastpg_mem_parallelscan_estimate(Relation rel)
 {
@@ -1208,7 +1282,9 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 						int norderbys)
 {
 	FastPgMemIndexScan *opaque = (FastPgMemIndexScan *) scan->opaque;
+	bool		exact_lookup = nkeys == (int) opaque->nkeys;
 
+	fastpg_mem_index_clear_fallback_scan(opaque);
 	opaque->done = false;
 	opaque->unsupported = false;
 	memset(opaque->values, 0, sizeof(opaque->values));
@@ -1217,8 +1293,6 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 
 	if (norderbys != 0)
 		fastpg_mem_index_unsupported("ordered rescans");
-	if (nkeys != (int) opaque->nkeys)
-		fastpg_mem_index_unsupported("partial primary-key probes");
 	if (nkeys > 0 && keys == NULL)
 		fastpg_mem_index_unsupported("rescans without scan keys");
 
@@ -1230,11 +1304,14 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 		if (key->sk_flags & (SK_SEARCHARRAY | SK_SEARCHNULL |
 							 SK_SEARCHNOTNULL | SK_ORDER_BY |
 							 SK_ROW_HEADER | SK_ROW_MEMBER))
-			fastpg_mem_index_unsupported("non-scalar equality scan keys");
-		if (key->sk_strategy != BTEqualStrategyNumber)
-			fastpg_mem_index_unsupported("non-equality scan keys");
+			fastpg_mem_index_unsupported("non-scalar scan keys");
 		if (key_index < 0 || key_index >= (int) opaque->nkeys)
 			fastpg_mem_index_unsupported("scan keys outside the primary-key prefix");
+		if (key->sk_strategy != BTEqualStrategyNumber)
+		{
+			exact_lookup = false;
+			continue;
+		}
 
 		opaque->values[key_index] = (uintptr_t) key->sk_argument;
 		opaque->isnull[key_index] =
@@ -1245,8 +1322,14 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 	for (size_t index = 0; index < opaque->nkeys; index++)
 	{
 		if (opaque->key_seen[index] == 0)
-			fastpg_mem_index_unsupported("sparse primary-key probes");
+		{
+			exact_lookup = false;
+			break;
+		}
 	}
+
+	if (!exact_lookup)
+		fastpg_mem_index_begin_fallback_scan(scan, keys, nkeys);
 }
 
 static bool
@@ -1256,6 +1339,19 @@ fastpg_mem_index_get_tuple(IndexScanDesc scan, ScanDirection direction)
 	uint64_t	row_id = 0;
 	bool		storage2 =
 		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->indexRelation));
+
+	if (opaque->fallback_scan != NULL)
+	{
+		if (!fastpg_mem_scan_getnextslot(opaque->fallback_scan,
+										 direction,
+										 opaque->fallback_slot))
+			return false;
+
+		scan->xs_heaptid = opaque->fallback_slot->tts_tid;
+		scan->xs_recheck = false;
+		scan->xs_recheckorderby = false;
+		return true;
+	}
 
 	if (ScanDirectionIsBackward(direction))
 		fastpg_mem_index_unsupported("backward scans");
@@ -1295,6 +1391,7 @@ fastpg_mem_index_end_scan(IndexScanDesc scan)
 {
 	if (scan->opaque != NULL)
 	{
+		fastpg_mem_index_clear_fallback_scan((FastPgMemIndexScan *) scan->opaque);
 		pfree(scan->opaque);
 		scan->opaque = NULL;
 	}
