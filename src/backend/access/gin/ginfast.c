@@ -797,6 +797,15 @@ ginInsertCleanup(GinState *ginstate, bool full_clean,
 	bool		fsm_vac = false;
 	int			workMemory;
 
+#ifdef USE_FASTPG
+	/*
+	 * FastPG keeps relation contents outside PostgreSQL's shared-buffer GIN
+	 * pending-list pages.  Treat cleanup as already complete in the embedded
+	 * server rather than walking uninitialized buffer-manager state.
+	 */
+	return;
+#endif
+
 	/*
 	 * We would like to prevent concurrent cleanup process. For that we will
 	 * lock metapage in exclusive mode using LockPage() call. Nobody other
@@ -1064,6 +1073,16 @@ gin_clean_pending_list(PG_FUNCTION_ARGS)
 					   RelationGetRelationName(indexRel));
 
 	memset(&stats, 0, sizeof(stats));
+
+#ifdef USE_FASTPG
+	/*
+	 * FastPG's virtual GIN catalog metadata is enough to create the index
+	 * object, but not to initialize PostgreSQL's support-proc state or clean
+	 * shared-buffer pending-list pages.  Report an empty cleanup.
+	 */
+	index_close(indexRel, RowExclusiveLock);
+	PG_RETURN_INT64(0);
+#endif
 
 	/*
 	 * Can't assume anything about the content of an !indisready index.  Make

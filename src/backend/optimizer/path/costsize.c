@@ -3388,6 +3388,10 @@ initial_cost_nestloop(PlannerInfo *root, JoinCostWorkspace *workspace,
 	disabled_nodes = (extra->pgs_mask & enable_mask) == enable_mask ? 0 : 1;
 	disabled_nodes += inner_path->disabled_nodes;
 	disabled_nodes += outer_path->disabled_nodes;
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && inner_path->pathtype == T_SeqScan)
+		disabled_nodes++;
+#endif
 
 	/* estimate costs to rescan the inner relation */
 	cost_rescan(root, inner_path,
@@ -3607,6 +3611,18 @@ final_cost_nestloop(PlannerInfo *root, NestPath *path,
 		/* Compute number of tuples processed (not number emitted!) */
 		ntuples = outer_path_rows * inner_path_rows;
 	}
+
+#ifdef USE_FASTPG
+	/*
+	 * FastPG standalone scans cross the Rust storage boundary tuple-by-tuple.
+	 * PostgreSQL's default nested-loop cost model significantly
+	 * underestimates large repeated sequential scans in that shape, which can
+	 * select quadratic plans for upstream hash-join regression cases.
+	 */
+	if (!IsUnderPostmaster && inner_path->pathtype == T_SeqScan &&
+		ntuples > 1000000.0)
+		run_cost += disable_cost;
+#endif
 
 	/* CPU costs */
 	cost_qual_eval(&restrict_qual_cost, path->jpath.joinrestrictinfo, root);
@@ -4550,6 +4566,22 @@ final_cost_hashjoin(PlannerInfo *root, HashPath *path,
 				innermcvfreq = thismcvfreq;
 		}
 	}
+
+#ifdef USE_FASTPG
+	/*
+	 * FastPG's standalone regression server does not yet populate pg_statistic
+	 * for in-memory test tables.  PostgreSQL's no-stats fallback is
+	 * deliberately conservative and can make low-memory hash joins look
+	 * impossible because the whole inner relation is treated like one MCV.
+	 * That pushes hash-join regression cases onto quadratic nested loops.
+	 */
+	if (!IsUnderPostmaster && inner_path_rows_total > 1.0 &&
+		innerbucketsize >= 1.0 && innermcvfreq >= 1.0)
+	{
+		innerbucketsize = Min(innerbucketsize, 1.0 / virtualbuckets);
+		innermcvfreq = Min(innermcvfreq, 1.0 / inner_path_rows_total);
+	}
+#endif
 
 	/*
 	 * If the bucket holding the inner MCV would exceed hash_mem, we don't

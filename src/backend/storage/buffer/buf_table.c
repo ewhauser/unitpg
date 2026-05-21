@@ -34,11 +34,27 @@ typedef struct
 static HTAB *SharedBufHash;
 
 static void BufTableShmemRequest(void *arg);
+#ifdef USE_FASTPG
+static void FastPgCheckSharedBufHash(void);
+#endif
 
 const ShmemCallbacks BufTableShmemCallbacks = {
 	.request_fn = BufTableShmemRequest,
 	/* no special initialization needed, the hash table will start empty */
 };
+
+#ifdef USE_FASTPG
+static void
+FastPgCheckSharedBufHash(void)
+{
+	if (SharedBufHash != NULL)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg_internal("FASTPG_SHARED_BUFFER_UNAVAILABLE: shared buffer access is not initialized")));
+}
+#endif
 
 /*
  * Register shmem hash table for mapping buffers.
@@ -83,6 +99,9 @@ BufTableShmemRequest(void *arg)
 uint32
 BufTableHashCode(BufferTag *tagPtr)
 {
+#ifdef USE_FASTPG
+	FastPgCheckSharedBufHash();
+#endif
 	return get_hash_value(SharedBufHash, tagPtr);
 }
 
@@ -97,6 +116,9 @@ BufTableLookup(BufferTag *tagPtr, uint32 hashcode)
 {
 	BufferLookupEnt *result;
 
+#ifdef USE_FASTPG
+	FastPgCheckSharedBufHash();
+#endif
 	result = (BufferLookupEnt *)
 		hash_search_with_hash_value(SharedBufHash,
 									tagPtr,
@@ -126,6 +148,9 @@ BufTableInsert(BufferTag *tagPtr, uint32 hashcode, int buf_id)
 	BufferLookupEnt *result;
 	bool		found;
 
+#ifdef USE_FASTPG
+	FastPgCheckSharedBufHash();
+#endif
 	Assert(buf_id >= 0);		/* -1 is reserved for not-in-table */
 	Assert(tagPtr->blockNum != P_NEW);	/* invalid tag */
 
@@ -155,6 +180,9 @@ BufTableDelete(BufferTag *tagPtr, uint32 hashcode)
 {
 	BufferLookupEnt *result;
 
+#ifdef USE_FASTPG
+	FastPgCheckSharedBufHash();
+#endif
 	result = (BufferLookupEnt *)
 		hash_search_with_hash_value(SharedBufHash,
 									tagPtr,

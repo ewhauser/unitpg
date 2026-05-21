@@ -1131,7 +1131,7 @@ fastpg_pgcore_repair_session_authorization_reset(Node *utility_stmt)
 }
 
 static bool
-fastpg_pgcore_reindex_param_is_concurrently(const DefElem *opt)
+fastpg_pgcore_defelem_is_concurrently(const DefElem *opt)
 {
 	return opt->defname != NULL && strcmp(opt->defname, "concurrently") == 0;
 }
@@ -1145,7 +1145,7 @@ fastpg_pgcore_reindex_stmt_has_concurrently(const ReindexStmt *stmt)
 	{
 		DefElem    *opt = (DefElem *) lfirst(lc);
 
-		if (fastpg_pgcore_reindex_param_is_concurrently(opt))
+		if (fastpg_pgcore_defelem_is_concurrently(opt))
 			return true;
 	}
 
@@ -1162,7 +1162,7 @@ fastpg_pgcore_reindex_params_without_concurrently(List *params)
 	{
 		DefElem    *opt = (DefElem *) lfirst(lc);
 
-		if (!fastpg_pgcore_reindex_param_is_concurrently(opt))
+		if (!fastpg_pgcore_defelem_is_concurrently(opt))
 			result = lappend(result, opt);
 	}
 
@@ -1215,6 +1215,90 @@ fastpg_pgcore_reject_internal_transaction_reindex(Node *utility_stmt)
 			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 			 errmsg("fastpg pgcore does not support REINDEX commands that run internal transactions")));
 }
+
+static void
+fastpg_pgcore_reject_internal_transaction_refresh_matview(Node *utility_stmt)
+{
+	RefreshMatViewStmt *stmt;
+
+	if (IsUnderPostmaster || !IsA(utility_stmt, RefreshMatViewStmt))
+		return;
+
+	stmt = (RefreshMatViewStmt *) utility_stmt;
+	if (!stmt->concurrent)
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("fastpg pgcore does not support REFRESH MATERIALIZED VIEW CONCURRENTLY")));
+}
+
+static bool
+fastpg_pgcore_repack_stmt_has_concurrently(const RepackStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->params)
+	{
+		DefElem    *opt = (DefElem *) lfirst(lc);
+
+		if (fastpg_pgcore_defelem_is_concurrently(opt))
+			return true;
+	}
+
+	return false;
+}
+
+static void
+fastpg_pgcore_reject_internal_transaction_repack(Node *utility_stmt)
+{
+	if (IsUnderPostmaster || !IsA(utility_stmt, RepackStmt))
+		return;
+
+	if (!fastpg_pgcore_repack_stmt_has_concurrently((RepackStmt *) utility_stmt))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("fastpg pgcore does not support REPACK CONCURRENTLY")));
+}
+
+static bool
+fastpg_pgcore_alter_table_has_concurrent_detach(const AlterTableStmt *stmt)
+{
+	ListCell   *lc;
+
+	foreach(lc, stmt->cmds)
+	{
+		AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+		PartitionCmd *partition_cmd;
+
+		if (cmd->subtype != AT_DetachPartition ||
+			cmd->def == NULL ||
+			!IsA(cmd->def, PartitionCmd))
+			continue;
+
+		partition_cmd = (PartitionCmd *) cmd->def;
+		if (partition_cmd->concurrent)
+			return true;
+	}
+
+	return false;
+}
+
+static void
+fastpg_pgcore_reject_internal_transaction_alter_table(Node *utility_stmt)
+{
+	if (IsUnderPostmaster || !IsA(utility_stmt, AlterTableStmt))
+		return;
+
+	if (!fastpg_pgcore_alter_table_has_concurrent_detach((AlterTableStmt *) utility_stmt))
+		return;
+
+	ereport(ERROR,
+			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+			 errmsg("fastpg pgcore does not support ALTER TABLE DETACH PARTITION CONCURRENTLY")));
+}
 #endif
 
 static void
@@ -1256,6 +1340,9 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 
 #ifdef USE_FASTPG
 	fastpg_pgcore_reject_internal_transaction_reindex(utility_stmt);
+	fastpg_pgcore_reject_internal_transaction_refresh_matview(utility_stmt);
+	fastpg_pgcore_reject_internal_transaction_repack(utility_stmt);
+	fastpg_pgcore_reject_internal_transaction_alter_table(utility_stmt);
 
 	if (!IsUnderPostmaster &&
 		IsA(utility_stmt, IndexStmt) &&

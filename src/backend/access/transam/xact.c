@@ -54,6 +54,7 @@
 #include "replication/snapbuild.h"
 #include "replication/syncrep.h"
 #include "storage/aio_subsys.h"
+#include "storage/bufmgr.h"
 #include "storage/condition_variable.h"
 #include "storage/fd.h"
 #include "storage/lmgr.h"
@@ -259,8 +260,10 @@ static PGPROC FastPgStandaloneProc;
 static LocalTransactionId FastPgStandaloneNextLocalTransactionId = 1;
 static TransactionId FastPgStandaloneNextTransactionId = FirstNormalTransactionId;
 static bool FastPgStandaloneProcInitialized = false;
+static bool FastPgStandaloneBufferManagerAccessInitialized = false;
 
 static void FastPgEnsureStandaloneProc(void);
+static void FastPgEnsureStandaloneBufferManagerAccess(void);
 static void FastPgResetStandaloneTransactionCharacteristics(TransactionState s);
 
 static LocalTransactionId
@@ -340,6 +343,20 @@ FastPgEnsureStandaloneLocalTransactionId(void)
 	if (!IsUnderPostmaster &&
 		!LocalTransactionIdIsValid(MyProc->vxid.lxid))
 		MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
+}
+
+static void
+FastPgEnsureStandaloneBufferManagerAccess(void)
+{
+	if (IsUnderPostmaster)
+		return;
+
+	FastPgEnsureStandaloneProc();
+	if (!FastPgStandaloneBufferManagerAccessInitialized)
+	{
+		InitBufferManagerAccess();
+		FastPgStandaloneBufferManagerAccessInitialized = true;
+	}
 }
 
 #endif
@@ -1083,7 +1100,7 @@ FastPgStartStandaloneStatement(void)
 	if (IsUnderPostmaster)
 		return;
 
-	FastPgEnsureStandaloneProc();
+	FastPgEnsureStandaloneBufferManagerAccess();
 	MyProc->vxid.lxid = FastPgNextStandaloneLocalTransactionId();
 }
 #endif
@@ -1447,6 +1464,7 @@ FastPgEnsureStandaloneTransactionState(void)
 
 	if (IsUnderPostmaster)
 		return;
+	FastPgEnsureStandaloneBufferManagerAccess();
 	FastPgEnsureStandaloneLocalTransactionId();
 	if (s->blockState != TBLOCK_DEFAULT || s->state != TRANS_DEFAULT)
 		return;
@@ -1495,6 +1513,8 @@ FastPgReleaseStandaloneStatementResources(bool isCommit)
 	 */
 	XLogResetInsertion();
 	AtEOXact_Enum();
+	if (!isCommit)
+		ResetReindexState(s->nestingLevel);
 
 	if (TopTransactionResourceOwner != NULL)
 	{

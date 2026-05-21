@@ -156,6 +156,11 @@ pgstat_prepare_report_checksum_failure(Oid dboid)
 {
 	Assert(!CritSectionCount);
 
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return;
+#endif
+
 	/*
 	 * Just need to ensure this backend has an entry ref for the database.
 	 * That will allows us to report checksum failures without e.g. needing to
@@ -180,6 +185,11 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
 
 	if (!pgstat_track_counts)
 		return;
+
+#ifdef USE_FASTPG
+	if (!IsUnderPostmaster && pgStatLocal.shared_hash == NULL)
+		return;
+#endif
 
 	/*
 	 * Update the shared stats directly - checksum failures should never be
