@@ -22,6 +22,7 @@
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 #include "utils/ascii.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/guc.h"			/* for application_name */
 #include "utils/memutils.h"
 
@@ -70,6 +71,11 @@ static int	localNumBackends = 0;
 
 static MemoryContext backendStatusSnapContext;
 
+#ifdef USE_FASTPG
+static _Thread_local int64 fastpg_pgstat_noop_query_id = 0;
+static _Thread_local int64 fastpg_pgstat_noop_plan_id = 0;
+#endif
+
 
 static void pgstat_beshutdown_hook(int code, Datum arg);
 static void pgstat_read_current_status(void);
@@ -91,6 +97,9 @@ const ShmemCallbacks BackendStatusShmemCallbacks = {
 static void
 BackendStatusShmemRequest(void *arg)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	ShmemRequestStruct(.name = "Backend Status Array",
 					   .size = mul_size(sizeof(PgBackendStatus), NumBackendStatSlots),
 					   .ptr = (void **) &BackendStatusArray,
@@ -137,6 +146,9 @@ BackendStatusShmemInit(void *arg)
 {
 	int			i;
 	char	   *buffer;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* Initialize st_appname pointers. */
 	buffer = BackendAppnameBuffer;
@@ -194,6 +206,9 @@ BackendStatusShmemInit(void *arg)
 static void
 BackendStatusShmemAttach(void *arg)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	BackendActivityBufferSize = mul_size(pgstat_track_activity_query_size,
 										 NumBackendStatSlots);
 }
@@ -209,6 +224,16 @@ BackendStatusShmemAttach(void *arg)
 void
 pgstat_beinit(void)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+		MyBEEntry = NULL;
+#ifdef USE_FASTPG
+		fastpg_pgstat_noop_query_id = 0;
+		fastpg_pgstat_noop_plan_id = 0;
+#endif
+		return;
+	}
+
 	/* Initialize MyBEEntry */
 	Assert(MyProcNumber != INVALID_PROC_NUMBER);
 	Assert(MyProcNumber >= 0 && MyProcNumber < NumBackendStatSlots);
@@ -236,6 +261,9 @@ pgstat_bestart_initial(void)
 {
 	volatile PgBackendStatus *vbeentry = MyBEEntry;
 	PgBackendStatus lbeentry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* pgstats state must be initialized from pgstat_beinit() */
 	Assert(vbeentry != NULL);
@@ -361,6 +389,9 @@ pgstat_bestart_security(void)
 	PgBackendGSSStatus *st_gssstatus;
 #endif
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* pgstats state must be initialized from pgstat_beinit() */
 	Assert(beentry != NULL);
 	Assert(MyProcPort);			/* otherwise there's no point */
@@ -434,6 +465,9 @@ pgstat_bestart_final(void)
 	volatile PgBackendStatus *beentry = MyBEEntry;
 	Oid			userid;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* pgstats state must be initialized from pgstat_beinit() */
 	Assert(beentry != NULL);
 
@@ -474,6 +508,16 @@ static void
 pgstat_beshutdown_hook(int code, Datum arg)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (fastpg_pgstat_noop_active() || beentry == NULL)
+	{
+		MyBEEntry = NULL;
+#ifdef USE_FASTPG
+		fastpg_pgstat_noop_query_id = 0;
+		fastpg_pgstat_noop_plan_id = 0;
+#endif
+		return;
+	}
 
 	/*
 	 * Clear my status entry, following the protocol of bumping st_changecount
@@ -540,6 +584,18 @@ pgstat_report_activity(BackendState state, const char *cmd_str)
 	TimestampTz start_timestamp;
 	TimestampTz current_timestamp;
 	int			len = 0;
+
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_FASTPG
+		if (state == STATE_RUNNING)
+		{
+			fastpg_pgstat_noop_query_id = 0;
+			fastpg_pgstat_noop_plan_id = 0;
+		}
+#endif
+		return;
+	}
 
 	TRACE_POSTGRESQL_STATEMENT_STATUS(cmd_str);
 
@@ -652,6 +708,15 @@ pgstat_report_query_id(int64 query_id, bool force)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_FASTPG
+		if (fastpg_pgstat_noop_query_id == INT64CONST(0) || force)
+			fastpg_pgstat_noop_query_id = query_id;
+#endif
+		return;
+	}
+
 	/*
 	 * if track_activities is disabled, st_query_id should already have been
 	 * reset
@@ -690,6 +755,15 @@ void
 pgstat_report_plan_id(int64 plan_id, bool force)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_FASTPG
+		if (fastpg_pgstat_noop_plan_id == INT64CONST(0) || force)
+			fastpg_pgstat_noop_plan_id = plan_id;
+#endif
+		return;
+	}
 
 	/*
 	 * if track_activities is disabled, st_plan_id should already have been
@@ -731,6 +805,9 @@ pgstat_report_appname(const char *appname)
 	volatile PgBackendStatus *beentry = MyBEEntry;
 	int			len;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!beentry)
 		return;
 
@@ -758,6 +835,9 @@ void
 pgstat_report_xact_timestamp(TimestampTz tstamp)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (!pgstat_track_activities || !beentry)
 		return;
@@ -797,6 +877,13 @@ pgstat_read_current_status(void)
 	PgBackendGSSStatus *localgssstatus;
 #endif
 	ProcNumber	procNumber;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		localBackendStatusTable = NULL;
+		localNumBackends = 0;
+		return;
+	}
 
 	if (localBackendStatusTable)
 		return;					/* already done */
@@ -963,6 +1050,9 @@ pgstat_get_backend_current_activity(int pid, bool checkUser)
 	PgBackendStatus *beentry;
 	int			i;
 
+	if (fastpg_pgstat_noop_active())
+		return "<backend information not available>";
+
 	beentry = BackendStatusArray;
 	for (i = 1; i <= MaxBackends; i++)
 	{
@@ -1041,6 +1131,9 @@ pgstat_get_crashed_backend_activity(int pid, char *buffer, int buflen)
 	volatile PgBackendStatus *beentry;
 	int			i;
 
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	beentry = BackendStatusArray;
 
 	/*
@@ -1102,6 +1195,15 @@ pgstat_get_crashed_backend_activity(int pid, char *buffer, int buflen)
 int64
 pgstat_get_my_query_id(void)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_FASTPG
+		return fastpg_pgstat_noop_query_id;
+#else
+		return 0;
+#endif
+	}
+
 	if (!MyBEEntry)
 		return 0;
 
@@ -1122,6 +1224,15 @@ pgstat_get_my_query_id(void)
 int64
 pgstat_get_my_plan_id(void)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_FASTPG
+		return fastpg_pgstat_noop_plan_id;
+#else
+		return 0;
+#endif
+	}
+
 	if (!MyBEEntry)
 		return 0;
 
@@ -1189,6 +1300,9 @@ pgstat_get_local_beentry_by_proc_number(ProcNumber procNumber)
 {
 	LocalPgBackendStatus key;
 
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	pgstat_read_current_status();
 
 	/*
@@ -1218,6 +1332,9 @@ pgstat_get_local_beentry_by_proc_number(ProcNumber procNumber)
 LocalPgBackendStatus *
 pgstat_get_local_beentry_by_index(int idx)
 {
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	pgstat_read_current_status();
 
 	if (idx < 1 || idx > localNumBackends)
@@ -1238,6 +1355,9 @@ pgstat_get_local_beentry_by_index(int idx)
 int
 pgstat_fetch_stat_numbackends(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return 0;
+
 	pgstat_read_current_status();
 
 	return localNumBackends;

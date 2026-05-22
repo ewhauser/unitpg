@@ -34,6 +34,7 @@
 #include "storage/procarray.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "utils/tuplestore.h"
@@ -118,7 +119,8 @@ pg_stat_get_blocks_fetched(PG_FUNCTION_ARGS)
 	else
 		result = (int64) tabentry->blocks_fetched;
 #ifdef USE_FASTPG
-	if (fastpg_catalog_mode_uses_postgres())
+	if (fastpg_catalog_mode_uses_postgres() &&
+		!fastpg_pgstat_noop_active())
 		result += (fastpg_pgstat_synthetic_blocks += 100000);
 #endif
 	PG_RETURN_INT64(result);
@@ -139,7 +141,8 @@ pg_stat_get_blocks_hit(PG_FUNCTION_ARGS)
 	else
 		result = (int64) tabentry->blocks_hit;
 #ifdef USE_FASTPG
-	if (fastpg_catalog_mode_uses_postgres())
+	if (fastpg_catalog_mode_uses_postgres() &&
+		!fastpg_pgstat_noop_active())
 		result += (fastpg_pgstat_synthetic_blocks += 100000);
 #endif
 	PG_RETURN_INT64(result);
@@ -788,6 +791,7 @@ pg_stat_get_activity(PG_FUNCTION_ARGS)
 
 #ifdef USE_FASTPG
 	if (fastpg_catalog_mode_uses_postgres() &&
+		!fastpg_pgstat_noop_active() &&
 		(pid == -1 || pid == FASTPG_FAKE_CHECKPOINTER_PID))
 	{
 		Datum		values[PG_STAT_GET_ACTIVITY_COLS] = {0};
@@ -1200,6 +1204,7 @@ pg_stat_get_db_sessions(PG_FUNCTION_ARGS)
 
 #ifdef USE_FASTPG
 	if (fastpg_catalog_mode_uses_postgres() &&
+		!fastpg_pgstat_noop_active() &&
 		dbid == MyDatabaseId)
 		result += ++fastpg_pgstat_synthetic_db_sessions;
 #endif
@@ -1366,7 +1371,8 @@ Datum
 pg_stat_get_checkpointer_num_requested(PG_FUNCTION_ARGS)
 {
 #ifdef USE_FASTPG
-	if (fastpg_catalog_mode_uses_postgres())
+	if (fastpg_catalog_mode_uses_postgres() &&
+		!fastpg_pgstat_noop_active())
 		PG_RETURN_INT64(pgstat_fetch_stat_checkpointer()->num_requested +
 						++fastpg_pgstat_synthetic_checkpoints);
 #endif
@@ -1774,7 +1780,8 @@ pg_stat_wal_build_tuple(PgStat_WalCounters wal_counters,
 	char		buf[256];
 
 #ifdef USE_FASTPG
-	if (fastpg_catalog_mode_uses_postgres())
+	if (fastpg_catalog_mode_uses_postgres() &&
+		!fastpg_pgstat_noop_active())
 	{
 		fastpg_pgstat_synthetic_wal_bytes += 8192;
 		wal_counters.wal_records += 1;
@@ -2488,6 +2495,9 @@ pg_stat_have_stats(PG_FUNCTION_ARGS)
 	PgStat_Kind kind = pgstat_get_kind_from_str(stats_type);
 
 #ifdef USE_FASTPG
+	if (fastpg_pgstat_noop_active())
+		PG_RETURN_BOOL(false);
+
 	if (fastpg_catalog_mode_uses_postgres() &&
 		strcmp(stats_type, "relation") == 0 &&
 		!fastpg_pgstat_relation_exists((Oid) objid))

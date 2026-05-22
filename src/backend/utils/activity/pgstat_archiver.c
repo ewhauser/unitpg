@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
 
@@ -27,8 +28,14 @@
 void
 pgstat_report_archiver(const char *xlog, bool failed)
 {
-	PgStatShared_Archiver *stats_shmem = &pgStatLocal.shmem->archiver;
-	TimestampTz now = GetCurrentTimestamp();
+	PgStatShared_Archiver *stats_shmem;
+	TimestampTz now;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->archiver;
+	now = GetCurrentTimestamp();
 
 	pgstat_begin_changecount_write(&stats_shmem->changecount);
 
@@ -57,6 +64,11 @@ pgstat_report_archiver(const char *xlog, bool failed)
 PgStat_ArchiverStats *
 pgstat_fetch_stat_archiver(void)
 {
+	static PgStat_ArchiverStats fastpg_zero_archiver_stats;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_archiver_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_ARCHIVER);
 
 	return &pgStatLocal.snapshot.archiver;
@@ -73,7 +85,12 @@ pgstat_archiver_init_shmem_cb(void *stats)
 void
 pgstat_archiver_reset_all_cb(TimestampTz ts)
 {
-	PgStatShared_Archiver *stats_shmem = &pgStatLocal.shmem->archiver;
+	PgStatShared_Archiver *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->archiver;
 
 	/* see explanation above PgStatShared_Archiver for the reset protocol */
 	LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
@@ -88,10 +105,17 @@ pgstat_archiver_reset_all_cb(TimestampTz ts)
 void
 pgstat_archiver_snapshot_cb(void)
 {
-	PgStatShared_Archiver *stats_shmem = &pgStatLocal.shmem->archiver;
-	PgStat_ArchiverStats *stat_snap = &pgStatLocal.snapshot.archiver;
-	PgStat_ArchiverStats *reset_offset = &stats_shmem->reset_offset;
+	PgStatShared_Archiver *stats_shmem;
+	PgStat_ArchiverStats *stat_snap;
+	PgStat_ArchiverStats *reset_offset;
 	PgStat_ArchiverStats reset;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->archiver;
+	stat_snap = &pgStatLocal.snapshot.archiver;
+	reset_offset = &stats_shmem->reset_offset;
 
 	pgstat_copy_changecounted_stats(stat_snap,
 									&stats_shmem->stats,

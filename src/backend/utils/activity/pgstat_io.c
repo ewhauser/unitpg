@@ -18,6 +18,7 @@
 
 #include "executor/instrument.h"
 #include "storage/bufmgr.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 
 static PgStat_PendingIO PendingIOStats;
@@ -37,6 +38,9 @@ bool
 pgstat_bktype_io_stats_valid(PgStat_BktypeIO *backend_io,
 							 BackendType bktype)
 {
+	if (fastpg_pgstat_noop_active())
+		return true;
+
 	for (int io_object = 0; io_object < IOOBJECT_NUM_TYPES; io_object++)
 	{
 		for (int io_context = 0; io_context < IOCONTEXT_NUM_TYPES; io_context++)
@@ -68,6 +72,9 @@ void
 pgstat_count_io_op(IOObject io_object, IOContext io_context, IOOp io_op,
 				   uint32 cnt, uint64 bytes)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert((unsigned int) io_object < IOOBJECT_NUM_TYPES);
 	Assert((unsigned int) io_context < IOCONTEXT_NUM_TYPES);
 	Assert(pgstat_is_ioop_tracked_in_bytes(io_op) || bytes == 0);
@@ -91,6 +98,12 @@ instr_time
 pgstat_prepare_io_time(bool track_io_guc)
 {
 	instr_time	io_start;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		INSTR_TIME_SET_ZERO(io_start);
+		return io_start;
+	}
 
 	if (track_io_guc)
 		INSTR_TIME_SET_CURRENT(io_start);
@@ -122,6 +135,9 @@ void
 pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 						instr_time start_time, uint32 cnt, uint64 bytes)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!INSTR_TIME_IS_ZERO(start_time))
 	{
 		instr_time	io_time;
@@ -163,6 +179,11 @@ pgstat_count_io_op_time(IOObject io_object, IOContext io_context, IOOp io_op,
 PgStat_IO *
 pgstat_fetch_stat_io(void)
 {
+	static PgStat_IO fastpg_zero_io_stats;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_io_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_IO);
 
 	return &pgStatLocal.snapshot.io;
@@ -174,6 +195,9 @@ pgstat_fetch_stat_io(void)
 void
 pgstat_flush_io(bool nowait)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	(void) pgstat_io_flush_cb(nowait);
 }
 
@@ -190,6 +214,9 @@ pgstat_io_flush_cb(bool nowait)
 {
 	LWLock	   *bktype_lock;
 	PgStat_BktypeIO *bktype_shstats;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
 
 	if (!have_iostats)
 		return false;
@@ -286,6 +313,9 @@ pgstat_io_init_shmem_cb(void *stats)
 void
 pgstat_io_reset_all_cb(TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
 	{
 		LWLock	   *bktype_lock = &pgStatLocal.shmem->io.locks[i];
@@ -308,6 +338,9 @@ pgstat_io_reset_all_cb(TimestampTz ts)
 void
 pgstat_io_snapshot_cb(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	for (int i = 0; i < BACKEND_NUM_TYPES; i++)
 	{
 		LWLock	   *bktype_lock = &pgStatLocal.shmem->io.locks[i];
@@ -350,6 +383,9 @@ pgstat_io_snapshot_cb(void)
 bool
 pgstat_tracks_io_bktype(BackendType bktype)
 {
+	if (fastpg_pgstat_noop_active())
+		return false;
+
 	/*
 	 * List every type so that new backend types trigger a warning about
 	 * needing to adjust this switch.

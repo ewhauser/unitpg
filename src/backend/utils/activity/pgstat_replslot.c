@@ -26,6 +26,7 @@
 #include "postgres.h"
 
 #include "replication/slot.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 
 
@@ -42,6 +43,9 @@ void
 pgstat_reset_replslot(const char *name)
 {
 	ReplicationSlot *slot;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	Assert(name != NULL);
 
@@ -80,6 +84,9 @@ pgstat_report_replslot(ReplicationSlot *slot, const PgStat_StatReplSlotEntry *re
 	PgStatShared_ReplSlot *shstatent;
 	PgStat_StatReplSlotEntry *statent;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_REPLSLOT, InvalidOid,
 											ReplicationSlotIndex(slot), false);
 	shstatent = (PgStatShared_ReplSlot *) entry_ref->shared_stats;
@@ -114,6 +121,9 @@ pgstat_report_replslotsync(ReplicationSlot *slot)
 	PgStatShared_ReplSlot *shstatent;
 	PgStat_StatReplSlotEntry *statent;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* Slot sync stats are valid only for synced logical slots on standby. */
 	Assert(slot->data.synced);
 	Assert(RecoveryInProgress());
@@ -142,6 +152,9 @@ pgstat_create_replslot(ReplicationSlot *slot)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_ReplSlot *shstatent;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
 
@@ -175,6 +188,9 @@ pgstat_create_replslot(ReplicationSlot *slot)
 void
 pgstat_acquire_replslot(ReplicationSlot *slot)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_get_entry_ref(PGSTAT_KIND_REPLSLOT, InvalidOid,
 						 ReplicationSlotIndex(slot), true, NULL);
 }
@@ -185,6 +201,9 @@ pgstat_acquire_replslot(ReplicationSlot *slot)
 void
 pgstat_drop_replslot(ReplicationSlot *slot)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
 
 	if (!pgstat_drop_entry(PGSTAT_KIND_REPLSLOT, InvalidOid,
@@ -201,6 +220,9 @@ pgstat_fetch_replslot(NameData slotname)
 {
 	int			idx;
 	PgStat_StatReplSlotEntry *slotentry = NULL;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	LWLockAcquire(ReplicationSlotControlLock, LW_SHARED);
 
@@ -219,6 +241,9 @@ pgstat_fetch_replslot(NameData slotname)
 void
 pgstat_replslot_to_serialized_name_cb(const PgStat_HashKey *key, const PgStatShared_Common *header, NameData *name)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/*
 	 * This is only called late during shutdown. The set of existing slots
 	 * isn't allowed to change at this point, we can assume that a slot exists
@@ -234,6 +259,9 @@ pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat_HashKey *ke
 {
 	int			idx = get_replslot_index(NameStr(*name), true);
 
+	if (fastpg_pgstat_noop_active())
+		return false;
+
 	/* slot might have been deleted */
 	if (idx == -1)
 		return false;
@@ -248,6 +276,9 @@ pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat_HashKey *ke
 void
 pgstat_replslot_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	((PgStatShared_ReplSlot *) header)->stats.stat_reset_timestamp = ts;
 }
 
@@ -255,6 +286,9 @@ static int
 get_replslot_index(const char *name, bool need_lock)
 {
 	ReplicationSlot *slot;
+
+	if (fastpg_pgstat_noop_active())
+		return -1;
 
 	Assert(name != NULL);
 

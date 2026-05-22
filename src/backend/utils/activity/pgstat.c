@@ -111,6 +111,7 @@
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
 #include "utils/guc_hooks.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
@@ -525,6 +526,9 @@ static const PgStat_KindInfo **pgstat_kind_custom_infos = NULL;
 void
 pgstat_restore_stats(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_read_statsfile();
 }
 
@@ -538,6 +542,9 @@ void
 pgstat_discard_stats(void)
 {
 	int			ret;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* NB: this needs to be done even in single user mode */
 
@@ -590,6 +597,9 @@ pgstat_discard_stats(void)
 void
 pgstat_before_server_shutdown(int code, Datum arg)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(pgStatLocal.shmem != NULL);
 	Assert(!pgStatLocal.shmem->is_shutdown);
 
@@ -631,6 +641,14 @@ pgstat_before_server_shutdown(int code, Datum arg)
 static void
 pgstat_shutdown_hook(int code, Datum arg)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_ASSERT_CHECKING
+		pgstat_is_shutdown = true;
+#endif
+		return;
+	}
+
 	Assert(!pgstat_is_shutdown);
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 
@@ -670,6 +688,14 @@ void
 pgstat_initialize(void)
 {
 	Assert(!pgstat_is_initialized);
+
+	if (fastpg_pgstat_noop_active())
+	{
+#ifdef USE_ASSERT_CHECKING
+		pgstat_is_initialized = true;
+#endif
+		return;
+	}
 
 	pgstat_attach_shmem();
 
@@ -727,6 +753,14 @@ pgstat_report_stat(bool force)
 	bool		partial_flush;
 	TimestampTz now;
 	bool		nowait;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		pgStatForceNextFlush = false;
+		pgstat_report_fixed = false;
+		pending_since = 0;
+		return 0;
+	}
 
 	pgstat_assert_is_up();
 	Assert(!IsTransactionOrTransactionBlock());
@@ -842,6 +876,9 @@ pgstat_report_stat(bool force)
 void
 pgstat_force_next_flush(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgStatForceNextFlush = true;
 }
 
@@ -865,6 +902,9 @@ pgstat_reset_counters(void)
 {
 	TimestampTz ts = GetCurrentTimestamp();
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_reset_matching_entries(match_db_entries,
 								  ObjectIdGetDatum(MyDatabaseId),
 								  ts);
@@ -884,6 +924,9 @@ pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 	TimestampTz ts = GetCurrentTimestamp();
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* not needed atm, and doesn't make sense with the current signature */
 	Assert(!pgstat_get_kind_info(kind)->fixed_amount);
@@ -906,6 +949,9 @@ pgstat_reset_of_kind(PgStat_Kind kind)
 {
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
 	TimestampTz ts = GetCurrentTimestamp();
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (kind_info->fixed_amount)
 		kind_info->reset_all_cb(ts);
@@ -930,6 +976,13 @@ pgstat_reset_of_kind(PgStat_Kind kind)
 void
 pgstat_clear_snapshot(void)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+		pgstat_clear_backend_activity_snapshot();
+		force_stats_snapshot_clear = false;
+		return;
+	}
+
 	pgstat_assert_is_up();
 
 	memset(&pgStatLocal.snapshot.fixed_valid, 0,
@@ -966,6 +1019,13 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 	PgStat_EntryRef *entry_ref;
 	void	   *stats_data;
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+
+	if (fastpg_pgstat_noop_active())
+	{
+		if (may_free)
+			*may_free = false;
+		return NULL;
+	}
 
 	/* should be called from backends */
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
@@ -1071,6 +1131,12 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *may_free)
 TimestampTz
 pgstat_get_stat_snapshot_timestamp(bool *have_snapshot)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+		*have_snapshot = false;
+		return 0;
+	}
+
 	if (force_stats_snapshot_clear)
 		pgstat_clear_snapshot();
 
@@ -1088,6 +1154,9 @@ pgstat_get_stat_snapshot_timestamp(bool *have_snapshot)
 bool
 pgstat_have_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
+	if (fastpg_pgstat_noop_active())
+		return false;
+
 	/* fixed-numbered stats always exist */
 	if (pgstat_get_kind_info(kind)->fixed_amount)
 		return true;
@@ -1104,6 +1173,9 @@ pgstat_have_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 void
 pgstat_snapshot_fixed(PgStat_Kind kind)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(pgstat_is_kind_valid(kind));
 	Assert(pgstat_get_kind_info(kind)->fixed_amount);
 
@@ -1124,6 +1196,9 @@ pgstat_snapshot_fixed(PgStat_Kind kind)
 static void
 pgstat_init_snapshot_fixed(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/*
 	 * Initialize fixed-numbered statistics data in snapshots, only for custom
 	 * stats kinds.
@@ -1143,6 +1218,9 @@ pgstat_init_snapshot_fixed(void)
 static void
 pgstat_prep_snapshot(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (force_stats_snapshot_clear)
 		pgstat_clear_snapshot();
 
@@ -1166,6 +1244,9 @@ pgstat_build_snapshot(void)
 {
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *p;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* should only be called when we need a snapshot */
 	Assert(pgstat_fetch_consistency == PGSTAT_FETCH_CONSISTENCY_SNAPSHOT);
@@ -1258,6 +1339,9 @@ pgstat_build_snapshot_fixed(PgStat_Kind kind)
 	int			idx;
 	bool	   *valid;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* Position in fixed_valid or custom_valid */
 	if (pgstat_is_kind_builtin(kind))
 	{
@@ -1311,6 +1395,13 @@ pgstat_prep_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid, bool *creat
 {
 	PgStat_EntryRef *entry_ref;
 
+	if (fastpg_pgstat_noop_active())
+	{
+		if (created_entry)
+			*created_entry = false;
+		return NULL;
+	}
+
 	/* need to be able to flush out */
 	Assert(pgstat_get_kind_info(kind)->flush_pending_cb != NULL);
 
@@ -1349,6 +1440,9 @@ pgstat_fetch_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 	PgStat_EntryRef *entry_ref;
 
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	entry_ref = pgstat_get_entry_ref(kind, dboid, objid, false, NULL);
 
 	if (entry_ref == NULL || entry_ref->pending == NULL)
@@ -1360,9 +1454,16 @@ pgstat_fetch_pending_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 void
 pgstat_delete_pending_entry(PgStat_EntryRef *entry_ref)
 {
-	PgStat_Kind kind = entry_ref->shared_entry->key.kind;
-	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
-	void	   *pending_data = entry_ref->pending;
+	PgStat_Kind kind;
+	const PgStat_KindInfo *kind_info;
+	void	   *pending_data;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	kind = entry_ref->shared_entry->key.kind;
+	kind_info = pgstat_get_kind_info(kind);
+	pending_data = entry_ref->pending;
 
 	Assert(pending_data != NULL);
 	/* !fixed_amount stats should be handled explicitly */
@@ -1385,6 +1486,9 @@ pgstat_flush_pending_entries(bool nowait)
 {
 	bool		have_pending = false;
 	dlist_node *cur = NULL;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
 
 	/*
 	 * Need to be a bit careful iterating over the list of pending entries.
@@ -1585,6 +1689,9 @@ pgstat_register_kind(PgStat_Kind kind, const PgStat_KindInfo *kind_info)
 void
 pgstat_assert_is_up(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(pgstat_is_initialized && !pgstat_is_shutdown);
 }
 #endif
@@ -1620,6 +1727,9 @@ pgstat_write_statsfile(void)
 	const char *statfile = PGSTAT_STAT_PERMANENT_FILENAME;
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *ps;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	pgstat_assert_is_up();
 
@@ -1814,6 +1924,9 @@ pgstat_read_statsfile(void)
 	bool		found;
 	const char *statfile = PGSTAT_STAT_PERMANENT_FILENAME;
 	PgStat_ShmemControl *shmem = pgStatLocal.shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* shouldn't be called from postmaster */
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
@@ -2123,6 +2236,9 @@ static void
 pgstat_reset_after_failure(void)
 {
 	TimestampTz ts = GetCurrentTimestamp();
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* reset fixed-numbered stats */
 	for (PgStat_Kind kind = PGSTAT_KIND_MIN; kind <= PGSTAT_KIND_MAX; kind++)

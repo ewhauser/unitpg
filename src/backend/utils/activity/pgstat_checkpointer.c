@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 
@@ -30,7 +31,15 @@ PgStat_CheckpointerStats PendingCheckpointerStats = {0};
 void
 pgstat_report_checkpointer(void)
 {
-	PgStatShared_Checkpointer *stats_shmem = &pgStatLocal.shmem->checkpointer;
+	PgStatShared_Checkpointer *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		MemSet(&PendingCheckpointerStats, 0, sizeof(PendingCheckpointerStats));
+		return;
+	}
+
+	stats_shmem = &pgStatLocal.shmem->checkpointer;
 
 	Assert(!pgStatLocal.shmem->is_shutdown);
 	pgstat_assert_is_up();
@@ -80,6 +89,11 @@ pgstat_report_checkpointer(void)
 PgStat_CheckpointerStats *
 pgstat_fetch_stat_checkpointer(void)
 {
+	static PgStat_CheckpointerStats fastpg_zero_checkpointer_stats;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_checkpointer_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_CHECKPOINTER);
 
 	return &pgStatLocal.snapshot.checkpointer;
@@ -96,7 +110,12 @@ pgstat_checkpointer_init_shmem_cb(void *stats)
 void
 pgstat_checkpointer_reset_all_cb(TimestampTz ts)
 {
-	PgStatShared_Checkpointer *stats_shmem = &pgStatLocal.shmem->checkpointer;
+	PgStatShared_Checkpointer *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->checkpointer;
 
 	/* see explanation above PgStatShared_Checkpointer for the reset protocol */
 	LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
@@ -111,9 +130,15 @@ pgstat_checkpointer_reset_all_cb(TimestampTz ts)
 void
 pgstat_checkpointer_snapshot_cb(void)
 {
-	PgStatShared_Checkpointer *stats_shmem = &pgStatLocal.shmem->checkpointer;
-	PgStat_CheckpointerStats *reset_offset = &stats_shmem->reset_offset;
+	PgStatShared_Checkpointer *stats_shmem;
+	PgStat_CheckpointerStats *reset_offset;
 	PgStat_CheckpointerStats reset;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->checkpointer;
+	reset_offset = &stats_shmem->reset_offset;
 
 	pgstat_copy_changecounted_stats(&pgStatLocal.snapshot.checkpointer,
 									&stats_shmem->stats,

@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "executor/instrument.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 
 
@@ -47,6 +48,9 @@ pgstat_report_wal(bool force)
 {
 	bool		nowait;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* like in pgstat.c, don't wait for lock acquisition when !force */
 	nowait = !force;
 
@@ -66,6 +70,11 @@ pgstat_report_wal(bool force)
 PgStat_WalStats *
 pgstat_fetch_stat_wal(void)
 {
+	static PgStat_WalStats fastpg_zero_wal_stats;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_wal_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_WAL);
 
 	return &pgStatLocal.snapshot.wal;
@@ -90,8 +99,11 @@ pgstat_wal_have_pending(void)
 bool
 pgstat_wal_flush_cb(bool nowait)
 {
-	PgStatShared_Wal *stats_shmem = &pgStatLocal.shmem->wal;
+	PgStatShared_Wal *stats_shmem;
 	WalUsage	wal_usage_diff = {0};
+
+	if (fastpg_pgstat_noop_active())
+		return false;
 
 	Assert(IsUnderPostmaster || !IsPostmasterEnvironment);
 	Assert(pgStatLocal.shmem != NULL &&
@@ -103,6 +115,8 @@ pgstat_wal_flush_cb(bool nowait)
 	 */
 	if (!pgstat_wal_have_pending())
 		return false;
+
+	stats_shmem = &pgStatLocal.shmem->wal;
 
 	/*
 	 * We don't update the WAL usage portion of the local WalStats elsewhere.
@@ -138,6 +152,9 @@ pgstat_wal_flush_cb(bool nowait)
 void
 pgstat_wal_init_backend_cb(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/*
 	 * Initialize prevWalUsage with pgWalUsage so that pgstat_wal_flush_cb()
 	 * can calculate how much pgWalUsage counters are increased by subtracting
@@ -157,7 +174,12 @@ pgstat_wal_init_shmem_cb(void *stats)
 void
 pgstat_wal_reset_all_cb(TimestampTz ts)
 {
-	PgStatShared_Wal *stats_shmem = &pgStatLocal.shmem->wal;
+	PgStatShared_Wal *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->wal;
 
 	LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
 	memset(&stats_shmem->stats, 0, sizeof(stats_shmem->stats));
@@ -168,7 +190,12 @@ pgstat_wal_reset_all_cb(TimestampTz ts)
 void
 pgstat_wal_snapshot_cb(void)
 {
-	PgStatShared_Wal *stats_shmem = &pgStatLocal.shmem->wal;
+	PgStatShared_Wal *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->wal;
 
 	LWLockAcquire(&stats_shmem->lock, LW_SHARED);
 	memcpy(&pgStatLocal.snapshot.wal, &stats_shmem->stats,
