@@ -13,6 +13,17 @@ pub(crate) struct TransactionOverlay {
 }
 
 impl TransactionOverlay {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.relation_checkpoints.is_empty()
+            && self.page_checkpoints.is_empty()
+            && self.new_pages.is_empty()
+            && self.inserted_tids.is_empty()
+            && self.invalidated_tids.is_empty()
+            && self.hot_redirect_inserts.is_empty()
+            && self.primary_key_inserts.is_empty()
+            && self.primary_key_deletes.is_empty()
+    }
+
     pub(crate) fn checkpoint_relation(&mut self, relid: u32, relation: &RelationStorage) {
         self.relation_checkpoints
             .entry(relid)
@@ -177,6 +188,34 @@ impl SessionStorage {
         if self.transaction_stack.is_empty() {
             self.transaction_stack.push(TransactionOverlay::default());
         }
+    }
+
+    pub(crate) fn commit_empty_implicit_transaction(&mut self) -> bool {
+        if self.explicit_transaction {
+            return false;
+        }
+        if self
+            .transaction_stack
+            .last()
+            .is_some_and(TransactionOverlay::is_empty)
+        {
+            self.transaction_stack.pop();
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn abort_empty_implicit_transaction(&mut self) -> bool {
+        if self.explicit_transaction
+            || self
+                .transaction_stack
+                .iter()
+                .any(|overlay| !overlay.is_empty())
+        {
+            return false;
+        }
+        self.transaction_stack.clear();
+        true
     }
 
     pub(crate) fn allocate_scan_handle(&mut self) -> u64 {

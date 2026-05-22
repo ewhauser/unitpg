@@ -64,7 +64,7 @@ pub extern "C" fn fastpg_storage2_xact_begin() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_begin_implicit() {
-    with_storage(|_state, session| session.ensure_transaction());
+    with_session_storage(SessionStorage::ensure_transaction);
 }
 
 #[unsafe(no_mangle)]
@@ -79,17 +79,23 @@ pub extern "C" fn fastpg_storage2_xact_abort() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_commit_if_implicit() {
+    if with_session_storage(SessionStorage::commit_empty_implicit_transaction) {
+        return;
+    }
     with_storage(|state, session| state.commit_implicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_abort_if_implicit() {
+    if with_session_storage(SessionStorage::abort_empty_implicit_transaction) {
+        return;
+    }
     with_storage(|state, session| state.abort_implicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_subxact_begin() {
-    with_storage(|_state, session| {
+    with_session_storage(|session| {
         session.ensure_transaction();
         session
             .transaction_stack
@@ -440,6 +446,8 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
         return false;
     };
     with_storage(|state, session| {
+        let tid =
+            state.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid);
         let Some(tuple) =
             state.visible_tuple_slice_in_overlays(&session.transaction_stack, relid, tid)
         else {
@@ -518,7 +526,7 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
             typbyval,
             typlen,
             nkeys,
-            is_primary: false,
+            is_primary: true,
             nulls_not_distinct: false,
         })
     }) else {
@@ -528,7 +536,15 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
         return false;
     };
     let tid = with_storage(|state, session| {
-        state.find_visible_by_index_key_excluding(session, heap_relid, &index_spec, &key, None)
+        state
+            .primary_key_lookup(session, heap_relid, &key)
+            .or_else(|| {
+                let mut scan_spec = index_spec.clone();
+                scan_spec.is_primary = false;
+                state.find_visible_by_index_key_excluding(
+                    session, heap_relid, &scan_spec, &key, None,
+                )
+            })
     });
     let Some(tid) = tid else {
         return false;
