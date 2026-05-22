@@ -1234,7 +1234,7 @@ pub(crate) fn relation_insert_impl(
 fn tid_beyond_high_water(tid: Tid, high_water_offsets: &[u16]) -> bool {
     high_water_offsets
         .get(tid.block as usize)
-        .map_or(true, |max_offset| tid.offset > *max_offset)
+        .is_none_or(|max_offset| tid.offset > *max_offset)
 }
 
 pub(crate) fn relation_update_impl(
