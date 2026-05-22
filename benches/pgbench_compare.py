@@ -137,11 +137,13 @@ class PostgresBackendMemorySampler:
 
     def _run(self) -> None:
         while not self._stop.is_set():
-            backend_pid = postgres_backend_child_pid(self.postmaster_pid)
-            if backend_pid is not None:
-                rss_kb = process_rss_kb(backend_pid)
-                if rss_kb is not None:
-                    self._samples.append(rss_kb * 1024)
+            rss_kb = 0
+            for backend_pid in postgres_backend_child_pids(self.postmaster_pid):
+                process_rss = process_rss_kb(backend_pid)
+                if process_rss is not None:
+                    rss_kb += process_rss
+            if rss_kb > 0:
+                self._samples.append(rss_kb * 1024)
             self._stop.wait(self.interval_seconds)
 
     def stop(self) -> dict[str, Any]:
@@ -303,17 +305,44 @@ class PgBenchCompare:
         else:
             self.checked_command(variant.name, "setup", setup_args, output_dir, "meson-setup")
 
-        self.checked_command(
-            variant.name,
-            "setup",
-            ["meson", "test", "-C", str(build_dir), "--suite", "setup", "--print-errorlogs"],
-            output_dir,
-            "meson-test-setup",
-        )
-
         prefix = build_dir / "tmp_install" / "usr" / "local" / "pgsql"
         bindir = prefix / "bin"
         libdir = prefix / "lib"
+
+        if platform.system() == "Darwin":
+            self.checked_command(
+                variant.name,
+                "setup",
+                ["meson", "compile", "-C", str(build_dir)],
+                output_dir,
+                "meson-compile",
+            )
+            self.checked_command(
+                variant.name,
+                "setup",
+                [
+                    "meson",
+                    "install",
+                    "-C",
+                    str(build_dir),
+                    "--quiet",
+                    "--only-changed",
+                    "--no-rebuild",
+                    "--destdir",
+                    str(build_dir / "tmp_install"),
+                ],
+                output_dir,
+                "meson-install",
+            )
+        else:
+            self.checked_command(
+                variant.name,
+                "setup",
+                ["meson", "test", "-C", str(build_dir), "--suite", "setup", "--print-errorlogs"],
+                output_dir,
+                "meson-test-setup",
+            )
+
         for program in ("initdb", "pg_ctl", "psql", "pgbench"):
             if not (bindir / program).exists():
                 raise BenchmarkFailure(
@@ -553,7 +582,7 @@ class PgBenchCompare:
 
         old_name = "/usr/local/pgsql/lib/libpq.5.dylib"
         new_name = str(libdir / "libpq.5.dylib")
-        targets = [bindir / "psql", bindir / "pgbench"]
+        targets = [bindir / program for program in ("initdb", "pg_ctl", "postgres", "psql", "pgbench")]
         targets.extend(sorted(libdir.glob("*.dylib")))
 
         for target in targets:
@@ -1022,8 +1051,12 @@ class PgBenchCompare:
         memory_sampler: ProcessMemorySampler | None = None
         server_memory: dict[str, Any] | None = None
         try:
-            backend_pid = wait_for_postgres_backend(postmaster_pid, pgbench_process)
-            if backend_pid is None:
+            backend_pids = wait_for_postgres_backends(
+                postmaster_pid,
+                pgbench_process,
+                expected_count=max(1, self.args.clients),
+            )
+            if not backend_pids:
                 failure = CommandResult(
                     command,
                     str(self.source_root),
@@ -1036,24 +1069,37 @@ class PgBenchCompare:
                     variant,
                     "profile",
                     CommandResult(
-                        ["find-postgres-backend", f"postmaster={postmaster_pid}"],
+                        [
+                            "find-postgres-backends",
+                            f"postmaster={postmaster_pid}",
+                            f"expected={self.args.clients}",
+                        ],
                         str(self.source_root),
                         1,
                         failure.stdout,
-                        "could not find active Postgres backend to profile",
+                        "could not find active Postgres backends to profile",
                         failure.seconds,
                     ),
                     output_dir,
                 )
+            profile_pids = backend_pids
+            profile_title = "normal Postgres pgbench backends"
+            if platform.system() == "Darwin" and len(backend_pids) > 1:
+                profile_pids = [backend_pids[-1]]
+                profile_title = "normal Postgres pgbench backend"
+
             profiler = self.start_profiler(
                 variant,
-                backend_pid,
+                profile_pids,
                 output_dir,
                 "normal-postgres-flamegraph.svg",
-                "normal Postgres pgbench backend",
+                profile_title,
             )
+            profiler["profile_record"]["available_pids"] = backend_pids
+            if profile_pids != backend_pids:
+                profiler["profile_record"]["pid_selection"] = "single-backend"
             memory_sampler = (
-                ProcessMemorySampler(backend_pid)
+                PostgresBackendMemorySampler(postmaster_pid)
                 if self.args.profile_server_memory
                 else None
             )
@@ -1176,7 +1222,7 @@ class PgBenchCompare:
     def start_profiler(
         self,
         variant: str,
-        pid: int,
+        pids: int | list[int],
         output_dir: Path,
         output_name: str,
         title: str,
@@ -1185,7 +1231,7 @@ class PgBenchCompare:
         profile_dir.mkdir(parents=True, exist_ok=True)
         tool = self.args.profile_tool
         if tool == "flamegraph":
-            command, profile_path = self.flamegraph_command(pid, profile_dir, output_name, title)
+            command, profile_path = self.flamegraph_command(pids, profile_dir, output_name, title)
         else:
             raise BenchmarkFailure(
                 variant,
@@ -1194,6 +1240,7 @@ class PgBenchCompare:
                 profile_dir,
             )
 
+        pid_list = [pids] if isinstance(pids, int) else list(pids)
         stdout_path = profile_dir / f"{tool}.stdout"
         stderr_path = profile_dir / f"{tool}.stderr"
         stdout_file = stdout_path.open("w")
@@ -1238,14 +1285,15 @@ class PgBenchCompare:
             "result": result,
             "profile_record": {
                 "tool": tool,
-                "pid": pid,
+                "pid": pid_list[0] if len(pid_list) == 1 else None,
+                "pids": pid_list,
                 "path": str(profile_path),
                 "opened": bool(self.args.profile_open),
             },
         }
 
     def flamegraph_command(
-        self, pid: int, profile_dir: Path, output_name: str, title: str
+        self, pids: int | list[int], profile_dir: Path, output_name: str, title: str
     ) -> tuple[list[str], Path]:
         flamegraph = shutil.which("flamegraph")
         if flamegraph is None:
@@ -1264,10 +1312,11 @@ class PgBenchCompare:
             )
 
         output = profile_dir / output_name
+        pid_arg = str(pids) if isinstance(pids, int) else ",".join(str(pid) for pid in pids)
         command = [
             flamegraph,
             "-p",
-            str(pid),
+            pid_arg,
             "-o",
             str(output),
             "--title",
@@ -1575,8 +1624,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     args = parser.parse_args(argv)
     if args.runs < 1:
         parser.error("--runs must be at least 1")
-    if args.profile_normal_postgres and args.clients != 1:
-        parser.error("--profile-normal-postgres currently requires --clients=1")
     if args.profile_warmup_seconds < 0:
         parser.error("--profile-warmup-seconds must be non-negative")
     if args.profile_hyperfine_runs < 1:
@@ -1706,18 +1753,37 @@ def wait_for_postgres_backend(
     pgbench_process: subprocess.Popen[str],
     timeout_seconds: float = 10.0,
 ) -> int | None:
+    backend_pids = wait_for_postgres_backends(postmaster_pid, pgbench_process, timeout_seconds=timeout_seconds)
+    return max(backend_pids) if backend_pids else None
+
+
+def wait_for_postgres_backends(
+    postmaster_pid: int,
+    pgbench_process: subprocess.Popen[str],
+    *,
+    expected_count: int = 1,
+    timeout_seconds: float = 10.0,
+) -> list[int]:
     deadline = time.monotonic() + timeout_seconds
+    best_pids: list[int] = []
     while time.monotonic() < deadline:
-        backend_pid = postgres_backend_child_pid(postmaster_pid)
-        if backend_pid is not None:
-            return backend_pid
+        backend_pids = postgres_backend_child_pids(postmaster_pid)
+        if backend_pids:
+            best_pids = backend_pids
+            if len(backend_pids) >= expected_count:
+                return backend_pids
         if pgbench_process.poll() is not None:
-            return None
+            return best_pids
         time.sleep(0.02)
-    return None
+    return best_pids
 
 
 def postgres_backend_child_pid(postmaster_pid: int) -> int | None:
+    backend_pids = postgres_backend_child_pids(postmaster_pid)
+    return max(backend_pids) if backend_pids else None
+
+
+def postgres_backend_child_pids(postmaster_pid: int) -> list[int]:
     ps = subprocess.run(
         ["ps", "-axo", "pid=,ppid=,command="],
         text=True,
@@ -1726,7 +1792,7 @@ def postgres_backend_child_pid(postmaster_pid: int) -> int | None:
         check=False,
     )
     if ps.returncode != 0:
-        return None
+        return []
     candidates: list[int] = []
     for line in ps.stdout.splitlines():
         parts = line.strip().split(None, 2)
@@ -1740,7 +1806,7 @@ def postgres_backend_child_pid(postmaster_pid: int) -> int | None:
         command = parts[2]
         if ppid == postmaster_pid and is_postgres_client_backend(command):
             candidates.append(pid)
-    return max(candidates) if candidates else None
+    return sorted(candidates)
 
 
 def is_postgres_client_backend(command: str) -> bool:

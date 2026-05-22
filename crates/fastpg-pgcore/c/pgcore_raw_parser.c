@@ -750,6 +750,8 @@ fastpg_pgcore_init_postgres_catalog_once(void)
 				 errmsg("could not load PostgreSQL configuration for FASTPG_PGDATA")));
 	SetConfigOption("synchronous_commit", "on",
 					PGC_USERSET, PGC_S_OVERRIDE);
+	SetConfigOption("io_method", "sync",
+					PGC_POSTMASTER, PGC_S_OVERRIDE);
 	SetConfigOption("fsync", "off",
 					PGC_SIGHUP, PGC_S_OVERRIDE);
 	SetConfigOption("full_page_writes", "off",
@@ -1052,6 +1054,16 @@ fastpg_pgcore_start_statement_timestamp(void)
 	else if (fastpg_use_rust_catalog())
 		FastPgEnsureStandaloneTransactionState();
 #endif
+}
+
+static void
+fastpg_pgcore_push_analyze_snapshot(void)
+{
+	/*
+	 * In the embedded multithreaded server, keep this short-lived analyze/planner
+	 * snapshot independent from the transaction's reusable CurrentSnapshotData.
+	 */
+	PushCopiedSnapshot(GetTransactionSnapshot());
 }
 
 static void
@@ -2246,7 +2258,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 
 	if (PlannedStmtRequiresSnapshot(statement))
 	{
-		PushActiveSnapshot(GetTransactionSnapshot());
+		fastpg_pgcore_push_analyze_snapshot();
 		snapshot_pushed = true;
 	}
 
@@ -2712,7 +2724,7 @@ fastpg_pgcore_prepare(const char *query)
 				if (fastpg_catalog_mode_uses_postgres() &&
 					analyze_requires_snapshot(rawstmt))
 				{
-					PushActiveSnapshot(GetTransactionSnapshot());
+					fastpg_pgcore_push_analyze_snapshot();
 					snapshot_pushed = true;
 				}
 				if (strchr(result->source_text, '$') == NULL)
@@ -3220,7 +3232,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 				BeginImplicitTransactionBlock();
 				if (analyze_requires_snapshot(rawstmt))
 				{
-					PushActiveSnapshot(GetTransactionSnapshot());
+					fastpg_pgcore_push_analyze_snapshot();
 					snapshot_pushed = true;
 				}
 				querytree = parse_analyze_fixedparams(rawstmt,
@@ -3635,7 +3647,7 @@ fastpg_pgcore_execute_simple(const char *query)
 				BeginImplicitTransactionBlock();
 			if (analyze_requires_snapshot(rawstmt))
 			{
-				PushActiveSnapshot(GetTransactionSnapshot());
+				fastpg_pgcore_push_analyze_snapshot();
 				snapshot_pushed = true;
 			}
 			querytree = parse_analyze_fixedparams(rawstmt,
@@ -3949,7 +3961,7 @@ fastpg_pgcore_execute_copy_from_stdin(const char *query,
 		pstate = make_parsestate(NULL);
 		whereClause = fastpg_pgcore_transform_copy_where(pstate, relation, stmt);
 
-		PushActiveSnapshot(GetTransactionSnapshot());
+		fastpg_pgcore_push_analyze_snapshot();
 		snapshot_pushed = true;
 		fastpg_pgcore_active_copy_buffer = &buffer;
 		cstate = BeginCopyFrom(pstate,

@@ -1,5 +1,7 @@
 use crate::*;
 
+const MAX_HOT_REDIRECT_HOPS: usize = 1_000_000;
+
 #[derive(Debug, Default)]
 pub(crate) struct StorageState {
     pub(crate) relations: HashMap<u32, RelationStorage>,
@@ -242,7 +244,7 @@ impl StorageState {
         relid: u32,
         mut tid: Tid,
     ) -> Tid {
-        for _ in 0..32 {
+        for _ in 0..MAX_HOT_REDIRECT_HOPS {
             if let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) {
                 tid = next_tid;
                 continue;

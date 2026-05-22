@@ -26,6 +26,9 @@
 
 #include <limits.h>
 #include <math.h>
+#ifdef USE_FASTPG
+#include <pthread.h>
+#endif
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -232,6 +235,7 @@ static bool reporting_enabled;	/* true to enable GUC_REPORT */
 
 #ifdef USE_FASTPG
 static _Thread_local int GUCNestLevel = 0;	/* 1 when in main transaction */
+static pthread_mutex_t FastPgGucStackMutex = PTHREAD_MUTEX_INITIALIZER;
 #else
 static int	GUCNestLevel = 0;	/* 1 when in main transaction */
 #endif
@@ -2050,6 +2054,10 @@ push_old_value(struct config_generic *gconf, GucAction action)
 	if (GUCNestLevel == 0)
 		return;
 
+#ifdef USE_FASTPG
+	pthread_mutex_lock(&FastPgGucStackMutex);
+#endif
+
 	/* Do we already have a stack entry of the current nest level? */
 	stack = gconf->stack;
 	if (stack && stack->nest_level >= GUCNestLevel)
@@ -2083,6 +2091,9 @@ push_old_value(struct config_generic *gconf, GucAction action)
 				Assert(stack->state == GUC_SAVE);
 				break;
 		}
+#ifdef USE_FASTPG
+		pthread_mutex_unlock(&FastPgGucStackMutex);
+#endif
 		return;
 	}
 
@@ -2116,6 +2127,10 @@ push_old_value(struct config_generic *gconf, GucAction action)
 	if (gconf->stack == NULL)
 		slist_push_head(&guc_stack_list, &gconf->stack_link);
 	gconf->stack = stack;
+
+#ifdef USE_FASTPG
+	pthread_mutex_unlock(&FastPgGucStackMutex);
+#endif
 }
 
 
@@ -2178,6 +2193,10 @@ void
 AtEOXact_GUC(bool isCommit, int nestLevel)
 {
 	slist_mutable_iter iter;
+
+#ifdef USE_FASTPG
+	pthread_mutex_lock(&FastPgGucStackMutex);
+#endif
 
 	/*
 	 * Note: it's possible to get here with GUCNestLevel == nestLevel-1 during
@@ -2451,6 +2470,10 @@ AtEOXact_GUC(bool isCommit, int nestLevel)
 
 	/* Update nesting level */
 	GUCNestLevel = nestLevel - 1;
+
+#ifdef USE_FASTPG
+	pthread_mutex_unlock(&FastPgGucStackMutex);
+#endif
 }
 
 

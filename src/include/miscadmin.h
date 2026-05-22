@@ -194,7 +194,11 @@ extern PGDLLIMPORT int MyProcPid;
 extern PGDLLIMPORT pg_time_t MyStartTime;
 extern PGDLLIMPORT TimestampTz MyStartTimestamp;
 extern PGDLLIMPORT struct Port *MyProcPort;
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL struct Latch *MyLatch;
+#else
 extern PGDLLIMPORT struct Latch *MyLatch;
+#endif
 extern PGDLLIMPORT uint8 MyCancelKey[];
 extern PGDLLIMPORT int MyCancelKeyLength;
 extern PGDLLIMPORT int MyPMChildSlot;

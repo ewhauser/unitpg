@@ -49,6 +49,7 @@
 #include "storage/aio_subsys.h"
 #include "storage/condition_variable.h"
 #include "storage/ipc.h"
+#include "storage/latch.h"
 #include "storage/lmgr.h"
 #include "storage/pmsignal.h"
 #include "storage/proc.h"
@@ -109,6 +110,12 @@ static DeadLockState CheckDeadLock(void);
 void
 FastPgEnsureThreadProc(void)
 {
+	if (MyLatch == NULL)
+	{
+		InitProcessLocalLatch();
+		InitializeLatchWaitSet();
+	}
+
 	if (IsUnderPostmaster || MyProc != NULL || ProcGlobal == NULL)
 		return;
 

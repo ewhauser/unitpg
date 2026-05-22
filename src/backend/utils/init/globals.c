@@ -62,7 +62,11 @@ int			MyPMChildSlot;
  * PGPROC->procLatch if it has. Thus it can always be used in signal handlers,
  * without checking for its existence.
  */
+#ifdef USE_FASTPG
+_Thread_local struct Latch *MyLatch;
+#else
 struct Latch *MyLatch;
+#endif
 
 /*
  * DataDir is the absolute path to the top level of the PGDATA directory tree.

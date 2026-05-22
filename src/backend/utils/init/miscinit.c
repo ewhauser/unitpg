@@ -67,7 +67,11 @@ BackendType MyBackendType;
 /* List of lock files to be removed at proc exit */
 static List *lock_files = NIL;
 
+#ifdef USE_FASTPG
+static _Thread_local Latch LocalLatchData;
+#else
 static Latch LocalLatchData;
+#endif
 
 /* ----------------------------------------------------------------
  *		ignoring system indexes support stuff

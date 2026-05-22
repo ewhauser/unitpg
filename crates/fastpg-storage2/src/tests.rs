@@ -188,6 +188,42 @@ fn hot_update_redirects_old_tid_to_committed_new_tid() {
 }
 
 #[test]
+fn hot_update_redirects_follow_long_committed_chains() {
+    let _guard = test_guard();
+    let relid = 146;
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 0);
+    fastpg_storage2_xact_commit();
+
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut current_tid = first_tid;
+    for value in 1..=96usize {
+        let values = [value];
+        let mut new_tid = 0;
+        fastpg_storage2_xact_begin();
+        assert!(unsafe {
+            fastpg_storage2_relation_update_hot_unchecked(
+                relid,
+                current_tid,
+                values.as_ptr(),
+                nulls.as_ptr(),
+                byval.as_ptr(),
+                lens.as_ptr(),
+                values.len(),
+                &mut new_tid,
+            )
+        });
+        fastpg_storage2_xact_commit();
+        current_tid = new_tid;
+    }
+
+    assert_eq!(fetch_i32(relid, first_tid), Some(96));
+    assert_eq!(fetch_i32(relid, current_tid), Some(96));
+}
+
+#[test]
 fn savepoint_abort_drops_nested_pages() {
     let _guard = test_guard();
     let relid = 46;
