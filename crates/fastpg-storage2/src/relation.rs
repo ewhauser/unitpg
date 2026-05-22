@@ -4,6 +4,7 @@ use crate::*;
 pub(crate) struct RelationStorage {
     pub(crate) pages: Vec<Option<Page>>,
     pub(crate) primary_key_index: BTreeMap<IndexKey, Tid>,
+    pub(crate) hot_redirects: BTreeMap<Tid, Tid>,
     pub(crate) next_block: u32,
     pub(crate) append_hint: Option<u32>,
     pub(crate) live_tuple_count: usize,
@@ -204,7 +205,11 @@ impl RelationStorage {
         self.primary_key_index
             .keys()
             .map(|key| key.accounted_bytes() + std::mem::size_of::<Tid>())
-            .sum()
+            .sum::<usize>()
+            + self
+                .hot_redirects
+                .len()
+                .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
     }
 }
 

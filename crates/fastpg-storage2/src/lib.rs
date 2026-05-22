@@ -196,7 +196,14 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update(
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
         return false;
     };
-    relation_update_impl(relid, packed_tid, input, new_tid_out, UniqueCheck::Enforce)
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Enforce,
+        false,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -218,7 +225,43 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_unchecked(
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
         return false;
     };
-    relation_update_impl(relid, packed_tid, input, new_tid_out, UniqueCheck::Skip)
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        false,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_unchecked(
+    relid: u32,
+    packed_tid: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    new_tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        true,
+    )
 }
 
 #[unsafe(no_mangle)]

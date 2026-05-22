@@ -85,6 +85,12 @@ impl StorageState {
             }
         }
 
+        for (relid, redirects) in overlay.hot_redirect_inserts {
+            if let Some(relation) = self.relations.get_mut(&relid) {
+                relation.hot_redirects.extend(redirects);
+            }
+        }
+
         for (relid, keys) in overlay.primary_key_deletes {
             if let Some(relation) = self.relations.get_mut(&relid) {
                 for key in keys {
@@ -223,10 +229,36 @@ impl StorageState {
         relid: u32,
         tid: Tid,
     ) -> Option<DecodedTuple<'a>> {
+        let tid = self.resolve_tid_redirect_in_overlays(overlays, relid, tid);
         decode_tuple(
             tid,
             self.visible_tuple_slice_in_overlays(overlays, relid, tid)?,
         )
+    }
+
+    pub(crate) fn resolve_tid_redirect_in_overlays(
+        &self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        mut tid: Tid,
+    ) -> Tid {
+        for _ in 0..32 {
+            if let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) {
+                tid = next_tid;
+                continue;
+            }
+            if let Some(next_tid) = self
+                .relations
+                .get(&relid)
+                .and_then(|relation| relation.hot_redirects.get(&tid))
+                .copied()
+            {
+                tid = next_tid;
+                continue;
+            }
+            break;
+        }
+        tid
     }
 
     pub(crate) fn visible_tuple_slice_in_overlays<'a>(
@@ -235,6 +267,7 @@ impl StorageState {
         relid: u32,
         tid: Tid,
     ) -> Option<&'a [u8]> {
+        let tid = self.resolve_tid_redirect_in_overlays(overlays, relid, tid);
         if overlays_invalidate_tid(overlays, relid, tid) {
             return None;
         }
@@ -445,6 +478,7 @@ impl StorageState {
             .primary_key_index
             .get(key)
             .copied()?;
+        let tid = self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
         self.find_visible_tuple(session, relid, tid).map(|_| tid)
     }
 
@@ -456,6 +490,9 @@ impl StorageState {
         key: &IndexKey,
         replacing_tid: Option<Tid>,
     ) -> Option<Tid> {
+        let replacing_tid = replacing_tid.map(|tid| {
+            self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
+        });
         if index_spec.is_primary {
             if let Some(tid) = self.primary_key_lookup(session, relid, key)
                 && Some(tid) != replacing_tid
@@ -620,11 +657,14 @@ pub(crate) fn relation_update_impl(
     input: RowInput<'_>,
     new_tid_out: *mut u64,
     unique_check: UniqueCheck,
+    record_hot_redirect: bool,
 ) -> bool {
     let Some(old_tid) = Tid::unpack(packed_tid) else {
         return false;
     };
     let result = with_storage(|state, session| -> Result<Option<Tid>, CatalogError> {
+        let old_tid =
+            state.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, old_tid);
         let Some(old_tuple) = state.find_visible_tuple(session, relid, old_tid) else {
             return Ok(None);
         };
@@ -649,6 +689,9 @@ pub(crate) fn relation_update_impl(
             .last_mut()
             .expect("transaction was just ensured");
         overlay.invalidate(relid, old_tid);
+        if record_hot_redirect {
+            overlay.insert_hot_redirect(relid, old_tid, new_tid);
+        }
         if old_primary_key.is_some()
             && old_primary_key != new_primary_key
             && let Some(key) = old_primary_key

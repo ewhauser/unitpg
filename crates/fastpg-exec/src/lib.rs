@@ -798,12 +798,17 @@ impl QueryExecutor {
             );
         }
 
-        let parameters = parameters
-            .iter()
-            .map(pgcore_param_value)
-            .collect::<Vec<_>>();
-
-        let execution_result = self.pgcore_session.execute_with_params(sql, &parameters);
+        let execution_result = if parameters.is_empty() {
+            self.pgcore_session.execute_simple(sql)
+        } else {
+            let parameters = parameters
+                .iter()
+                .map(pgcore_param_value)
+                .collect::<Vec<_>>();
+            self.pgcore_session
+                .prepare(sql)
+                .and_then(|statement| statement.execute_with_params(&parameters))
+        };
 
         match execution_result {
             Ok(result) => {

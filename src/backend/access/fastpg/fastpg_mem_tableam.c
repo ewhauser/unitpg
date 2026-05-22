@@ -413,6 +413,14 @@ extern bool fastpg_storage2_relation_update_unchecked(uint32_t relid,
 													  const size_t *value_lens,
 													  size_t natts,
 													  uint64_t *new_tid);
+extern bool fastpg_storage2_relation_update_hot_unchecked(uint32_t relid,
+														  uint64_t tid,
+														  const uintptr_t *values,
+														  const uint8_t *isnull,
+														  const uint8_t *byval,
+														  const size_t *value_lens,
+														  size_t natts,
+														  uint64_t *new_tid);
 extern bool fastpg_storage2_relation_delete(uint32_t relid, uint64_t tid);
 extern uint64_t fastpg_storage2_scan_begin(uint32_t relid);
 extern void fastpg_storage2_scan_reset(uint64_t scan_handle);
@@ -4474,7 +4482,8 @@ fastpg_mem_relation_has_unique_index(Relation rel)
 static bool
 fastpg_mem_update_preserves_index_attrs(Relation rel,
 										uint64_t row_id,
-										TupleTableSlot *new_slot)
+										TupleTableSlot *new_slot,
+										bool storage2)
 {
 	Bitmapset  *attrs = NULL;
 	TupleTableSlot *old_slot;
@@ -4483,8 +4492,6 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 	bool		preserves = true;
 
 	if (!fastpg_catalog_mode_uses_postgres())
-		return false;
-	if (!fastpg_mem_relation_has_deferred_unique_index(rel))
 		return false;
 
 	attrs = bms_add_members(attrs,
@@ -4505,7 +4512,15 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 		return false;
 	}
 
-	if (!fastpg_mem_row_id_to_tid(rel, row_id, &tid))
+	if (storage2)
+	{
+		if (!fastpg_mem_storage2_tid_to_tid(row_id, &tid))
+		{
+			bms_free(attrs);
+			return false;
+		}
+	}
+	else if (!fastpg_mem_row_id_to_tid(rel, row_id, &tid))
 	{
 		bms_free(attrs);
 		return false;
@@ -4594,6 +4609,7 @@ fastpg_mem_tuple_update(Relation rel,
 	HeapTuple	old_heap_tuple = NULL;
 	TupleTableSlot *old_slot = NULL;
 	bool		preserve_update_tid = false;
+	bool		storage2_hot_update = false;
 
 	if (update_indexes != NULL)
 		*update_indexes = (storage2 || fastpg_catalog_mode_uses_postgres()) ?
@@ -4642,6 +4658,14 @@ fastpg_mem_tuple_update(Relation rel,
 			fastpg_mem_fill_self_modified_tmfd(otid, touched_cid, tmfd);
 			return TM_SelfModified;
 		}
+	}
+
+	if (storage2 && fastpg_catalog_mode_uses_postgres() &&
+		fastpg_mem_update_preserves_index_attrs(rel, row_id, slot, true))
+	{
+		storage2_hot_update = true;
+		if (update_indexes != NULL)
+			*update_indexes = TU_None;
 	}
 
 	fastpg_mem_ensure_write_xact();
@@ -4797,14 +4821,23 @@ fastpg_mem_tuple_update(Relation rel,
 										   new_row_id);
 	}
 	else if (!(storage2 ?
-			   fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
-														 row_id,
-														 values,
-														 isnull,
-														 byval,
-														 value_lens,
-														 tupdesc->natts,
-														 &row_id) :
+			   (storage2_hot_update ?
+				fastpg_storage2_relation_update_hot_unchecked(RelationGetRelid(rel),
+															  row_id,
+															  values,
+															  isnull,
+															  byval,
+															  value_lens,
+															  tupdesc->natts,
+															  &row_id) :
+				fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
+														  row_id,
+														  values,
+														  isnull,
+														  byval,
+														  value_lens,
+														  tupdesc->natts,
+														  &row_id)) :
 			   fastpg_rust_relation_update_unchecked(RelationGetRelid(rel),
 													 row_id,
 													 values,
