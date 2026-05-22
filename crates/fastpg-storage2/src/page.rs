@@ -14,7 +14,7 @@ pub(crate) struct LinePointer {
     pub(crate) state: LinePointerState,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Page {
     pub(crate) block: u32,
     pub(crate) epoch: u64,
@@ -44,11 +44,15 @@ impl Page {
     }
 
     pub(crate) fn remaining(&self) -> usize {
-        self.bytes.len().saturating_sub(self.used)
+        self.bytes.len().saturating_sub(self.aligned_used())
     }
 
     pub(crate) fn can_fit(&self, tuple_len: usize) -> bool {
         tuple_len <= self.remaining() && self.line_pointers.len() < MAX_CTID_OFFSET
+    }
+
+    fn aligned_used(&self) -> usize {
+        self.used.next_multiple_of(DATUM_ALIGNMENT)
     }
 
     pub(crate) fn append_tuple_with_state(
@@ -59,8 +63,11 @@ impl Page {
         if tuple.len() > self.remaining() || self.line_pointers.len() >= MAX_CTID_OFFSET {
             return None;
         }
-        let offset = self.used;
+        let offset = self.aligned_used();
         let end = offset.checked_add(tuple.len())?;
+        if end > self.bytes.len() {
+            return None;
+        }
         self.bytes[offset..end].copy_from_slice(tuple);
         self.used = end;
         self.line_pointers.push(LinePointer {
@@ -93,6 +100,14 @@ impl Page {
         {
             return None;
         }
+        let start = line.offset as usize;
+        let end = start.checked_add(line.len as usize)?;
+        self.bytes.get(start..end)
+    }
+
+    pub(crate) fn tuple_slice_any(&self, offset: u16) -> Option<&[u8]> {
+        let index = usize::from(offset.checked_sub(1)?);
+        let line = self.line_pointers.get(index)?;
         let start = line.offset as usize;
         let end = start.checked_add(line.len as usize)?;
         self.bytes.get(start..end)
@@ -152,19 +167,47 @@ impl Page {
         }
     }
 
-    pub(crate) fn restore_to(&mut self, checkpoint: &PageCheckpoint) {
-        self.used = checkpoint.used.min(self.bytes.len());
-        self.line_pointers.truncate(checkpoint.line_count);
+    pub(crate) fn restore_to_preserving_tid_space(&mut self, checkpoint: &PageCheckpoint) {
+        let checkpoint_line_count = checkpoint.line_count.min(self.line_pointers.len());
         for (line, state) in self
             .line_pointers
             .iter_mut()
+            .take(checkpoint_line_count)
             .zip(checkpoint.line_states.iter().copied())
         {
             line.state = state;
         }
-        self.pending_tuple_bytes = checkpoint.pending_tuple_bytes;
-        self.live_tuple_bytes = checkpoint.live_tuple_bytes;
-        self.dead_tuple_bytes = checkpoint.dead_tuple_bytes;
+        for line in self.line_pointers.iter_mut().skip(checkpoint_line_count) {
+            line.state = LinePointerState::Dead;
+        }
+        self.recompute_tuple_bytes();
+    }
+
+    pub(crate) fn mark_all_dead(&mut self) {
+        for line in &mut self.line_pointers {
+            line.state = LinePointerState::Dead;
+        }
+        self.recompute_tuple_bytes();
+    }
+
+    fn recompute_tuple_bytes(&mut self) {
+        self.pending_tuple_bytes = 0;
+        self.live_tuple_bytes = 0;
+        self.dead_tuple_bytes = 0;
+        for line in &self.line_pointers {
+            let len = line.len as usize;
+            match line.state {
+                LinePointerState::Pending => {
+                    self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(len)
+                }
+                LinePointerState::Live => {
+                    self.live_tuple_bytes = self.live_tuple_bytes.saturating_add(len)
+                }
+                LinePointerState::Dead => {
+                    self.dead_tuple_bytes = self.dead_tuple_bytes.saturating_add(len)
+                }
+            }
+        }
     }
 
     pub(crate) fn live_tids(&self) -> impl Iterator<Item = Tid> + '_ {

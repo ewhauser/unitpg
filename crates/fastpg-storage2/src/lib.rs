@@ -131,8 +131,91 @@ pub extern "C" fn fastpg_storage2_relation_clear(relid: u32) {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_replace_from(dst_relid: u32, src_relid: u32) -> bool {
+    clear_last_storage_error();
+    let result =
+        with_storage(|state, session| state.replace_relation_from(session, dst_relid, src_relid));
+    match result {
+        Ok(()) => true,
+        Err(error) => {
+            set_last_storage_error(error);
+            false
+        }
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_row_count(relid: u32) -> usize {
     visible_row_count_cached(relid)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_page_count(relid: u32) -> usize {
+    with_storage(|state, _session| {
+        state
+            .relations
+            .get(&relid)
+            .map(RelationStorage::page_count)
+            .unwrap_or_default()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_block_count(relid: u32) -> usize {
+    with_storage(|state, _session| {
+        state
+            .relations
+            .get(&relid)
+            .map(RelationStorage::block_count)
+            .unwrap_or_default()
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_set_max_tuples_per_block(relid: u32, max_tuples: u16) {
+    with_storage(|state, _session| {
+        state
+            .relation_mut(relid)
+            .set_max_tuples_per_block(max_tuples);
+    });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_block_max_offset(relid: u32, block: u32) -> u16 {
+    with_storage(|state, _session| {
+        state
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.page(block))
+            .and_then(|page| u16::try_from(page.line_pointers.len()).ok())
+            .unwrap_or_default()
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_visible_tid_at(
+    relid: u32,
+    zero_based_index: usize,
+    tid_out: *mut u64,
+) -> bool {
+    let tid = with_storage(|state, session| {
+        state
+            .visible_tids(session, relid)
+            .get(zero_based_index)
+            .copied()
+    });
+    let Some(tid) = tid else {
+        return false;
+    };
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tid.pack();
+        }
+    }
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -141,6 +224,139 @@ pub extern "C" fn fastpg_storage2_relation_contains_tid(relid: u32, packed_tid: 
         return false;
     };
     with_storage(|state, session| state.find_visible_tuple(session, relid, tid).is_some())
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_resolve_tid(
+    relid: u32,
+    packed_tid: u64,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let resolved = with_storage(|state, session| {
+        state.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid)
+    });
+    if !resolved_tid_out.is_null() {
+        unsafe {
+            *resolved_tid_out = resolved.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_resolve_update_tid(
+    relid: u32,
+    packed_tid: u64,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let resolved = with_storage(|state, session| {
+        state.resolve_update_redirect_in_overlays(&session.transaction_stack, relid, tid)
+    });
+    if !resolved_tid_out.is_null() {
+        unsafe {
+            *resolved_tid_out = resolved.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_record_insert_metadata(
+    relid: u32,
+    packed_tid: u64,
+    xid: u32,
+    cid: u32,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        state.record_insert_metadata(session, relid, tid, xid, cid);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_record_invalidate_metadata(
+    relid: u32,
+    packed_tid: u64,
+    xid: u32,
+    cid: u32,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        state.record_invalidate_metadata(session, relid, tid, xid, cid);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_record_row_xmax(
+    relid: u32,
+    packed_tid: u64,
+    xmax: u32,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        state.record_row_xmax(session, relid, tid, xmax);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_row_xmin(relid: u32, packed_tid: u64) -> u32 {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return 0;
+    };
+    with_storage(|state, session| state.row_xmin(session, relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_row_cmin(relid: u32, packed_tid: u64) -> u32 {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return 0;
+    };
+    with_storage(|state, session| state.row_cmin(session, relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_row_xmax(relid: u32, packed_tid: u64) -> u32 {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return 0;
+    };
+    with_storage(|state, session| state.row_xmax(session, relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_row_delete_xid(relid: u32, packed_tid: u64) -> u32 {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return 0;
+    };
+    with_storage(|state, session| state.row_delete_xid(session, relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_row_delete_cid(relid: u32, packed_tid: u64) -> u32 {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return 0;
+    };
+    with_storage(|state, session| state.row_delete_cid(session, relid, tid))
 }
 
 #[unsafe(no_mangle)]
@@ -308,6 +524,7 @@ pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -
         return false;
     };
     with_storage(|state, session| {
+        let own_insert = session.owns_inserted_tid(relid, tid);
         let Some(tuple) = state.find_visible_tuple(session, relid, tid) else {
             return false;
         };
@@ -321,7 +538,11 @@ pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -
             .expect("transaction was just ensured");
         overlay.invalidate(relid, tid);
         if let Some(key) = old_primary_key {
-            overlay.delete_primary_key(relid, key);
+            if own_insert {
+                overlay.remove_primary_key_insert(relid, &key);
+            } else {
+                overlay.delete_primary_key(relid, key);
+            }
         }
         session.mark_scans_visibility_delta(relid);
         true
@@ -330,6 +551,15 @@ pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_scan_begin(relid: u32) -> u64 {
+    scan_begin_impl(relid, None)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_scan_begin_with_snapshot(relid: u32, curcid: u32) -> u64 {
+    scan_begin_impl(relid, Some(curcid))
+}
+
+fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
     clear_last_storage_error();
     with_storage(|state, session| {
         let high_water_offsets = state
@@ -354,6 +584,7 @@ pub extern "C" fn fastpg_storage2_scan_begin(relid: u32) -> u64 {
             forward_cursor: ScanCursor::forward_start(),
             backward_cursor: ScanCursor::backward_start(),
             has_visibility_deltas: session.transaction_has_visibility_deltas(relid),
+            snapshot_curcid,
         };
         if !session.insert_scan(handle, scan) {
             return 0;
@@ -397,6 +628,50 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next(
     natts: usize,
     tid_out: *mut u64,
 ) -> bool {
+    scan_next_impl(
+        scan_handle,
+        forward,
+        values_out,
+        is_null_out,
+        natts,
+        tid_out,
+        std::ptr::null_mut(),
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_scan_next_with_stored_natts(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    tid_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> bool {
+    scan_next_impl(
+        scan_handle,
+        forward,
+        values_out,
+        is_null_out,
+        natts,
+        tid_out,
+        stored_natts_out,
+    )
+}
+
+fn scan_next_impl(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    tid_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> bool {
     with_storage(|state, session| {
         let Some(scan) = session.scan_slot(scan_handle) else {
             return false;
@@ -415,21 +690,119 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next(
                 cursor,
                 &scan.high_water_offsets,
                 is_forward,
+                scan.snapshot_curcid,
             )
         } else {
             state.next_committed_tuple_slice(relid, cursor, &scan.high_water_offsets, is_forward)
         };
         let Some((tid, tuple)) = tuple else {
+            if let Some(scan) = session.scan_slot_mut(scan_handle) {
+                if is_forward {
+                    scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
+                } else {
+                    scan.forward_cursor = ScanCursor::after_cursor(scan.backward_cursor);
+                }
+            }
             return false;
         };
         if let Some(scan) = session.scan_slot_mut(scan_handle) {
             if is_forward {
                 scan.forward_cursor = ScanCursor::after(tid);
+                scan.backward_cursor = ScanCursor::before(tid);
             } else {
                 scan.backward_cursor = ScanCursor::before(tid);
+                scan.forward_cursor = ScanCursor::after(tid);
             }
         }
-        copy_tuple_to_outputs(tid, tuple, values_out, is_null_out, natts, tid_out)
+        copy_tuple_to_outputs(
+            tid,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            tid_out,
+            stored_natts_out,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_tid_snapshot(
+    relid: u32,
+    packed_tid: u64,
+    curcid: u32,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+) -> bool {
+    fetch_tid_snapshot_impl(
+        relid,
+        packed_tid,
+        curcid,
+        values_out,
+        is_null_out,
+        natts,
+        std::ptr::null_mut(),
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_tid_snapshot_with_stored_natts(
+    relid: u32,
+    packed_tid: u64,
+    curcid: u32,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    fetch_tid_snapshot_impl(
+        relid,
+        packed_tid,
+        curcid,
+        values_out,
+        is_null_out,
+        natts,
+        stored_natts_out,
+    )
+}
+
+fn fetch_tid_snapshot_impl(
+    relid: u32,
+    packed_tid: u64,
+    curcid: u32,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        let Some(tuple) = state.visible_tuple_slice_in_overlays_at_cid(
+            &session.transaction_stack,
+            relid,
+            tid,
+            curcid,
+        ) else {
+            return false;
+        };
+        copy_tuple_to_outputs(
+            tid,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            std::ptr::null_mut(),
+            stored_natts_out,
+        )
     })
 }
 
@@ -443,6 +816,46 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
     values_out: *mut usize,
     is_null_out: *mut u8,
     natts: usize,
+) -> bool {
+    fetch_tid_impl(
+        relid,
+        packed_tid,
+        values_out,
+        is_null_out,
+        natts,
+        std::ptr::null_mut(),
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_tid_with_stored_natts(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    fetch_tid_impl(
+        relid,
+        packed_tid,
+        values_out,
+        is_null_out,
+        natts,
+        stored_natts_out,
+    )
+}
+
+fn fetch_tid_impl(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
 ) -> bool {
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
@@ -462,6 +875,81 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
             is_null_out,
             natts,
             std::ptr::null_mut(),
+            stored_natts_out,
+        )
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_tid_any(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+) -> bool {
+    fetch_tid_any_impl(
+        relid,
+        packed_tid,
+        values_out,
+        is_null_out,
+        natts,
+        std::ptr::null_mut(),
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_tid_any_with_stored_natts(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    fetch_tid_any_impl(
+        relid,
+        packed_tid,
+        values_out,
+        is_null_out,
+        natts,
+        stored_natts_out,
+    )
+}
+
+fn fetch_tid_any_impl(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, _session| {
+        let Some(tuple) = state
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.tuple_slice_any(tid))
+        else {
+            return false;
+        };
+        copy_tuple_to_outputs(
+            tid,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            std::ptr::null_mut(),
+            stored_natts_out,
         )
     })
 }

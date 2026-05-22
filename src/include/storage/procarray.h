@@ -21,6 +21,9 @@
 
 extern void ProcArrayAdd(PGPROC *proc);
 extern void ProcArrayRemove(PGPROC *proc, TransactionId latestXid);
+#ifdef USE_FASTPG
+extern bool FastPgProcArrayContains(PGPROC *proc);
+#endif
 
 extern void ProcArrayEndTransaction(PGPROC *proc, TransactionId latestXid);
 extern void ProcArrayClearTransaction(PGPROC *proc);

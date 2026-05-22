@@ -31,8 +31,12 @@
 #include "access/tsmapi.h"
 #include "access/xact.h"
 #include "catalog/index.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_am_d.h"
 #include "catalog/pg_attribute.h"
+#include "catalog/pg_class.h"
+#include "catalog/pg_constraint.h"
+#include "catalog/pg_index.h"
 #include "catalog/pg_type.h"
 #include "commands/vacuum.h"
 #include "executor/executor.h"
@@ -53,11 +57,14 @@
 #include "storage/predicate.h"
 #include "storage/read_stream.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/datum.h"
 #include "utils/elog.h"
 #include "utils/errcodes.h"
+#include "utils/fmgroids.h"
 #include "utils/hsearch.h"
 #include "utils/index_selfuncs.h"
+#include "utils/inval.h"
 #include "utils/array.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -146,6 +153,7 @@ typedef struct FastPgMemVisibilityState
 	struct FastPgMemVisibilityState *next;
 	uint32_t	relid;
 	bool		all_visible;
+	bool		known_empty;
 	TransactionId touched_xid;
 	CommandId	max_touched_cid;
 } FastPgMemVisibilityState;
@@ -382,8 +390,40 @@ extern void fastpg_storage2_subxact_commit(void);
 extern void fastpg_storage2_subxact_abort(void);
 extern void fastpg_storage2_relation_clear(uint32_t relid);
 extern size_t fastpg_storage2_relation_row_count(uint32_t relid);
+extern size_t fastpg_storage2_relation_page_count(uint32_t relid);
+extern size_t fastpg_storage2_relation_block_count(uint32_t relid);
+extern uint32_t fastpg_storage2_relation_row_xmin(uint32_t relid,
+												  uint64_t packed_tid);
+extern void fastpg_storage2_relation_set_max_tuples_per_block(uint32_t relid,
+															  uint16_t max_tuples);
+extern uint16_t fastpg_storage2_relation_block_max_offset(uint32_t relid,
+														  uint32_t block);
+extern bool fastpg_storage2_relation_visible_tid_at(uint32_t relid,
+													size_t zero_based_index,
+													uint64_t *tid_out);
 extern bool fastpg_storage2_relation_contains_tid(uint32_t relid,
 												  uint64_t tid);
+extern bool fastpg_storage2_relation_resolve_tid(uint32_t relid,
+												 uint64_t tid,
+												 uint64_t *resolved_tid);
+extern bool fastpg_storage2_relation_resolve_update_tid(uint32_t relid,
+														uint64_t tid,
+														uint64_t *resolved_tid);
+extern bool fastpg_storage2_relation_record_insert_metadata(uint32_t relid,
+															uint64_t tid,
+															uint32_t xid,
+															uint32_t cid);
+extern bool fastpg_storage2_relation_record_invalidate_metadata(uint32_t relid,
+																uint64_t tid,
+																uint32_t xid,
+																uint32_t cid);
+extern bool fastpg_storage2_relation_record_row_xmax(uint32_t relid,
+													 uint64_t tid,
+													 uint32_t xmax);
+extern uint32_t fastpg_storage2_relation_row_delete_xid(uint32_t relid,
+														uint64_t tid);
+extern uint32_t fastpg_storage2_relation_row_delete_cid(uint32_t relid,
+														uint64_t tid);
 extern bool fastpg_storage2_relation_insert(uint32_t relid,
 											const uintptr_t *values,
 											const uint8_t *isnull,
@@ -432,19 +472,36 @@ extern bool fastpg_storage2_relation_update_hot_unchecked(uint32_t relid,
 														  uint64_t *new_tid);
 extern bool fastpg_storage2_relation_delete(uint32_t relid, uint64_t tid);
 extern uint64_t fastpg_storage2_scan_begin(uint32_t relid);
+extern uint64_t fastpg_storage2_scan_begin_with_snapshot(uint32_t relid,
+														 uint32_t curcid);
 extern void fastpg_storage2_scan_reset(uint64_t scan_handle);
 extern void fastpg_storage2_scan_end(uint64_t scan_handle);
-extern bool fastpg_storage2_scan_next(uint64_t scan_handle,
-									  uint8_t forward,
-									  uintptr_t *values,
-									  uint8_t *isnull,
-									  size_t natts,
-									  uint64_t *tid);
-extern bool fastpg_storage2_fetch_tid(uint32_t relid,
-									  uint64_t tid,
-									  uintptr_t *values,
-									  uint8_t *isnull,
-									  size_t natts);
+	extern bool fastpg_storage2_scan_next_with_stored_natts(uint64_t scan_handle,
+															uint8_t forward,
+															uintptr_t *values,
+															uint8_t *isnull,
+															size_t natts,
+															uint64_t *tid,
+															size_t *stored_natts);
+	extern bool fastpg_storage2_fetch_tid_with_stored_natts(uint32_t relid,
+															uint64_t tid,
+															uintptr_t *values,
+															uint8_t *isnull,
+															size_t natts,
+															size_t *stored_natts);
+	extern bool fastpg_storage2_fetch_tid_any_with_stored_natts(uint32_t relid,
+																uint64_t tid,
+																uintptr_t *values,
+																uint8_t *isnull,
+																size_t natts,
+																size_t *stored_natts);
+	extern bool fastpg_storage2_fetch_tid_snapshot_with_stored_natts(uint32_t relid,
+																	 uint64_t tid,
+																	 uint32_t curcid,
+																	 uintptr_t *values,
+																	 uint8_t *isnull,
+																	 size_t natts,
+																	 size_t *stored_natts);
 extern bool fastpg_storage2_primary_key_index_lookup(uint32_t index_relid,
 													 const uintptr_t *values,
 													 const uint8_t *isnull,
@@ -573,6 +630,7 @@ static uint64_t fastpg_mem_relation_rows_per_block(Relation rel);
 bool		fastpg_mem_tableoid_tid_to_row_id(uint32_t relid,
 											  ItemPointer tid,
 											  uint64_t *row_id);
+bool		fastpg_mem_tableoid_uses_storage2(uint32_t relid);
 static void fastpg_mem_ensure_block_layout_for_slot(Relation rel,
 													TupleTableSlot *slot);
 
@@ -859,22 +917,15 @@ fastpg_mem_set_relation_all_visible(uint32_t relid, bool all_visible)
 	entry->all_visible = all_visible;
 }
 
-static bool
-fastpg_mem_relation_is_all_visible(uint32_t relid)
-{
-	FastPgMemVisibilityState *entry;
-
-	if (!fastpg_catalog_mode_uses_postgres())
-		return false;
-
-	entry = fastpg_mem_relation_visibility_state(relid, false);
-	return entry != NULL && entry->all_visible;
-}
-
 static void
 fastpg_mem_note_relation_changed(uint32_t relid)
 {
+	FastPgMemVisibilityState *entry;
+
 	fastpg_mem_set_relation_all_visible(relid, false);
+	entry = fastpg_mem_relation_visibility_state(relid, false);
+	if (entry != NULL)
+		entry->known_empty = false;
 }
 
 static bool
@@ -1002,6 +1053,7 @@ fastpg_mem_fill_self_modified_tmfd(ItemPointer tid, CommandId cmax,
 static bool
 fastpg_mem_row_deleted_by_current_xact(uint32_t relid, uint64_t row_id,
 									   CommandId cid,
+									   bool storage2,
 									   CommandId *delete_cid_out)
 {
 	TransactionId delete_xid;
@@ -1010,16 +1062,43 @@ fastpg_mem_row_deleted_by_current_xact(uint32_t relid, uint64_t row_id,
 	if (!fastpg_catalog_mode_uses_postgres())
 		return false;
 
-	delete_xid =
-		(TransactionId) fastpg_rust_relation_row_delete_xid(relid, row_id);
+	delete_xid = (TransactionId) (storage2 ?
+								  fastpg_storage2_relation_row_delete_xid(relid, row_id) :
+								  fastpg_rust_relation_row_delete_xid(relid, row_id));
 	if (!TransactionIdIsValid(delete_xid) ||
 		!TransactionIdIsCurrentTransactionId(delete_xid))
 		return false;
 
-	delete_cid = (CommandId) fastpg_rust_relation_row_delete_cid(relid, row_id);
+	delete_cid = (CommandId) (storage2 ?
+							  fastpg_storage2_relation_row_delete_cid(relid, row_id) :
+							  fastpg_rust_relation_row_delete_cid(relid, row_id));
 	if (delete_cid < cid)
 		return false;
 
+	if (delete_cid_out != NULL)
+		*delete_cid_out = delete_cid;
+	return true;
+}
+
+static bool
+fastpg_mem_storage2_row_deleted_by_current_xact_any_cid(uint32_t relid,
+														uint64_t row_id,
+														CommandId *delete_cid_out)
+{
+	TransactionId delete_xid;
+	CommandId	delete_cid;
+
+	if (!fastpg_catalog_mode_uses_postgres())
+		return false;
+
+	delete_xid = (TransactionId) fastpg_storage2_relation_row_delete_xid(relid,
+																		 row_id);
+	if (!TransactionIdIsValid(delete_xid) ||
+		!TransactionIdIsCurrentTransactionId(delete_xid))
+		return false;
+
+	delete_cid = (CommandId) fastpg_storage2_relation_row_delete_cid(relid,
+																	 row_id);
 	if (delete_cid_out != NULL)
 		*delete_cid_out = delete_cid;
 	return true;
@@ -1151,6 +1230,11 @@ fastpg_mem_tableoid_tid_to_row_id(uint32_t relid, ItemPointer tid,
 
 	if (!OffsetNumberIsValid(offset))
 		return false;
+	if (fastpg_mem_use_storage2_for_relid(relid))
+	{
+		*row_id = (((uint64_t) block) << 16) | (uint64_t) offset;
+		return *row_id != 0;
+	}
 
 	entry = fastpg_mem_block_layout_entry(relid, false);
 	if (entry != NULL && entry->rows_per_block > 0)
@@ -1162,6 +1246,12 @@ fastpg_mem_tableoid_tid_to_row_id(uint32_t relid, ItemPointer tid,
 	*row_id = ((uint64_t) block * rows_per_block) +
 		(uint64_t) offset;
 	return true;
+}
+
+bool
+fastpg_mem_tableoid_uses_storage2(uint32_t relid)
+{
+	return fastpg_mem_use_storage2_for_relid(relid);
 }
 
 static bool
@@ -1200,12 +1290,21 @@ fastpg_mem_row_metadata_visible_to_snapshot(TransactionId xmin, CommandId cmin,
 }
 
 static CommandId
+fastpg_mem_effective_snapshot_curcid(Snapshot snapshot)
+{
+	if (snapshot == NULL || snapshot->snapshot_type != SNAPSHOT_MVCC)
+		return InvalidCommandId;
+
+	return snapshot->curcid;
+}
+
+static CommandId
 fastpg_mem_delete_cid_for_snapshot(CommandId cid, Snapshot snapshot)
 {
 	if (fastpg_catalog_mode_uses_postgres() &&
 		snapshot != NULL &&
 		snapshot->snapshot_type == SNAPSHOT_MVCC)
-		return snapshot->curcid;
+		return fastpg_mem_effective_snapshot_curcid(snapshot);
 	return cid;
 }
 
@@ -1273,6 +1372,30 @@ fastpg_mem_storage2_tid_to_tid(uint64_t storage2_tid, ItemPointer tid)
 	return true;
 }
 
+static uint64_t
+fastpg_mem_storage2_resolve_row_id(uint32_t relid, uint64_t row_id)
+{
+	uint64_t	resolved_row_id = row_id;
+
+	if (row_id == 0)
+		return 0;
+	if (fastpg_storage2_relation_resolve_tid(relid, row_id, &resolved_row_id))
+		return resolved_row_id;
+	return row_id;
+}
+
+static uint64_t
+fastpg_mem_storage2_resolve_update_row_id(uint32_t relid, uint64_t row_id)
+{
+	uint64_t	resolved_row_id = row_id;
+
+	if (row_id == 0)
+		return 0;
+	if (fastpg_storage2_relation_resolve_update_tid(relid, row_id, &resolved_row_id))
+		return resolved_row_id;
+	return row_id;
+}
+
 static size_t
 fastpg_mem_datum_size(Datum value, Form_pg_attribute attr)
 {
@@ -1288,6 +1411,33 @@ fastpg_mem_datum_size(Datum value, Form_pg_attribute attr)
 	elog(ERROR, "fastpg_mem found unsupported attribute length %d",
 		 attr->attlen);
 	return 0;
+}
+
+static bool
+fastpg_mem_datum_attr_equal(Datum value1, Datum value2, Form_pg_attribute attr)
+{
+	if (attr->attbyval)
+		return value1 == value2;
+	if (attr->attlen == -1)
+	{
+		struct varlena *varlena1 =
+			(struct varlena *) PG_DETOAST_DATUM_PACKED(value1);
+		struct varlena *varlena2 =
+			(struct varlena *) PG_DETOAST_DATUM_PACKED(value2);
+		Size		size1 = VARSIZE_ANY_EXHDR(varlena1);
+		Size		size2 = VARSIZE_ANY_EXHDR(varlena2);
+		bool		equal = size1 == size2 &&
+			memcmp(VARDATA_ANY(varlena1), VARDATA_ANY(varlena2), size1) == 0;
+
+		if ((Pointer) varlena1 != DatumGetPointer(value1))
+			pfree(varlena1);
+		if ((Pointer) varlena2 != DatumGetPointer(value2))
+			pfree(varlena2);
+		return equal;
+	}
+	if (attr->attlen == -2)
+		return strcmp(DatumGetCString(value1), DatumGetCString(value2)) == 0;
+	return datumIsEqual(value1, value2, attr->attbyval, attr->attlen);
 }
 
 static bool
@@ -1479,6 +1629,11 @@ fastpg_mem_ensure_block_layout_for_slot(Relation rel, TupleTableSlot *slot)
 		fastpg_mem_block_layout_entry((uint32_t) RelationGetRelid(rel), true);
 	if (entry->rows_per_block == 0)
 		entry->rows_per_block = fastpg_mem_rows_per_block_for_slot(rel, slot);
+	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel)) &&
+		entry->rows_per_block > 0)
+		fastpg_storage2_relation_set_max_tuples_per_block((uint32_t) RelationGetRelid(rel),
+														  (uint16_t) Min(entry->rows_per_block,
+																		 UINT16_MAX));
 }
 
 static BlockNumber
@@ -1528,14 +1683,35 @@ FastPgMemRelationPages(Relation rel)
 }
 
 BlockNumber
-FastPgMemRelationAllVisiblePages(Relation rel)
+FastPgMemRelationPhysicalPages(Relation rel)
 {
 	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
 
-	if (!fastpg_mem_relation_is_all_visible(relid))
-		return 0;
+	if (fastpg_mem_use_storage2_for_relid(relid))
+		return (BlockNumber) fastpg_storage2_relation_block_count(relid);
 
 	return FastPgMemRelationPages(rel);
+}
+
+BlockNumber
+FastPgMemRelationAllVisiblePages(Relation rel)
+{
+	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
+	FastPgMemVisibilityState *entry;
+	BlockNumber pages;
+
+	if (!fastpg_catalog_mode_uses_postgres())
+		return 0;
+
+	entry = fastpg_mem_relation_visibility_state(relid, false);
+	if (entry != NULL)
+		return entry->all_visible ? FastPgMemRelationPages(rel) : 0;
+
+	if (rel->rd_rel->relallvisible <= 0)
+		return 0;
+
+	pages = FastPgMemRelationPages(rel);
+	return (BlockNumber) Min((BlockNumber) rel->rd_rel->relallvisible, pages);
 }
 
 static void
@@ -1805,12 +1981,85 @@ fastpg_mem_relation_can_toast(Relation rel)
 }
 
 static void
-fastpg_mem_store_virtual_tuple(Relation rel,
-							   TupleTableSlot *slot,
-							   const uintptr_t *values,
-							   const uint8_t *isnull,
-							   size_t stored_natts,
-							   uint64_t row_id)
+fastpg_mem_local_relcache_invalidate_for_catalog_tuple(Relation rel,
+													   HeapTuple tuple)
+{
+	Oid			tupleRelId = RelationGetRelid(rel);
+	Oid			relationId = InvalidOid;
+
+	if (!IsCatalogRelation(rel) || IsToastRelation(rel))
+		return;
+
+	if (tupleRelId == RelationRelationId)
+	{
+		Form_pg_class classtup = (Form_pg_class) GETSTRUCT(tuple);
+
+		relationId = classtup->oid;
+	}
+	else if (tupleRelId == AttributeRelationId)
+	{
+		Form_pg_attribute atttup = (Form_pg_attribute) GETSTRUCT(tuple);
+
+		relationId = atttup->attrelid;
+	}
+	else if (tupleRelId == IndexRelationId)
+	{
+		Form_pg_index indextup = (Form_pg_index) GETSTRUCT(tuple);
+
+		relationId = indextup->indexrelid;
+	}
+	else if (tupleRelId == ConstraintRelationId)
+	{
+		Form_pg_constraint constrtup = (Form_pg_constraint) GETSTRUCT(tuple);
+
+		if (constrtup->contype == CONSTRAINT_FOREIGN)
+			relationId = constrtup->conrelid;
+	}
+
+	if (OidIsValid(relationId))
+		RelationCacheInvalidateEntry(relationId);
+}
+
+static void
+fastpg_mem_refresh_local_relcache_from_pg_class(Relation rel, HeapTuple tuple)
+{
+	Form_pg_class classtup;
+	Relation	target;
+
+	if (RelationGetRelid(rel) != RelationRelationId || tuple == NULL)
+		return;
+
+	classtup = (Form_pg_class) GETSTRUCT(tuple);
+	target = RelationIdGetRelation(classtup->oid);
+	if (target == NULL)
+		return;
+
+	target->rd_rel->relpages = classtup->relpages;
+	target->rd_rel->reltuples = classtup->reltuples;
+	target->rd_rel->relallvisible = classtup->relallvisible;
+	target->rd_rel->relallfrozen = classtup->relallfrozen;
+	RelationClose(target);
+}
+
+static void
+fastpg_mem_cache_invalidate_heap_tuple(Relation rel,
+									   HeapTuple tuple,
+									   HeapTuple newtuple)
+{
+	if (IsCatalogRelation(rel) && !IsToastRelation(rel))
+		CatalogCacheFlushCatalog(RelationGetRelid(rel));
+	CacheInvalidateHeapTuple(rel, tuple, newtuple);
+	fastpg_mem_local_relcache_invalidate_for_catalog_tuple(rel, tuple);
+	fastpg_mem_refresh_local_relcache_from_pg_class(rel,
+													newtuple != NULL ? newtuple : tuple);
+}
+
+static void
+fastpg_mem_fill_virtual_tuple_attrs(Relation rel,
+									TupleTableSlot *slot,
+									const uintptr_t *values,
+									const uint8_t *isnull,
+									size_t stored_natts)
 {
 	int			natts = slot->tts_tupleDescriptor->natts;
 
@@ -1826,6 +2075,17 @@ fastpg_mem_store_virtual_tuple(Relation rel,
 	}
 	if (stored_natts < (size_t) natts)
 		slot_getmissingattrs(slot, (int) stored_natts, natts);
+}
+
+static void
+fastpg_mem_store_virtual_tuple(Relation rel,
+							   TupleTableSlot *slot,
+							   const uintptr_t *values,
+							   const uint8_t *isnull,
+							   size_t stored_natts,
+							   uint64_t row_id)
+{
+	fastpg_mem_fill_virtual_tuple_attrs(rel, slot, values, isnull, stored_natts);
 
 	if (!fastpg_mem_row_id_to_tid(rel, row_id, &slot->tts_tid))
 		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
@@ -2053,7 +2313,12 @@ fastpg_mem_scan_begin(Relation rel,
 			scan->analyze_rows_per_block = 1;
 	}
 	scan->scan_handle = scan->storage2 ?
-		fastpg_storage2_scan_begin(RelationGetRelid(rel)) :
+		(fastpg_catalog_mode_uses_postgres() &&
+		 snapshot != NULL &&
+		 snapshot->snapshot_type == SNAPSHOT_MVCC ?
+		 fastpg_storage2_scan_begin_with_snapshot(RelationGetRelid(rel),
+												  fastpg_mem_effective_snapshot_curcid(snapshot)) :
+		 fastpg_storage2_scan_begin(RelationGetRelid(rel))) :
 		fastpg_mem_scan_begin_storage1(rel, snapshot, nkeys, key);
 	if (scan->scan_handle == 0)
 		fastpg_mem_raise_storage_error("fastpg_mem failed to create Rust scan handle");
@@ -2137,22 +2402,23 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 		values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
 		isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
 
-		while ((found =
-				fastpg_storage2_scan_next(scan->scan_handle,
-										  forward ? 1 : 0,
-										  values,
-										  isnull,
-										  natts,
-										  &row_id)))
-		{
-			for (int index = 0; index < natts; index++)
+			while ((found =
+					fastpg_storage2_scan_next_with_stored_natts(scan->scan_handle,
+																forward ? 1 : 0,
+																values,
+																isnull,
+																natts,
+																&row_id,
+																&stored_natts)))
 			{
-				slot->tts_values[index] = (Datum) values[index];
-				slot->tts_isnull[index] = isnull[index] != 0;
-			}
-			if (!fastpg_mem_storage2_tid_to_tid(row_id, &slot->tts_tid))
-				elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
-					 (unsigned long long) row_id);
+				fastpg_mem_fill_virtual_tuple_attrs(scan->base.rs_rd,
+													slot,
+													values,
+													isnull,
+													stored_natts);
+				if (!fastpg_mem_storage2_tid_to_tid(row_id, &slot->tts_tid))
+					elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+						 (unsigned long long) row_id);
 			slot->tts_tableOid = RelationGetRelid(scan->base.rs_rd);
 			ExecStoreVirtualTuple(slot);
 
@@ -2161,6 +2427,12 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 			{
 				if (fastpg_catalog_mode_uses_postgres())
 				{
+					if (scan->base.rs_snapshot != NULL)
+						PredicateLockTID(scan->base.rs_rd,
+										 &slot->tts_tid,
+										 scan->base.rs_snapshot,
+										 (TransactionId) fastpg_storage2_relation_row_xmin((uint32_t) RelationGetRelid(scan->base.rs_rd),
+																						   row_id));
 					pgstat_count_heap_getnext(scan->base.rs_rd);
 					pgstat_count_buffer_hit(scan->base.rs_rd);
 				}
@@ -2426,9 +2698,9 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 	bool		found;
 	bool		heap_buffers = natts > FASTPG_MEM_STACK_NATTS;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
+	uint64_t	storage2_fetch_row_id = 0;
 	bool		postgres_catalog = fastpg_catalog_mode_uses_postgres();
 	bool		use_mvcc_snapshot =
-		!storage2 &&
 		postgres_catalog &&
 		snapshot != NULL &&
 		snapshot->snapshot_type == SNAPSHOT_MVCC;
@@ -2445,6 +2717,13 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 		row_id = fastpg_mem_tid_to_storage2_tid(tid);
 		if (row_id == 0)
 			return false;
+		storage2_fetch_row_id = row_id;
+		if (postgres_catalog &&
+			snapshot != SnapshotAny &&
+			!use_mvcc_snapshot)
+			storage2_fetch_row_id =
+				fastpg_mem_storage2_resolve_row_id((uint32_t) RelationGetRelid(rel),
+												   row_id);
 	}
 	else if (!fastpg_mem_tid_to_row_id(rel, tid, &row_id))
 		return false;
@@ -2452,12 +2731,28 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 	ExecClearTuple(slot);
 	values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
 	isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
-	found = storage2 ?
-		fastpg_storage2_fetch_tid(RelationGetRelid(rel),
-								  row_id,
-								  values,
-								  isnull,
-								  natts) :
+		found = storage2 ?
+			(snapshot == SnapshotAny ?
+			 fastpg_storage2_fetch_tid_any_with_stored_natts(RelationGetRelid(rel),
+															 row_id,
+															 values,
+															 isnull,
+															 natts,
+															 &stored_natts) :
+			 (use_mvcc_snapshot ?
+			  fastpg_storage2_fetch_tid_snapshot_with_stored_natts(RelationGetRelid(rel),
+																   row_id,
+																   fastpg_mem_effective_snapshot_curcid(snapshot),
+																   values,
+																   isnull,
+																   natts,
+																   &stored_natts) :
+			  fastpg_storage2_fetch_tid_with_stored_natts(RelationGetRelid(rel),
+														  storage2_fetch_row_id,
+														  values,
+														  isnull,
+														  natts,
+														  &stored_natts))) :
 		(snapshot == SnapshotAny ?
 		 fastpg_rust_fetch_row_any_with_stored_natts(RelationGetRelid(rel),
 													 row_id,
@@ -2483,14 +2778,16 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 												  isnull,
 												  natts,
 												  &stored_natts)));
-	if (found && storage2)
-	{
-		for (int index = 0; index < natts; index++)
+		if (found && storage2)
 		{
-			slot->tts_values[index] = (Datum) values[index];
-			slot->tts_isnull[index] = isnull[index] != 0;
-		}
-		slot->tts_tid = *tid;
+			ItemPointerData slot_tid = *tid;
+
+			fastpg_mem_fill_virtual_tuple_attrs(rel, slot, values, isnull, stored_natts);
+			if (storage2_fetch_row_id != 0 &&
+				storage2_fetch_row_id != row_id &&
+				!fastpg_mem_storage2_tid_to_tid(storage2_fetch_row_id, &slot_tid))
+			slot_tid = *tid;
+		slot->tts_tid = slot_tid;
 		slot->tts_tableOid = RelationGetRelid(rel);
 		ExecStoreVirtualTuple(slot);
 	}
@@ -2509,13 +2806,16 @@ fastpg_mem_tuple_fetch_row_version(Relation rel,
 	}
 	if (found &&
 		snapshot != NULL &&
-		!storage2 &&
 		postgres_catalog)
 	{
-		TransactionId predicate_xmin = use_mvcc_snapshot ?
-			(TransactionId) row_xmin :
-			(TransactionId) fastpg_rust_relation_row_xmin((uint32_t) RelationGetRelid(rel),
-														  row_id);
+		TransactionId predicate_xmin = storage2 ?
+			(TransactionId) fastpg_storage2_relation_row_xmin((uint32_t) RelationGetRelid(rel),
+															  storage2_fetch_row_id != 0 ?
+															  storage2_fetch_row_id : row_id) :
+			(use_mvcc_snapshot ?
+			 (TransactionId) row_xmin :
+			 (TransactionId) fastpg_rust_relation_row_xmin((uint32_t) RelationGetRelid(rel),
+														   row_id));
 
 		PredicateLockTID(rel, &slot->tts_tid, snapshot, predicate_xmin);
 	}
@@ -2541,9 +2841,16 @@ fastpg_mem_index_fetch_tuple(IndexFetchTableData *scan,
 							 bool *call_again,
 							 bool *all_dead)
 {
+	ItemPointerData resolved_tid;
+
 	*call_again = false;
 	if (all_dead != NULL)
 		*all_dead = false;
+	if (FastPgMemResolveIndexFetchTid(scan->rel, tid, &resolved_tid))
+		return fastpg_mem_tuple_fetch_row_version(scan->rel,
+												  &resolved_tid,
+												  snapshot,
+												  slot);
 	return fastpg_mem_tuple_fetch_row_version(scan->rel, tid, snapshot, slot);
 }
 
@@ -2554,12 +2861,20 @@ fastpg_mem_tuple_tid_valid(TableScanDesc scan, ItemPointer tid)
 
 	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->rs_rd)))
 	{
+		uint32_t	relid = (uint32_t) RelationGetRelid(scan->rs_rd);
 		uint64_t	storage2_tid = fastpg_mem_tid_to_storage2_tid(tid);
+		uint64_t	resolved_tid;
 
 		if (storage2_tid == 0)
 			return false;
-		return fastpg_storage2_relation_contains_tid(RelationGetRelid(scan->rs_rd),
-													 storage2_tid);
+		if (fastpg_storage2_relation_contains_tid(relid, storage2_tid))
+			return true;
+		if (!fastpg_catalog_mode_uses_postgres())
+			return false;
+		resolved_tid = fastpg_mem_storage2_resolve_update_row_id(relid,
+																 storage2_tid);
+		return resolved_tid != storage2_tid &&
+			fastpg_storage2_relation_contains_tid(relid, resolved_tid);
 	}
 
 	if (!fastpg_mem_tid_to_row_id(scan->rs_rd, tid, &row_id))
@@ -2577,10 +2892,24 @@ fastpg_mem_tuple_get_latest_tid(TableScanDesc scan, ItemPointer tid)
 {
 	uint64_t	row_id;
 	uint64_t	latest_row_id;
+	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->rs_rd));
 
-	if (!fastpg_catalog_mode_uses_postgres() ||
-		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->rs_rd)))
+	if (!fastpg_catalog_mode_uses_postgres())
 		return;
+	if (storage2)
+	{
+		row_id = fastpg_mem_tid_to_storage2_tid(tid);
+		if (row_id == 0)
+			return;
+		latest_row_id =
+			fastpg_mem_storage2_resolve_update_row_id((uint32_t) RelationGetRelid(scan->rs_rd),
+													  row_id);
+		if (latest_row_id != row_id &&
+			!fastpg_mem_storage2_tid_to_tid(latest_row_id, tid))
+			elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+				 (unsigned long long) latest_row_id);
+		return;
+	}
 	if (!fastpg_mem_tid_to_row_id(scan->rs_rd, tid, &row_id))
 		return;
 
@@ -2916,7 +3245,7 @@ fastpg_mem_index_insert(Relation indexRelation,
 		uint64_t	self_row_id = 0;
 		uint64_t	conflict_row_id = 0;
 		bool		storage2 =
-			fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(indexRelation));
+			fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation));
 
 		if (indexUnchanged)
 			return true;
@@ -3155,6 +3484,31 @@ fastpg_mem_index_path_is_unique_equality(IndexPath *path)
 }
 
 bool
+FastPgMemResolveIndexFetchTid(Relation heapRelation,
+							  const ItemPointerData *tupleid,
+							  ItemPointer resolvedTid)
+{
+	uint64_t	row_id;
+	uint64_t	resolved_row_id;
+
+	if (tupleid == NULL ||
+		!ItemPointerIsValid(tupleid) ||
+		resolvedTid == NULL ||
+		!fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation)))
+		return false;
+
+	row_id = fastpg_mem_tid_to_storage2_tid((ItemPointer) tupleid);
+	if (row_id == 0)
+		return false;
+	resolved_row_id =
+		fastpg_mem_storage2_resolve_row_id((uint32_t) RelationGetRelid(heapRelation),
+										   row_id);
+	if (resolved_row_id == 0)
+		return false;
+	return fastpg_mem_storage2_tid_to_tid(resolved_row_id, resolvedTid);
+}
+
+bool
 FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 								  Relation indexRelation,
 								  const Datum *values,
@@ -3184,7 +3538,7 @@ FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 	if (key_count <= 0 || key_count > FASTPG_MAX_INDEX_KEYS)
 		return false;
 
-	storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(indexRelation));
+	storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation));
 	if (tupleid != NULL && ItemPointerIsValid(tupleid))
 	{
 		if (storage2)
@@ -3614,7 +3968,6 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 	if (heapRelation == NULL)
 		fastpg_mem_index_unsupported("heapless index scans");
 	use_mvcc_snapshot =
-		!fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation)) &&
 		fastpg_catalog_mode_uses_postgres() &&
 		scan->xs_snapshot != NULL &&
 		scan->xs_snapshot->snapshot_type == SNAPSHOT_MVCC;
@@ -3624,7 +3977,10 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 		opaque->scan_storage2 =
 			fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation));
 		opaque->scan_handle = opaque->scan_storage2 ?
-			fastpg_storage2_scan_begin(RelationGetRelid(heapRelation)) :
+			(use_mvcc_snapshot ?
+			 fastpg_storage2_scan_begin_with_snapshot(RelationGetRelid(heapRelation),
+													  fastpg_mem_effective_snapshot_curcid(scan->xs_snapshot)) :
+			 fastpg_storage2_scan_begin(RelationGetRelid(heapRelation))) :
 			(use_mvcc_snapshot ?
 			 fastpg_rust_scan_begin_with_snapshot(RelationGetRelid(heapRelation),
 												  1,
@@ -3642,16 +3998,17 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 	values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
 	isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
 
-	while ((found = opaque->scan_storage2 ?
-			fastpg_storage2_scan_next(opaque->scan_handle,
-									  1,
-									  values,
-									  isnull,
-									  natts,
-									  &row_id) :
-			(use_mvcc_snapshot ?
-			 fastpg_rust_scan_next_with_metadata(opaque->scan_handle,
-												 1,
+		while ((found = opaque->scan_storage2 ?
+				fastpg_storage2_scan_next_with_stored_natts(opaque->scan_handle,
+															1,
+															values,
+															isnull,
+															natts,
+															&row_id,
+															&stored_natts) :
+				(use_mvcc_snapshot ?
+				 fastpg_rust_scan_next_with_metadata(opaque->scan_handle,
+													 1,
 												 values,
 												 isnull,
 												 natts,
@@ -3667,17 +4024,17 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 													 &row_id,
 													 &stored_natts))))
 	{
-		ExecClearTuple(opaque->scan_slot);
-		if (opaque->scan_storage2)
-		{
-			for (int index = 0; index < natts; index++)
+			ExecClearTuple(opaque->scan_slot);
+			if (opaque->scan_storage2)
 			{
-				opaque->scan_slot->tts_values[index] = (Datum) values[index];
-				opaque->scan_slot->tts_isnull[index] = isnull[index] != 0;
-			}
-			if (!fastpg_mem_storage2_tid_to_tid(row_id, &opaque->scan_slot->tts_tid))
-				elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
-					 (unsigned long long) row_id);
+				fastpg_mem_fill_virtual_tuple_attrs(heapRelation,
+													opaque->scan_slot,
+													values,
+													isnull,
+													stored_natts);
+				if (!fastpg_mem_storage2_tid_to_tid(row_id, &opaque->scan_slot->tts_tid))
+					elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+						 (unsigned long long) row_id);
 			opaque->scan_slot->tts_tableOid = RelationGetRelid(heapRelation);
 			ExecStoreVirtualTuple(opaque->scan_slot);
 		}
@@ -3910,7 +4267,7 @@ fastpg_mem_index_get_tuple(IndexScanDesc scan, ScanDirection direction)
 	uint8_t		fastpg_typbyval[FASTPG_MAX_INDEX_KEYS];
 	int16_t		fastpg_typlen[FASTPG_MAX_INDEX_KEYS];
 	bool		storage2 =
-		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->indexRelation));
+		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->heapRelation));
 
 	if (ScanDirectionIsBackward(direction))
 	{
@@ -4052,8 +4409,7 @@ fastpg_mem_tuple_insert(Relation rel,
 		value_lens = palloc_array(size_t, tupdesc->natts);
 		owned = palloc_array(uint8_t, tupdesc->natts);
 	}
-	if (!storage2 &&
-		fastpg_catalog_mode_uses_postgres() &&
+	if (fastpg_catalog_mode_uses_postgres() &&
 		fastpg_mem_relation_can_toast(rel))
 	{
 		heap_tuple = ExecFetchSlotHeapTuple(slot, true, &should_free_heap_tuple);
@@ -4098,8 +4454,7 @@ fastpg_mem_tuple_insert(Relation rel,
 											 byval,
 											 value_lens,
 											 owned);
-	if (!storage2)
-		fastpg_mem_ensure_block_layout_for_slot(rel, slot);
+	fastpg_mem_ensure_block_layout_for_slot(rel, slot);
 	if (!(storage2 ?
 		  fastpg_storage2_relation_insert_unchecked(RelationGetRelid(rel),
 													values,
@@ -4116,7 +4471,7 @@ fastpg_mem_tuple_insert(Relation rel,
 												tupdesc->natts,
 												&row_id)))
 	{
-		if (storage2)
+		if (storage2 && !used_toasted_tuple)
 			fastpg_mem_free_slot_value_payloads(rel, values, isnull);
 		else if (!used_toasted_tuple)
 			fastpg_mem_free_owned_slot_value_payloads(rel, values, isnull, owned);
@@ -4140,11 +4495,25 @@ fastpg_mem_tuple_insert(Relation rel,
 		if (!fastpg_mem_storage2_tid_to_tid(row_id, &slot->tts_tid))
 			elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
 				 (unsigned long long) row_id);
+		if (fastpg_catalog_mode_uses_postgres())
+			(void) fastpg_storage2_relation_record_insert_metadata(RelationGetRelid(rel),
+																   row_id,
+																   GetCurrentTransactionId(),
+																   cid);
 	}
 	else if (!fastpg_mem_row_id_to_tid(rel, row_id, &slot->tts_tid))
 		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
 			 (unsigned long long) row_id);
 	slot->tts_tableOid = RelationGetRelid(rel);
+	if (fastpg_catalog_mode_uses_postgres() &&
+		heap_tuple != NULL &&
+		IsCatalogRelation(rel) &&
+		!IsToastRelation(rel))
+	{
+		heap_tuple->t_self = slot->tts_tid;
+		heap_tuple->t_tableOid = RelationGetRelid(rel);
+		fastpg_mem_cache_invalidate_heap_tuple(rel, heap_tuple, NULL);
+	}
 	if (!storage2)
 	{
 		(void) fastpg_rust_relation_set_row_xmin((uint32_t) RelationGetRelid(rel),
@@ -4162,7 +4531,7 @@ fastpg_mem_tuple_insert(Relation rel,
 	}
 	fastpg_mem_mark_row_touched((uint32_t) RelationGetRelid(rel), row_id, cid);
 	fastpg_mem_note_relation_changed((uint32_t) RelationGetRelid(rel));
-	if (storage2)
+	if (storage2 && !used_toasted_tuple)
 		fastpg_mem_free_slot_value_payloads(rel, values, isnull);
 	else if (!used_toasted_tuple)
 		fastpg_mem_free_owned_slot_value_payloads(rel, values, isnull, owned);
@@ -4357,6 +4726,10 @@ fastpg_mem_tuple_delete(Relation rel,
 	HeapTuple	old_heap_tuple = NULL;
 	bool		old_heap_tuple_should_free = false;
 	bool		old_heap_tuple_has_external = false;
+	bool		invalidate_catalog_tuple =
+		fastpg_catalog_mode_uses_postgres() &&
+		IsCatalogRelation(rel) &&
+		!IsToastRelation(rel);
 
 	if (storage2)
 	{
@@ -4365,6 +4738,26 @@ fastpg_mem_tuple_delete(Relation rel,
 		{
 			fastpg_mem_fill_deleted_tmfd(tid, tmfd);
 			return TM_Deleted;
+		}
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			uint64_t	resolved_row_id;
+			CommandId	delete_cid;
+
+			if (fastpg_mem_row_deleted_by_current_xact((uint32_t) RelationGetRelid(rel),
+													   row_id,
+													   cid,
+													   true,
+													   &delete_cid))
+			{
+				fastpg_mem_fill_self_modified_tmfd(tid, delete_cid, tmfd);
+				return TM_SelfModified;
+			}
+			resolved_row_id =
+				fastpg_mem_storage2_resolve_update_row_id((uint32_t) RelationGetRelid(rel),
+														  row_id);
+			if (resolved_row_id != row_id)
+				row_id = resolved_row_id;
 		}
 	}
 	else if (!fastpg_mem_tid_to_row_id(rel, tid, &row_id))
@@ -4379,6 +4772,7 @@ fastpg_mem_tuple_delete(Relation rel,
 		if (fastpg_mem_row_deleted_by_current_xact((uint32_t) RelationGetRelid(rel),
 												   row_id,
 												   cid,
+												   false,
 												   &delete_cid))
 		{
 			fastpg_mem_fill_self_modified_tmfd(tid, delete_cid, tmfd);
@@ -4401,14 +4795,20 @@ fastpg_mem_tuple_delete(Relation rel,
 		}
 	}
 
-	if (!storage2 &&
-		fastpg_catalog_mode_uses_postgres() &&
+	if (fastpg_catalog_mode_uses_postgres() &&
 		fastpg_mem_relation_can_toast(rel) &&
-		rel->rd_rel->reltoastrelid != InvalidOid)
+		(rel->rd_rel->reltoastrelid != InvalidOid ||
+		 invalidate_catalog_tuple))
 	{
 		ItemPointerData resolved_tid;
 
-		if (!fastpg_mem_row_id_to_tid(rel, row_id, &resolved_tid))
+		if (storage2)
+		{
+			if (!fastpg_mem_storage2_tid_to_tid(row_id, &resolved_tid))
+				elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+					 (unsigned long long) row_id);
+		}
+		else if (!fastpg_mem_row_id_to_tid(rel, row_id, &resolved_tid))
 			elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
 				 (unsigned long long) row_id);
 		old_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
@@ -4443,7 +4843,15 @@ fastpg_mem_tuple_delete(Relation rel,
 		fastpg_mem_fill_deleted_tmfd(tid, tmfd);
 		return TM_Deleted;
 	}
+	if (storage2 && fastpg_catalog_mode_uses_postgres())
+		(void) fastpg_storage2_relation_record_invalidate_metadata(RelationGetRelid(rel),
+																   row_id,
+																   GetCurrentTransactionId(),
+																   fastpg_mem_delete_cid_for_snapshot(cid,
+																									 snapshot));
 
+	if (invalidate_catalog_tuple && old_heap_tuple != NULL)
+		fastpg_mem_cache_invalidate_heap_tuple(rel, old_heap_tuple, NULL);
 	if (old_heap_tuple_has_external)
 		heap_toast_delete(rel, old_heap_tuple, false);
 	if (old_heap_tuple != NULL && old_heap_tuple_should_free)
@@ -4574,6 +4982,8 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 
 	if (storage2)
 	{
+		row_id = fastpg_mem_storage2_resolve_row_id((uint32_t) RelationGetRelid(rel),
+													row_id);
 		if (!fastpg_mem_storage2_tid_to_tid(row_id, &tid))
 		{
 			bms_free(attrs);
@@ -4619,10 +5029,7 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 		new_value = slot_getattr(new_slot, attnum, &new_isnull);
 		if (old_isnull != new_isnull ||
 			(!old_isnull &&
-			 !datumIsEqual(old_value,
-						   new_value,
-						   attr->attbyval,
-						   attr->attlen)))
+			 !fastpg_mem_datum_attr_equal(old_value, new_value, attr)))
 		{
 			preserves = false;
 			break;
@@ -4668,8 +5075,13 @@ fastpg_mem_tuple_update(Relation rel,
 	HeapTuple	toasted_tuple = NULL;
 	HeapTuple	old_heap_tuple = NULL;
 	TupleTableSlot *old_slot = NULL;
+	bool		invalidate_catalog_tuple =
+		fastpg_catalog_mode_uses_postgres() &&
+		IsCatalogRelation(rel) &&
+		!IsToastRelation(rel);
 	bool		preserve_update_tid = false;
 	bool		storage2_hot_update = false;
+	uint64_t	storage2_old_row_id = 0;
 
 	if (update_indexes != NULL)
 		*update_indexes = (storage2 || fastpg_catalog_mode_uses_postgres()) ?
@@ -4685,6 +5097,28 @@ fastpg_mem_tuple_update(Relation rel,
 			fastpg_mem_fill_deleted_tmfd(otid, tmfd);
 			return TM_Deleted;
 		}
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			uint64_t	resolved_row_id;
+			CommandId	delete_cid;
+
+			resolved_row_id =
+				fastpg_mem_storage2_resolve_update_row_id((uint32_t) RelationGetRelid(rel),
+														  row_id);
+			if (resolved_row_id != row_id)
+				row_id = resolved_row_id;
+			else
+			if (fastpg_mem_row_deleted_by_current_xact((uint32_t) RelationGetRelid(rel),
+													   row_id,
+													   cid,
+													   true,
+													   &delete_cid))
+			{
+				fastpg_mem_fill_self_modified_tmfd(otid, delete_cid, tmfd);
+				return TM_SelfModified;
+			}
+		}
+		storage2_old_row_id = row_id;
 	}
 	else if (!fastpg_mem_tid_to_row_id(rel, otid, &row_id))
 	{
@@ -4698,6 +5132,7 @@ fastpg_mem_tuple_update(Relation rel,
 		if (fastpg_mem_row_deleted_by_current_xact((uint32_t) RelationGetRelid(rel),
 												   row_id,
 												   cid,
+												   false,
 												   &delete_cid))
 		{
 			fastpg_mem_fill_self_modified_tmfd(otid, delete_cid, tmfd);
@@ -4737,17 +5172,23 @@ fastpg_mem_tuple_update(Relation rel,
 		value_lens = palloc_array(size_t, tupdesc->natts);
 		owned = palloc_array(uint8_t, tupdesc->natts);
 	}
-	if (!storage2 &&
-		fastpg_catalog_mode_uses_postgres() &&
+	if (fastpg_catalog_mode_uses_postgres() &&
 		fastpg_mem_relation_can_toast(rel))
 	{
 		heap_tuple = ExecFetchSlotHeapTuple(slot, true, &should_free_heap_tuple);
 		fastpg_mem_prepare_heap_tuple_header(rel, heap_tuple, cid, 0);
-		if (rel->rd_rel->reltoastrelid != InvalidOid)
+		if (rel->rd_rel->reltoastrelid != InvalidOid ||
+			invalidate_catalog_tuple)
 		{
 			ItemPointerData resolved_tid;
 
-			if (!fastpg_mem_row_id_to_tid(rel, row_id, &resolved_tid))
+			if (storage2)
+			{
+				if (!fastpg_mem_storage2_tid_to_tid(row_id, &resolved_tid))
+					elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+						 (unsigned long long) row_id);
+			}
+			else if (!fastpg_mem_row_id_to_tid(rel, row_id, &resolved_tid))
 				elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
 					 (unsigned long long) row_id);
 			old_slot = MakeSingleTupleTableSlot(RelationGetDescr(rel),
@@ -4805,8 +5246,7 @@ fastpg_mem_tuple_update(Relation rel,
 											 byval,
 											 value_lens,
 											 owned);
-	if (!storage2)
-		fastpg_mem_ensure_block_layout_for_slot(rel, slot);
+	fastpg_mem_ensure_block_layout_for_slot(rel, slot);
 	if (fastpg_catalog_mode_uses_postgres() && !storage2)
 	{
 		uint64_t	old_row_id = row_id;
@@ -4848,7 +5288,7 @@ fastpg_mem_tuple_update(Relation rel,
 
 		if (new_row_id == 0)
 		{
-			if (storage2)
+			if (storage2 && !used_toasted_tuple)
 				fastpg_mem_free_slot_value_payloads(rel, values, isnull);
 			else if (!used_toasted_tuple)
 				fastpg_mem_free_owned_slot_value_payloads(rel, values, isnull, owned);
@@ -4890,23 +5330,14 @@ fastpg_mem_tuple_update(Relation rel,
 															  value_lens,
 															  tupdesc->natts,
 															  &row_id) :
-				(fastpg_catalog_mode_uses_postgres() ?
-				 fastpg_storage2_relation_update_redirect_unchecked(RelationGetRelid(rel),
-																	row_id,
-																	values,
-																	isnull,
-																	byval,
-																	value_lens,
-																	tupdesc->natts,
-																	&row_id) :
-				 fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
-														   row_id,
-														   values,
-														   isnull,
-														   byval,
-														   value_lens,
-														   tupdesc->natts,
-														   &row_id))) :
+				fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
+														  row_id,
+														  values,
+														  isnull,
+														  byval,
+														  value_lens,
+														  tupdesc->natts,
+														  &row_id)) :
 			   fastpg_rust_relation_update_unchecked(RelationGetRelid(rel),
 													 row_id,
 													 values,
@@ -4915,7 +5346,7 @@ fastpg_mem_tuple_update(Relation rel,
 													 value_lens,
 													 tupdesc->natts)))
 	{
-		if (storage2)
+		if (storage2 && !used_toasted_tuple)
 			fastpg_mem_free_slot_value_payloads(rel, values, isnull);
 		else if (!used_toasted_tuple)
 			fastpg_mem_free_owned_slot_value_payloads(rel, values, isnull, owned);
@@ -4946,11 +5377,34 @@ fastpg_mem_tuple_update(Relation rel,
 		if (!fastpg_mem_storage2_tid_to_tid(row_id, &slot->tts_tid))
 			elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
 				 (unsigned long long) row_id);
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			(void) fastpg_storage2_relation_record_invalidate_metadata(RelationGetRelid(rel),
+																	   storage2_old_row_id,
+																	   GetCurrentTransactionId(),
+																	   fastpg_mem_delete_cid_for_snapshot(cid,
+																										 snapshot));
+			(void) fastpg_storage2_relation_record_insert_metadata(RelationGetRelid(rel),
+																   row_id,
+																   GetCurrentTransactionId(),
+																   cid);
+			(void) fastpg_storage2_relation_record_row_xmax(RelationGetRelid(rel),
+															row_id,
+															GetCurrentTransactionId());
+		}
 	}
 	else if (!fastpg_mem_row_id_to_tid(rel, row_id, &slot->tts_tid))
 		elog(ERROR, "fastpg_mem row id %llu cannot be represented as a CTID",
 			 (unsigned long long) row_id);
 	slot->tts_tableOid = RelationGetRelid(rel);
+	if (invalidate_catalog_tuple &&
+		old_heap_tuple != NULL &&
+		heap_tuple != NULL)
+	{
+		heap_tuple->t_self = slot->tts_tid;
+		heap_tuple->t_tableOid = RelationGetRelid(rel);
+		fastpg_mem_cache_invalidate_heap_tuple(rel, old_heap_tuple, heap_tuple);
+	}
 	if (!storage2)
 	{
 		(void) fastpg_rust_relation_set_row_xmin((uint32_t) RelationGetRelid(rel),
@@ -4968,7 +5422,7 @@ fastpg_mem_tuple_update(Relation rel,
 		fastpg_mem_count_io_op(rel, IOCONTEXT_NORMAL, IOOP_WRITE, 1);
 		fastpg_mem_count_io_op(rel, IOCONTEXT_NORMAL, IOOP_FSYNC, 1);
 	}
-	if (storage2)
+	if (storage2 && !used_toasted_tuple)
 		fastpg_mem_free_slot_value_payloads(rel, values, isnull);
 	else if (!used_toasted_tuple)
 		fastpg_mem_free_owned_slot_value_payloads(rel, values, isnull, owned);
@@ -5024,6 +5478,24 @@ fastpg_mem_tuple_lock(Relation rel,
 			fastpg_mem_fill_deleted_tmfd(tid, tmfd);
 			return TM_Deleted;
 		}
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			uint64_t	resolved_row_id;
+			CommandId	delete_cid;
+
+			if (fastpg_mem_storage2_row_deleted_by_current_xact_any_cid((uint32_t) RelationGetRelid(rel),
+																		row_id,
+																		&delete_cid))
+			{
+				fastpg_mem_fill_self_modified_tmfd(tid, delete_cid, tmfd);
+				return TM_SelfModified;
+			}
+			resolved_row_id =
+				fastpg_mem_storage2_resolve_update_row_id((uint32_t) RelationGetRelid(rel),
+														  row_id);
+			if (resolved_row_id != row_id)
+				row_id = resolved_row_id;
+		}
 	}
 	else if (!fastpg_mem_tid_to_row_id(rel, tid, &row_id))
 	{
@@ -5037,6 +5509,7 @@ fastpg_mem_tuple_lock(Relation rel,
 		if (fastpg_mem_row_deleted_by_current_xact((uint32_t) RelationGetRelid(rel),
 												   row_id,
 												   cid,
+												   false,
 												   &delete_cid))
 		{
 			fastpg_mem_fill_self_modified_tmfd(tid, delete_cid, tmfd);
@@ -5059,7 +5532,20 @@ fastpg_mem_tuple_lock(Relation rel,
 		}
 	}
 
-	if (fastpg_catalog_mode_uses_postgres() && !storage2)
+	if (fastpg_catalog_mode_uses_postgres() && storage2)
+	{
+		ItemPointerData resolved_tid;
+
+		if (!fastpg_mem_storage2_tid_to_tid(row_id, &resolved_tid))
+			elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+				 (unsigned long long) row_id);
+		if (!fastpg_mem_tuple_fetch_row_version(rel, &resolved_tid, snapshot, slot))
+		{
+			fastpg_mem_fill_deleted_tmfd(tid, tmfd);
+			return TM_Deleted;
+		}
+	}
+	else if (fastpg_catalog_mode_uses_postgres() && !storage2)
 	{
 		ItemPointerData resolved_tid;
 
@@ -5088,7 +5574,10 @@ fastpg_mem_relation_set_new_filelocator(Relation rel,
 										MultiXactId *minmulti)
 {
 	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel)))
+	{
+		fastpg_mem_ensure_write_xact();
 		fastpg_storage2_relation_clear(RelationGetRelid(rel));
+	}
 	else if (fastpg_catalog_mode_uses_postgres() &&
 			 rel->rd_rel->relkind == RELKIND_RELATION)
 		fastpg_rust_relation_clear_transactional(RelationGetRelid(rel));
@@ -5297,6 +5786,12 @@ fastpg_mem_relation_vacuum(Relation rel,
 	pages = fastpg_mem_heap_pages_for_layout(rel, row_count);
 
 	fastpg_mem_set_relation_all_visible(relid, pages > 0);
+	{
+		FastPgMemVisibilityState *visibility =
+			fastpg_mem_relation_visibility_state(relid, true);
+
+		visibility->known_empty = row_count == 0;
+	}
 	rel->rd_rel->relpages = (int32) pages;
 	rel->rd_rel->reltuples = (float4) row_count;
 	rel->rd_rel->relallvisible = (int32) pages;
@@ -5376,6 +5871,26 @@ fastpg_mem_scan_analyze_next_tuple(TableScanDesc scan,
 		!BlockNumberIsValid(fscan->analyze_current_block) ||
 		!OffsetNumberIsValid(fscan->analyze_current_max_offset))
 		return false;
+
+	if (fscan->storage2)
+	{
+		while (fscan->analyze_current_offset <=
+			   fscan->analyze_current_max_offset)
+		{
+			CHECK_FOR_INTERRUPTS();
+			fscan->analyze_current_offset++;
+
+			if (fastpg_mem_scan_getnextslot(scan, ForwardScanDirection, slot))
+			{
+				*liverows += 1;
+				return true;
+			}
+
+			return false;
+		}
+
+		return false;
+	}
 
 	while (fscan->analyze_current_offset <=
 		   fscan->analyze_current_max_offset)
@@ -5790,6 +6305,47 @@ fastpg_mem_relation_size(Relation rel, ForkNumber forkNumber)
 }
 
 static bool
+fastpg_mem_pg_class_planner_stats_by_oid(Oid relid,
+										 int32_t *relpages_out,
+										 float4 *reltuples_out,
+										 int32_t *relallvisible_out)
+{
+	Relation	pg_class;
+	SysScanDesc scan;
+	ScanKeyData key[1];
+	HeapTuple	tuple;
+	bool		found = false;
+
+	if (!fastpg_catalog_mode_uses_postgres() || IsCatalogRelationOid(relid))
+		return false;
+
+	pg_class = table_open(RelationRelationId, AccessShareLock);
+	ScanKeyInit(&key[0],
+				Anum_pg_class_oid,
+				BTEqualStrategyNumber, F_OIDEQ,
+				ObjectIdGetDatum(relid));
+	scan = systable_beginscan(pg_class, ClassOidIndexId, true,
+							  NULL, 1, key);
+	tuple = systable_getnext(scan);
+	if (HeapTupleIsValid(tuple))
+	{
+		Form_pg_class classtup = (Form_pg_class) GETSTRUCT(tuple);
+
+		if (relpages_out != NULL)
+			*relpages_out = classtup->relpages;
+		if (reltuples_out != NULL)
+			*reltuples_out = classtup->reltuples;
+		if (relallvisible_out != NULL)
+			*relallvisible_out = classtup->relallvisible;
+		found = true;
+	}
+	systable_endscan(scan);
+	table_close(pg_class, AccessShareLock);
+
+	return found;
+}
+
+static bool
 fastpg_mem_relation_needs_toast_table(Relation rel)
 {
 	int32		data_length = 0;
@@ -5855,7 +6411,12 @@ fastpg_mem_relation_fetch_toast_slice(Relation toastrel,
 									  int32 slicelength,
 									  varlena *result)
 {
-	fastpg_mem_unsupported("TOAST fetch");
+	heap_fetch_toast_slice(toastrel,
+						   valueid,
+						   attrsize,
+						   sliceoffset,
+						   slicelength,
+						   result);
 }
 
 static void
@@ -5871,6 +6432,9 @@ fastpg_mem_relation_estimate_size(Relation rel,
 	size_t		row_count;
 	BlockNumber layout_pages;
 	bool		storage2;
+	int32_t		catalog_relpages = 0;
+	float4		catalog_reltuples = 0;
+	int32_t		catalog_relallvisible = 0;
 
 	if (fastpg_use_rust_catalog() &&
 		fastpg_rust_catalog_relation_planner_stats_by_oid(relid,
@@ -5884,6 +6448,22 @@ fastpg_mem_relation_estimate_size(Relation rel,
 	}
 
 	storage2 = fastpg_mem_use_storage2_for_relid(relid);
+	if (fastpg_mem_pg_class_planner_stats_by_oid(relid,
+												 &catalog_relpages,
+												 &catalog_reltuples,
+												 &catalog_relallvisible) &&
+		catalog_reltuples >= 0 &&
+		catalog_relpages > 0)
+	{
+		BlockNumber catalog_allvisible =
+			(BlockNumber) Min(catalog_relallvisible, catalog_relpages);
+
+		*pages = (BlockNumber) catalog_relpages;
+		*tuples = (double) catalog_reltuples;
+		*allvisfrac = (double) catalog_allvisible / (double) catalog_relpages;
+		return;
+	}
+
 	if (storage2 &&
 		fastpg_catalog_mode_uses_postgres() &&
 		rel->rd_rel->reltuples >= 0 &&
@@ -5922,6 +6502,18 @@ fastpg_mem_relation_estimate_size(Relation rel,
 		*pages = catalog_relpages;
 		*tuples = (double) rel->rd_rel->reltuples;
 		*allvisfrac = (double) catalog_allvisible / (double) catalog_relpages;
+		return;
+	}
+
+	if (fastpg_catalog_mode_uses_postgres() &&
+		row_count == 0 &&
+		rel->rd_rel->reltuples < 0 &&
+		fastpg_mem_relation_visibility_state(relid, false) != NULL &&
+		fastpg_mem_relation_visibility_state(relid, false)->known_empty)
+	{
+		*pages = 0;
+		*tuples = 0;
+		*allvisfrac = 0;
 		return;
 	}
 
@@ -5984,6 +6576,7 @@ fastpg_mem_scan_bitmap_next_tuple(TableScanDesc scan,
 		while (fscan->bitmap_index < fscan->bitmap_noffsets)
 		{
 			ItemPointerData tid;
+			ItemPointerData fetch_tid;
 			OffsetNumber offset;
 
 			if (fscan->bitmap_result.lossy)
@@ -5993,8 +6586,16 @@ fastpg_mem_scan_bitmap_next_tuple(TableScanDesc scan,
 			fscan->bitmap_index++;
 
 			ItemPointerSet(&tid, fscan->bitmap_result.blockno, offset);
+			fetch_tid = tid;
+			if (!fscan->bitmap_result.lossy)
+			{
+				ItemPointerData resolved_tid;
+
+				if (FastPgMemResolveIndexFetchTid(scan->rs_rd, &tid, &resolved_tid))
+					fetch_tid = resolved_tid;
+			}
 			if (fastpg_mem_tuple_fetch_row_version(scan->rs_rd,
-												   &tid,
+												   &fetch_tid,
 												   scan->rs_snapshot,
 												   slot))
 			{
@@ -6014,9 +6615,10 @@ fastpg_mem_scan_sample_next_block(TableScanDesc scan,
 {
 	FastPgMemScanDesc *fscan = (FastPgMemScanDesc *) scan;
 	TsmRoutine *tsm = scanstate->tsmroutine;
+	Oid			relid = RelationGetRelid(scan->rs_rd);
 	size_t		row_count = fscan->storage2 ?
-		fastpg_storage2_relation_row_count(RelationGetRelid(scan->rs_rd)) :
-		fastpg_rust_relation_row_count(RelationGetRelid(scan->rs_rd));
+		fastpg_storage2_relation_row_count(relid) :
+		fastpg_rust_relation_row_count(relid);
 	BlockNumber blockno;
 
 	fscan->sample_nblocks =
@@ -6047,6 +6649,7 @@ fastpg_mem_scan_sample_next_tuple(TableScanDesc scan,
 	FastPgMemScanDesc *fscan = (FastPgMemScanDesc *) scan;
 	TsmRoutine *tsm = scanstate->tsmroutine;
 	BlockNumber blockno = fscan->sample_block;
+	Oid			relid = RelationGetRelid(scan->rs_rd);
 	size_t		row_count;
 	uint64_t	first_row_index;
 	OffsetNumber maxoffset;
@@ -6055,8 +6658,8 @@ fastpg_mem_scan_sample_next_tuple(TableScanDesc scan,
 		return false;
 
 	row_count = fscan->storage2 ?
-		fastpg_storage2_relation_row_count(RelationGetRelid(scan->rs_rd)) :
-		fastpg_rust_relation_row_count(RelationGetRelid(scan->rs_rd));
+		fastpg_storage2_relation_row_count(relid) :
+		fastpg_rust_relation_row_count(relid);
 	first_row_index =
 		(uint64_t) blockno * fastpg_mem_relation_rows_per_block(scan->rs_rd);
 	if (first_row_index >= row_count)
@@ -6077,7 +6680,19 @@ fastpg_mem_scan_sample_next_tuple(TableScanDesc scan,
 			return false;
 		}
 
-		ItemPointerSet(&tid, blockno, tupoffset);
+		if (fscan->storage2)
+		{
+			uint64_t	packed_tid;
+
+			if (!fastpg_storage2_relation_visible_tid_at(relid,
+														 first_row_index + tupoffset - 1,
+														 &packed_tid))
+				continue;
+			if (!fastpg_mem_storage2_tid_to_tid(packed_tid, &tid))
+				continue;
+		}
+		else
+			ItemPointerSet(&tid, blockno, tupoffset);
 		if (fastpg_mem_tuple_fetch_row_version(scan->rs_rd,
 											   &tid,
 											   scan->rs_snapshot,

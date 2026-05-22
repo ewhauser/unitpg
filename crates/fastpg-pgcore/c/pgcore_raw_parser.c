@@ -1308,6 +1308,18 @@ fastpg_pgcore_start_client_session(void)
 	EventTriggerOnLogin();
 }
 
+void
+fastpg_pgcore_end_client_session(void)
+{
+#ifdef USE_FASTPG
+	if (!fastpg_catalog_mode_uses_postgres() || MyProc == NULL)
+		return;
+
+	fastpg_pgcore_end_notice_capture();
+	FastPgReleaseThreadProc();
+#endif
+}
+
 static bool
 fastpg_pgcore_is_transaction_exit_stmt(Node *parsetree)
 {
@@ -3271,6 +3283,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 				foreach(planned_lc, planned)
 				{
 					PlannedStmt *statement = lfirst_node(PlannedStmt, planned_lc);
+					bool		is_last_planned = lnext(planned, planned_lc) == NULL;
 					FastPgPgCoreExecuteStatement *summary =
 						fastpg_pgcore_next_execute_statement(result,
 															 &statement_capacity,
@@ -3296,6 +3309,8 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 							fastpg_storage2_xact_commit_if_implicit();
 						}
 #endif
+						if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+							CommandCounterIncrement();
 						continue;
 					}
 
@@ -3305,6 +3320,8 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 					{
 						summary->command_tag =
 							(char *) fastpg_pgcore_command_tag_name(statement->commandType);
+						if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+							CommandCounterIncrement();
 						continue;
 					}
 #endif
@@ -3350,10 +3367,14 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 
 					dest->rDestroy(dest);
 					dest = NULL;
+					if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+						CommandCounterIncrement();
 				}
 
 				if (is_last_raw)
 				{
+					if (!is_transaction_stmt)
+						CommandCounterIncrement();
 					EndImplicitTransactionBlock();
 					fastpg_pgcore_finish_postgres_catalog_command(&postgres_command_started);
 					postgres_finish_at_end = false;
@@ -3484,6 +3505,8 @@ finish_statement:
 				{
 					if (use_implicit_block)
 						EndImplicitTransactionBlock();
+					if (!is_transaction_stmt)
+						CommandCounterIncrement();
 					fastpg_pgcore_finish_postgres_catalog_command(&postgres_command_started);
 					postgres_finish_at_end = false;
 				}
@@ -3692,6 +3715,7 @@ fastpg_pgcore_execute_simple(const char *query)
 			foreach(planned_lc, planned)
 			{
 				PlannedStmt *statement = lfirst_node(PlannedStmt, planned_lc);
+				bool		is_last_planned = lnext(planned, planned_lc) == NULL;
 				FastPgPgCoreExecuteStatement *summary =
 					fastpg_pgcore_next_execute_statement(result,
 														 &statement_capacity,
@@ -3717,6 +3741,8 @@ fastpg_pgcore_execute_simple(const char *query)
 						fastpg_storage2_xact_commit_if_implicit();
 					}
 #endif
+					if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+						CommandCounterIncrement();
 					continue;
 				}
 
@@ -3734,6 +3760,8 @@ fastpg_pgcore_execute_simple(const char *query)
 						fastpg_storage2_xact_commit_if_implicit();
 					}
 #endif
+					if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+						CommandCounterIncrement();
 					continue;
 				}
 #endif
@@ -3779,6 +3807,8 @@ fastpg_pgcore_execute_simple(const char *query)
 
 				dest->rDestroy(dest);
 				dest = NULL;
+				if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+					CommandCounterIncrement();
 			}
 
 			if (fastpg_catalog_mode_uses_postgres())
@@ -3787,6 +3817,8 @@ fastpg_pgcore_execute_simple(const char *query)
 				{
 					if (use_implicit_block)
 						EndImplicitTransactionBlock();
+					if (!is_transaction_stmt)
+						CommandCounterIncrement();
 					fastpg_pgcore_finish_postgres_catalog_command(&postgres_command_started);
 					postgres_finish_at_end = false;
 				}

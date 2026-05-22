@@ -87,6 +87,16 @@
 #ifdef USE_FASTPG
 extern bool fastpg_rust_relation_replace_from(uint32_t dst_relid,
 											  uint32_t src_relid);
+extern bool fastpg_storage2_relation_replace_from(uint32_t dst_relid,
+												  uint32_t src_relid);
+
+static bool
+fastpg_rewritten_storage_uses_storage2(void)
+{
+	const char *engine = getenv("FASTPG_STORAGE_ENGINE");
+
+	return engine == NULL || strcmp(engine, "storage2") == 0;
+}
 #endif
 
 /*
@@ -1926,12 +1936,20 @@ finish_heap_swap(Oid OIDOldHeap, Oid OIDNewHeap,
 						frozenXid, cutoffMulti, mapped_tables);
 
 #ifdef USE_FASTPG
-	if (fastpg_replace_rewritten_storage &&
-		!fastpg_rust_relation_replace_from((uint32_t) OIDOldHeap,
-										   (uint32_t) OIDNewHeap))
-		elog(ERROR,
-			 "fastpg failed to replace rewritten relation storage for relation %u",
-			 OIDOldHeap);
+	if (fastpg_replace_rewritten_storage)
+	{
+		bool		replaced;
+
+		replaced = fastpg_rewritten_storage_uses_storage2() ?
+			fastpg_storage2_relation_replace_from((uint32_t) OIDOldHeap,
+												  (uint32_t) OIDNewHeap) :
+			fastpg_rust_relation_replace_from((uint32_t) OIDOldHeap,
+											  (uint32_t) OIDNewHeap);
+		if (!replaced)
+			elog(ERROR,
+				 "fastpg failed to replace rewritten relation storage for relation %u",
+				 OIDOldHeap);
+	}
 #endif
 
 	/*

@@ -91,8 +91,13 @@ typedef struct SimpleEcontextStackEntry
 	struct SimpleEcontextStackEntry *next;	/* next stack entry up */
 } SimpleEcontextStackEntry;
 
+#ifdef USE_FASTPG
+static _Thread_local EState *shared_simple_eval_estate = NULL;
+static _Thread_local SimpleEcontextStackEntry *simple_econtext_stack = NULL;
+#else
 static EState *shared_simple_eval_estate = NULL;
 static SimpleEcontextStackEntry *simple_econtext_stack = NULL;
+#endif
 
 /*
  * In addition to the shared simple-eval EState, we have a shared resource
@@ -102,7 +107,11 @@ static SimpleEcontextStackEntry *simple_econtext_stack = NULL;
  * is used over and over.  (DO blocks use their own resowner, in exactly the
  * same way described above for shared_simple_eval_estate.)
  */
+#ifdef USE_FASTPG
+static _Thread_local ResourceOwner shared_simple_eval_resowner = NULL;
+#else
 static ResourceOwner shared_simple_eval_resowner = NULL;
+#endif
 
 /*
  * Memory management within a plpgsql function generally works with three

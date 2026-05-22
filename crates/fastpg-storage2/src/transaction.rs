@@ -6,10 +6,17 @@ pub(crate) struct TransactionOverlay {
     pub(crate) page_checkpoints: HashMap<u32, BTreeMap<u32, PageCheckpoint>>,
     pub(crate) new_pages: HashMap<u32, BTreeSet<u32>>,
     pub(crate) inserted_tids: HashMap<u32, BTreeSet<Tid>>,
+    pub(crate) inserted_xids: HashMap<u32, BTreeMap<Tid, u32>>,
+    pub(crate) inserted_cids: HashMap<u32, BTreeMap<Tid, u32>>,
     pub(crate) invalidated_tids: HashMap<u32, BTreeSet<Tid>>,
+    pub(crate) invalidated_xids: HashMap<u32, BTreeMap<Tid, u32>>,
+    pub(crate) invalidated_cids: HashMap<u32, BTreeMap<Tid, u32>>,
+    pub(crate) row_xmaxs: HashMap<u32, BTreeMap<Tid, u32>>,
     pub(crate) hot_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
+    pub(crate) update_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
     pub(crate) primary_key_inserts: HashMap<u32, BTreeMap<IndexKey, Tid>>,
     pub(crate) primary_key_deletes: HashMap<u32, BTreeSet<IndexKey>>,
+    pub(crate) cleared_relations: HashMap<u32, RelationStorage>,
 }
 
 impl TransactionOverlay {
@@ -18,10 +25,17 @@ impl TransactionOverlay {
             && self.page_checkpoints.is_empty()
             && self.new_pages.is_empty()
             && self.inserted_tids.is_empty()
+            && self.inserted_xids.is_empty()
+            && self.inserted_cids.is_empty()
             && self.invalidated_tids.is_empty()
+            && self.invalidated_xids.is_empty()
+            && self.invalidated_cids.is_empty()
+            && self.row_xmaxs.is_empty()
             && self.hot_redirect_inserts.is_empty()
+            && self.update_redirect_inserts.is_empty()
             && self.primary_key_inserts.is_empty()
             && self.primary_key_deletes.is_empty()
+            && self.cleared_relations.is_empty()
     }
 
     pub(crate) fn checkpoint_relation(&mut self, relid: u32, relation: &RelationStorage) {
@@ -53,13 +67,54 @@ impl TransactionOverlay {
         self.inserted_tids.entry(relid).or_default().insert(tid);
     }
 
+    pub(crate) fn set_insert_xid(&mut self, relid: u32, tid: Tid, xid: u32) {
+        self.inserted_xids
+            .entry(relid)
+            .or_default()
+            .insert(tid, xid);
+    }
+
+    pub(crate) fn set_insert_cid(&mut self, relid: u32, tid: Tid, cid: u32) {
+        self.inserted_cids
+            .entry(relid)
+            .or_default()
+            .insert(tid, cid);
+    }
+
     pub(crate) fn invalidate(&mut self, relid: u32, tid: Tid) {
         self.invalidated_tids.entry(relid).or_default().insert(tid);
+    }
+
+    pub(crate) fn set_invalidate_xid(&mut self, relid: u32, tid: Tid, xid: u32) {
+        self.invalidated_xids
+            .entry(relid)
+            .or_default()
+            .insert(tid, xid);
+    }
+
+    pub(crate) fn set_invalidate_cid(&mut self, relid: u32, tid: Tid, cid: u32) {
+        self.invalidated_cids
+            .entry(relid)
+            .or_default()
+            .insert(tid, cid);
+    }
+
+    pub(crate) fn set_row_xmax(&mut self, relid: u32, tid: Tid, xmax: u32) {
+        self.row_xmaxs.entry(relid).or_default().insert(tid, xmax);
     }
 
     pub(crate) fn insert_hot_redirect(&mut self, relid: u32, old_tid: Tid, new_tid: Tid) {
         if old_tid != new_tid {
             self.hot_redirect_inserts
+                .entry(relid)
+                .or_default()
+                .insert(old_tid, new_tid);
+        }
+    }
+
+    pub(crate) fn insert_update_redirect(&mut self, relid: u32, old_tid: Tid, new_tid: Tid) {
+        if old_tid != new_tid {
+            self.update_redirect_inserts
                 .entry(relid)
                 .or_default()
                 .insert(old_tid, new_tid);
@@ -78,6 +133,82 @@ impl TransactionOverlay {
             .entry(relid)
             .or_default()
             .insert(key, tid);
+    }
+
+    pub(crate) fn remove_primary_key_insert(&mut self, relid: u32, key: &IndexKey) {
+        if let Some(entries) = self.primary_key_inserts.get_mut(&relid) {
+            entries.remove(key);
+            if entries.is_empty() {
+                self.primary_key_inserts.remove(&relid);
+            }
+        }
+    }
+
+    pub(crate) fn record_relation_clear(&mut self, relid: u32, mut relation: RelationStorage) {
+        if self.cleared_relations.contains_key(&relid) {
+            return;
+        }
+        self.restore_relation_snapshot(relid, &mut relation);
+        self.cleared_relations.insert(relid, relation);
+    }
+
+    pub(crate) fn clear_insert_shadows_invalidation(&self, relid: u32, tid: Tid) -> bool {
+        self.cleared_relations.contains_key(&relid)
+            && self.inserted_cid(relid, tid).is_some_and(|insert_cid| {
+                insert_shadows_invalidation(insert_cid, self.invalidated_cid(relid, tid))
+            })
+    }
+
+    pub(crate) fn inserted_cid(&self, relid: u32, tid: Tid) -> Option<u32> {
+        if !self
+            .inserted_tids
+            .get(&relid)
+            .is_some_and(|tids| tids.contains(&tid))
+        {
+            return None;
+        }
+        Some(
+            self.inserted_cids
+                .get(&relid)
+                .and_then(|cids| cids.get(&tid))
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn invalidated_cid(&self, relid: u32, tid: Tid) -> Option<u32> {
+        if !self
+            .invalidated_tids
+            .get(&relid)
+            .is_some_and(|tids| tids.contains(&tid))
+        {
+            return None;
+        }
+        Some(
+            self.invalidated_cids
+                .get(&relid)
+                .and_then(|cids| cids.get(&tid))
+                .copied()
+                .unwrap_or_default(),
+        )
+    }
+
+    pub(crate) fn restore_relation_snapshot(&self, relid: u32, relation: &mut RelationStorage) {
+        if let Some(blocks) = self.new_pages.get(&relid) {
+            for block in blocks {
+                relation.mark_page_dead(*block);
+            }
+        }
+        if let Some(checkpoints) = self.page_checkpoints.get(&relid) {
+            for (block, checkpoint) in checkpoints {
+                if let Some(page) = relation.page_mut(*block) {
+                    page.restore_to_preserving_tid_space(checkpoint);
+                }
+            }
+        }
+        if let Some(checkpoint) = self.relation_checkpoints.get(&relid) {
+            relation.restore_metadata_preserving_tid_space(*checkpoint);
+        }
     }
 
     pub(crate) fn has_visibility_deltas(&self, relid: u32) -> bool {
@@ -120,11 +251,32 @@ impl TransactionOverlay {
         for (relid, tids) in other.inserted_tids.drain() {
             self.inserted_tids.entry(relid).or_default().extend(tids);
         }
+        for (relid, xids) in other.inserted_xids.drain() {
+            self.inserted_xids.entry(relid).or_default().extend(xids);
+        }
+        for (relid, cids) in other.inserted_cids.drain() {
+            self.inserted_cids.entry(relid).or_default().extend(cids);
+        }
         for (relid, tids) in other.invalidated_tids.drain() {
             self.invalidated_tids.entry(relid).or_default().extend(tids);
         }
+        for (relid, xids) in other.invalidated_xids.drain() {
+            self.invalidated_xids.entry(relid).or_default().extend(xids);
+        }
+        for (relid, cids) in other.invalidated_cids.drain() {
+            self.invalidated_cids.entry(relid).or_default().extend(cids);
+        }
+        for (relid, xmaxs) in other.row_xmaxs.drain() {
+            self.row_xmaxs.entry(relid).or_default().extend(xmaxs);
+        }
         for (relid, redirects) in other.hot_redirect_inserts.drain() {
             self.hot_redirect_inserts
+                .entry(relid)
+                .or_default()
+                .extend(redirects);
+        }
+        for (relid, redirects) in other.update_redirect_inserts.drain() {
+            self.update_redirect_inserts
                 .entry(relid)
                 .or_default()
                 .extend(redirects);
@@ -140,6 +292,12 @@ impl TransactionOverlay {
                 .entry(relid)
                 .or_default()
                 .extend(entries);
+        }
+        for (relid, mut relation) in other.cleared_relations.drain() {
+            if !self.cleared_relations.contains_key(&relid) {
+                self.restore_relation_snapshot(relid, &mut relation);
+                self.cleared_relations.insert(relid, relation);
+            }
         }
     }
 
@@ -180,7 +338,16 @@ impl TransactionOverlay {
                     .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
             })
             .sum::<usize>();
-        inserts + deletes + redirects
+        let update_redirects = self
+            .update_redirect_inserts
+            .values()
+            .map(|entries| {
+                entries
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
+            })
+            .sum::<usize>();
+        inserts + deletes + redirects + update_redirects
     }
 }
 
@@ -369,17 +536,87 @@ pub(crate) fn overlays_own_inserted_tid(
     })
 }
 
+pub(crate) fn overlay_inserted_cid(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> Option<u32> {
+    overlays.iter().rev().find_map(|overlay| {
+        if !overlay
+            .inserted_tids
+            .get(&relid)
+            .is_some_and(|tids| tids.contains(&tid))
+        {
+            return None;
+        }
+        Some(
+            overlay
+                .inserted_cids
+                .get(&relid)
+                .and_then(|cids| cids.get(&tid))
+                .copied()
+                .unwrap_or_default(),
+        )
+    })
+}
+
+pub(crate) fn overlays_own_inserted_tid_before(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+    curcid: u32,
+) -> bool {
+    overlay_inserted_cid(overlays, relid, tid).is_some_and(|cid| cid < curcid)
+}
+
 pub(crate) fn overlays_invalidate_tid(
     overlays: &[TransactionOverlay],
     relid: u32,
     tid: Tid,
 ) -> bool {
-    overlays.iter().rev().any(|overlay| {
-        overlay
-            .invalidated_tids
-            .get(&relid)
-            .is_some_and(|tids| tids.contains(&tid))
-    })
+    let mut later_insert_cid = None;
+    for overlay in overlays.iter().rev() {
+        if let Some(insert_cid) = overlay.inserted_cid(relid, tid) {
+            later_insert_cid = Some(insert_cid);
+        }
+        if let Some(invalidated_cid) = overlay.invalidated_cid(relid, tid) {
+            return !(overlay.cleared_relations.contains_key(&relid)
+                && later_insert_cid.is_some_and(|insert_cid| {
+                    insert_shadows_invalidation(insert_cid, Some(invalidated_cid))
+                }));
+        }
+    }
+    false
+}
+
+pub(crate) fn overlays_invalidate_tid_before(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+    curcid: u32,
+) -> bool {
+    let mut later_insert_cid = None;
+    for overlay in overlays.iter().rev() {
+        if let Some(insert_cid) = overlay.inserted_cid(relid, tid)
+            && insert_cid < curcid
+        {
+            later_insert_cid = Some(insert_cid);
+        }
+        if let Some(invalidated_cid) = overlay.invalidated_cid(relid, tid)
+            && invalidated_cid < curcid
+        {
+            return !(overlay.cleared_relations.contains_key(&relid)
+                && later_insert_cid.is_some_and(|insert_cid| {
+                    insert_shadows_invalidation(insert_cid, Some(invalidated_cid))
+                }));
+        }
+    }
+    false
+}
+
+fn insert_shadows_invalidation(insert_cid: u32, invalidated_cid: Option<u32>) -> bool {
+    let invalidated_cid = invalidated_cid.unwrap_or_default();
+    insert_cid > invalidated_cid || (insert_cid == 0 && invalidated_cid == 0)
 }
 
 pub(crate) fn overlay_tid_redirect(
@@ -390,6 +627,20 @@ pub(crate) fn overlay_tid_redirect(
     overlays.iter().rev().find_map(|overlay| {
         overlay
             .hot_redirect_inserts
+            .get(&relid)
+            .and_then(|redirects| redirects.get(&tid))
+            .copied()
+    })
+}
+
+pub(crate) fn overlay_update_redirect(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> Option<Tid> {
+    overlays.iter().rev().find_map(|overlay| {
+        overlay
+            .update_redirect_inserts
             .get(&relid)
             .and_then(|redirects| redirects.get(&tid))
             .copied()

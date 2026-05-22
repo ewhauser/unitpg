@@ -89,8 +89,14 @@ extern uint32_t fastpg_rust_relation_row_delete_xid(uint32_t relid,
 													uint64_t row_id);
 extern uint32_t fastpg_rust_relation_row_cmin(uint32_t relid, uint64_t row_id);
 extern bool fastpg_rust_relation_contains_row(uint32_t relid, uint64_t row_id);
+extern uint32_t fastpg_storage2_relation_row_xmin(uint32_t relid, uint64_t row_id);
+extern uint32_t fastpg_storage2_relation_row_xmax(uint32_t relid, uint64_t row_id);
+extern uint32_t fastpg_storage2_relation_row_delete_xid(uint32_t relid,
+														uint64_t row_id);
+extern uint32_t fastpg_storage2_relation_row_cmin(uint32_t relid, uint64_t row_id);
 extern bool fastpg_mem_tableoid_tid_to_row_id(uint32_t relid, ItemPointer tid,
 											  uint64_t *row_id);
+extern bool fastpg_mem_tableoid_uses_storage2(uint32_t relid);
 
 static bool
 fastpg_slot_system_attrs_available(TupleTableSlot *slot)
@@ -110,6 +116,38 @@ fastpg_slot_system_attrs_available(TupleTableSlot *slot)
 		return false;
 
 	return true;
+}
+
+static uint32_t
+fastpg_slot_row_xmin(uint32_t relid, uint64_t row_id)
+{
+	return fastpg_mem_tableoid_uses_storage2(relid) ?
+		fastpg_storage2_relation_row_xmin(relid, row_id) :
+		fastpg_rust_relation_row_xmin(relid, row_id);
+}
+
+static uint32_t
+fastpg_slot_row_xmax(uint32_t relid, uint64_t row_id)
+{
+	return fastpg_mem_tableoid_uses_storage2(relid) ?
+		fastpg_storage2_relation_row_xmax(relid, row_id) :
+		fastpg_rust_relation_row_xmax(relid, row_id);
+}
+
+static uint32_t
+fastpg_slot_row_delete_xid(uint32_t relid, uint64_t row_id)
+{
+	return fastpg_mem_tableoid_uses_storage2(relid) ?
+		fastpg_storage2_relation_row_delete_xid(relid, row_id) :
+		fastpg_rust_relation_row_delete_xid(relid, row_id);
+}
+
+static uint32_t
+fastpg_slot_row_cmin(uint32_t relid, uint64_t row_id)
+{
+	return fastpg_mem_tableoid_uses_storage2(relid) ?
+		fastpg_storage2_relation_row_cmin(relid, row_id) :
+		fastpg_rust_relation_row_cmin(relid, row_id);
 }
 #endif
 
@@ -190,7 +228,7 @@ tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 														   &slot->tts_tid,
 														   &row_id))
 						break;
-					xmin = fastpg_rust_relation_row_xmin((uint32_t) slot->tts_tableOid,
+					xmin = fastpg_slot_row_xmin((uint32_t) slot->tts_tableOid,
 														 row_id);
 					if (xmin != 0)
 					{
@@ -212,14 +250,14 @@ tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 														   &slot->tts_tid,
 														   &row_id))
 						break;
-					xmax = fastpg_rust_relation_row_xmax((uint32_t) slot->tts_tableOid,
+					xmax = fastpg_slot_row_xmax((uint32_t) slot->tts_tableOid,
 														 row_id);
 					if (xmax != 0)
 					{
 						*isnull = false;
 						return TransactionIdGetDatum(xmax);
 					}
-					xmax = fastpg_rust_relation_row_delete_xid((uint32_t) slot->tts_tableOid,
+					xmax = fastpg_slot_row_delete_xid((uint32_t) slot->tts_tableOid,
 															   row_id);
 					if (xmax != 0)
 					{
@@ -241,7 +279,7 @@ tts_virtual_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 														   &slot->tts_tid,
 														   &row_id))
 						break;
-					cmin = fastpg_rust_relation_row_cmin((uint32_t) slot->tts_tableOid,
+					cmin = fastpg_slot_row_cmin((uint32_t) slot->tts_tableOid,
 														 row_id);
 					*isnull = false;
 					return CommandIdGetDatum(cmin);
@@ -501,7 +539,7 @@ tts_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 					{
 						uint32_t	xmin;
 
-						xmin = fastpg_rust_relation_row_xmin((uint32_t) slot->tts_tableOid,
+						xmin = fastpg_slot_row_xmin((uint32_t) slot->tts_tableOid,
 															 row_id);
 						*isnull = false;
 						return TransactionIdGetDatum(xmin != 0 ? xmin : GetCurrentTransactionId());
@@ -510,14 +548,14 @@ tts_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 					{
 						uint32_t	xmax;
 
-						xmax = fastpg_rust_relation_row_xmax((uint32_t) slot->tts_tableOid,
+						xmax = fastpg_slot_row_xmax((uint32_t) slot->tts_tableOid,
 															 row_id);
 						if (xmax != 0)
 						{
 							*isnull = false;
 							return TransactionIdGetDatum(xmax);
 						}
-						xmax = fastpg_rust_relation_row_delete_xid((uint32_t) slot->tts_tableOid,
+						xmax = fastpg_slot_row_delete_xid((uint32_t) slot->tts_tableOid,
 																   row_id);
 						if (xmax != 0)
 						{
@@ -531,7 +569,7 @@ tts_heap_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 					{
 						uint32_t	cmin;
 
-						cmin = fastpg_rust_relation_row_cmin((uint32_t) slot->tts_tableOid,
+						cmin = fastpg_slot_row_cmin((uint32_t) slot->tts_tableOid,
 															 row_id);
 						*isnull = false;
 						return CommandIdGetDatum(cmin);
@@ -764,7 +802,7 @@ tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 					{
 						uint32_t	xmin;
 
-						xmin = fastpg_rust_relation_row_xmin((uint32_t) slot->tts_tableOid,
+						xmin = fastpg_slot_row_xmin((uint32_t) slot->tts_tableOid,
 															 row_id);
 						*isnull = false;
 						return TransactionIdGetDatum(xmin != 0 ? xmin : GetCurrentTransactionId());
@@ -773,14 +811,14 @@ tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 					{
 						uint32_t	xmax;
 
-						xmax = fastpg_rust_relation_row_xmax((uint32_t) slot->tts_tableOid,
+						xmax = fastpg_slot_row_xmax((uint32_t) slot->tts_tableOid,
 															 row_id);
 						if (xmax != 0)
 						{
 							*isnull = false;
 							return TransactionIdGetDatum(xmax);
 						}
-						xmax = fastpg_rust_relation_row_delete_xid((uint32_t) slot->tts_tableOid,
+						xmax = fastpg_slot_row_delete_xid((uint32_t) slot->tts_tableOid,
 																   row_id);
 						if (xmax != 0)
 						{
@@ -794,7 +832,7 @@ tts_minimal_getsysattr(TupleTableSlot *slot, int attnum, bool *isnull)
 					{
 						uint32_t	cmin;
 
-						cmin = fastpg_rust_relation_row_cmin((uint32_t) slot->tts_tableOid,
+						cmin = fastpg_slot_row_cmin((uint32_t) slot->tts_tableOid,
 															 row_id);
 						*isnull = false;
 						return CommandIdGetDatum(cmin);

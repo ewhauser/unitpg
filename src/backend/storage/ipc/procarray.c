@@ -648,6 +648,28 @@ ProcArrayRemove(PGPROC *proc, TransactionId latestXid)
 	LWLockRelease(ProcArrayLock);
 }
 
+#ifdef USE_FASTPG
+bool
+FastPgProcArrayContains(PGPROC *proc)
+{
+	ProcArrayStruct *arrayP = procArray;
+	int			pgxactoff;
+	bool		contains;
+
+	if (proc == NULL || arrayP == NULL)
+		return false;
+
+	LWLockAcquire(ProcArrayLock, LW_SHARED);
+	pgxactoff = proc->pgxactoff;
+	contains = pgxactoff >= 0 &&
+		pgxactoff < arrayP->numProcs &&
+		arrayP->pgprocnos[pgxactoff] == GetNumberFromPGProc(proc);
+	LWLockRelease(ProcArrayLock);
+
+	return contains;
+}
+#endif
+
 
 /*
  * ProcArrayEndTransaction -- mark a transaction as no longer running

@@ -193,6 +193,9 @@ bool
 IsInplaceUpdateOid(Oid relid)
 {
 	return (relid == RelationRelationId ||
+#ifdef USE_FASTPG
+			relid == IndexRelationId ||
+#endif
 			relid == DatabaseRelationId);
 }
 

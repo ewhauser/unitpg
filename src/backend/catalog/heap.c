@@ -31,6 +31,7 @@
 
 #include "access/genam.h"
 #ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
 #endif
 #include "access/multixact.h"
@@ -74,6 +75,7 @@
 #include "storage/predicate.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -2075,6 +2077,39 @@ RelationClearMissing(Relation rel)
 
 	/* Get a lock on pg_attribute */
 	attr_rel = table_open(AttributeRelationId, RowExclusiveLock);
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		ScanKeyData key[1];
+		SysScanDesc scan;
+
+		ScanKeyInit(&key[0],
+					Anum_pg_attribute_attrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(relid));
+
+		scan = systable_beginscan(attr_rel, AttributeRelidNumIndexId, true,
+								  NULL, 1, key);
+		while (HeapTupleIsValid(tuple = systable_getnext(scan)))
+		{
+			attrtuple = (Form_pg_attribute) GETSTRUCT(tuple);
+			if (attrtuple->attnum <= 0 ||
+				attrtuple->attnum > natts ||
+				!attrtuple->atthasmissing)
+				continue;
+
+			newtuple = heap_modify_tuple(tuple, RelationGetDescr(attr_rel),
+										 repl_val, repl_null, repl_repl);
+			CatalogTupleUpdate(attr_rel, &newtuple->t_self, newtuple);
+			heap_freetuple(newtuple);
+		}
+		systable_endscan(scan);
+		CatalogCacheFlushCatalog(AttributeRelationId);
+		table_close(attr_rel, RowExclusiveLock);
+		return;
+	}
+#endif
 
 	/* process each non-system attribute, including any dropped columns */
 	for (attnum = 1; attnum <= natts; attnum++)

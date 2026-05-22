@@ -1,10 +1,16 @@
 use crate::*;
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct RelationStorage {
     pub(crate) pages: Vec<Option<Page>>,
     pub(crate) primary_key_index: BTreeMap<IndexKey, Tid>,
     pub(crate) hot_redirects: BTreeMap<Tid, Tid>,
+    pub(crate) update_redirects: BTreeMap<Tid, Tid>,
+    pub(crate) row_xmins: BTreeMap<Tid, u32>,
+    pub(crate) row_cmins: BTreeMap<Tid, u32>,
+    pub(crate) row_xmaxs: BTreeMap<Tid, u32>,
+    pub(crate) row_delete_xids: BTreeMap<Tid, u32>,
+    pub(crate) row_delete_cids: BTreeMap<Tid, u32>,
     pub(crate) next_block: u32,
     pub(crate) append_hint: Option<u32>,
     pub(crate) live_tuple_count: usize,
@@ -13,6 +19,7 @@ pub(crate) struct RelationStorage {
     pub(crate) live_tuple_bytes: usize,
     pub(crate) pending_tuple_bytes: usize,
     pub(crate) dead_tuple_bytes: usize,
+    pub(crate) max_tuples_per_block: Option<u16>,
 }
 
 impl RelationStorage {
@@ -27,19 +34,21 @@ impl RelationStorage {
             live_tuple_bytes: self.live_tuple_bytes,
             pending_tuple_bytes: self.pending_tuple_bytes,
             dead_tuple_bytes: self.dead_tuple_bytes,
+            max_tuples_per_block: self.max_tuples_per_block,
         }
     }
 
-    pub(crate) fn restore_metadata(&mut self, checkpoint: RelationCheckpoint) {
-        self.pages.truncate(checkpoint.pages_len);
-        self.next_block = checkpoint.next_block;
-        self.append_hint = checkpoint.append_hint;
-        self.live_tuple_count = checkpoint.live_tuple_count;
-        self.pending_tuple_count = checkpoint.pending_tuple_count;
-        self.dead_tuple_count = checkpoint.dead_tuple_count;
-        self.live_tuple_bytes = checkpoint.live_tuple_bytes;
-        self.pending_tuple_bytes = checkpoint.pending_tuple_bytes;
-        self.dead_tuple_bytes = checkpoint.dead_tuple_bytes;
+    pub(crate) fn restore_metadata_preserving_tid_space(&mut self, checkpoint: RelationCheckpoint) {
+        self.next_block = self
+            .next_block
+            .max(checkpoint.next_block)
+            .max(u32::try_from(self.pages.len()).unwrap_or(u32::MAX));
+        self.append_hint = checkpoint.append_hint.filter(|block| {
+            self.page(*block)
+                .is_some_and(|page| self.page_can_accept_tuple(page, 1))
+        });
+        self.max_tuples_per_block = checkpoint.max_tuples_per_block;
+        self.recompute_tuple_stats();
     }
 
     pub(crate) fn reserve_block(&mut self) -> Option<u32> {
@@ -53,15 +62,15 @@ impl RelationStorage {
         if self.pages.len() <= block {
             self.pages.resize_with(block + 1, || None);
         }
-        if page.can_fit(1) {
+        if self.page_can_accept_tuple(&page, 1) {
             self.append_hint = Some(page.block);
         }
         self.pages[block] = Some(page);
     }
 
-    pub(crate) fn remove_page(&mut self, block: u32) {
-        if let Some(slot) = self.pages.get_mut(block as usize) {
-            *slot = None;
+    pub(crate) fn mark_page_dead(&mut self, block: u32) {
+        if let Some(page) = self.page_mut(block) {
+            page.mark_all_dead();
         }
         if self.append_hint == Some(block) {
             self.append_hint = None;
@@ -79,6 +88,10 @@ impl RelationStorage {
     pub(crate) fn tuple_slice(&self, tid: Tid, include_pending: bool) -> Option<&[u8]> {
         self.page(tid.block)?
             .tuple_slice(tid.offset, include_pending)
+    }
+
+    pub(crate) fn tuple_slice_any(&self, tid: Tid) -> Option<&[u8]> {
+        self.page(tid.block)?.tuple_slice_any(tid.offset)
     }
 
     pub(crate) fn mark_dead(&mut self, tid: Tid) -> bool {
@@ -139,7 +152,9 @@ impl RelationStorage {
         generation: u64,
     ) -> Option<u32> {
         if let Some(block) = self.append_hint
-            && self.page(block).is_some_and(|page| page.can_fit(tuple_len))
+            && self
+                .page(block)
+                .is_some_and(|page| self.page_can_accept_tuple(page, tuple_len))
         {
             return Some(block);
         }
@@ -150,7 +165,7 @@ impl RelationStorage {
             .enumerate()
             .rev()
             .filter_map(|(block, page)| Some((u32::try_from(block).ok()?, page.as_ref()?)))
-            .find(|(_, page)| page.can_fit(tuple_len))
+            .find(|(_, page)| self.page_can_accept_tuple(page, tuple_len))
         {
             self.append_hint = Some(block);
             return Some(block);
@@ -163,10 +178,14 @@ impl RelationStorage {
     }
 
     pub(crate) fn append_pending_tuple(&mut self, block: u32, tuple: &[u8]) -> Option<Tid> {
+        let max_tuples_per_block = self.max_tuples_per_block;
         let (tid, can_fit_more) = {
             let page = self.page_mut(block)?;
             let tid = page.append_tuple_with_state(tuple, LinePointerState::Pending)?;
-            (tid, page.can_fit(1))
+            let can_fit_more = page.can_fit(1)
+                && max_tuples_per_block
+                    .is_none_or(|max| page.line_pointers.len() < usize::from(max));
+            (tid, can_fit_more)
         };
         self.pending_tuple_count = self.pending_tuple_count.saturating_add(1);
         self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(tuple.len());
@@ -201,6 +220,55 @@ impl RelationStorage {
         self.pages.iter().filter(|page| page.is_some()).count()
     }
 
+    pub(crate) fn block_count(&self) -> usize {
+        self.next_block as usize
+    }
+
+    pub(crate) fn set_max_tuples_per_block(&mut self, max_tuples: u16) {
+        let max_tuples = max_tuples.clamp(1, MAX_CTID_OFFSET as u16);
+        self.max_tuples_per_block = Some(max_tuples);
+        self.append_hint = self.append_hint.filter(|block| {
+            self.page(*block)
+                .is_some_and(|page| self.page_can_accept_tuple(page, 1))
+        });
+    }
+
+    fn page_can_accept_tuple(&self, page: &Page, tuple_len: usize) -> bool {
+        page.can_fit(tuple_len)
+            && self
+                .max_tuples_per_block
+                .is_none_or(|max| page.line_pointers.len() < usize::from(max))
+    }
+
+    fn recompute_tuple_stats(&mut self) {
+        self.live_tuple_count = 0;
+        self.pending_tuple_count = 0;
+        self.dead_tuple_count = 0;
+        self.live_tuple_bytes = 0;
+        self.pending_tuple_bytes = 0;
+        self.dead_tuple_bytes = 0;
+
+        for page in self.pages.iter().filter_map(Option::as_ref) {
+            for line in &page.line_pointers {
+                let len = line.len as usize;
+                match line.state {
+                    LinePointerState::Pending => {
+                        self.pending_tuple_count = self.pending_tuple_count.saturating_add(1);
+                        self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(len);
+                    }
+                    LinePointerState::Live => {
+                        self.live_tuple_count = self.live_tuple_count.saturating_add(1);
+                        self.live_tuple_bytes = self.live_tuple_bytes.saturating_add(len);
+                    }
+                    LinePointerState::Dead => {
+                        self.dead_tuple_count = self.dead_tuple_count.saturating_add(1);
+                        self.dead_tuple_bytes = self.dead_tuple_bytes.saturating_add(len);
+                    }
+                }
+            }
+        }
+    }
+
     pub(crate) fn index_bytes(&self) -> usize {
         self.primary_key_index
             .keys()
@@ -208,6 +276,10 @@ impl RelationStorage {
             .sum::<usize>()
             + self
                 .hot_redirects
+                .len()
+                .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
+            + self
+                .update_redirects
                 .len()
                 .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
     }
@@ -224,4 +296,5 @@ pub(crate) struct RelationCheckpoint {
     pub(crate) live_tuple_bytes: usize,
     pub(crate) pending_tuple_bytes: usize,
     pub(crate) dead_tuple_bytes: usize,
+    pub(crate) max_tuples_per_block: Option<u16>,
 }

@@ -17,6 +17,31 @@
 #include "utils/backend_status.h"
 #include "utils/fastpg_pgstat_noop.h"
 
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+static _Thread_local ProgressCommandType fastpg_noop_progress_command =
+	PROGRESS_COMMAND_INVALID;
+static _Thread_local Oid fastpg_noop_progress_relid = InvalidOid;
+static _Thread_local int64 fastpg_noop_progress_param[PGSTAT_NUM_PROGRESS_PARAM];
+#endif
+
+bool
+fastpg_pgstat_noop_progress_snapshot(ProgressCommandType *cmdtype, Oid *relid,
+									 int64 *params)
+{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+	if (!fastpg_pgstat_noop_active() ||
+		fastpg_noop_progress_command == PROGRESS_COMMAND_INVALID)
+		return false;
+
+	*cmdtype = fastpg_noop_progress_command;
+	*relid = fastpg_noop_progress_relid;
+	memcpy(params, fastpg_noop_progress_param, sizeof(fastpg_noop_progress_param));
+	return true;
+#else
+	return false;
+#endif
+}
+
 
 /*-----------
  * pgstat_progress_start_command() -
@@ -31,7 +56,14 @@ pgstat_progress_start_command(ProgressCommandType cmdtype, Oid relid)
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	if (fastpg_pgstat_noop_active())
+	{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+		fastpg_noop_progress_command = cmdtype;
+		fastpg_noop_progress_relid = relid;
+		MemSet(fastpg_noop_progress_param, 0, sizeof(fastpg_noop_progress_param));
+#endif
 		return;
+	}
 
 	if (!beentry || !pgstat_track_activities)
 		return;
@@ -55,7 +87,13 @@ pgstat_progress_update_param(int index, int64 val)
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	if (fastpg_pgstat_noop_active())
+	{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+		Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
+		fastpg_noop_progress_param[index] = val;
+#endif
 		return;
+	}
 
 	Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
 
@@ -79,7 +117,13 @@ pgstat_progress_incr_param(int index, int64 incr)
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	if (fastpg_pgstat_noop_active())
+	{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+		Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
+		fastpg_noop_progress_param[index] += incr;
+#endif
 		return;
+	}
 
 	Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
 
@@ -102,7 +146,10 @@ void
 pgstat_progress_parallel_incr_param(int index, int64 incr)
 {
 	if (fastpg_pgstat_noop_active())
+	{
+		pgstat_progress_incr_param(index, incr);
 		return;
+	}
 
 	/*
 	 * Parallel workers notify a leader through a PqMsg_Progress message to
@@ -139,7 +186,16 @@ pgstat_progress_update_multi_param(int nparam, const int *index,
 	int			i;
 
 	if (fastpg_pgstat_noop_active())
+	{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+		for (i = 0; i < nparam; ++i)
+		{
+			Assert(index[i] >= 0 && index[i] < PGSTAT_NUM_PROGRESS_PARAM);
+			fastpg_noop_progress_param[index[i]] = val[i];
+		}
+#endif
 		return;
+	}
 
 	if (!beentry || !pgstat_track_activities || nparam == 0)
 		return;
@@ -169,7 +225,13 @@ pgstat_progress_end_command(void)
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
 	if (fastpg_pgstat_noop_active())
+	{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+		fastpg_noop_progress_command = PROGRESS_COMMAND_INVALID;
+		fastpg_noop_progress_relid = InvalidOid;
+#endif
 		return;
+	}
 
 	if (!beentry || !pgstat_track_activities)
 		return;
