@@ -29,6 +29,7 @@
 #include "storage/bufmgr.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 
@@ -56,6 +57,9 @@ void
 pgstat_count_backend_io_op_time(IOObject io_object, IOContext io_context,
 								IOOp io_op, instr_time io_time)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(track_io_timing || track_wal_io_timing);
 
 	if (!pgstat_tracks_backend_bktype(MyBackendType))
@@ -74,6 +78,9 @@ void
 pgstat_count_backend_io_op(IOObject io_object, IOContext io_context,
 						   IOOp io_op, uint32 cnt, uint64 bytes)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!pgstat_tracks_backend_bktype(MyBackendType))
 		return;
 
@@ -93,6 +100,9 @@ PgStat_Backend *
 pgstat_fetch_stat_backend(ProcNumber procNumber)
 {
 	PgStat_Backend *backend_entry;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	backend_entry = (PgStat_Backend *) pgstat_fetch_entry(PGSTAT_KIND_BACKEND,
 														  InvalidOid, procNumber,
@@ -115,6 +125,13 @@ pgstat_fetch_stat_backend_by_pid(int pid, BackendType *bktype)
 	PgBackendStatus *beentry;
 	ProcNumber	procNumber;
 	PgStat_Backend *backend_stats;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		if (bktype)
+			*bktype = B_INVALID;
+		return NULL;
+	}
 
 	proc = BackendPidGetProc(pid);
 	if (bktype)
@@ -169,6 +186,9 @@ pgstat_flush_backend_entry_io(PgStat_EntryRef *entry_ref)
 	PgStatShared_Backend *shbackendent;
 	PgStat_BktypeIO *bktype_shstats;
 	PgStat_PendingIO pending_io;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/*
 	 * This function can be called even if nothing at all has happened for IO
@@ -230,6 +250,9 @@ pgstat_flush_backend_entry_wal(PgStat_EntryRef *entry_ref)
 	PgStat_WalCounters *bktype_shstats;
 	WalUsage	wal_usage_diff = {0};
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/*
 	 * This function can be called even if nothing at all has happened for WAL
 	 * statistics.  In this case, avoid unnecessarily modifying the stats
@@ -273,6 +296,9 @@ pgstat_flush_backend(bool nowait, uint32 flags)
 {
 	PgStat_EntryRef *entry_ref;
 	bool		has_pending_data = false;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
 
 	if (!pgstat_tracks_backend_bktype(MyBackendType))
 		return false;
@@ -326,6 +352,9 @@ pgstat_create_backend(ProcNumber procnum)
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Backend *shstatent;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	entry_ref = pgstat_get_entry_ref_locked(PGSTAT_KIND_BACKEND, InvalidOid,
 											procnum, false);
 	shstatent = (PgStatShared_Backend *) entry_ref->shared_stats;
@@ -366,6 +395,9 @@ pgstat_create_backend(ProcNumber procnum)
 bool
 pgstat_tracks_backend_bktype(BackendType bktype)
 {
+	if (fastpg_pgstat_noop_active())
+		return false;
+
 	/*
 	 * List every type so that new backend types trigger a warning about
 	 * needing to adjust this switch.
@@ -403,5 +435,8 @@ pgstat_tracks_backend_bktype(BackendType bktype)
 void
 pgstat_backend_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	((PgStatShared_Backend *) header)->stats.stat_reset_timestamp = ts;
 }

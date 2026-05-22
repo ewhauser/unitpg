@@ -22,6 +22,7 @@
 #include "access/xact.h"
 #include "catalog/catalog.h"
 #include "miscadmin.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 #include "utils/rel.h"
@@ -54,8 +55,9 @@ static void restore_truncdrop_counters(PgStat_TableXactStatus *trans);
 static bool
 fastpg_skip_relation_stats(Relation rel)
 {
-	return !IsUnderPostmaster &&
-		(!fastpg_catalog_mode_uses_postgres() || IsCatalogRelation(rel));
+	return fastpg_pgstat_noop_active() ||
+		(!IsUnderPostmaster &&
+		 (!fastpg_catalog_mode_uses_postgres() || IsCatalogRelation(rel)));
 }
 #endif
 
@@ -517,6 +519,9 @@ pgstat_update_heap_dead_tuples(Relation rel, int delta)
 PgStat_StatTabEntry *
 pgstat_fetch_stat_tabentry(Oid relid)
 {
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	return pgstat_fetch_stat_tabentry_ext(IsSharedRelation(relid), relid, NULL);
 }
 
@@ -529,6 +534,13 @@ PgStat_StatTabEntry *
 pgstat_fetch_stat_tabentry_ext(bool shared, Oid reloid, bool *may_free)
 {
 	Oid			dboid = (shared ? InvalidOid : MyDatabaseId);
+
+	if (fastpg_pgstat_noop_active())
+	{
+		if (may_free)
+			*may_free = false;
+		return NULL;
+	}
 
 	return (PgStat_StatTabEntry *)
 		pgstat_fetch_entry(PGSTAT_KIND_RELATION, dboid, reloid, may_free);
@@ -553,6 +565,9 @@ find_tabstat_entry(Oid rel_id)
 	PgStat_TableXactStatus *trans;
 	PgStat_TableStatus *tabentry = NULL;
 	PgStat_TableStatus *tablestatus = NULL;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	entry_ref = pgstat_fetch_pending_entry(PGSTAT_KIND_RELATION, MyDatabaseId, rel_id);
 	if (!entry_ref)
@@ -600,6 +615,9 @@ void
 AtEOXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit)
 {
 	PgStat_TableXactStatus *trans;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	for (trans = xact_state->first; trans != NULL; trans = trans->next)
 	{
@@ -659,6 +677,9 @@ AtEOSubXact_PgStat_Relations(PgStat_SubXactStatus *xact_state, bool isCommit, in
 {
 	PgStat_TableXactStatus *trans;
 	PgStat_TableXactStatus *next_trans;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	for (trans = xact_state->first; trans != NULL; trans = next_trans)
 	{
@@ -740,6 +761,9 @@ AtPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state)
 {
 	PgStat_TableXactStatus *trans;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	for (trans = xact_state->first; trans != NULL; trans = trans->next)
 	{
 		PgStat_TableStatus *tabstat PG_USED_FOR_ASSERTS_ONLY;
@@ -778,6 +802,9 @@ PostPrepare_PgStat_Relations(PgStat_SubXactStatus *xact_state)
 {
 	PgStat_TableXactStatus *trans;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	for (trans = xact_state->first; trans != NULL; trans = trans->next)
 	{
 		PgStat_TableStatus *tabstat;
@@ -798,6 +825,9 @@ pgstat_twophase_postcommit(FullTransactionId fxid, uint16 info,
 {
 	TwoPhasePgStatRecord *rec = (TwoPhasePgStatRecord *) recdata;
 	PgStat_TableStatus *pgstat_info;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* Find or create a tabstat entry for the rel */
 	pgstat_info = pgstat_prep_relation_pending(rec->id, rec->shared);
@@ -835,6 +865,9 @@ pgstat_twophase_postabort(FullTransactionId fxid, uint16 info,
 	TwoPhasePgStatRecord *rec = (TwoPhasePgStatRecord *) recdata;
 	PgStat_TableStatus *pgstat_info;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* Find or create a tabstat entry for the rel */
 	pgstat_info = pgstat_prep_relation_pending(rec->id, rec->shared);
 
@@ -869,6 +902,9 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	PgStatShared_Relation *shtabstats;
 	PgStat_StatTabEntry *tabentry;	/* table entry of shared stats */
 	PgStat_StatDBEntry *dbentry;	/* pending database entry */
+
+	if (fastpg_pgstat_noop_active())
+		return true;
 
 	dboid = entry_ref->shared_entry->key.dboid;
 	lstats = (PgStat_TableStatus *) entry_ref->pending;
@@ -953,7 +989,12 @@ pgstat_relation_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 void
 pgstat_relation_delete_pending_cb(PgStat_EntryRef *entry_ref)
 {
-	PgStat_TableStatus *pending = (PgStat_TableStatus *) entry_ref->pending;
+	PgStat_TableStatus *pending;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	pending = (PgStat_TableStatus *) entry_ref->pending;
 
 	if (pending->relation)
 		pgstat_unlink_relation(pending->relation);
@@ -962,6 +1003,9 @@ pgstat_relation_delete_pending_cb(PgStat_EntryRef *entry_ref)
 void
 pgstat_relation_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	((PgStatShared_Relation *) header)->stats.stat_reset_time = ts;
 }
 
@@ -974,6 +1018,9 @@ pgstat_prep_relation_pending(Oid rel_id, bool isshared)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStat_TableStatus *pending;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_RELATION,
 										  isshared ? InvalidOid : MyDatabaseId,

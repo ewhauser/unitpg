@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "replication/worker_internal.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 
 
@@ -29,7 +30,12 @@ pgstat_report_subscription_error(Oid subid)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStat_BackendSubEntry *pending;
-	LogicalRepWorkerType wtype = get_logical_worker_type();
+	LogicalRepWorkerType wtype;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	wtype = get_logical_worker_type();
 
 	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_SUBSCRIPTION,
 										  InvalidOid, subid, NULL);
@@ -65,6 +71,9 @@ pgstat_report_subscription_conflict(Oid subid, ConflictType type)
 	PgStat_EntryRef *entry_ref;
 	PgStat_BackendSubEntry *pending;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	entry_ref = pgstat_prep_pending_entry(PGSTAT_KIND_SUBSCRIPTION,
 										  InvalidOid, subid, NULL);
 	pending = entry_ref->pending;
@@ -77,6 +86,9 @@ pgstat_report_subscription_conflict(Oid subid, ConflictType type)
 void
 pgstat_create_subscription(Oid subid)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* Ensures that stats are dropped if transaction rolls back */
 	pgstat_create_transactional(PGSTAT_KIND_SUBSCRIPTION,
 								InvalidOid, subid);
@@ -95,6 +107,9 @@ pgstat_create_subscription(Oid subid)
 void
 pgstat_drop_subscription(Oid subid)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_drop_transactional(PGSTAT_KIND_SUBSCRIPTION,
 							  InvalidOid, subid);
 }
@@ -106,6 +121,9 @@ pgstat_drop_subscription(Oid subid)
 PgStat_StatSubEntry *
 pgstat_fetch_stat_subscription(Oid subid)
 {
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	return (PgStat_StatSubEntry *)
 		pgstat_fetch_entry(PGSTAT_KIND_SUBSCRIPTION, InvalidOid, subid, NULL);
 }
@@ -121,6 +139,9 @@ pgstat_subscription_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 {
 	PgStat_BackendSubEntry *localent;
 	PgStatShared_Subscription *shsubent;
+
+	if (fastpg_pgstat_noop_active())
+		return true;
 
 	localent = (PgStat_BackendSubEntry *) entry_ref->pending;
 	shsubent = (PgStatShared_Subscription *) entry_ref->shared_stats;
@@ -145,5 +166,8 @@ pgstat_subscription_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 void
 pgstat_subscription_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	((PgStatShared_Subscription *) header)->stats.stat_reset_timestamp = ts;
 }

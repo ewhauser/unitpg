@@ -16,6 +16,7 @@
 #include "access/xact.h"
 #include "miscadmin.h"
 #include "pgstat.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 
@@ -42,6 +43,14 @@ void
 AtEOXact_PgStat(bool isCommit, bool parallel)
 {
 	PgStat_SubXactStatus *xact_state;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		AtEOXact_PgStat_Database(isCommit, parallel);
+		pgStatXactStack = NULL;
+		pgstat_clear_snapshot();
+		return;
+	}
 
 	AtEOXact_PgStat_Database(isCommit, parallel);
 
@@ -70,6 +79,9 @@ AtEOXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state, bool isCommit)
 {
 	dlist_mutable_iter iter;
 	int			not_freed_count = 0;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (dclist_count(&xact_state->pending_drops) == 0)
 		return;
@@ -116,6 +128,12 @@ AtEOSubXact_PgStat(bool isCommit, int nestDepth)
 {
 	PgStat_SubXactStatus *xact_state;
 
+	if (fastpg_pgstat_noop_active())
+	{
+		pgStatXactStack = NULL;
+		return;
+	}
+
 	/* merge the sub-transaction's transactional stats into the parent */
 	xact_state = pgStatXactStack;
 	if (xact_state != NULL &&
@@ -141,6 +159,9 @@ AtEOSubXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state,
 	PgStat_SubXactStatus *parent_xact_state;
 	dlist_mutable_iter iter;
 	int			not_freed_count = 0;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (dclist_count(&xact_state->pending_drops) == 0)
 		return;
@@ -194,6 +215,9 @@ AtPrepare_PgStat(void)
 {
 	PgStat_SubXactStatus *xact_state;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	xact_state = pgStatXactStack;
 	if (xact_state != NULL)
 	{
@@ -213,6 +237,13 @@ void
 PostPrepare_PgStat(void)
 {
 	PgStat_SubXactStatus *xact_state;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		pgStatXactStack = NULL;
+		pgstat_clear_snapshot();
+		return;
+	}
 
 	/*
 	 * We don't bother to free any of the transactional state, since it's all
@@ -240,6 +271,9 @@ PgStat_SubXactStatus *
 pgstat_get_xact_stack_level(int nest_level)
 {
 	PgStat_SubXactStatus *xact_state;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	xact_state = pgStatXactStack;
 	if (xact_state == NULL || xact_state->nest_level != nest_level)
@@ -276,6 +310,12 @@ pgstat_get_transactional_drops(bool isCommit, xl_xact_stats_item **items)
 	PgStat_SubXactStatus *xact_state = pgStatXactStack;
 	int			nitems = 0;
 	dlist_iter	iter;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		*items = NULL;
+		return 0;
+	}
 
 	if (xact_state == NULL)
 		return 0;
@@ -317,6 +357,9 @@ pgstat_execute_transactional_drops(int ndrops, struct xl_xact_stats_item *items,
 {
 	int			not_freed_count = 0;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (ndrops == 0)
 		return;
 
@@ -336,12 +379,17 @@ pgstat_execute_transactional_drops(int ndrops, struct xl_xact_stats_item *items,
 static void
 create_drop_transactional_internal(PgStat_Kind kind, Oid dboid, uint64 objid, bool is_create)
 {
-	int			nest_level = GetCurrentTransactionNestLevel();
+	int			nest_level;
 	PgStat_SubXactStatus *xact_state;
-	PgStat_PendingDroppedStatsItem *drop = (PgStat_PendingDroppedStatsItem *)
-		MemoryContextAlloc(TopTransactionContext, sizeof(PgStat_PendingDroppedStatsItem));
+	PgStat_PendingDroppedStatsItem *drop;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	nest_level = GetCurrentTransactionNestLevel();
 	xact_state = pgstat_get_xact_stack_level(nest_level);
+	drop = (PgStat_PendingDroppedStatsItem *)
+		MemoryContextAlloc(TopTransactionContext, sizeof(PgStat_PendingDroppedStatsItem));
 
 	drop->is_create = is_create;
 	drop->item.kind = kind;
@@ -363,7 +411,8 @@ void
 pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
+	if (fastpg_pgstat_noop_active() ||
+		(!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres()))
 		return;
 #endif
 
@@ -391,7 +440,8 @@ void
 pgstat_drop_transactional(PgStat_Kind kind, Oid dboid, uint64 objid)
 {
 #ifdef USE_FASTPG
-	if (!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres())
+	if (fastpg_pgstat_noop_active() ||
+		(!IsUnderPostmaster && !fastpg_catalog_mode_uses_postgres()))
 		return;
 #endif
 

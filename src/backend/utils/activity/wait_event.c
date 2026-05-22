@@ -27,6 +27,7 @@
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
 #include "storage/spin.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/wait_event.h"
 
 
@@ -110,6 +111,9 @@ const ShmemCallbacks WaitEventCustomShmemCallbacks = {
 static void
 WaitEventCustomShmemRequest(void *arg)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	ShmemRequestStruct(.name = "WaitEventCustomCounterData",
 					   .size = sizeof(WaitEventCustomCounterData),
 					   .ptr = (void **) &WaitEventCustomCounter,
@@ -134,6 +138,9 @@ WaitEventCustomShmemRequest(void *arg)
 static void
 WaitEventCustomShmemInit(void *arg)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* initialize the allocation counter and its spinlock. */
 	WaitEventCustomCounter->nextId = WAIT_EVENT_CUSTOM_INITIAL_ID;
 	SpinLockInit(&WaitEventCustomCounter->mutex);
@@ -165,6 +172,9 @@ WaitEventCustomNew(uint32 classId, const char *wait_event_name)
 	WaitEventCustomEntryByName *entry_by_name;
 	WaitEventCustomEntryByInfo *entry_by_info;
 	uint32		wait_event_info;
+
+	if (fastpg_pgstat_noop_active())
+		return classId;
 
 	/* Check the limit of the length of the event name */
 	if (strlen(wait_event_name) >= NAMEDATALEN)
@@ -264,9 +274,14 @@ GetWaitEventCustomIdentifier(uint32 wait_event_info)
 	bool		found;
 	WaitEventCustomEntryByInfo *entry;
 
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	/* Built-in event? */
 	if (wait_event_info == PG_WAIT_EXTENSION)
 		return "Extension";
+	if (wait_event_info == PG_WAIT_INJECTIONPOINT)
+		return "InjectionPoint";
 
 	/* It is a user-defined wait event, so lookup hash table. */
 	LWLockAcquire(WaitEventCustomLock, LW_SHARED);
@@ -296,6 +311,12 @@ GetWaitEventCustomNames(uint32 classId, int *nwaitevents)
 	HASH_SEQ_STATUS hash_seq;
 	int			index;
 	int			els;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		*nwaitevents = 0;
+		return NULL;
+	}
 
 	LWLockAcquire(WaitEventCustomLock, LW_SHARED);
 
@@ -334,6 +355,9 @@ GetWaitEventCustomNames(uint32 classId, int *nwaitevents)
 void
 pgstat_set_wait_event_storage(uint32 *wait_event_info)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	my_wait_event_info = wait_event_info;
 }
 
@@ -360,6 +384,9 @@ pgstat_get_wait_event_type(uint32 wait_event_info)
 {
 	uint32		classId;
 	const char *event_type;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	/* report process as not waiting. */
 	if (wait_event_info == 0)
@@ -419,6 +446,9 @@ pgstat_get_wait_event(uint32 wait_event_info)
 	uint32		classId;
 	uint16		eventId;
 	const char *event_name;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	/* report process as not waiting. */
 	if (wait_event_info == 0)

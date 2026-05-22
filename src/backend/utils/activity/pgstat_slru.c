@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
 
@@ -46,6 +47,9 @@ pgstat_reset_slru(const char *name)
 {
 	TimestampTz ts = GetCurrentTimestamp();
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(name != NULL);
 
 	pgstat_reset_slru_counter_internal(pgstat_get_slru_index(name), ts);
@@ -59,6 +63,8 @@ pgstat_reset_slru(const char *name)
 void												\
 CppConcat(pgstat_count_slru_,stat)(int slru_idx)	\
 {													\
+	if (fastpg_pgstat_noop_active())					\
+		return;										\
 	get_slru_entry(slru_idx)->stat += 1;			\
 }
 
@@ -90,6 +96,11 @@ PGSTAT_COUNT_SLRU(truncate)
 PgStat_SLRUStats *
 pgstat_fetch_slru(void)
 {
+	static PgStat_SLRUStats fastpg_zero_slru_stats[SLRU_NUM_ELEMENTS];
+
+	if (fastpg_pgstat_noop_active())
+		return fastpg_zero_slru_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_SLRU);
 
 	return pgStatLocal.snapshot.slru;
@@ -103,6 +114,9 @@ pgstat_fetch_slru(void)
 const char *
 pgstat_get_slru_name(int slru_idx)
 {
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	if (slru_idx < 0 || slru_idx >= SLRU_NUM_ELEMENTS)
 		return NULL;
 
@@ -118,6 +132,9 @@ int
 pgstat_get_slru_index(const char *name)
 {
 	int			i;
+
+	if (fastpg_pgstat_noop_active())
+		return 0;
 
 	Assert(name);
 	for (i = 0; i < SLRU_NUM_ELEMENTS; i++)
@@ -142,11 +159,16 @@ pgstat_get_slru_index(const char *name)
 bool
 pgstat_slru_flush_cb(bool nowait)
 {
-	PgStatShared_SLRU *stats_shmem = &pgStatLocal.shmem->slru;
+	PgStatShared_SLRU *stats_shmem;
 	int			i;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
 
 	if (!have_slrustats)
 		return false;
+
+	stats_shmem = &pgStatLocal.shmem->slru;
 
 	if (!nowait)
 		LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
@@ -190,6 +212,9 @@ pgstat_slru_init_shmem_cb(void *stats)
 void
 pgstat_slru_reset_all_cb(TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	for (int i = 0; i < SLRU_NUM_ELEMENTS; i++)
 		pgstat_reset_slru_counter_internal(i, ts);
 }
@@ -197,7 +222,12 @@ pgstat_slru_reset_all_cb(TimestampTz ts)
 void
 pgstat_slru_snapshot_cb(void)
 {
-	PgStatShared_SLRU *stats_shmem = &pgStatLocal.shmem->slru;
+	PgStatShared_SLRU *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->slru;
 
 	LWLockAcquire(&stats_shmem->lock, LW_SHARED);
 
@@ -214,6 +244,11 @@ pgstat_slru_snapshot_cb(void)
 static inline PgStat_SLRUStats *
 get_slru_entry(int slru_idx)
 {
+	static PgStat_SLRUStats fastpg_zero_slru_entry;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_slru_entry;
+
 	pgstat_assert_is_up();
 
 	/*
@@ -233,7 +268,12 @@ get_slru_entry(int slru_idx)
 static void
 pgstat_reset_slru_counter_internal(int index, TimestampTz ts)
 {
-	PgStatShared_SLRU *stats_shmem = &pgStatLocal.shmem->slru;
+	PgStatShared_SLRU *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->slru;
 
 	LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
 
