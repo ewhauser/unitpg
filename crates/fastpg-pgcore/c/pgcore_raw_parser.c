@@ -3645,7 +3645,12 @@ fastpg_pgcore_execute_simple(const char *query)
 				fastpg_pgcore_reject_if_aborted_transaction(rawstmt->stmt);
 			if (use_implicit_block)
 				BeginImplicitTransactionBlock();
-			if (analyze_requires_snapshot(rawstmt))
+#ifdef USE_FASTPG
+			if (fastpg_use_rust_catalog() && !is_transaction_stmt)
+				fastpg_pgcore_ensure_execution_owner();
+#endif
+			if (fastpg_catalog_mode_uses_postgres() &&
+				analyze_requires_snapshot(rawstmt))
 			{
 				fastpg_pgcore_push_analyze_snapshot();
 				snapshot_pushed = true;
@@ -3703,6 +3708,14 @@ fastpg_pgcore_execute_simple(const char *query)
 				{
 					summary->command_tag =
 						(char *) fastpg_pgcore_command_tag_name(statement->commandType);
+#ifdef USE_FASTPG
+					if (fastpg_use_rust_catalog() && !fastpg_rust_xact_is_explicit())
+					{
+						fastpg_xid_commit();
+						fastpg_rust_xact_commit_if_implicit();
+						fastpg_storage2_xact_commit_if_implicit();
+					}
+#endif
 					continue;
 				}
 #endif

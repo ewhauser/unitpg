@@ -59,6 +59,9 @@
 #include "storage/standby.h"
 #include "storage/subsystems.h"
 #include "utils/injection_point.h"
+#ifdef USE_FASTPG
+#include "utils/fastpg_ipc_guard.h"
+#endif
 #include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "utils/wait_event.h"
@@ -113,7 +116,8 @@ FastPgEnsureThreadProc(void)
 	if (MyLatch == NULL)
 	{
 		InitProcessLocalLatch();
-		InitializeLatchWaitSet();
+		if (!fastpg_internal_ipc_forbidden())
+			InitializeLatchWaitSet();
 	}
 
 	if (IsUnderPostmaster || MyProc != NULL || ProcGlobal == NULL)
