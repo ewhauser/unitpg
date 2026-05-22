@@ -122,6 +122,9 @@ typedef struct MemoryContextData
 	/* these two fields are placed here to minimize alignment wastage: */
 	bool		isReset;		/* T = no space allocated since last reset */
 	bool		allowInCritSection; /* allow palloc in critical section */
+#ifdef USE_FASTPG
+	bool		fastpg_shared;	/* context tree can be touched by threads */
+#endif
 	Size		mem_allocated;	/* track memory allocated for this context */
 	const MemoryContextMethods *methods;	/* virtual function table */
 	MemoryContext parent;		/* NULL if no parent (toplevel context) */

@@ -14,6 +14,15 @@ impl StorageState {
         self.relations.entry(relid).or_default()
     }
 
+    fn refresh_cached_row_count(&self, relid: u32) {
+        let committed = self
+            .relations
+            .get(&relid)
+            .map(|relation| relation.live_tuple_count)
+            .unwrap_or_default();
+        store_committed_row_count(relid, committed);
+    }
+
     pub(crate) fn begin_explicit_transaction(&mut self, session: &mut SessionStorage) {
         if !session.explicit_transaction {
             self.commit_implicit_transaction(session);
@@ -71,6 +80,8 @@ impl StorageState {
     }
 
     pub(crate) fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
+        let affected_relids = overlay.visibility_delta_relids();
+
         for (relid, tids) in &overlay.inserted_tids {
             if let Some(relation) = self.relations.get_mut(relid) {
                 for tid in tids {
@@ -109,6 +120,10 @@ impl StorageState {
                     }
                 }
             }
+        }
+
+        for relid in affected_relids {
+            self.refresh_cached_row_count(relid);
         }
     }
 
@@ -154,6 +169,7 @@ impl StorageState {
     pub(crate) fn clear_relation(&mut self, session: &mut SessionStorage, relid: u32) {
         if session.transaction_stack.is_empty() {
             self.relations.insert(relid, RelationStorage::default());
+            self.refresh_cached_row_count(relid);
             return;
         }
 
@@ -347,17 +363,6 @@ impl StorageState {
         tids.dedup();
         tids.retain(|tid| self.find_visible_tuple(session, relid, *tid).is_some());
         tids
-    }
-
-    pub(crate) fn visible_row_count(&self, session: &SessionStorage, relid: u32) -> usize {
-        let committed = self
-            .relations
-            .get(&relid)
-            .map(|relation| relation.live_tuple_count)
-            .unwrap_or_default();
-        committed
-            .saturating_add(session.transaction_visible_insert_count(relid))
-            .saturating_sub(session.transaction_invalidated_live_count(relid))
     }
 
     pub(crate) fn next_visible_tuple_slice_in_overlays<'a>(
@@ -645,6 +650,71 @@ static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
 
 pub(crate) fn storage() -> &'static Mutex<StorageState> {
     STORAGE.get_or_init(|| Mutex::new(StorageState::default()))
+}
+
+fn row_counts() -> &'static Mutex<HashMap<u32, Arc<AtomicUsize>>> {
+    STORAGE2_ROW_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+thread_local! {
+    static LAST_ROW_COUNT_COUNTER: RefCell<Option<(u32, Arc<AtomicUsize>)>> = const { RefCell::new(None) };
+}
+
+fn row_count_counter(relid: u32) -> Arc<AtomicUsize> {
+    let mut counts = row_counts()
+        .lock()
+        .expect("storage2 row-count cache mutex poisoned");
+    counts
+        .entry(relid)
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+        .clone()
+}
+
+fn store_committed_row_count(relid: u32, row_count: usize) {
+    let counter = row_count_counter(relid);
+    counter.store(row_count, Ordering::Relaxed);
+    LAST_ROW_COUNT_COUNTER.with(|last| {
+        last.replace(Some((relid, counter)));
+    });
+}
+
+fn load_committed_row_count(relid: u32) -> usize {
+    let counter = LAST_ROW_COUNT_COUNTER.with(|last| {
+        if let Some((cached_relid, counter)) = last.borrow().as_ref()
+            && *cached_relid == relid
+        {
+            return Some(counter.clone());
+        }
+
+        let counter = {
+            let counts = row_counts()
+                .lock()
+                .expect("storage2 row-count cache mutex poisoned");
+            counts.get(&relid).cloned()
+        };
+        if let Some(counter) = counter.as_ref() {
+            last.replace(Some((relid, counter.clone())));
+        }
+        counter
+    });
+    counter
+        .map(|counter| counter.load(Ordering::Relaxed))
+        .unwrap_or_default()
+}
+
+pub(crate) fn visible_row_count_cached(relid: u32) -> usize {
+    let committed = load_committed_row_count(relid);
+    let session = current_session_storage();
+    let session = match session.lock() {
+        Ok(session) => session,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !session.transaction_has_visibility_deltas(relid) {
+        return committed;
+    }
+    committed
+        .saturating_add(session.transaction_visible_insert_count(relid))
+        .saturating_sub(session.transaction_invalidated_live_count(relid))
 }
 
 pub(crate) fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStorage) -> R) -> R {

@@ -55,6 +55,8 @@ static void BogusFree(void *pointer);
 static void *BogusRealloc(void *pointer, Size size, int flags);
 static MemoryContext BogusGetChunkContext(void *pointer);
 static Size BogusGetChunkSpace(void *pointer);
+static MemoryContext MemoryContextTraverseNext(MemoryContext curr,
+											   MemoryContext top);
 
 #ifdef USE_FASTPG
 static pthread_once_t fastpg_memory_context_lock_once = PTHREAD_ONCE_INIT;
@@ -72,17 +74,76 @@ FastPgInitMemoryContextLock(void)
 }
 
 static inline void
-FastPgMemoryContextLock(void)
-{
-	pthread_once(&fastpg_memory_context_lock_once, FastPgInitMemoryContextLock);
-	pthread_mutex_lock(&fastpg_memory_context_lock);
-}
-
-static inline void
 FastPgMemoryContextUnlock(void)
 {
 	pthread_mutex_unlock(&fastpg_memory_context_lock);
 }
+
+static inline bool
+FastPgMemoryContextIsShared(MemoryContext context)
+{
+	return context != NULL && context->fastpg_shared;
+}
+
+static inline bool
+FastPgMemoryContextLockIfShared(MemoryContext context)
+{
+	if (!FastPgMemoryContextIsShared(context))
+		return false;
+
+	pthread_once(&fastpg_memory_context_lock_once, FastPgInitMemoryContextLock);
+	pthread_mutex_lock(&fastpg_memory_context_lock);
+	return true;
+}
+
+static inline bool
+FastPgMemoryContextLockIfEitherShared(MemoryContext left, MemoryContext right)
+{
+	if (!FastPgMemoryContextIsShared(left) && !FastPgMemoryContextIsShared(right))
+		return false;
+
+	pthread_once(&fastpg_memory_context_lock_once, FastPgInitMemoryContextLock);
+	pthread_mutex_lock(&fastpg_memory_context_lock);
+	return true;
+}
+
+static void
+FastPgMemoryContextSetSharedRecursive(MemoryContext context, bool shared)
+{
+	if (context == NULL)
+		return;
+
+	context->fastpg_shared = shared;
+	for (MemoryContext curr = context->firstchild;
+		 curr != NULL;
+		 curr = MemoryContextTraverseNext(curr, context))
+		curr->fastpg_shared = shared;
+}
+
+#define FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context, code) \
+	do { \
+		MemoryContext fastpg_locked_context = (context); \
+		bool fastpg_memory_context_locked = \
+			FastPgMemoryContextLockIfShared(fastpg_locked_context); \
+		if (fastpg_memory_context_locked) \
+		{ \
+			PG_TRY(); \
+			{ \
+				code; \
+			} \
+			PG_CATCH(); \
+			{ \
+				FastPgMemoryContextUnlock(); \
+				PG_RE_THROW(); \
+			} \
+			PG_END_TRY(); \
+			FastPgMemoryContextUnlock(); \
+		} \
+		else \
+		{ \
+			code; \
+		} \
+	} while (0)
 
 #endif
 
@@ -457,6 +518,7 @@ MemoryContextInit(void)
 	MemoryContextAllowInCriticalSection(ErrorContext, true);
 #ifdef USE_FASTPG
 	FastPgProcessTopMemoryContext = TopMemoryContext;
+	FastPgMemoryContextSetSharedRecursive(TopMemoryContext, true);
 #endif
 }
 
@@ -471,7 +533,10 @@ void
 FastPgRememberProcessCacheMemoryContext(MemoryContext context)
 {
 	if (FastPgProcessCacheMemoryContext == NULL)
+	{
 		FastPgProcessCacheMemoryContext = context;
+		FastPgMemoryContextSetSharedRecursive(context, true);
+	}
 }
 
 void
@@ -549,21 +614,14 @@ MemoryContextResetOnly(MemoryContext context)
 		 */
 
 #ifdef USE_FASTPG
-		FastPgMemoryContextLock();
-		PG_TRY();
+		FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 		{
-#endif
+			context->methods->reset(context);
+			context->isReset = true;
+		});
+#else
 		context->methods->reset(context);
 		context->isReset = true;
-#ifdef USE_FASTPG
-		}
-		PG_CATCH();
-		{
-			FastPgMemoryContextUnlock();
-			PG_RE_THROW();
-		}
-		PG_END_TRY();
-		FastPgMemoryContextUnlock();
 #endif
 	}
 }
@@ -671,20 +729,12 @@ MemoryContextDeleteOnly(MemoryContext context)
 	context->ident = NULL;
 
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 	{
-#endif
+		context->methods->delete_context(context);
+	});
+#else
 	context->methods->delete_context(context);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 }
 
@@ -827,18 +877,24 @@ MemoryContextSetIdentifier(MemoryContext context, const char *id)
 void
 MemoryContextSetParent(MemoryContext context, MemoryContext new_parent)
 {
+#ifdef USE_FASTPG
+	bool		fastpg_memory_context_locked;
+#endif
+
 	Assert(MemoryContextIsValid(context));
 	Assert(context != new_parent);
 
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
+	fastpg_memory_context_locked =
+		FastPgMemoryContextLockIfEitherShared(context, new_parent);
 #endif
 
 	/* Fast path if it's got correct parent already */
 	if (new_parent == context->parent)
 	{
 #ifdef USE_FASTPG
-		FastPgMemoryContextUnlock();
+		if (fastpg_memory_context_locked)
+			FastPgMemoryContextUnlock();
 #endif
 		return;
 	}
@@ -878,7 +934,14 @@ MemoryContextSetParent(MemoryContext context, MemoryContext new_parent)
 		context->nextchild = NULL;
 	}
 #ifdef USE_FASTPG
-	FastPgMemoryContextUnlock();
+	FastPgMemoryContextSetSharedRecursive(context,
+										  new_parent != NULL &&
+										  new_parent->fastpg_shared);
+	if (context == FastPgProcessTopMemoryContext ||
+		context == FastPgProcessCacheMemoryContext)
+		FastPgMemoryContextSetSharedRecursive(context, true);
+	if (fastpg_memory_context_locked)
+		FastPgMemoryContextUnlock();
 #endif
 }
 
@@ -1306,6 +1369,10 @@ MemoryContextCreate(MemoryContext node,
 					MemoryContext parent,
 					const char *name)
 {
+#ifdef USE_FASTPG
+	bool		fastpg_memory_context_locked;
+#endif
+
 	/* Creating new memory contexts is not allowed in a critical section */
 	Assert(CritSectionCount == 0);
 
@@ -1326,7 +1393,11 @@ MemoryContextCreate(MemoryContext node,
 	node->reset_cbs = NULL;
 
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
+	node->fastpg_shared = parent != NULL && parent->fastpg_shared;
+	if (node == FastPgProcessTopMemoryContext ||
+		node == FastPgProcessCacheMemoryContext)
+		node->fastpg_shared = true;
+	fastpg_memory_context_locked = FastPgMemoryContextLockIfShared(parent);
 #endif
 
 	/* OK to link node into context tree */
@@ -1345,7 +1416,8 @@ MemoryContextCreate(MemoryContext node,
 		node->allowInCritSection = false;
 	}
 #ifdef USE_FASTPG
-	FastPgMemoryContextUnlock();
+	if (fastpg_memory_context_locked)
+		FastPgMemoryContextUnlock();
 #endif
 }
 
@@ -1397,13 +1469,14 @@ MemoryContextAlloc(MemoryContext context, Size size)
 	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
-	context->isReset = false;
-
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 	{
-#endif
+		context->isReset = false;
+		ret = context->methods->alloc(context, size, 0);
+	});
+#else
+	context->isReset = false;
 	/*
 	 * For efficiency reasons, we purposefully offload the handling of
 	 * allocation failures to the MemoryContextMethods implementation as this
@@ -1415,15 +1488,6 @@ MemoryContextAlloc(MemoryContext context, Size size)
 	 * function instead.
 	 */
 	ret = context->methods->alloc(context, size, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 
 	VALGRIND_MEMPOOL_ALLOC(context, ret, size);
@@ -1446,23 +1510,15 @@ MemoryContextAllocZero(MemoryContext context, Size size)
 	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
+#ifdef USE_FASTPG
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
+	{
+		context->isReset = false;
+		ret = context->methods->alloc(context, size, 0);
+	});
+#else
 	context->isReset = false;
-
-#ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
-	{
-#endif
 	ret = context->methods->alloc(context, size, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 
 	VALGRIND_MEMPOOL_ALLOC(context, ret, size);
@@ -1490,23 +1546,15 @@ MemoryContextAllocExtended(MemoryContext context, Size size, int flags)
 		elog(ERROR, "invalid memory alloc request size %zu", size);
 	}
 
+#ifdef USE_FASTPG
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
+	{
+		context->isReset = false;
+		ret = context->methods->alloc(context, size, flags);
+	});
+#else
 	context->isReset = false;
-
-#ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
-	{
-#endif
 	ret = context->methods->alloc(context, size, flags);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 	if (unlikely(ret == NULL))
 		return NULL;
@@ -1601,13 +1649,14 @@ palloc(Size size)
 	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
-	context->isReset = false;
-
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 	{
-#endif
+		context->isReset = false;
+		ret = context->methods->alloc(context, size, 0);
+	});
+#else
+	context->isReset = false;
 	/*
 	 * For efficiency reasons, we purposefully offload the handling of
 	 * allocation failures to the MemoryContextMethods implementation as this
@@ -1619,15 +1668,6 @@ palloc(Size size)
 	 * function instead.
 	 */
 	ret = context->methods->alloc(context, size, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 	/* We expect OOM to be handled by the alloc function */
 	Assert(ret != NULL);
@@ -1646,23 +1686,15 @@ palloc0(Size size)
 	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
+#ifdef USE_FASTPG
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
+	{
+		context->isReset = false;
+		ret = context->methods->alloc(context, size, 0);
+	});
+#else
 	context->isReset = false;
-
-#ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
-	{
-#endif
 	ret = context->methods->alloc(context, size, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 	/* We expect OOM to be handled by the alloc function */
 	Assert(ret != NULL);
@@ -1683,23 +1715,15 @@ palloc_extended(Size size, int flags)
 	Assert(MemoryContextIsValid(context));
 	AssertNotInCriticalSection(context);
 
+#ifdef USE_FASTPG
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
+	{
+		context->isReset = false;
+		ret = context->methods->alloc(context, size, flags);
+	});
+#else
 	context->isReset = false;
-
-#ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
-	{
-#endif
 	ret = context->methods->alloc(context, size, flags);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 	if (unlikely(ret == NULL))
 	{
@@ -1868,25 +1892,17 @@ palloc_aligned(Size size, Size alignto, int flags)
 void
 pfree(void *pointer)
 {
-#ifdef USE_VALGRIND
+#if defined(USE_FASTPG) || defined(USE_VALGRIND)
 	MemoryContext context = GetMemoryChunkContext(pointer);
 #endif
 
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 	{
-#endif
+		MCXT_METHOD(pointer, free_p) (pointer);
+	});
+#else
 	MCXT_METHOD(pointer, free_p) (pointer);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 
 	VALGRIND_MEMPOOL_FREE(context, pointer);
@@ -1899,7 +1915,7 @@ pfree(void *pointer)
 void *
 repalloc(void *pointer, Size size)
 {
-#if defined(USE_ASSERT_CHECKING) || defined(USE_VALGRIND)
+#if defined(USE_FASTPG) || defined(USE_ASSERT_CHECKING) || defined(USE_VALGRIND)
 	MemoryContext context = GetMemoryChunkContext(pointer);
 #endif
 	void	   *ret;
@@ -1920,20 +1936,12 @@ repalloc(void *pointer, Size size)
 	 * function instead.
 	 */
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 	{
-#endif
+		ret = MCXT_METHOD(pointer, realloc) (pointer, size, 0);
+	});
+#else
 	ret = MCXT_METHOD(pointer, realloc) (pointer, size, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 
 	VALGRIND_MEMPOOL_CHANGE(context, pointer, ret, size);
@@ -1949,7 +1957,7 @@ repalloc(void *pointer, Size size)
 void *
 repalloc_extended(void *pointer, Size size, int flags)
 {
-#if defined(USE_ASSERT_CHECKING) || defined(USE_VALGRIND)
+#if defined(USE_FASTPG) || defined(USE_ASSERT_CHECKING) || defined(USE_VALGRIND)
 	MemoryContext context = GetMemoryChunkContext(pointer);
 #endif
 	void	   *ret;
@@ -1970,20 +1978,12 @@ repalloc_extended(void *pointer, Size size, int flags)
 	 * function instead.
 	 */
 #ifdef USE_FASTPG
-	FastPgMemoryContextLock();
-	PG_TRY();
+	FASTPG_MEMORY_CONTEXT_WITH_OPTIONAL_LOCK(context,
 	{
-#endif
+		ret = MCXT_METHOD(pointer, realloc) (pointer, size, flags);
+	});
+#else
 	ret = MCXT_METHOD(pointer, realloc) (pointer, size, flags);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgMemoryContextUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgMemoryContextUnlock();
 #endif
 	if (unlikely(ret == NULL))
 		return NULL;

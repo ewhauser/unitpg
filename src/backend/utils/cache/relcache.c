@@ -148,6 +148,7 @@ static HTAB *RelationIdCache;
 #ifdef USE_FASTPG
 static pthread_once_t fastpg_catalog_cache_lock_once = PTHREAD_ONCE_INIT;
 static pthread_mutex_t fastpg_catalog_cache_lock;
+static _Thread_local int fastpg_catalog_cache_lock_depth = 0;
 
 typedef struct FastPgLocalRelRef
 {
@@ -161,25 +162,35 @@ static _Thread_local FastPgLocalRelRef *fastpg_local_relrefs = NULL;
 static void
 FastPgInitCatalogCacheLock(void)
 {
-	pthread_mutexattr_t attr;
-
-	pthread_mutexattr_init(&attr);
-	pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
-	pthread_mutex_init(&fastpg_catalog_cache_lock, &attr);
-	pthread_mutexattr_destroy(&attr);
+	pthread_mutex_init(&fastpg_catalog_cache_lock, NULL);
 }
 
 void
 FastPgCatalogCacheLock(void)
 {
-	pthread_once(&fastpg_catalog_cache_lock_once, FastPgInitCatalogCacheLock);
-	pthread_mutex_lock(&fastpg_catalog_cache_lock);
+	if (fastpg_catalog_cache_lock_depth++ == 0)
+	{
+		pthread_once(&fastpg_catalog_cache_lock_once, FastPgInitCatalogCacheLock);
+		pthread_mutex_lock(&fastpg_catalog_cache_lock);
+	}
 }
 
 void
 FastPgCatalogCacheUnlock(void)
 {
-	pthread_mutex_unlock(&fastpg_catalog_cache_lock);
+	Assert(fastpg_catalog_cache_lock_depth > 0);
+	if (--fastpg_catalog_cache_lock_depth == 0)
+		pthread_mutex_unlock(&fastpg_catalog_cache_lock);
+}
+
+void
+FastPgCatalogCacheUnlockAll(void)
+{
+	if (fastpg_catalog_cache_lock_depth > 0)
+	{
+		fastpg_catalog_cache_lock_depth = 0;
+		pthread_mutex_unlock(&fastpg_catalog_cache_lock);
+	}
 }
 
 static void
@@ -216,12 +227,8 @@ FastPgForgetLocalRelationRef(Relation rel)
 
 		if (entry->rel == rel)
 		{
+			Assert(entry->count > 0);
 			entry->count--;
-			if (entry->count <= 0)
-			{
-				*link = entry->next;
-				free(entry);
-			}
 			return;
 		}
 		link = &entry->next;
@@ -3377,6 +3384,9 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
 	bms_free(relation->rd_idattr);
 	bms_free(relation->rd_hotblockingattr);
 	bms_free(relation->rd_summarizedattr);
+#ifdef USE_FASTPG
+	relation->rd_fastpg_pubdesc_valid = false;
+#endif
 	if (relation->rd_pubdesc)
 		pfree(relation->rd_pubdesc);
 	if (relation->rd_options)
@@ -3996,6 +4006,7 @@ RelationCacheInvalidateInternal(bool debug_discard)
 				pfree(relation->rd_pubdesc);
 				relation->rd_pubdesc = NULL;
 			}
+			relation->rd_fastpg_pubdesc_valid = false;
 #endif
 			continue;
 		}
@@ -7044,9 +7055,6 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	Oid			schemaid;
 	List	   *ancestors = NIL;
 	Oid			relid = RelationGetRelid(relation);
-#ifdef USE_FASTPG
-	bool		fastpg_skip_pubdesc_cache = fastpg_catalog_mode_uses_postgres();
-#endif
 
 	/*
 	 * If not publishable, it publishes no actions.  (pgoutput_change() will
@@ -7065,10 +7073,22 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	}
 
 #ifdef USE_FASTPG
-	if (!fastpg_skip_pubdesc_cache && relation->rd_pubdesc)
-#else
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		FastPgCatalogCacheLock();
+		if (relation->rd_fastpg_pubdesc_valid)
+		{
+			memcpy(pubdesc, &relation->rd_fastpg_pubdesc,
+				   sizeof(PublicationDesc));
+			FastPgCatalogCacheUnlock();
+			return;
+		}
+		FastPgCatalogCacheUnlock();
+	}
+	else if (relation->rd_pubdesc)
+#else							/* !USE_FASTPG */
 	if (relation->rd_pubdesc)
-#endif
+#endif							/* USE_FASTPG */
 	{
 		memcpy(pubdesc, relation->rd_pubdesc, sizeof(PublicationDesc));
 		return;
@@ -7225,8 +7245,18 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	}
 
 #ifdef USE_FASTPG
-	if (fastpg_skip_pubdesc_cache)
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		FastPgCatalogCacheLock();
+		if (relation->rd_isvalid)
+		{
+			memcpy(&relation->rd_fastpg_pubdesc, pubdesc,
+				   sizeof(PublicationDesc));
+			relation->rd_fastpg_pubdesc_valid = true;
+		}
+		FastPgCatalogCacheUnlock();
 		return;
+	}
 #endif
 
 	if (relation->rd_pubdesc)

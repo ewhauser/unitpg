@@ -1,10 +1,12 @@
 #![forbid(unsafe_code)]
 
+use std::any::Any;
 use std::fmt::Debug;
 use std::io;
 #[cfg(unix)]
 use std::net::SocketAddr;
 use std::num::NonZeroUsize;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 #[cfg(unix)]
 use std::pin::Pin;
 use std::sync::Arc;
@@ -58,7 +60,7 @@ use postgres_types::Kind;
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::Semaphore;
+use tokio::sync::{Semaphore, oneshot};
 #[cfg(unix)]
 use tokio::time::{Duration, sleep};
 #[cfg(unix)]
@@ -1668,11 +1670,18 @@ impl ExecutionDispatcher {
             .acquire_owned()
             .await
             .map_err(api_io_error)?;
-        Ok(tokio::task::block_in_place(move || {
+        let (sender, receiver) = oneshot::channel::<Result<R, Box<dyn Any + Send + 'static>>>();
+        let operation_session = session.clone();
+        session.enqueue_on_backend(move || {
             let _permit = permit;
-            let operation_session = session.clone();
-            session.run_on_backend(move || operation(operation_session))
-        }))
+            let result = catch_unwind(AssertUnwindSafe(|| operation(operation_session)));
+            let _ = sender.send(result);
+        });
+
+        match receiver.await.map_err(api_io_error)? {
+            Ok(result) => Ok(result),
+            Err(payload) => resume_unwind(payload),
+        }
     }
 }
 

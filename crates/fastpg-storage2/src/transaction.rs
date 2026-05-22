@@ -90,6 +90,14 @@ impl TransactionOverlay {
                 .is_some_and(|tids| !tids.is_empty())
     }
 
+    pub(crate) fn visibility_delta_relids(&self) -> BTreeSet<u32> {
+        self.inserted_tids
+            .keys()
+            .chain(self.invalidated_tids.keys())
+            .copied()
+            .collect()
+    }
+
     pub(crate) fn append_from(&mut self, other: &mut Self) {
         for (relid, checkpoint) in other.relation_checkpoints.drain() {
             self.relation_checkpoints.entry(relid).or_insert(checkpoint);

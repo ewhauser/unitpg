@@ -164,6 +164,7 @@ extern void RelationCacheInitFileRemove(void);
 #ifdef USE_FASTPG
 extern void FastPgCatalogCacheLock(void);
 extern void FastPgCatalogCacheUnlock(void);
+extern void FastPgCatalogCacheUnlockAll(void);
 #endif
 
 /* should be used only by relcache.c and catcache.c */

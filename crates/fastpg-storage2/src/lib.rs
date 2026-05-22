@@ -4,7 +4,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::c_char;
 use std::slice;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use fastpg_catalog::{
@@ -25,6 +25,8 @@ pub(crate) const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
 pub(crate) static STORAGE2_ARENA_REWINDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static STORAGE2_ARENA_DROPS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static STORAGE2_METADATA_CACHE: OnceLock<Mutex<Storage2MetadataCache>> = OnceLock::new();
+pub(crate) static STORAGE2_ROW_COUNTS: OnceLock<Mutex<HashMap<u32, Arc<AtomicUsize>>>> =
+    OnceLock::new();
 
 mod copy;
 mod error;
@@ -130,7 +132,7 @@ pub extern "C" fn fastpg_storage2_relation_clear(relid: u32) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_row_count(relid: u32) -> usize {
-    with_storage(|state, session| state.visible_row_count(session, relid))
+    visible_row_count_cached(relid)
 }
 
 #[unsafe(no_mangle)]

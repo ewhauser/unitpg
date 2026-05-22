@@ -45,6 +45,7 @@
 #include "nodes/primnodes.h"
 #include "nodes/tidbitmap.h"
 #include "optimizer/cost.h"
+#include "optimizer/optimizer.h"
 #include "optimizer/plancat.h"
 #include "pgstat.h"
 #include "storage/bufpage.h"
@@ -1289,6 +1290,44 @@ fastpg_mem_datum_size(Datum value, Form_pg_attribute attr)
 	return 0;
 }
 
+static bool
+fastpg_mem_relation_fast_data_width(Relation rel, int32 *attr_widths,
+									int32 *width)
+{
+	int64		tuple_width = 0;
+
+	for (int index = 1; index <= RelationGetNumberOfAttributes(rel); index++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(rel->rd_att, index - 1);
+		int32		item_width = 0;
+
+		if (attr->attisdropped)
+			continue;
+
+		if (attr_widths != NULL && attr_widths[index] > 0)
+		{
+			tuple_width += attr_widths[index];
+			continue;
+		}
+
+		if (attr->attlen > 0)
+			item_width = attr->attlen;
+		else if (attr->atttypid == BPCHAROID)
+			item_width = type_maximum_size(attr->atttypid, attr->atttypmod);
+		else
+			return false;
+
+		if (item_width <= 0)
+			return false;
+		if (attr_widths != NULL)
+			attr_widths[index] = item_width;
+		tuple_width += item_width;
+	}
+
+	*width = clamp_width_est(tuple_width);
+	return true;
+}
+
 static double
 fastpg_mem_heap_tuple_density(Relation rel, int32 *attr_widths)
 {
@@ -1297,7 +1336,8 @@ fastpg_mem_heap_tuple_density(Relation rel, int32 *attr_widths)
 	double		density;
 
 	fillfactor = RelationGetFillFactor(rel, HEAP_DEFAULT_FILLFACTOR);
-	tuple_width = get_rel_data_width(rel, attr_widths);
+	if (!fastpg_mem_relation_fast_data_width(rel, attr_widths, &tuple_width))
+		tuple_width = get_rel_data_width(rel, attr_widths);
 	tuple_width += FASTPG_MEM_HEAP_OVERHEAD_BYTES_PER_TUPLE;
 	if (tuple_width <= 0)
 		tuple_width = 1;
@@ -5830,6 +5870,7 @@ fastpg_mem_relation_estimate_size(Relation rel,
 	uint32_t	relid = (uint32_t) RelationGetRelid(rel);
 	size_t		row_count;
 	BlockNumber layout_pages;
+	bool		storage2;
 
 	if (fastpg_use_rust_catalog() &&
 		fastpg_rust_catalog_relation_planner_stats_by_oid(relid,
@@ -5842,13 +5883,31 @@ fastpg_mem_relation_estimate_size(Relation rel,
 		return;
 	}
 
+	storage2 = fastpg_mem_use_storage2_for_relid(relid);
+	if (storage2 &&
+		fastpg_catalog_mode_uses_postgres() &&
+		rel->rd_rel->reltuples >= 0 &&
+		rel->rd_rel->relpages > 0)
+	{
+		BlockNumber catalog_relpages = (BlockNumber) rel->rd_rel->relpages;
+		BlockNumber catalog_allvisible =
+			(BlockNumber) Min(rel->rd_rel->relallvisible, rel->rd_rel->relpages);
+
+		*pages = catalog_relpages;
+		*tuples = (double) rel->rd_rel->reltuples;
+		*allvisfrac = (double) catalog_allvisible / (double) catalog_relpages;
+		return;
+	}
+
 	if (fastpg_use_rust_catalog() &&
 		fastpg_rust_catalog_policy_by_relation_oid(relid) != 0)
 		row_count = fastpg_rust_catalog_row_count(relid);
 	else
-		row_count = fastpg_mem_use_storage2_for_relid(relid) ?
+	{
+		row_count = storage2 ?
 			fastpg_storage2_relation_row_count(RelationGetRelid(rel)) :
 			fastpg_rust_relation_row_count(RelationGetRelid(rel));
+	}
 
 	if (fastpg_catalog_mode_uses_postgres() &&
 		rel->rd_rel->reltuples >= 0 &&
@@ -5857,19 +5916,20 @@ fastpg_mem_relation_estimate_size(Relation rel,
 		(double) row_count <= (double) rel->rd_rel->reltuples)
 	{
 		BlockNumber catalog_relpages = (BlockNumber) rel->rd_rel->relpages;
+		BlockNumber catalog_allvisible =
+			(BlockNumber) Min(rel->rd_rel->relallvisible, rel->rd_rel->relpages);
 
 		*pages = catalog_relpages;
 		*tuples = (double) rel->rd_rel->reltuples;
-		*allvisfrac = (double) FastPgMemRelationAllVisiblePages(rel) /
-			(double) catalog_relpages;
+		*allvisfrac = (double) catalog_allvisible / (double) catalog_relpages;
 		return;
 	}
 
 	fastpg_mem_estimate_heap_size(rel, attr_widths, row_count,
 								  pages, tuples, allvisfrac);
-	if (row_count > 0 && fastpg_mem_use_storage2_for_relid(relid))
+	if (row_count > 0 && storage2)
 		*pages = Max(*pages, 8);
-	if (!fastpg_mem_use_storage2_for_relid(relid) &&
+	if (!storage2 &&
 		!fastpg_mem_heap_pages_from_recorded_layout(rel, row_count, &layout_pages))
 	{
 		layout_pages = fastpg_mem_heap_pages_for_layout(rel, row_count);
