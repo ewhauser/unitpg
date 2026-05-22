@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 
@@ -30,7 +31,15 @@ PgStat_BgWriterStats PendingBgWriterStats = {0};
 void
 pgstat_report_bgwriter(void)
 {
-	PgStatShared_BgWriter *stats_shmem = &pgStatLocal.shmem->bgwriter;
+	PgStatShared_BgWriter *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		MemSet(&PendingBgWriterStats, 0, sizeof(PendingBgWriterStats));
+		return;
+	}
+
+	stats_shmem = &pgStatLocal.shmem->bgwriter;
 
 	Assert(!pgStatLocal.shmem->is_shutdown);
 	pgstat_assert_is_up();
@@ -71,6 +80,11 @@ pgstat_report_bgwriter(void)
 PgStat_BgWriterStats *
 pgstat_fetch_stat_bgwriter(void)
 {
+	static PgStat_BgWriterStats fastpg_zero_bgwriter_stats;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_bgwriter_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_BGWRITER);
 
 	return &pgStatLocal.snapshot.bgwriter;
@@ -87,7 +101,12 @@ pgstat_bgwriter_init_shmem_cb(void *stats)
 void
 pgstat_bgwriter_reset_all_cb(TimestampTz ts)
 {
-	PgStatShared_BgWriter *stats_shmem = &pgStatLocal.shmem->bgwriter;
+	PgStatShared_BgWriter *stats_shmem;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->bgwriter;
 
 	/* see explanation above PgStatShared_BgWriter for the reset protocol */
 	LWLockAcquire(&stats_shmem->lock, LW_EXCLUSIVE);
@@ -102,9 +121,15 @@ pgstat_bgwriter_reset_all_cb(TimestampTz ts)
 void
 pgstat_bgwriter_snapshot_cb(void)
 {
-	PgStatShared_BgWriter *stats_shmem = &pgStatLocal.shmem->bgwriter;
-	PgStat_BgWriterStats *reset_offset = &stats_shmem->reset_offset;
+	PgStatShared_BgWriter *stats_shmem;
+	PgStat_BgWriterStats *reset_offset;
 	PgStat_BgWriterStats reset;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	stats_shmem = &pgStatLocal.shmem->bgwriter;
+	reset_offset = &stats_shmem->reset_offset;
 
 	pgstat_copy_changecounted_stats(&pgStatLocal.snapshot.bgwriter,
 									&stats_shmem->stats,

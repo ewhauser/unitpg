@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "storage/standby.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 #include "utils/timestamp.h"
 
@@ -43,6 +44,9 @@ static PgStat_Counter pgLastSessionReportTime = 0;
 void
 pgstat_drop_database(Oid databaseid)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_drop_transactional(PGSTAT_KIND_DATABASE, databaseid, InvalidOid);
 }
 
@@ -56,6 +60,9 @@ pgstat_report_autovac(Oid dboid)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Database *dbentry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* can't get here in single user mode */
 	Assert(IsUnderPostmaster);
@@ -81,6 +88,9 @@ void
 pgstat_report_recovery_conflict(int reason)
 {
 	PgStat_StatDBEntry *dbentry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	Assert(IsUnderPostmaster);
 	if (!pgstat_track_counts)
@@ -136,6 +146,9 @@ pgstat_report_deadlock(void)
 {
 	PgStat_StatDBEntry *dbent;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!pgstat_track_counts)
 		return;
 
@@ -154,6 +167,9 @@ pgstat_report_deadlock(void)
 void
 pgstat_prepare_report_checksum_failure(Oid dboid)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(!CritSectionCount);
 
 	/*
@@ -177,6 +193,9 @@ pgstat_report_checksum_failures_in_db(Oid dboid, int failurecount)
 {
 	PgStat_EntryRef *entry_ref;
 	PgStatShared_Database *sharedent;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (!pgstat_track_counts)
 		return;
@@ -222,6 +241,9 @@ pgstat_report_tempfile(size_t filesize)
 {
 	PgStat_StatDBEntry *dbent;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!pgstat_track_counts)
 		return;
 
@@ -237,6 +259,9 @@ void
 pgstat_report_connect(Oid dboid)
 {
 	PgStat_StatDBEntry *dbentry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (!pgstat_should_report_connstat())
 		return;
@@ -254,6 +279,9 @@ void
 pgstat_report_disconnect(Oid dboid)
 {
 	PgStat_StatDBEntry *dbentry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (!pgstat_should_report_connstat())
 		return;
@@ -287,6 +315,9 @@ pgstat_report_disconnect(Oid dboid)
 PgStat_StatDBEntry *
 pgstat_fetch_stat_dbentry(Oid dboid)
 {
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	return (PgStat_StatDBEntry *)
 		pgstat_fetch_entry(PGSTAT_KIND_DATABASE, dboid, InvalidOid, NULL);
 }
@@ -294,6 +325,17 @@ pgstat_fetch_stat_dbentry(Oid dboid)
 void
 AtEOXact_PgStat_Database(bool isCommit, bool parallel)
 {
+	if (fastpg_pgstat_noop_active())
+	{
+		pgStatXactCommit = 0;
+		pgStatXactRollback = 0;
+		pgStatBlockReadTime = 0;
+		pgStatBlockWriteTime = 0;
+		pgStatActiveTime = 0;
+		pgStatTransactionIdleTime = 0;
+		return;
+	}
+
 	/* Don't count parallel worker transaction stats */
 	if (!parallel)
 	{
@@ -317,6 +359,9 @@ pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 {
 	PgStat_StatDBEntry *dbentry;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!OidIsValid(MyDatabaseId))
 		return;
 
@@ -333,6 +378,17 @@ void
 pgstat_update_dbstats(TimestampTz ts)
 {
 	PgStat_StatDBEntry *dbentry;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		pgStatXactCommit = 0;
+		pgStatXactRollback = 0;
+		pgStatBlockReadTime = 0;
+		pgStatBlockWriteTime = 0;
+		pgStatActiveTime = 0;
+		pgStatTransactionIdleTime = 0;
+		return;
+	}
 
 	/*
 	 * If not connected to a database yet, don't attribute time to "shared
@@ -397,6 +453,9 @@ pgstat_prep_database_pending(Oid dboid)
 {
 	PgStat_EntryRef *entry_ref;
 
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	/*
 	 * This should not report stats on database objects before having
 	 * connected to a database.
@@ -419,6 +478,9 @@ pgstat_reset_database_timestamp(Oid dboid, TimestampTz ts)
 	PgStat_EntryRef *dbref;
 	PgStatShared_Database *dbentry;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	dbref = pgstat_get_entry_ref_locked(PGSTAT_KIND_DATABASE, dboid, InvalidOid,
 										false);
 
@@ -439,6 +501,9 @@ pgstat_database_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 {
 	PgStatShared_Database *sharedent;
 	PgStat_StatDBEntry *pendingent;
+
+	if (fastpg_pgstat_noop_active())
+		return true;
 
 	pendingent = (PgStat_StatDBEntry *) entry_ref->pending;
 	sharedent = (PgStatShared_Database *) entry_ref->shared_stats;
@@ -502,5 +567,8 @@ pgstat_database_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 void
 pgstat_database_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	((PgStatShared_Database *) header)->stats.stat_reset_timestamp = ts;
 }

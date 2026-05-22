@@ -18,6 +18,7 @@
 #include "postgres.h"
 
 #include "fmgr.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/inval.h"
 #include "utils/pgstat_internal.h"
 #include "utils/syscache.h"
@@ -44,6 +45,9 @@ static instr_time total_func_time;
 void
 pgstat_create_function(Oid proid)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_create_transactional(PGSTAT_KIND_FUNCTION,
 								MyDatabaseId,
 								proid);
@@ -59,6 +63,9 @@ pgstat_create_function(Oid proid)
 void
 pgstat_drop_function(Oid proid)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_drop_transactional(PGSTAT_KIND_FUNCTION,
 							  MyDatabaseId,
 							  proid);
@@ -75,6 +82,12 @@ pgstat_init_function_usage(FunctionCallInfo fcinfo,
 	PgStat_EntryRef *entry_ref;
 	PgStat_FunctionCounts *pending;
 	bool		created_entry;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		fcu->fs = NULL;
+		return;
+	}
 
 	if (pgstat_track_functions <= fcinfo->flinfo->fn_stats)
 	{
@@ -150,6 +163,9 @@ pgstat_end_function_usage(PgStat_FunctionCallUsage *fcu, bool finalize)
 	instr_time	others;
 	instr_time	self;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* stats not wanted? */
 	if (fs == NULL)
 		return;
@@ -195,6 +211,9 @@ pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 	PgStat_FunctionCounts *localent;
 	PgStatShared_Function *shfuncent;
 
+	if (fastpg_pgstat_noop_active())
+		return true;
+
 	localent = (PgStat_FunctionCounts *) entry_ref->pending;
 	shfuncent = (PgStatShared_Function *) entry_ref->shared_stats;
 
@@ -217,6 +236,9 @@ pgstat_function_flush_cb(PgStat_EntryRef *entry_ref, bool nowait)
 void
 pgstat_function_reset_timestamp_cb(PgStatShared_Common *header, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	((PgStatShared_Function *) header)->stats.stat_reset_timestamp = ts;
 }
 
@@ -229,6 +251,9 @@ PgStat_FunctionCounts *
 find_funcstat_entry(Oid func_id)
 {
 	PgStat_EntryRef *entry_ref;
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	entry_ref = pgstat_fetch_pending_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id);
 
@@ -244,6 +269,9 @@ find_funcstat_entry(Oid func_id)
 PgStat_StatFuncEntry *
 pgstat_fetch_stat_funcentry(Oid func_id)
 {
+	if (fastpg_pgstat_noop_active())
+		return NULL;
+
 	return (PgStat_StatFuncEntry *)
 		pgstat_fetch_entry(PGSTAT_KIND_FUNCTION, MyDatabaseId, func_id, NULL);
 }

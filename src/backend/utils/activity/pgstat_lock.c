@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
 
 static PgStat_PendingLock PendingLockStats;
@@ -25,6 +26,11 @@ static bool have_lockstats = false;
 PgStat_Lock *
 pgstat_fetch_stat_lock(void)
 {
+	static PgStat_Lock fastpg_zero_lock_stats;
+
+	if (fastpg_pgstat_noop_active())
+		return &fastpg_zero_lock_stats;
+
 	pgstat_snapshot_fixed(PGSTAT_KIND_LOCK);
 
 	return &pgStatLocal.snapshot.lock;
@@ -36,6 +42,9 @@ pgstat_fetch_stat_lock(void)
 void
 pgstat_lock_flush(bool nowait)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	(void) pgstat_lock_flush_cb(nowait);
 }
 
@@ -52,6 +61,9 @@ pgstat_lock_flush_cb(bool nowait)
 {
 	LWLock	   *lckstat_lock;
 	PgStatShared_Lock *shstats;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
 
 	if (!have_lockstats)
 		return false;
@@ -93,7 +105,12 @@ pgstat_lock_init_shmem_cb(void *stats)
 void
 pgstat_lock_reset_all_cb(TimestampTz ts)
 {
-	LWLock	   *lckstat_lock = &pgStatLocal.shmem->lock.lock;
+	LWLock	   *lckstat_lock;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	lckstat_lock = &pgStatLocal.shmem->lock.lock;
 
 	LWLockAcquire(lckstat_lock, LW_EXCLUSIVE);
 
@@ -108,7 +125,12 @@ pgstat_lock_reset_all_cb(TimestampTz ts)
 void
 pgstat_lock_snapshot_cb(void)
 {
-	LWLock	   *lckstat_lock = &pgStatLocal.shmem->lock.lock;
+	LWLock	   *lckstat_lock;
+
+	if (fastpg_pgstat_noop_active())
+		return;
+
+	lckstat_lock = &pgStatLocal.shmem->lock.lock;
 
 	LWLockAcquire(lckstat_lock, LW_SHARED);
 
@@ -127,6 +149,9 @@ pgstat_lock_snapshot_cb(void)
 void
 pgstat_count_lock_fastpath_exceeded(uint8 locktag_type)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(locktag_type <= LOCKTAG_LAST_TYPE);
 	PendingLockStats.stats[locktag_type].fastpath_exceeded++;
 	have_lockstats = true;
@@ -142,6 +167,9 @@ pgstat_count_lock_fastpath_exceeded(uint8 locktag_type)
 void
 pgstat_count_lock_waits(uint8 locktag_type, long msecs)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(locktag_type <= LOCKTAG_LAST_TYPE);
 	PendingLockStats.stats[locktag_type].waits++;
 	PendingLockStats.stats[locktag_type].wait_time += (PgStat_Counter) msecs;

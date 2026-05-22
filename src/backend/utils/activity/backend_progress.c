@@ -15,6 +15,7 @@
 #include "storage/proc.h"
 #include "utils/backend_progress.h"
 #include "utils/backend_status.h"
+#include "utils/fastpg_pgstat_noop.h"
 
 
 /*-----------
@@ -28,6 +29,9 @@ void
 pgstat_progress_start_command(ProgressCommandType cmdtype, Oid relid)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (!beentry || !pgstat_track_activities)
 		return;
@@ -50,6 +54,9 @@ pgstat_progress_update_param(int index, int64 val)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
 
 	if (!beentry || !pgstat_track_activities)
@@ -71,6 +78,9 @@ pgstat_progress_incr_param(int index, int64 incr)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(index >= 0 && index < PGSTAT_NUM_PROGRESS_PARAM);
 
 	if (!beentry || !pgstat_track_activities)
@@ -91,6 +101,9 @@ pgstat_progress_incr_param(int index, int64 incr)
 void
 pgstat_progress_parallel_incr_param(int index, int64 incr)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/*
 	 * Parallel workers notify a leader through a PqMsg_Progress message to
 	 * update progress, passing the progress index and incremented value.
@@ -125,6 +138,9 @@ pgstat_progress_update_multi_param(int nparam, const int *index,
 	volatile PgBackendStatus *beentry = MyBEEntry;
 	int			i;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (!beentry || !pgstat_track_activities || nparam == 0)
 		return;
 
@@ -151,6 +167,9 @@ void
 pgstat_progress_end_command(void)
 {
 	volatile PgBackendStatus *beentry = MyBEEntry;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	if (!beentry || !pgstat_track_activities)
 		return;

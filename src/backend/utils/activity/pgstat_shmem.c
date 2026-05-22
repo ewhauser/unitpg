@@ -15,6 +15,7 @@
 #include "pgstat.h"
 #include "storage/shmem.h"
 #include "storage/subsystems.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/memutils.h"
 #include "utils/pgstat_internal.h"
 
@@ -162,6 +163,9 @@ StatsShmemSize(void)
 static void
 StatsShmemRequest(void *arg)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	ShmemRequestStruct(.name = "Shared Memory Stats",
 					   .size = StatsShmemSize(),
 					   .ptr = (void **) &pgStatLocal.shmem,
@@ -178,6 +182,9 @@ StatsShmemInit(void *arg)
 	dshash_table *dsh;
 	PgStat_ShmemControl *ctl = pgStatLocal.shmem;
 	char	   *p = (char *) ctl;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* the allocation of pgStatLocal.shmem itself */
 	p += MAXALIGN(sizeof(PgStat_ShmemControl));
@@ -257,6 +264,9 @@ pgstat_attach_shmem(void)
 {
 	MemoryContext oldcontext;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(pgStatLocal.dsa == NULL);
 
 	/* stats shared memory persists for the backend lifetime */
@@ -276,6 +286,9 @@ pgstat_attach_shmem(void)
 void
 pgstat_detach_shmem(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(pgStatLocal.dsa);
 
 	/* we shouldn't leave references to shared stats */
@@ -317,6 +330,9 @@ pgstat_init_entry(PgStat_Kind kind,
 	dsa_pointer chunk;
 	PgStatShared_Common *shheader;
 	const PgStat_KindInfo *kind_info = pgstat_get_kind_info(kind);
+
+	if (fastpg_pgstat_noop_active())
+		return NULL;
 
 	/*
 	 * Initialize refcount to 1, marking it as valid / not dropped. The entry
@@ -381,6 +397,9 @@ pgstat_reinit_entry(PgStat_Kind kind, PgStatShared_HashEntry *shhashent)
 static void
 pgstat_setup_shared_refs(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (likely(pgStatEntryRefHash != NULL))
 		return;
 
@@ -478,6 +497,13 @@ pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid, bool create,
 	PgStatShared_HashEntry *shhashent;
 	PgStatShared_Common *shheader = NULL;
 	PgStat_EntryRef *entry_ref;
+
+	if (fastpg_pgstat_noop_active())
+	{
+		if (created_entry)
+			*created_entry = false;
+		return NULL;
+	}
 
 	key.kind = kind;
 	key.dboid = dboid;
@@ -617,6 +643,9 @@ static void
 pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref,
 						 bool discard_pending)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	if (entry_ref && entry_ref->pending)
 	{
 		if (discard_pending)
@@ -694,7 +723,12 @@ pgstat_release_entry_ref(PgStat_HashKey key, PgStat_EntryRef *entry_ref,
 bool
 pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 {
-	LWLock	   *lock = &entry_ref->shared_stats->lock;
+	LWLock	   *lock;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
+
+	lock = &entry_ref->shared_stats->lock;
 
 	if (nowait)
 		return LWLockConditionalAcquire(lock, LW_EXCLUSIVE);
@@ -712,7 +746,12 @@ pgstat_lock_entry(PgStat_EntryRef *entry_ref, bool nowait)
 bool
 pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait)
 {
-	LWLock	   *lock = &entry_ref->shared_stats->lock;
+	LWLock	   *lock;
+
+	if (fastpg_pgstat_noop_active())
+		return false;
+
+	lock = &entry_ref->shared_stats->lock;
 
 	if (nowait)
 		return LWLockConditionalAcquire(lock, LW_SHARED);
@@ -724,6 +763,9 @@ pgstat_lock_entry_shared(PgStat_EntryRef *entry_ref, bool nowait)
 void
 pgstat_unlock_entry(PgStat_EntryRef *entry_ref)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	LWLockRelease(&entry_ref->shared_stats->lock);
 }
 
@@ -738,6 +780,8 @@ pgstat_get_entry_ref_locked(PgStat_Kind kind, Oid dboid, uint64 objid,
 
 	/* find shared table stats entry corresponding to the local entry */
 	entry_ref = pgstat_get_entry_ref(kind, dboid, objid, true, NULL);
+	if (entry_ref == NULL)
+		return NULL;
 
 	/* lock the shared entry to protect the content, skip if failed */
 	if (!pgstat_lock_entry(entry_ref, nowait))
@@ -749,6 +793,9 @@ pgstat_get_entry_ref_locked(PgStat_Kind kind, Oid dboid, uint64 objid,
 void
 pgstat_request_entry_refs_gc(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pg_atomic_fetch_add_u64(&pgStatLocal.shmem->gc_request_count, 1);
 }
 
@@ -951,6 +998,9 @@ pgstat_drop_database_and_contents(Oid dboid)
 	PgStatShared_HashEntry *p;
 	uint64		not_freed_count = 0;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(OidIsValid(dboid));
 
 	Assert(pgStatLocal.shared_hash != NULL);
@@ -1012,6 +1062,9 @@ pgstat_drop_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	PgStatShared_HashEntry *shent;
 	bool		freed = true;
 
+	if (fastpg_pgstat_noop_active())
+		return true;
+
 	key.kind = kind;
 	key.dboid = dboid;
 	key.objid = objid;
@@ -1058,6 +1111,9 @@ pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 	PgStatShared_HashEntry *ps;
 	uint64		not_freed_count = 0;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	/* entries are removed, take an exclusive lock */
 	dshash_seq_init(&hstat, pgStatLocal.shared_hash, true);
 	while ((ps = dshash_seq_next(&hstat)) != NULL)
@@ -1094,6 +1150,9 @@ pgstat_drop_matching_entries(bool (*do_drop) (PgStatShared_HashEntry *, Datum),
 void
 pgstat_drop_all_entries(void)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_drop_matching_entries(NULL, 0);
 }
 
@@ -1118,6 +1177,9 @@ pgstat_reset_entry(PgStat_Kind kind, Oid dboid, uint64 objid, TimestampTz ts)
 {
 	PgStat_EntryRef *entry_ref;
 
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	Assert(!pgstat_get_kind_info(kind)->fixed_amount);
 
 	entry_ref = pgstat_get_entry_ref(kind, dboid, objid, false, NULL);
@@ -1139,6 +1201,9 @@ pgstat_reset_matching_entries(bool (*do_reset) (PgStatShared_HashEntry *, Datum)
 {
 	dshash_seq_status hstat;
 	PgStatShared_HashEntry *p;
+
+	if (fastpg_pgstat_noop_active())
+		return;
 
 	/* dshash entry is not modified, take shared lock */
 	dshash_seq_init(&hstat, pgStatLocal.shared_hash, false);
@@ -1172,6 +1237,9 @@ match_kind(PgStatShared_HashEntry *p, Datum match_data)
 void
 pgstat_reset_entries_of_kind(PgStat_Kind kind, TimestampTz ts)
 {
+	if (fastpg_pgstat_noop_active())
+		return;
+
 	pgstat_reset_matching_entries(match_kind, Int32GetDatum(kind), ts);
 }
 

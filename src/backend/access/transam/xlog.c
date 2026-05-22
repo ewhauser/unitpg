@@ -103,6 +103,7 @@
 #include "storage/sync.h"
 #include "utils/guc_hooks.h"
 #include "utils/guc_tables.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/injection_point.h"
 #include "utils/pgstat_internal.h"
 #include "utils/ps_status.h"
@@ -1124,7 +1125,8 @@ XLogInsertRecord(XLogRecData *rdata,
 		pgWalUsage.wal_fpi_bytes += fpi_bytes;
 
 		/* Required for the flush of pending stats WAL data */
-		pgstat_report_fixed = true;
+		if (!fastpg_pgstat_noop_active())
+			pgstat_report_fixed = true;
 	}
 
 	return EndPos;
@@ -2107,7 +2109,8 @@ AdvanceXLInsertBuffer(XLogRecPtr upto, TimeLineID tli, bool opportunistic)
 					 * Required for the flush of pending stats WAL data, per
 					 * update of pgWalUsage.
 					 */
-					pgstat_report_fixed = true;
+					if (!fastpg_pgstat_noop_active())
+						pgstat_report_fixed = true;
 				}
 				/* Re-acquire WALBufMappingLock and retry */
 				LWLockAcquire(WALBufMappingLock, LW_EXCLUSIVE);

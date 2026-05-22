@@ -87,6 +87,7 @@
 #include "utils/elog.h"
 #include "utils/acl.h"
 #include "utils/builtins.h"
+#include "utils/fastpg_pgstat_noop.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
 #include "utils/lsyscache.h"
@@ -759,7 +760,8 @@ fastpg_pgcore_init_postgres_catalog_once(void)
 	CreateDataDirLockFile(false);
 	LocalProcessControlFile(false);
 	RegisterBuiltinShmemCallbacks();
-	process_shared_preload_libraries();
+	if (!fastpg_pgstat_noop_active())
+		process_shared_preload_libraries();
 	InitializeMaxBackends();
 	InitPostmasterChildSlots();
 	InitializeFastPathLocks();
