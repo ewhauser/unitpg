@@ -33,6 +33,7 @@
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "utils/acl.h"
+#include "utils/backend_progress.h"
 #include "utils/builtins.h"
 #include "utils/fastpg_pgstat_noop.h"
 #include "utils/syscache.h"
@@ -86,6 +87,9 @@ CppConcat(pg_stat_get_,stat)(PG_FUNCTION_ARGS)					\
 																\
 	if (!fastpg_pgstat_relation_exists(relid))					\
 		PG_RETURN_INT64(0);										\
+	if (fastpg_pgstat_noop_relation_int64(relid, CppAsString(stat), \
+										  &result))				\
+		PG_RETURN_INT64(result);								\
 																\
 	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)	\
 		result = 0;												\
@@ -222,6 +226,15 @@ CppConcat(pg_stat_get_,stat)(PG_FUNCTION_ARGS)					\
 	Oid			relid = PG_GETARG_OID(0);						\
 	TimestampTz result;											\
 	PgStat_StatTabEntry *tabentry;								\
+																\
+	if (fastpg_pgstat_noop_relation_timestamp(relid, CppAsString(stat), \
+											  &result))			\
+	{															\
+		if (result == 0)										\
+			PG_RETURN_NULL();									\
+		else													\
+			PG_RETURN_TIMESTAMPTZ(result);						\
+	}															\
 																\
 	if ((tabentry = pgstat_fetch_stat_tabentry(relid)) == NULL)	\
 		result = 0;												\
@@ -365,6 +378,9 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 	char	   *cmd = text_to_cstring(PG_GETARG_TEXT_PP(0));
 	ProgressCommandType cmdtype;
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	ProgressCommandType fastpg_cmdtype;
+	Oid			fastpg_relid;
+	int64		fastpg_params[PGSTAT_NUM_PROGRESS_PARAM];
 
 	/* Translate command name into command type code. */
 	if (pg_strcasecmp(cmd, "VACUUM") == 0)
@@ -387,6 +403,28 @@ pg_stat_get_progress_info(PG_FUNCTION_ARGS)
 				 errmsg("invalid command name: \"%s\"", cmd)));
 
 	InitMaterializedSRF(fcinfo, 0);
+
+	if (fastpg_pgstat_noop_progress_snapshot(&fastpg_cmdtype, &fastpg_relid,
+											 fastpg_params))
+	{
+		if (fastpg_cmdtype == cmdtype)
+		{
+			Datum		values[PG_STAT_GET_PROGRESS_COLS] = {0};
+			bool		nulls[PG_STAT_GET_PROGRESS_COLS] = {0};
+			int			i;
+
+			values[0] = Int32GetDatum(MyProcPid);
+			values[1] = ObjectIdGetDatum(MyDatabaseId);
+			values[2] = ObjectIdGetDatum(fastpg_relid);
+			for (i = 0; i < PGSTAT_NUM_PROGRESS_PARAM; i++)
+				values[i + 3] = Int64GetDatum(fastpg_params[i]);
+
+			tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values,
+								 nulls);
+		}
+
+		return (Datum) 0;
+	}
 
 	/* 1-based index */
 	for (curr_backend = 1; curr_backend <= num_backends; curr_backend++)

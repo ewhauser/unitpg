@@ -61,6 +61,21 @@ int			plpgsql_extra_errors;
 /* Hook for plugins */
 PLpgSQL_plugin **plpgsql_plugin_ptr = NULL;
 
+#ifdef USE_FASTPG
+static _Thread_local bool plpgsql_callbacks_registered = false;
+
+static void
+plpgsql_ensure_callbacks_registered(void)
+{
+	if (!plpgsql_callbacks_registered)
+	{
+		RegisterXactCallback(plpgsql_xact_cb, NULL);
+		RegisterSubXactCallback(plpgsql_subxact_cb, NULL);
+		plpgsql_callbacks_registered = true;
+	}
+}
+#endif
+
 
 static bool
 plpgsql_extra_checks_check_hook(char **newvalue, void **extra, GucSource source)
@@ -158,6 +173,7 @@ _PG_init(void)
 #ifdef USE_FASTPG
 		if (fastpg_catalog_mode_uses_postgres())
 			MarkGUCPrefixReserved("plpgsql");
+		plpgsql_ensure_callbacks_registered();
 #endif
 		return;
 	}
@@ -211,8 +227,12 @@ _PG_init(void)
 
 	MarkGUCPrefixReserved("plpgsql");
 
+#ifdef USE_FASTPG
+	plpgsql_ensure_callbacks_registered();
+#else
 	RegisterXactCallback(plpgsql_xact_cb, NULL);
 	RegisterSubXactCallback(plpgsql_subxact_cb, NULL);
+#endif
 
 	/* Set up a rendezvous point with optional instrumentation plugin */
 	plpgsql_plugin_ptr = (PLpgSQL_plugin **) find_rendezvous_variable("PLpgSQL_plugin");
@@ -238,6 +258,10 @@ plpgsql_call_handler(PG_FUNCTION_ARGS)
 	ResourceOwner procedure_resowner;
 	volatile Datum retval = (Datum) 0;
 	int			rc;
+
+#ifdef USE_FASTPG
+	plpgsql_ensure_callbacks_registered();
+#endif
 
 	nonatomic = fcinfo->context &&
 		IsA(fcinfo->context, CallContext) &&
@@ -332,6 +356,10 @@ plpgsql_inline_handler(PG_FUNCTION_ARGS)
 	ResourceOwner simple_eval_resowner;
 	Datum		retval;
 	int			rc;
+
+#ifdef USE_FASTPG
+	plpgsql_ensure_callbacks_registered();
+#endif
 
 	/*
 	 * Connect to SPI manager

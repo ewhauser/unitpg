@@ -43,5 +43,8 @@ extern void pgstat_progress_update_multi_param(int nparam, const int *index,
 											   const int64 *val);
 extern void pgstat_progress_end_command(void);
 
+extern bool fastpg_pgstat_noop_progress_snapshot(ProgressCommandType *cmdtype,
+												 Oid *relid,
+												 int64 *params);
 
 #endif							/* BACKEND_PROGRESS_H */

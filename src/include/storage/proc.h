@@ -388,6 +388,7 @@ PGPROC;
 #ifdef USE_FASTPG
 extern PGDLLIMPORT PG_THREAD_LOCAL PGPROC *MyProc;
 extern void FastPgEnsureThreadProc(void);
+extern void FastPgReleaseThreadProc(void);
 #else
 extern PGDLLIMPORT PGPROC *MyProc;
 #endif

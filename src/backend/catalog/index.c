@@ -137,6 +137,54 @@ static void SetReindexProcessing(Oid heapOid, Oid indexOid);
 static void ResetReindexProcessing(void);
 static void SetReindexPending(List *indexes);
 static void RemoveReindexPending(Oid indexOid);
+#ifdef USE_FASTPG
+static void FastPgCatalogTupleUpdatePgIndex(Relation pg_index,
+											Oid indexId,
+											HeapTuple tuple);
+#endif
+
+#ifdef USE_FASTPG
+static void
+FastPgCatalogTupleUpdatePgIndex(Relation pg_index, Oid indexId, HeapTuple tuple)
+{
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		ScanKeyData key[1];
+		HeapTuple	locked_tuple;
+		void	   *state;
+
+		ScanKeyInit(&key[0],
+					Anum_pg_index_indexrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(indexId));
+		systable_inplace_update_begin(pg_index, IndexRelidIndexId, true,
+									  NULL, 1, key, &locked_tuple, &state);
+		if (!HeapTupleIsValid(locked_tuple))
+			elog(ERROR, "cache lookup failed for index %u", indexId);
+		{
+			Form_pg_index lockedForm = (Form_pg_index) GETSTRUCT(locked_tuple);
+			Form_pg_index tupleForm = (Form_pg_index) GETSTRUCT(tuple);
+
+			lockedForm->indisunique = tupleForm->indisunique;
+			lockedForm->indnullsnotdistinct = tupleForm->indnullsnotdistinct;
+			lockedForm->indisprimary = tupleForm->indisprimary;
+			lockedForm->indisexclusion = tupleForm->indisexclusion;
+			lockedForm->indimmediate = tupleForm->indimmediate;
+			lockedForm->indisclustered = tupleForm->indisclustered;
+			lockedForm->indisvalid = tupleForm->indisvalid;
+			lockedForm->indcheckxmin = tupleForm->indcheckxmin;
+			lockedForm->indisready = tupleForm->indisready;
+			lockedForm->indislive = tupleForm->indislive;
+			lockedForm->indisreplident = tupleForm->indisreplident;
+		}
+		systable_inplace_update_finish(state, locked_tuple);
+		heap_freetuple(locked_tuple);
+		return;
+	}
+
+	CatalogTupleUpdate(pg_index, &tuple->t_self, tuple);
+}
+#endif
 
 
 /*
@@ -1677,8 +1725,13 @@ index_concurrently_swap(Oid newIndexId, Oid oldIndexId, const char *oldName)
 	oldIndexForm->indisclustered = false;
 	oldIndexForm->indisreplident = false;
 
+#ifdef USE_FASTPG
+	FastPgCatalogTupleUpdatePgIndex(pg_index, oldIndexId, oldIndexTuple);
+	FastPgCatalogTupleUpdatePgIndex(pg_index, newIndexId, newIndexTuple);
+#else
 	CatalogTupleUpdate(pg_index, &oldIndexTuple->t_self, oldIndexTuple);
 	CatalogTupleUpdate(pg_index, &newIndexTuple->t_self, newIndexTuple);
+#endif
 
 	heap_freetuple(oldIndexTuple);
 	heap_freetuple(newIndexTuple);
@@ -2115,7 +2168,11 @@ index_constraint_create(Relation heapRelation,
 
 		if (dirty)
 		{
-			CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+#ifdef USE_FASTPG
+				FastPgCatalogTupleUpdatePgIndex(pg_index, indexRelationId, indexTuple);
+#else
+				CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+#endif
 
 			/*
 			 * When we mark an existing index as primary, force a relcache
@@ -3247,7 +3304,11 @@ index_build(Relation heapRelation,
 		Assert(!indexForm->indcheckxmin);
 
 		indexForm->indcheckxmin = true;
-		CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+#ifdef USE_FASTPG
+				FastPgCatalogTupleUpdatePgIndex(pg_index, indexId, indexTuple);
+#else
+				CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+#endif
 
 		heap_freetuple(indexTuple);
 		table_close(pg_index, RowExclusiveLock);
@@ -3608,15 +3669,40 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 {
 	Relation	pg_index;
 	HeapTuple	indexTuple;
+	ItemPointerData otid;
 	Form_pg_index indexForm;
+#ifdef USE_FASTPG
+	bool		fastpg_inplace_update = false;
+	void	   *inplace_state = NULL;
+#endif
 
 	/* Open pg_index and fetch a writable copy of the index's tuple */
 	pg_index = table_open(IndexRelationId, RowExclusiveLock);
 
-	indexTuple = SearchSysCacheCopy1(INDEXRELID,
-									 ObjectIdGetDatum(indexId));
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		ScanKeyData key[1];
+
+		ScanKeyInit(&key[0],
+					Anum_pg_index_indexrelid,
+					BTEqualStrategyNumber, F_OIDEQ,
+					ObjectIdGetDatum(indexId));
+		systable_inplace_update_begin(pg_index, IndexRelidIndexId, true,
+									  NULL, 1, key, &indexTuple,
+									  &inplace_state);
+		fastpg_inplace_update = true;
+	}
+	else
+#endif
+		indexTuple = SearchSysCacheCopy1(INDEXRELID,
+										 ObjectIdGetDatum(indexId));
 	if (!HeapTupleIsValid(indexTuple))
 		elog(ERROR, "cache lookup failed for index %u", indexId);
+#ifdef USE_FASTPG
+	if (!fastpg_inplace_update)
+#endif
+		otid = indexTuple->t_self;
 	indexForm = (Form_pg_index) GETSTRUCT(indexTuple);
 
 	/* Perform the requested state change on the copy */
@@ -3673,8 +3759,14 @@ index_set_state_flags(Oid indexId, IndexStateFlagsAction action)
 	}
 
 	/* ... and update it */
-	CatalogTupleUpdate(pg_index, &indexTuple->t_self, indexTuple);
+#ifdef USE_FASTPG
+	if (fastpg_inplace_update)
+		systable_inplace_update_finish(inplace_state, indexTuple);
+	else
+#endif
+		CatalogTupleUpdate(pg_index, &otid, indexTuple);
 
+	heap_freetuple(indexTuple);
 	table_close(pg_index, RowExclusiveLock);
 }
 

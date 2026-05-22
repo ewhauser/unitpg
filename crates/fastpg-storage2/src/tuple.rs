@@ -1,5 +1,7 @@
 use crate::*;
 
+pub(crate) const DATUM_ALIGNMENT: usize = 8;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DecodedDatum<'a> {
     Null,
@@ -149,6 +151,8 @@ pub(crate) fn build_tuple(input: &RowInput<'_>) -> Result<Vec<u8>, CatalogError>
         } else {
             unsafe { slice::from_raw_parts(input.values[index] as *const u8, len) }
         };
+        let aligned_len = bytes.len().next_multiple_of(DATUM_ALIGNMENT);
+        bytes.resize(aligned_len, 0);
         let offset = bytes.len() - payload_offset;
         bytes.extend_from_slice(source);
         bytes[entry] = 2;
@@ -300,21 +304,22 @@ pub(crate) fn copy_tuple_to_outputs(
     is_null_out: *mut u8,
     natts: usize,
     tid_out: *mut u64,
+    stored_natts_out: *mut usize,
 ) -> bool {
     if tuple.len() < TUPLE_HEADER_LEN || tuple.get(0..4) != Some(TUPLE_MAGIC) {
         return false;
     }
     let base = tuple.as_ptr();
     let tuple_natts = unsafe { std::ptr::read_unaligned(base.add(4) as *const u16) } as usize;
-    if tuple_natts != natts {
+    if tuple_natts > natts {
         return false;
     }
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
         return false;
     }
-    let null_bitmap_len = natts.div_ceil(8);
+    let null_bitmap_len = tuple_natts.div_ceil(8);
     let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
-    let payload_offset = attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN));
+    let payload_offset = attr_dir_offset.saturating_add(tuple_natts.saturating_mul(ATTR_ENTRY_LEN));
     if payload_offset > tuple.len() {
         return false;
     }
@@ -331,7 +336,7 @@ pub(crate) fn copy_tuple_to_outputs(
         payload_offset
     );
 
-    for index in 0..natts {
+    for index in 0..tuple_natts {
         let null_byte = unsafe { *base.add(TUPLE_HEADER_LEN + index / 8) };
         let null = null_byte & (1 << (index % 8)) != 0;
         let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
@@ -374,9 +379,20 @@ pub(crate) fn copy_tuple_to_outputs(
             _ => return false,
         }
     }
+    for index in tuple_natts..natts {
+        unsafe {
+            values_out.add(index).write(0);
+            is_null_out.add(index).write(1);
+        }
+    }
     if !tid_out.is_null() {
         unsafe {
             *tid_out = tid.pack();
+        }
+    }
+    if !stored_natts_out.is_null() {
+        unsafe {
+            *stored_natts_out = tuple_natts;
         }
     }
     true

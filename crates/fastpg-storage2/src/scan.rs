@@ -40,11 +40,48 @@ impl ScanCursor {
                 block: tid.block,
                 offset: tid.offset - 1,
             }
+        } else if tid.block == 0 {
+            Self {
+                block: 0,
+                offset: 0,
+            }
         } else {
             Self {
                 block: tid.block.saturating_sub(1),
                 offset: u16::MAX,
             }
+        }
+    }
+
+    pub(crate) fn before_cursor(cursor: Self) -> Self {
+        if cursor.offset > 1 {
+            Self {
+                block: cursor.block,
+                offset: cursor.offset - 1,
+            }
+        } else if cursor.block == 0 {
+            Self {
+                block: 0,
+                offset: 0,
+            }
+        } else {
+            Self {
+                block: cursor.block - 1,
+                offset: u16::MAX,
+            }
+        }
+    }
+
+    pub(crate) fn after_cursor(cursor: Self) -> Self {
+        match cursor.offset.checked_add(1) {
+            Some(offset) => Self {
+                block: cursor.block,
+                offset,
+            },
+            None => Self {
+                block: cursor.block.saturating_add(1),
+                offset: 1,
+            },
         }
     }
 }
@@ -56,4 +93,5 @@ pub(crate) struct ScanState {
     pub(crate) forward_cursor: ScanCursor,
     pub(crate) backward_cursor: ScanCursor,
     pub(crate) has_visibility_deltas: bool,
+    pub(crate) snapshot_curcid: Option<u32>,
 }

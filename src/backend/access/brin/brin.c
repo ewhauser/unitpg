@@ -21,6 +21,7 @@
 #include "access/brin_xlog.h"
 #ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
+#include "access/fastpg_tableam.h"
 #endif
 #include "access/relation.h"
 #include "access/reloptions.h"
@@ -215,6 +216,7 @@ typedef struct BrinOpaque
 
 #define BRIN_ALL_BLOCKRANGES	InvalidBlockNumber
 
+static BlockNumber brin_heap_num_blocks(Relation heapRel);
 static BrinBuildState *initialize_brin_buildstate(Relation idxRel,
 												  BrinRevmap *revmap,
 												  BlockNumber pagesPerRange,
@@ -233,6 +235,16 @@ static bool add_values_to_range(Relation idxRel, BrinDesc *bdesc,
 static bool check_null_keys(BrinValues *bval, ScanKey *nullkeys, int nnullkeys);
 static void brin_fill_empty_ranges(BrinBuildState *state,
 								   BlockNumber prevRange, BlockNumber nextRange);
+
+static BlockNumber
+brin_heap_num_blocks(Relation heapRel)
+{
+#ifdef USE_FASTPG
+	if (heapRel->rd_tableam == GetFastPgMemTableAmRoutine())
+		return FastPgMemRelationPhysicalPages(heapRel);
+#endif
+	return RelationGetNumberOfBlocks(heapRel);
+}
 
 /* parallel index builds */
 static void _brin_begin_parallel(BrinBuildState *buildstate, Relation heap, Relation index,
@@ -608,7 +620,7 @@ bringetbitmap(IndexScanDesc scan, TIDBitmap *tbm)
 	 */
 	heapOid = IndexGetRelation(RelationGetRelid(idxRel), false);
 	heapRel = table_open(heapOid, AccessShareLock);
-	nblocks = RelationGetNumberOfBlocks(heapRel);
+	nblocks = brin_heap_num_blocks(heapRel);
 	table_close(heapRel, AccessShareLock);
 
 	/*
@@ -1166,7 +1178,7 @@ brinbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	 */
 	revmap = brinRevmapInitialize(index, &pagesPerRange);
 	state = initialize_brin_buildstate(index, revmap, pagesPerRange,
-									   RelationGetNumberOfBlocks(heap));
+									   brin_heap_num_blocks(heap));
 
 	/*
 	 * Attempt to launch parallel worker scan when required
@@ -1809,7 +1821,7 @@ summarize_range(IndexInfo *indexInfo, BrinBuildState *state, Relation heapRel,
 		 *
 		 * Fortunately, this should occur infrequently.
 		 */
-		scanNumBlks = Min(RelationGetNumberOfBlocks(heapRel) - heapBlk,
+		scanNumBlks = Min(brin_heap_num_blocks(heapRel) - heapBlk,
 						  state->bs_pagesPerRange);
 	}
 	else
@@ -1913,7 +1925,7 @@ brinsummarize(Relation index, Relation heapRel, BlockNumber pageRange,
 	revmap = brinRevmapInitialize(index, &pagesPerRange);
 
 	/* determine range of pages to process */
-	heapNumBlocks = RelationGetNumberOfBlocks(heapRel);
+	heapNumBlocks = brin_heap_num_blocks(heapRel);
 	if (pageRange == BRIN_ALL_BLOCKRANGES)
 		startBlk = 0;
 	else

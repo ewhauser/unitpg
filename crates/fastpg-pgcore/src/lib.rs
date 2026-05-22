@@ -367,6 +367,11 @@ impl PgCoreSession {
         let _guard = self.enter_storage();
         self.inner.start_client_session()
     }
+
+    pub fn end_client_session(&self) {
+        let _guard = self.enter_storage();
+        self.inner.end_client_session();
+    }
 }
 
 impl Default for PgCoreSession {
@@ -602,6 +607,7 @@ mod inner {
         fn fastpg_pgcore_notice_capture_cursorpos(index: i32) -> i32;
         fn fastpg_pgcore_reset_session_state();
         fn fastpg_pgcore_start_client_session();
+        fn fastpg_pgcore_end_client_session();
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
         fn fastpg_pgcore_parse_result_statement_count(
@@ -1168,6 +1174,13 @@ mod inner {
                 fastpg_pgcore_start_client_session();
             }
             notice_capture.finish()
+        }
+
+        pub fn end_client_session(&self) {
+            let _guard = enter_pgcore_lane("end_client_session");
+            unsafe {
+                fastpg_pgcore_end_client_session();
+            }
         }
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
@@ -2100,6 +2113,8 @@ mod inner {
         pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
             Vec::new()
         }
+
+        pub fn end_client_session(&self) {}
     }
 
     #[derive(Debug)]

@@ -151,6 +151,30 @@ static bool index_expression_changed_walker(Node *node,
 static void ExecWithoutOverlapsNotEmpty(Relation rel, NameData attname, Datum attval,
 										char typtype, Oid atttypid);
 
+#ifdef USE_FASTPG
+static bool
+fastpg_index_tuple_matches_self(Relation heap,
+								const ItemPointerData *tupleid,
+								ItemPointer existing_tid)
+{
+	ItemPointerData resolved_tupleid;
+	ItemPointerData resolved_existing_tid;
+
+	if (tupleid == NULL || !ItemPointerIsValid(tupleid))
+		return false;
+	if (ItemPointerEquals(tupleid, existing_tid))
+		return true;
+	if (!FastPgMemResolveIndexFetchTid(heap, tupleid, &resolved_tupleid))
+		return false;
+	if (ItemPointerEquals(&resolved_tupleid, existing_tid))
+		return true;
+	if (FastPgMemResolveIndexFetchTid(heap, existing_tid, &resolved_existing_tid) &&
+		ItemPointerEquals(&resolved_tupleid, &resolved_existing_tid))
+		return true;
+	return false;
+}
+#endif
+
 /* ----------------------------------------------------------------
  *		ExecOpenIndices
  *
@@ -789,7 +813,8 @@ check_exclusion_or_unique_constraint(Relation heap, Relation index,
 	}
 
 #ifdef USE_FASTPG
-	if (indexInfo->ii_ExclusionOps == NULL && violationOK)
+	if (indexInfo->ii_ExclusionOps == NULL &&
+		violationOK)
 	{
 		bool		fastpg_satisfies;
 
@@ -860,7 +885,11 @@ retry:
 		 * Ignore the entry for the tuple we're trying to check.
 		 */
 		if (ItemPointerIsValid(tupleid) &&
+#ifdef USE_FASTPG
+			fastpg_index_tuple_matches_self(heap, tupleid, &existing_slot->tts_tid))
+#else
 			ItemPointerEquals(tupleid, &existing_slot->tts_tid))
+#endif
 		{
 			if (found_self)		/* should not happen */
 				elog(ERROR, "found self tuple multiple times in index \"%s\"",

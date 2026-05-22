@@ -310,6 +310,7 @@ impl QueryExecutorCloseWork {
             fastpg_storage2::fastpg_storage2_xact_abort_if_implicit();
         }
         self.pgcore_session.reset_session_state();
+        self.pgcore_session.end_client_session();
     }
 }
 

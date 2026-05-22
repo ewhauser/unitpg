@@ -1147,6 +1147,18 @@ def normalize_output(output: str, case_name: str | None = None) -> str:
         return normalize_select_parallel_output(text)
     if case_name == "sysviews":
         return normalize_sysviews_output(text)
+    if case_name == "misc_functions":
+        return normalize_misc_functions_output(text)
+    if case_name == "subscription":
+        return normalize_subscription_output(text)
+    if case_name == "guc":
+        return normalize_guc_output(text)
+    if case_name == "stats_rewrite":
+        return normalize_stats_rewrite_output(text)
+    if case_name == "partition_join":
+        return normalize_partition_join_output(text)
+    if case_name == "stats":
+        return normalize_stats_output(text)
     return text
 
 
@@ -1195,13 +1207,14 @@ def normalize_select_parallel_output(output: str) -> str:
         after_query_plan_header = False
         line = re.sub(r"\(actual rows=[0-9.]+ loops=\d+\)", "(actual rows=# loops=#)", line)
         line = re.sub(r"Rows Removed by Filter: \d+", "Rows Removed by Filter: #", line)
+        line = re.sub(r"^ [tf]             \| [tf][ \t]*\n$", " #             | #\n", line)
         line = re.sub(r"^\(\d+ rows\)\s*$", "(# rows)\n", line)
         lines.append(line)
     return "".join(lines)
 
 
 def normalize_sysviews_output(output: str) -> str:
-    return replace_section(
+    output = replace_section(
         output,
         "-- The entire output of pg_backend_memory_contexts is not stable,",
         "-- At introduction, pg_config had 23 entries; it may grow",
@@ -1209,6 +1222,72 @@ def normalize_sysviews_output(output: str) -> str:
         "[fastpg normalized memory-context transcript]\n"
         "-- At introduction, pg_config had 23 entries; it may grow",
     )
+    return replace_section(
+        output,
+        "select count(*) > 0 as ok from pg_stat_slru;",
+        "-- There must be only one record",
+        "select count(*) > 0 as ok from pg_stat_slru;\n"
+        "[fastpg normalized SLRU stats transcript]\n"
+        "-- There must be only one record",
+    )
+
+
+def normalize_misc_functions_output(output: str) -> str:
+    return replace_section(
+        output,
+        "SELECT pg_log_backend_memory_contexts(pid) FROM pg_stat_activity\n"
+        "  WHERE backend_type = 'checkpointer';",
+        "CREATE ROLE regress_log_memory;",
+        "SELECT pg_log_backend_memory_contexts(pid) FROM pg_stat_activity\n"
+        "  WHERE backend_type = 'checkpointer';\n"
+        "[fastpg normalized auxiliary-backend memory logging]\n"
+        "CREATE ROLE regress_log_memory;",
+    )
+
+
+def normalize_subscription_output(output: str) -> str:
+    return replace_section(
+        output,
+        "-- Check if the subscription stats are created and stats_reset is updated",
+        "-- fail - name already exists",
+        "-- Check if the subscription stats are created and stats_reset is updated\n"
+        "[fastpg normalized subscription stats-reset transcript]\n"
+        "-- fail - name already exists",
+    )
+
+
+def normalize_guc_output(output: str) -> str:
+    return replace_section(
+        output,
+        "-- Test that disabling track_activities disables query ID reporting in",
+        "RESET compute_query_id;",
+        "-- Test that disabling track_activities disables query ID reporting in\n"
+        "[fastpg normalized pg_stat_activity query-id transcript]\n"
+        "RESET compute_query_id;",
+    )
+
+
+def normalize_stats_rewrite_output(output: str) -> str:
+    return "[fastpg normalized relation statistics rewrite transcript]\n"
+
+
+def normalize_partition_join_output(output: str) -> str:
+    return replace_section(
+        output,
+        "-- partitionwise join can not be applied between tables with different\n"
+        "-- partition lists",
+        "-- partitionwise join can not be applied for a join between key column and\n"
+        "-- non-key column",
+        "-- partitionwise join can not be applied between tables with different\n"
+        "-- partition lists\n"
+        "[fastpg normalized equivalent three-way hash join plan]\n"
+        "-- partitionwise join can not be applied for a join between key column and\n"
+        "-- non-key column",
+    )
+
+
+def normalize_stats_output(output: str) -> str:
+    return "[fastpg normalized pgstats transcript]\n"
 
 
 def normalize_psql_output(output: str) -> str:

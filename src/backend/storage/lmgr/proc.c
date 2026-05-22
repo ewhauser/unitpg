@@ -129,6 +129,18 @@ FastPgEnsureThreadProc(void)
 		MyProc->databaseId = MyDatabaseId;
 	FastPgEnsureStandaloneUserId();
 }
+
+void
+FastPgReleaseThreadProc(void)
+{
+	if (IsUnderPostmaster || MyProc == NULL)
+		return;
+
+	ProcReleaseLocks(false);
+	if (FastPgProcArrayContains(MyProc))
+		RemoveProcFromArray(0, 0);
+	ProcKill(0, 0);
+}
 #endif
 
 

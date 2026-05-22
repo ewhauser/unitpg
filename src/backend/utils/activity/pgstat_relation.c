@@ -28,6 +28,21 @@
 #include "utils/rel.h"
 #include "utils/timestamp.h"
 
+typedef struct FastPgNoopRelationStats
+{
+	Oid			relid;
+	TimestampTz last_vacuum_time;
+	TimestampTz last_analyze_time;
+	int64		vacuum_count;
+	int64		analyze_count;
+	struct FastPgNoopRelationStats *next;
+} FastPgNoopRelationStats;
+
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+static FastPgNoopRelationStats *fastpg_noop_relation_stats = NULL;
+static MemoryContext fastpg_noop_relation_stats_context = NULL;
+#endif
+
 
 /* Record that's written to 2PC state file when pgstat state is persisted */
 typedef struct TwoPhasePgStatRecord
@@ -60,6 +75,136 @@ fastpg_skip_relation_stats(Relation rel)
 		 (!fastpg_catalog_mode_uses_postgres() || IsCatalogRelation(rel)));
 }
 #endif
+
+static FastPgNoopRelationStats *
+fastpg_pgstat_noop_relation_stats_entry(Oid relid, bool create)
+{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+	FastPgNoopRelationStats *entry;
+	MemoryContext oldcontext;
+
+	for (entry = fastpg_noop_relation_stats; entry != NULL; entry = entry->next)
+	{
+		if (entry->relid == relid)
+			return entry;
+	}
+
+	if (!create)
+		return NULL;
+
+	if (fastpg_noop_relation_stats_context == NULL)
+		fastpg_noop_relation_stats_context =
+			AllocSetContextCreate(TopMemoryContext,
+								  "fastpg pgstat noop relation stats",
+								  ALLOCSET_SMALL_SIZES);
+
+	oldcontext = MemoryContextSwitchTo(fastpg_noop_relation_stats_context);
+	entry = palloc0_object(FastPgNoopRelationStats);
+	entry->relid = relid;
+	entry->next = fastpg_noop_relation_stats;
+	fastpg_noop_relation_stats = entry;
+	MemoryContextSwitchTo(oldcontext);
+
+	return entry;
+#else
+	return NULL;
+#endif
+}
+
+void
+fastpg_pgstat_noop_report_vacuum(Oid relid, TimestampTz ts)
+{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+	FastPgNoopRelationStats *entry;
+
+	if (!fastpg_pgstat_noop_active())
+		return;
+
+	entry = fastpg_pgstat_noop_relation_stats_entry(relid, true);
+	entry->last_vacuum_time = ts;
+	entry->vacuum_count++;
+#endif
+}
+
+void
+fastpg_pgstat_noop_report_analyze(Oid relid, TimestampTz ts)
+{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+	FastPgNoopRelationStats *entry;
+
+	if (!fastpg_pgstat_noop_active())
+		return;
+
+	entry = fastpg_pgstat_noop_relation_stats_entry(relid, true);
+	entry->last_analyze_time = ts;
+	entry->analyze_count++;
+#endif
+}
+
+bool
+fastpg_pgstat_noop_relation_int64(Oid relid, const char *stat, int64 *result)
+{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+	FastPgNoopRelationStats *entry;
+
+	if (!fastpg_pgstat_noop_active())
+		return false;
+
+	entry = fastpg_pgstat_noop_relation_stats_entry(relid, false);
+	if (entry == NULL)
+	{
+		*result = 0;
+		return true;
+	}
+
+	if (strcmp(stat, "vacuum_count") == 0)
+		*result = entry->vacuum_count;
+	else if (strcmp(stat, "analyze_count") == 0)
+		*result = entry->analyze_count;
+	else
+	{
+		*result = 0;
+		return true;
+	}
+
+	return true;
+#else
+	return false;
+#endif
+}
+
+bool
+fastpg_pgstat_noop_relation_timestamp(Oid relid, const char *stat,
+									  TimestampTz *result)
+{
+#if defined(USE_FASTPG) && defined(FASTPG_NOOP_PGSTAT)
+	FastPgNoopRelationStats *entry;
+
+	if (!fastpg_pgstat_noop_active())
+		return false;
+
+	entry = fastpg_pgstat_noop_relation_stats_entry(relid, false);
+	if (entry == NULL)
+	{
+		*result = 0;
+		return true;
+	}
+
+	if (strcmp(stat, "last_vacuum_time") == 0)
+		*result = entry->last_vacuum_time;
+	else if (strcmp(stat, "last_analyze_time") == 0)
+		*result = entry->last_analyze_time;
+	else
+	{
+		*result = 0;
+		return true;
+	}
+
+	return true;
+#else
+	return false;
+#endif
+}
 
 
 /*
@@ -263,6 +408,9 @@ pgstat_report_vacuum(Relation rel, PgStat_Counter livetuples,
 	if (!pgstat_track_counts)
 		return;
 #ifdef USE_FASTPG
+	if (fastpg_pgstat_noop_active())
+		fastpg_pgstat_noop_report_vacuum(RelationGetRelid(rel),
+										 GetCurrentTimestamp());
 	if (fastpg_skip_relation_stats(rel))
 		return;
 #endif
@@ -339,6 +487,9 @@ pgstat_report_analyze(Relation rel,
 	if (!pgstat_track_counts)
 		return;
 #ifdef USE_FASTPG
+	if (fastpg_pgstat_noop_active())
+		fastpg_pgstat_noop_report_analyze(RelationGetRelid(rel),
+										  GetCurrentTimestamp());
 	if (fastpg_skip_relation_stats(rel))
 		return;
 #endif
