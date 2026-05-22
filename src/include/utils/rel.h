@@ -166,6 +166,10 @@ typedef struct RelationData
 	Bitmapset  *rd_summarizedattr;	/* cols indexed by summarizing indexes */
 
 	PublicationDesc *rd_pubdesc;	/* publication descriptor, or NULL */
+#ifdef USE_FASTPG
+	bool		rd_fastpg_pubdesc_valid;
+	PublicationDesc rd_fastpg_pubdesc;
+#endif
 
 	/*
 	 * rd_options is set whenever rd_rel is loaded into the relcache entry.

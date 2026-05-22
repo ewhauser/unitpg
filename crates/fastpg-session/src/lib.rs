@@ -155,6 +155,12 @@ impl SessionBackendExecutor {
             Err(payload) => resume_unwind(payload),
         }
     }
+
+    fn enqueue(&self, operation: impl FnOnce() + Send + 'static) {
+        self.sender
+            .send(SessionBackendMessage::Run(Box::new(operation)))
+            .expect("fastpg session backend thread exited");
+    }
 }
 
 impl fmt::Debug for SessionBackendExecutor {
@@ -250,6 +256,10 @@ impl SessionState {
         R: Send + 'static,
     {
         self.backend.run(operation)
+    }
+
+    pub fn enqueue_on_backend(&self, operation: impl FnOnce() + Send + 'static) {
+        self.backend.enqueue(operation);
     }
 
     pub fn take_notices(&self) -> Vec<QueryNotice> {

@@ -118,6 +118,9 @@ extern void fastpg_storage2_subxact_begin(void);
 extern void fastpg_storage2_subxact_commit(void);
 extern void fastpg_storage2_subxact_abort(void);
 extern void fastpg_mem_ensure_xact_callbacks(void);
+#define FASTPG_PGCORE_CATALOG_ERROR_CLEANUP() FastPgCatalogCacheUnlockAll()
+#else
+#define FASTPG_PGCORE_CATALOG_ERROR_CLEANUP() ((void) 0)
 #endif
 
 typedef struct FastPgPgCoreParseResult
@@ -697,6 +700,7 @@ fastpg_pgcore_init_catalog_cache_phase2(void)
 	}
 	PG_CATCH();
 	{
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		CurrentResourceOwner = saved_owner;
 		if (startup_owner != NULL)
 		{
@@ -960,6 +964,15 @@ fastpg_pgcore_set_database(uint32_t database_oid)
 	if (!OidIsValid((Oid) database_oid))
 		database_oid = PostgresDbOid;
 
+	if (MyDatabaseId == (Oid) database_oid &&
+		MyDatabaseTableSpace == DEFAULTTABLESPACE_OID &&
+		DatabasePath != NULL)
+	{
+		if (MyProc != NULL)
+			MyProc->databaseId = MyDatabaseId;
+		return;
+	}
+
 	MyDatabaseId = (Oid) database_oid;
 	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
 	if (MyProc != NULL)
@@ -986,7 +999,7 @@ fastpg_pgcore_invalidate_system_caches(void)
 	}
 	PG_CATCH();
 	{
-		FastPgCatalogCacheUnlock();
+		FastPgCatalogCacheUnlockAll();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
@@ -1274,6 +1287,7 @@ fastpg_pgcore_reset_session_state(void)
 	}
 	PG_CATCH();
 	{
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		FlushErrorState();
 		MemoryContextSwitchTo(old_context);
 		fastpg_pgcore_abort_postgres_catalog_command(&postgres_command_started);
@@ -2309,6 +2323,7 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 	}
 	PG_CATCH();
 	{
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		if (copy_out_capture_active)
 		{
 			PqCommMethods = save_pq_methods;
@@ -2559,6 +2574,7 @@ fastpg_pgcore_raw_parse(const char *query)
 	{
 		ErrorData  *edata;
 
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		MemoryContextSwitchTo(oldcontext);
 		edata = CopyErrorData();
 		FlushErrorState();
@@ -2771,6 +2787,7 @@ fastpg_pgcore_prepare(const char *query)
 	{
 		ErrorData  *edata;
 
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		MemoryContextSwitchTo(oldcontext);
 		edata = CopyErrorData();
 		FlushErrorState();
@@ -3488,6 +3505,7 @@ finish_statement:
 	{
 		ErrorData  *edata;
 
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		MemoryContextSwitchTo(result->context);
 		edata = CopyErrorData();
 		FlushErrorState();
@@ -3791,6 +3809,7 @@ simple_execute_done:
 	{
 		ErrorData  *edata;
 
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		MemoryContextSwitchTo(result->context);
 		edata = CopyErrorData();
 		FlushErrorState();
@@ -4015,6 +4034,7 @@ fastpg_pgcore_execute_copy_from_stdin(const char *query,
 	{
 		ErrorData  *edata;
 
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		fastpg_pgcore_active_copy_buffer = NULL;
 		if (snapshot_pushed && ActiveSnapshotSet())
 			PopActiveSnapshot();
@@ -4155,6 +4175,7 @@ fastpg_pgcore_input_text_datum(Oid type_oid, int32 typmod, const char *value_tex
 	{
 		ErrorData  *edata;
 
+		FASTPG_PGCORE_CATALOG_ERROR_CLEANUP();
 		MemoryContextSwitchTo(oldcontext);
 		edata = CopyErrorData();
 		FlushErrorState();

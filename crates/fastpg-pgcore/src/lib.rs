@@ -444,6 +444,7 @@ impl Portal {
 #[cfg(feature = "postgres-execution")]
 mod inner {
     use std::borrow::Cow;
+    use std::cell::Cell;
     use std::ffi::{CStr, CString, c_char};
     use std::ptr;
     use std::ptr::NonNull;
@@ -463,6 +464,10 @@ mod inner {
     static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
     const STACK_SQL_BUFFER_LEN: usize = 1024;
+
+    thread_local! {
+        static CURRENT_DATABASE_OID: Cell<u32> = const { Cell::new(0) };
+    }
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
         PgCoreLaneMetrics {
@@ -537,6 +542,20 @@ mod inner {
             fastpg_pgcore_invalidate_system_caches();
         }
         PGCORE_CATALOG_GENERATION.store(current_generation, Ordering::Relaxed);
+    }
+
+    fn set_pgcore_database(database_oid: u32) {
+        if database_oid != 0 {
+            let current = CURRENT_DATABASE_OID.with(Cell::get);
+            if current == database_oid {
+                return;
+            }
+        }
+
+        unsafe {
+            fastpg_pgcore_set_database(database_oid);
+        }
+        CURRENT_DATABASE_OID.with(|current| current.set(database_oid));
     }
 
     pub(super) fn postgres_catalog_enabled() -> bool {
@@ -1131,9 +1150,7 @@ mod inner {
         }
 
         fn set_database(&self) {
-            unsafe {
-                fastpg_pgcore_set_database(self.database_oid);
-            }
+            set_pgcore_database(self.database_oid);
         }
 
         pub fn reset_session_state(&self) {
@@ -1366,9 +1383,7 @@ mod inner {
         }
 
         fn set_database(&self) {
-            unsafe {
-                fastpg_pgcore_set_database(self.database_oid);
-            }
+            set_pgcore_database(self.database_oid);
         }
 
         pub fn describe(&self) -> StatementDescription {

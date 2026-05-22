@@ -179,7 +179,11 @@ typedef struct TwoPhaseLockRecord
  * would have to initialize that, while for the static array that happens
  * automatically. Doesn't seem worth the extra complexity.
  */
+#ifdef USE_FASTPG
+static _Thread_local int FastPathLocalUseCounts[FP_LOCK_GROUPS_PER_BACKEND_MAX];
+#else
 static int	FastPathLocalUseCounts[FP_LOCK_GROUPS_PER_BACKEND_MAX];
+#endif
 
 /*
  * Flag to indicate if the relation extension lock is held by this backend.
@@ -272,7 +276,7 @@ int			FastPathLockGroupsPerBackend = 0;
  */
 #ifdef USE_FASTPG
 #define FastPgAllowRelationFastPathLocks() \
-	(IsUnderPostmaster || !fastpg_catalog_mode_uses_postgres())
+	true
 #else
 #define FastPgAllowRelationFastPathLocks() true
 #endif
