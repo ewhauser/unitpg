@@ -2567,13 +2567,11 @@ UseFastPgMemTableAmOid(Oid relid)
 static bool
 UseFastPgMemIndexAm(Relation relation)
 {
+#ifdef FASTPG_USE_MEM_INDEX_AM
 	int			key_count;
-	const char *use_mem_index_am = getenv("FASTPG_USE_MEM_INDEX_AM");
 
 	if (!fastpg_catalog_mode_uses_postgres() ||
 		IsUnderPostmaster ||
-		use_mem_index_am == NULL ||
-		strcmp(use_mem_index_am, "1") != 0 ||
 		relation->rd_index == NULL ||
 		relation->rd_indextuple == NULL ||
 		!relation->rd_index->indisunique ||
@@ -2595,6 +2593,9 @@ UseFastPgMemIndexAm(Relation relation)
 	}
 
 	return true;
+#else
+	return false;
+#endif
 }
 #endif
 

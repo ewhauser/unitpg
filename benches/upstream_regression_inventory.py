@@ -111,6 +111,7 @@ class UpstreamRegressionInventory:
                 "storage_engine": args.storage_engine,
                 "global_timeout": args.global_timeout,
                 "catalog_mode": args.catalog_mode,
+                "fastpg_use_mem_index_am": args.fastpg_use_mem_index_am,
                 "fastpg_isolation": args.fastpg_isolation,
                 "fastpg_case_timeout": args.fastpg_case_timeout,
             },
@@ -1099,6 +1100,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         rust_build_profile=args.rust_build_profile,
         storage_engine=args.storage_engine,
         catalog_mode=getattr(args, "catalog_mode", "postgres"),
+        fastpg_use_mem_index_am=args.fastpg_use_mem_index_am,
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
@@ -1378,6 +1380,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--catalog-mode",
         choices=["rust", "postgres"],
         default="postgres",
+    )
+    parser.add_argument(
+        "--fastpg-use-mem-index-am",
+        action="store_true",
+        help="compile fastpg with the in-memory index AM for eligible postgres-catalog indexes",
     )
     parser.add_argument(
         "--global-timeout",
