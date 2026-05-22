@@ -21,21 +21,13 @@
 #define FASTPG_VIRTUAL_CATALOG_DYNAMIC 2
 #define FASTPG_VIRTUAL_CATALOG_EMPTY 3
 
-static inline bool
-fastpg_use_rust_catalog(void)
-{
 #ifdef FASTPG_USE_RUST_CATALOG
-	return true;
+#define fastpg_use_rust_catalog() true
+#define fastpg_catalog_mode_uses_postgres() false
 #else
-	return false;
+#define fastpg_use_rust_catalog() false
+#define fastpg_catalog_mode_uses_postgres() true
 #endif
-}
-
-static inline bool
-fastpg_catalog_mode_uses_postgres(void)
-{
-	return !fastpg_use_rust_catalog();
-}
 
 #ifndef INTEGER_BTREE_FAM_OID
 #define INTEGER_BTREE_FAM_OID 1976
@@ -337,17 +329,8 @@ extern void fastpg_rust_subxact_abort(void);
 
 #else							/* USE_FASTPG */
 
-static inline bool
-fastpg_catalog_mode_uses_postgres(void)
-{
-	return false;
-}
-
-static inline bool
-fastpg_use_rust_catalog(void)
-{
-	return false;
-}
+#define fastpg_catalog_mode_uses_postgres() false
+#define fastpg_use_rust_catalog() false
 
 #endif							/* USE_FASTPG */
 

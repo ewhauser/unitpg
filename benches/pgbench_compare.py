@@ -202,6 +202,7 @@ class PgBenchCompare:
                 "protocol": args.protocol,
                 "storage_engine": args.storage_engine,
                 "catalog_mode": args.catalog_mode,
+                "fastpg_use_mem_index_am": args.fastpg_use_mem_index_am,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
@@ -270,6 +271,10 @@ class PgBenchCompare:
     def ensure_variant_install(self, variant: Variant, output_dir: Path) -> dict[str, Path]:
         output_dir.mkdir(parents=True, exist_ok=True)
         build_dir = self.build_root / variant.name
+        mem_index_arg = (
+            f"-Dfastpg_use_mem_index_am="
+            f"{'true' if variant.fastpg and self.args.fastpg_use_mem_index_am else 'false'}"
+        )
         setup_args = [
             "meson",
             "setup",
@@ -279,6 +284,7 @@ class PgBenchCompare:
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
+            mem_index_arg,
         ]
         reconfigure_args = [
             "meson",
@@ -289,6 +295,7 @@ class PgBenchCompare:
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
+            mem_index_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
@@ -384,6 +391,10 @@ class PgBenchCompare:
 
     def ensure_fastpg_pgcore_build(self, variant_name: str, output_dir: Path) -> Path:
         build_dir = self.build_root / "fastpg"
+        mem_index_arg = (
+            f"-Dfastpg_use_mem_index_am="
+            f"{'true' if self.args.fastpg_use_mem_index_am else 'false'}"
+        )
         setup_args = [
             "meson",
             "setup",
@@ -393,6 +404,7 @@ class PgBenchCompare:
             "--auto-features=disabled",
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
+            mem_index_arg,
         ]
         reconfigure_args = [
             "meson",
@@ -404,6 +416,7 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            mem_index_arg,
         ]
         configure_args = [
             "meson",
@@ -414,6 +427,7 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            mem_index_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
@@ -1496,6 +1510,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["rust", "postgres"],
         default="postgres",
         help="select the fastpg catalog implementation for the Rust server variant",
+    )
+    parser.add_argument(
+        "--fastpg-use-mem-index-am",
+        action="store_true",
+        help="compile fastpg with the in-memory index AM for eligible postgres-catalog indexes",
     )
     parser.add_argument(
         "--profile-fastpg-rust-server",

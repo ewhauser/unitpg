@@ -14,6 +14,7 @@ MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage1
 CATALOG_MODE ?= postgres
+FASTPG_USE_MEM_INDEX_AM ?= 0
 UPSTREAM_REGRESSION_CASES ?=
 UPSTREAM_REGRESSION_LIMIT ?=
 REGRESSION_GLOBAL_TIMEOUT ?= 300
@@ -37,6 +38,7 @@ PROFILE_SERVER_MEMORY_FLAG := $(if $(filter 1 true yes,$(PROFILE_SERVER_MEMORY))
 UPSTREAM_REGRESSION_CASE_ARGS := $(foreach case,$(UPSTREAM_REGRESSION_CASES),--case "$(case)")
 UPSTREAM_REGRESSION_LIMIT_ARG := $(if $(UPSTREAM_REGRESSION_LIMIT),--limit "$(UPSTREAM_REGRESSION_LIMIT)",)
 REGRESSION_FAIL_ON_DIFFERENCES_ARG := $(if $(filter 1 true yes,$(REGRESSION_FAIL_ON_DIFFERENCES)),--fail-on-differences,)
+FASTPG_USE_MEM_INDEX_AM_ARG := $(if $(filter 1 true yes,$(FASTPG_USE_MEM_INDEX_AM)),--fastpg-use-mem-index-am,)
 
 PGBENCH_COMMON_ARGS = \
 	--scale "$(SCALE)" \
@@ -48,7 +50,8 @@ PGBENCH_COMMON_ARGS = \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
-	--rust-build-profile "$(RUST_BUILD_PROFILE)"
+	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
+	$(FASTPG_USE_MEM_INDEX_AM_ARG)
 
 PGBENCH_PROFILE_ARGS = \
 	--scale "$(SCALE)" \
@@ -67,6 +70,7 @@ PGBENCH_PROFILE_ARGS = \
 	--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" \
 	--profile-hyperfine-runs "$(PROFILE_HYPERFINE_RUNS)" \
 	--profile-hyperfine-warmup "$(PROFILE_HYPERFINE_WARMUP)" \
+	$(FASTPG_USE_MEM_INDEX_AM_ARG) \
 	$(PROFILE_HYPERFINE_FLAG) \
 	$(PROFILE_SERVER_MEMORY_FLAG) \
 	$(PROFILE_OPEN_FLAG)
@@ -125,6 +129,7 @@ profile-side-by-side:
 		--profile-warmup-seconds "$(PROFILE_WARMUP_SECONDS)" \
 		--profile-hyperfine-runs "$(PROFILE_HYPERFINE_RUNS)" \
 		--profile-hyperfine-warmup "$(PROFILE_HYPERFINE_WARMUP)" \
+		$(FASTPG_USE_MEM_INDEX_AM_ARG) \
 		$(PROFILE_HYPERFINE_FLAG) \
 		$(PROFILE_SERVER_MEMORY_FLAG) \
 		$(PROFILE_OPEN_FLAG)
@@ -142,6 +147,7 @@ regression:
 	--catalog-mode "$(CATALOG_MODE)" \
 	--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \
 	--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
+	$(FASTPG_USE_MEM_INDEX_AM_ARG) \
 	$(REGRESSION_FAIL_ON_DIFFERENCES_ARG)
 
 bench:
