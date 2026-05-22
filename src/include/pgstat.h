@@ -548,6 +548,9 @@ extern void pgstat_before_server_shutdown(int code, Datum arg);
 
 /* Functions for backend initialization */
 extern void pgstat_initialize(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadPgStat(void);
+#endif
 
 /* Functions called from backends */
 extern long pgstat_report_stat(bool force);
@@ -865,17 +868,31 @@ extern PGDLLIMPORT PgStat_CheckpointerStats PendingCheckpointerStats;
  */
 
 /* Updated by pgstat_count_buffer_*_time macros */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL PgStat_Counter pgStatBlockReadTime;
+extern PGDLLIMPORT PG_THREAD_LOCAL PgStat_Counter pgStatBlockWriteTime;
+#else
 extern PGDLLIMPORT PgStat_Counter pgStatBlockReadTime;
 extern PGDLLIMPORT PgStat_Counter pgStatBlockWriteTime;
+#endif
 
 /*
  * Updated by pgstat_count_conn_*_time macros, called by
  * pgstat_report_activity().
  */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL PgStat_Counter pgStatActiveTime;
+extern PGDLLIMPORT PG_THREAD_LOCAL PgStat_Counter pgStatTransactionIdleTime;
+#else
 extern PGDLLIMPORT PgStat_Counter pgStatActiveTime;
 extern PGDLLIMPORT PgStat_Counter pgStatTransactionIdleTime;
+#endif
 
 /* updated by the traffic cop and in errfinish() */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL SessionEndType pgStatSessionEndCause;
+#else
 extern PGDLLIMPORT SessionEndType pgStatSessionEndCause;
+#endif
 
 #endif							/* PGSTAT_H */

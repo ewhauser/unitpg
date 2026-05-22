@@ -41,7 +41,11 @@ typedef int ProcNumber;
 /*
  * Proc number of this backend (same as GetNumberFromPGProc(MyProc))
  */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL ProcNumber MyProcNumber;
+#else
 extern PGDLLIMPORT ProcNumber MyProcNumber;
+#endif
 
 /* proc number of our parallel session leader, or INVALID_PROC_NUMBER if none */
 extern PGDLLIMPORT ProcNumber ParallelLeaderProcNumber;

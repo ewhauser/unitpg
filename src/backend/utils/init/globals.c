@@ -89,7 +89,11 @@ char		postgres_exec_path[MAXPGPATH];	/* full path to backend */
 /* note: currently this is not valid in backend processes */
 #endif
 
+#ifdef USE_FASTPG
+_Thread_local ProcNumber MyProcNumber = INVALID_PROC_NUMBER;
+#else
 ProcNumber	MyProcNumber = INVALID_PROC_NUMBER;
+#endif
 
 ProcNumber	ParallelLeaderProcNumber = INVALID_PROC_NUMBER;
 

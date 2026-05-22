@@ -225,7 +225,11 @@ int			bgwriter_flush_after = DEFAULT_BGWRITER_FLUSH_AFTER;
 int			backend_flush_after = DEFAULT_BACKEND_FLUSH_AFTER;
 
 /* local state for LockBufferForCleanup */
+#ifdef USE_FASTPG
+static _Thread_local BufferDesc *PinCountWaitBuf = NULL;
+#else
 static BufferDesc *PinCountWaitBuf = NULL;
+#endif
 
 /*
  * Backend-Private refcount management:
@@ -260,6 +264,16 @@ static BufferDesc *PinCountWaitBuf = NULL;
  * memory allocations in NewPrivateRefCountEntry() which can be important
  * because in some scenarios it's called with a spinlock held...
  */
+#ifdef USE_FASTPG
+static _Thread_local Buffer PrivateRefCountArrayKeys[REFCOUNT_ARRAY_ENTRIES];
+static _Thread_local struct PrivateRefCountEntry PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES];
+static _Thread_local refcount_hash *PrivateRefCountHash = NULL;
+static _Thread_local int32 PrivateRefCountOverflowed = 0;
+static _Thread_local uint32 PrivateRefCountClock = 0;
+static _Thread_local int ReservedRefCountSlot = -1;
+static _Thread_local int PrivateRefCountEntryLast = -1;
+static _Thread_local bool FastPgThreadBufferManagerAccessReady = false;
+#else
 static Buffer PrivateRefCountArrayKeys[REFCOUNT_ARRAY_ENTRIES];
 static struct PrivateRefCountEntry PrivateRefCountArray[REFCOUNT_ARRAY_ENTRIES];
 static refcount_hash *PrivateRefCountHash = NULL;
@@ -267,6 +281,7 @@ static int32 PrivateRefCountOverflowed = 0;
 static uint32 PrivateRefCountClock = 0;
 static int	ReservedRefCountSlot = -1;
 static int	PrivateRefCountEntryLast = -1;
+#endif
 
 static uint32 MaxProportionalPins;
 
@@ -4224,6 +4239,11 @@ AtEOXact_Buffers(bool isCommit)
 void
 InitBufferManagerAccess(void)
 {
+#ifdef USE_FASTPG
+	if (FastPgThreadBufferManagerAccessReady)
+		return;
+#endif
+
 	/*
 	 * An advisory limit on the number of pins each backend should hold, based
 	 * on shared_buffers and the maximum number of connections possible.
@@ -4244,7 +4264,22 @@ InitBufferManagerAccess(void)
 	 */
 	Assert(MyProc != NULL);
 	on_shmem_exit(AtProcExit_Buffers, 0);
+
+#ifdef USE_FASTPG
+	FastPgThreadBufferManagerAccessReady = true;
+#endif
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadBufferManagerAccess(void)
+{
+	if (IsUnderPostmaster || FastPgThreadBufferManagerAccessReady)
+		return;
+
+	InitBufferManagerAccess();
+}
+#endif
 
 /*
  * During backend exit, ensure that we released all shared-buffer locks and

@@ -385,7 +385,12 @@ typedef struct PGPROC
 }
 PGPROC;
 
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL PGPROC *MyProc;
+extern void FastPgEnsureThreadProc(void);
+#else
 extern PGDLLIMPORT PGPROC *MyProc;
+#endif
 
 /*
  * There is one ProcGlobal struct for the whole database cluster.

@@ -413,6 +413,14 @@ extern bool fastpg_storage2_relation_update_unchecked(uint32_t relid,
 													  const size_t *value_lens,
 													  size_t natts,
 													  uint64_t *new_tid);
+extern bool fastpg_storage2_relation_update_redirect_unchecked(uint32_t relid,
+															   uint64_t tid,
+															   const uintptr_t *values,
+															   const uint8_t *isnull,
+															   const uint8_t *byval,
+															   const size_t *value_lens,
+															   size_t natts,
+															   uint64_t *new_tid);
 extern bool fastpg_storage2_relation_update_hot_unchecked(uint32_t relid,
 														  uint64_t tid,
 														  const uintptr_t *values,
@@ -489,6 +497,17 @@ extern bool fastpg_storage2_last_error(char *sqlstate_out,
 
 static const TableAmRoutine fastpg_mem_methods;
 static const IndexAmRoutine fastpg_mem_index_methods;
+#ifdef USE_FASTPG
+static _Thread_local bool fastpg_mem_xact_callbacks_registered = false;
+static _Thread_local MemoryContext fastpg_mem_touched_context = NULL;
+static _Thread_local HTAB *fastpg_mem_touched_hash = NULL;
+static _Thread_local MemoryContext fastpg_mem_redirect_context = NULL;
+static _Thread_local FastPgMemRowRedirect *fastpg_mem_row_redirects = NULL;
+static _Thread_local MemoryContext fastpg_mem_visibility_context = NULL;
+static _Thread_local FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
+static _Thread_local MemoryContext fastpg_mem_block_layout_context = NULL;
+static _Thread_local FastPgMemBlockLayout *fastpg_mem_block_layouts = NULL;
+#else
 static bool fastpg_mem_xact_callbacks_registered = false;
 static MemoryContext fastpg_mem_touched_context = NULL;
 static HTAB *fastpg_mem_touched_hash = NULL;
@@ -498,6 +517,7 @@ static MemoryContext fastpg_mem_visibility_context = NULL;
 static FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
 static MemoryContext fastpg_mem_block_layout_context = NULL;
 static FastPgMemBlockLayout *fastpg_mem_block_layouts = NULL;
+#endif
 
 typedef struct FastPgMemIndexScan
 {
@@ -4830,14 +4850,23 @@ fastpg_mem_tuple_update(Relation rel,
 															  value_lens,
 															  tupdesc->natts,
 															  &row_id) :
-				fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
-														  row_id,
-														  values,
-														  isnull,
-														  byval,
-														  value_lens,
-														  tupdesc->natts,
-														  &row_id)) :
+				(fastpg_catalog_mode_uses_postgres() ?
+				 fastpg_storage2_relation_update_redirect_unchecked(RelationGetRelid(rel),
+																	row_id,
+																	values,
+																	isnull,
+																	byval,
+																	value_lens,
+																	tupdesc->natts,
+																	&row_id) :
+				 fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
+														   row_id,
+														   values,
+														   isnull,
+														   byval,
+														   value_lens,
+														   tupdesc->natts,
+														   &row_id))) :
 			   fastpg_rust_relation_update_unchecked(RelationGetRelid(rel),
 													 row_id,
 													 values,

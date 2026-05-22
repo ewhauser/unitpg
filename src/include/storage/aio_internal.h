@@ -414,7 +414,11 @@ extern PGDLLIMPORT const IoMethodOps pgaio_uring_ops;
 
 extern PGDLLIMPORT const IoMethodOps *pgaio_method_ops;
 extern PGDLLIMPORT PgAioCtl *pgaio_ctl;
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL PgAioBackend *pgaio_my_backend;
+#else
 extern PGDLLIMPORT PgAioBackend *pgaio_my_backend;
+#endif
 
 
 

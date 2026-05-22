@@ -284,6 +284,9 @@ extern Buffer ExtendBufferedRelTo(BufferManagerRelation bmr,
 								  ReadBufferMode mode);
 
 extern void InitBufferManagerAccess(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadBufferManagerAccess(void);
+#endif
 extern void AtEOXact_Buffers(bool isCommit);
 #ifdef USE_ASSERT_CHECKING
 extern void AssertBufferLocksPermitCatalogRead(void);

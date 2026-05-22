@@ -439,7 +439,11 @@ static bool forceSyncCommit = false;
 #endif
 
 /* Flag for logging statements in a transaction. */
+#ifdef USE_FASTPG
+PG_THREAD_LOCAL bool xact_is_sampled = false;
+#else
 bool		xact_is_sampled = false;
+#endif
 
 /*
  * Private context for transaction-abort work --- we reserve space for this
@@ -462,7 +466,11 @@ typedef struct XactCallbackItem
 	void	   *arg;
 } XactCallbackItem;
 
+#ifdef USE_FASTPG
+static _Thread_local XactCallbackItem *Xact_callbacks = NULL;
+#else
 static XactCallbackItem *Xact_callbacks = NULL;
+#endif
 
 /*
  * List of add-on start- and end-of-subxact callbacks
@@ -474,7 +482,11 @@ typedef struct SubXactCallbackItem
 	void	   *arg;
 } SubXactCallbackItem;
 
+#ifdef USE_FASTPG
+static _Thread_local SubXactCallbackItem *SubXact_callbacks = NULL;
+#else
 static SubXactCallbackItem *SubXact_callbacks = NULL;
+#endif
 
 
 /* local function prototypes */

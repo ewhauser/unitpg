@@ -804,6 +804,9 @@ fastpg_pgcore_enter(void)
 #ifdef USE_FASTPG
 	FastPgEnsureThreadMemoryContexts();
 	FastPgEnsureThreadTransactionState();
+	FastPgEnsureThreadProc();
+	FastPgEnsureThreadPgStat();
+	FastPgEnsureThreadBufferManagerAccess();
 	FastPgEnsureThreadNamespaceState();
 	FastPgEnsureThreadLockManagerAccess();
 #endif
@@ -957,6 +960,8 @@ fastpg_pgcore_set_database(uint32_t database_oid)
 
 	MyDatabaseId = (Oid) database_oid;
 	MyDatabaseTableSpace = DEFAULTTABLESPACE_OID;
+	if (MyProc != NULL)
+		MyProc->databaseId = MyDatabaseId;
 
 	if (DatabasePath != NULL)
 		pfree(DatabasePath);

@@ -7044,6 +7044,9 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 	Oid			schemaid;
 	List	   *ancestors = NIL;
 	Oid			relid = RelationGetRelid(relation);
+#ifdef USE_FASTPG
+	bool		fastpg_skip_pubdesc_cache = fastpg_catalog_mode_uses_postgres();
+#endif
 
 	/*
 	 * If not publishable, it publishes no actions.  (pgoutput_change() will
@@ -7061,7 +7064,11 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 		return;
 	}
 
+#ifdef USE_FASTPG
+	if (!fastpg_skip_pubdesc_cache && relation->rd_pubdesc)
+#else
 	if (relation->rd_pubdesc)
+#endif
 	{
 		memcpy(pubdesc, relation->rd_pubdesc, sizeof(PublicationDesc));
 		return;
@@ -7216,6 +7223,11 @@ RelationBuildPublicationDesc(Relation relation, PublicationDesc *pubdesc)
 			!pubdesc->gencols_valid_for_delete)
 			break;
 	}
+
+#ifdef USE_FASTPG
+	if (fastpg_skip_pubdesc_cache)
+		return;
+#endif
 
 	if (relation->rd_pubdesc)
 	{

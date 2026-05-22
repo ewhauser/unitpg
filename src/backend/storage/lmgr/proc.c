@@ -46,6 +46,7 @@
 #include "postmaster/autovacuum.h"
 #include "replication/slotsync.h"
 #include "replication/syncrep.h"
+#include "storage/aio_subsys.h"
 #include "storage/condition_variable.h"
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
@@ -70,8 +71,12 @@ int			TransactionTimeout = 0;
 int			IdleSessionTimeout = 0;
 bool		log_lock_waits = true;
 
-/* Pointer to this process's PGPROC struct, if any */
+/* Pointer to this backend's PGPROC struct, if any */
+#ifdef USE_FASTPG
+_Thread_local PGPROC *MyProc = NULL;
+#else
 PGPROC	   *MyProc = NULL;
+#endif
 
 /* Pointers to shared-memory structures */
 PROC_HDR   *ProcGlobal = NULL;
@@ -99,6 +104,21 @@ static void RemoveProcFromArray(int code, Datum arg);
 static void ProcKill(int code, Datum arg);
 static void AuxiliaryProcKill(int code, Datum arg);
 static DeadLockState CheckDeadLock(void);
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadProc(void)
+{
+	if (IsUnderPostmaster || MyProc != NULL || ProcGlobal == NULL)
+		return;
+
+	InitProcess();
+	pgaio_init_backend();
+	if (OidIsValid(MyDatabaseId))
+		MyProc->databaseId = MyDatabaseId;
+	FastPgEnsureStandaloneUserId();
+}
+#endif
 
 
 /*

@@ -230,7 +230,11 @@ static slist_head guc_report_list;	/* list of variables that have the
 
 static bool reporting_enabled;	/* true to enable GUC_REPORT */
 
+#ifdef USE_FASTPG
+static _Thread_local int GUCNestLevel = 0;	/* 1 when in main transaction */
+#else
 static int	GUCNestLevel = 0;	/* 1 when in main transaction */
+#endif
 
 
 static int	guc_var_compare(const void *a, const void *b);

@@ -88,16 +88,27 @@ static const dshash_parameters dsh_params = {
  * pgStatLocal.shmem->gc_request_count is incremented - which each backend
  * compares to their copy of pgStatSharedRefAge on a regular basis.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL pgstat_entry_ref_hash_hash *pgStatEntryRefHash = NULL;
+static PG_THREAD_LOCAL int pgStatSharedRefAge = 0; /* cache age of pgStatLocal.shmem */
+static PgStat_ShmemControl *FastPgPgStatShmem = NULL;
+#else
 static pgstat_entry_ref_hash_hash *pgStatEntryRefHash = NULL;
 static int	pgStatSharedRefAge = 0; /* cache age of pgStatLocal.shmem */
+#endif
 
 /*
  * Memory contexts containing the pgStatEntryRefHash table and the
  * pgStatSharedRef entries respectively. Kept separate to make it easier to
  * track / attribute memory usage.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL MemoryContext pgStatSharedRefContext = NULL;
+static PG_THREAD_LOCAL MemoryContext pgStatEntryRefHashContext = NULL;
+#else
 static MemoryContext pgStatSharedRefContext = NULL;
 static MemoryContext pgStatEntryRefHashContext = NULL;
+#endif
 
 
 /* ------------------------------------------------------------
@@ -186,6 +197,10 @@ StatsShmemInit(void *arg)
 	if (fastpg_pgstat_noop_active())
 		return;
 
+#ifdef USE_FASTPG
+	FastPgPgStatShmem = ctl;
+#endif
+
 	/* the allocation of pgStatLocal.shmem itself */
 	p += MAXALIGN(sizeof(PgStat_ShmemControl));
 
@@ -259,6 +274,15 @@ StatsShmemInit(void *arg)
 	}
 }
 
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadPgStatShmem(void)
+{
+	if (pgStatLocal.shmem == NULL)
+		pgStatLocal.shmem = FastPgPgStatShmem;
+}
+#endif
+
 void
 pgstat_attach_shmem(void)
 {
@@ -268,6 +292,7 @@ pgstat_attach_shmem(void)
 		return;
 
 	Assert(pgStatLocal.dsa == NULL);
+	Assert(pgStatLocal.shmem != NULL);
 
 	/* stats shared memory persists for the backend lifetime */
 	oldcontext = MemoryContextSwitchTo(TopMemoryContext);
