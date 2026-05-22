@@ -57,7 +57,11 @@ extern PGDLLIMPORT bool DefaultXactReadOnly;
 extern PGDLLIMPORT bool XactReadOnly;
 
 /* flag for logging statements in this transaction */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL bool xact_is_sampled;
+#else
 extern PGDLLIMPORT bool xact_is_sampled;
+#endif
 
 /*
  * Xact is deferrable -- only meaningful (currently) for read only

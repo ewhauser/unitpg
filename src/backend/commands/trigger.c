@@ -3949,7 +3949,11 @@ typedef struct AfterTriggerCallbackItem
 	void	   *arg;
 } AfterTriggerCallbackItem;
 
+#ifdef USE_FASTPG
+static _Thread_local AfterTriggersData afterTriggers;
+#else
 static AfterTriggersData afterTriggers;
+#endif
 
 static void AfterTriggerExecute(EState *estate,
 								AfterTriggerEvent event,

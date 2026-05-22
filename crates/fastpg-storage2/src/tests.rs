@@ -56,6 +56,29 @@ fn fetch_i32(relid: u32, tid: u64) -> Option<i32> {
     }
 }
 
+fn hot_redirect_target(relid: u32, tid: u64) -> Option<u64> {
+    let tid = Tid::unpack(tid)?;
+    with_storage(|state, _session| {
+        state
+            .relations
+            .get(&relid)?
+            .hot_redirects
+            .get(&tid)
+            .copied()
+            .map(Tid::pack)
+    })
+}
+
+fn byval_key(value: i32) -> IndexKey {
+    IndexKey {
+        parts: vec![IndexKeyPart::ByValue(value as usize)],
+    }
+}
+
+fn transaction_stack_len() -> usize {
+    with_session_storage(|session| session.transaction_stack.len())
+}
+
 #[test]
 fn insert_fetch_uses_stable_tid() {
     let _guard = test_guard();
@@ -78,6 +101,22 @@ fn explicit_abort_drops_transaction_arena() {
     assert_eq!(fetch_i32(relid, tid), None);
     assert_eq!(fastpg_storage2_relation_row_count(relid), 0);
     assert_eq!(fastpg_storage2_transaction_page_bytes(), 0);
+}
+
+#[test]
+fn empty_implicit_transactions_stay_session_local() {
+    let _guard = test_guard();
+
+    fastpg_storage2_xact_begin_implicit();
+    assert_eq!(transaction_stack_len(), 1);
+    fastpg_storage2_xact_commit_if_implicit();
+    assert_eq!(transaction_stack_len(), 0);
+
+    fastpg_storage2_xact_begin_implicit();
+    fastpg_storage2_subxact_begin();
+    assert_eq!(transaction_stack_len(), 2);
+    fastpg_storage2_xact_abort_if_implicit();
+    assert_eq!(transaction_stack_len(), 0);
 }
 
 #[test]
@@ -150,6 +189,117 @@ fn update_appends_new_tid_and_abort_restores_old_tid() {
     fastpg_storage2_xact_abort();
     assert_eq!(fetch_i32(relid, old_tid), Some(3));
     assert_eq!(fetch_i32(relid, new_tid), None);
+}
+
+#[test]
+fn hot_update_redirects_old_tid_to_committed_new_tid() {
+    let _guard = test_guard();
+    let relid = 145;
+    fastpg_storage2_xact_begin();
+    let old_tid = insert_i32(relid, 3);
+    fastpg_storage2_xact_commit();
+
+    let values = [4usize];
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut new_tid = 0;
+    fastpg_storage2_xact_begin();
+    assert!(unsafe {
+        fastpg_storage2_relation_update_hot_unchecked(
+            relid,
+            old_tid,
+            values.as_ptr(),
+            nulls.as_ptr(),
+            byval.as_ptr(),
+            lens.as_ptr(),
+            values.len(),
+            &mut new_tid,
+        )
+    });
+    assert_ne!(old_tid, new_tid);
+    assert_eq!(fetch_i32(relid, old_tid), Some(4));
+    assert_eq!(fetch_i32(relid, new_tid), Some(4));
+    fastpg_storage2_xact_commit();
+
+    assert_eq!(fetch_i32(relid, old_tid), Some(4));
+    assert_eq!(fetch_i32(relid, new_tid), Some(4));
+}
+
+#[test]
+fn hot_update_redirects_follow_long_committed_chains() {
+    let _guard = test_guard();
+    let relid = 146;
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 0);
+    fastpg_storage2_xact_commit();
+
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut current_tid = first_tid;
+    for value in 1..=96usize {
+        let values = [value];
+        let mut new_tid = 0;
+        fastpg_storage2_xact_begin();
+        assert!(unsafe {
+            fastpg_storage2_relation_update_hot_unchecked(
+                relid,
+                current_tid,
+                values.as_ptr(),
+                nulls.as_ptr(),
+                byval.as_ptr(),
+                lens.as_ptr(),
+                values.len(),
+                &mut new_tid,
+            )
+        });
+        fastpg_storage2_xact_commit();
+        current_tid = new_tid;
+    }
+
+    assert_eq!(fetch_i32(relid, first_tid), Some(96));
+    assert_eq!(fetch_i32(relid, current_tid), Some(96));
+    assert_eq!(hot_redirect_target(relid, first_tid), Some(current_tid));
+}
+
+#[test]
+fn primary_lookup_with_spec_uses_primary_index_not_full_scan() {
+    let _guard = test_guard();
+    let relid = 147;
+    let index_relid = 1470;
+    fastpg_storage2_xact_begin();
+    let tid = insert_i32(relid, 20);
+    fastpg_storage2_xact_commit();
+
+    with_storage(|state, _session| {
+        state
+            .relation_mut(relid)
+            .primary_key_index
+            .insert(byval_key(10), Tid::unpack(tid).expect("packed tid"));
+    });
+
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let typlen = [4i16];
+    let values = [10usize];
+    let nulls = [0u8];
+    let mut found_tid = 0u64;
+
+    assert!(unsafe {
+        fastpg_storage2_primary_key_index_lookup_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            &mut found_tid,
+        )
+    });
+    assert_eq!(found_tid, tid);
 }
 
 #[test]
@@ -274,6 +424,73 @@ fn committed_small_transactions_pack_into_relation_pages() {
             .saturating_sub(before.committed_page_bytes)
             < PAGE_SIZE * 2
     );
+}
+
+#[test]
+fn ffi_index_specs_scan_storage_without_rust_catalog_metadata() {
+    let _guard = test_guard();
+    let relid = 49;
+    let index_relid = 490;
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 12);
+    let second_tid = insert_i32(relid, 13);
+    fastpg_storage2_xact_commit();
+
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let typlen = [4i16];
+    let values = [12usize];
+    let nulls = [0u8];
+    let mut tid = 0u64;
+
+    assert!(unsafe {
+        fastpg_storage2_primary_key_index_lookup_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            &mut tid,
+        )
+    });
+    assert_eq!(tid, first_tid);
+
+    assert!(unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            second_tid,
+            &mut tid,
+        )
+    });
+    assert_eq!(tid, first_tid);
+
+    fastpg_storage2_xact_begin();
+    insert_i32(relid, 12);
+    assert!(unsafe {
+        fastpg_storage2_unique_index_validate_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.len(),
+            0,
+            &mut tid,
+        )
+    });
+    assert_eq!(tid, first_tid);
+    fastpg_storage2_xact_abort();
 }
 
 fn fastpg_storage2_metrics_snapshot() -> FastPgStorage2Metrics {

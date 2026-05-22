@@ -395,6 +395,15 @@ impl SimpleQueryHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
+        if postgres_catalog_enabled() && !simple_query_may_copy_from_stdin(query) {
+            let (execution, notices) = self
+                .execute_query(session.clone(), query.to_owned(), vec![])
+                .await?;
+            send_notices(client, notices).await?;
+            remember_copy_target(&session, &execution);
+            return execution_to_responses(execution, FieldFormat::Text);
+        }
+
         let statements = split_simple_query_statements(query);
         if statements.len() > 1 && should_split_simple_query(&statements) {
             let mut responses = Vec::with_capacity(statements.len());
@@ -1805,6 +1814,20 @@ fn should_split_simple_query(statements: &[&str]) -> bool {
 fn simple_statement_is_copy_from_stdin(statement: &str) -> bool {
     let lower = statement.trim_start().to_ascii_lowercase();
     lower.starts_with("copy ") && lower.contains(" from stdin")
+}
+
+fn simple_query_may_copy_from_stdin(query: &str) -> bool {
+    contains_ascii_case_insensitive(query.as_bytes(), b"copy")
+        && contains_ascii_case_insensitive(query.as_bytes(), b"from stdin")
+}
+
+fn contains_ascii_case_insensitive(haystack: &[u8], needle: &[u8]) -> bool {
+    if needle.is_empty() {
+        return true;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|candidate| candidate.eq_ignore_ascii_case(needle))
 }
 
 fn split_simple_query_statements(query: &str) -> Vec<&str> {

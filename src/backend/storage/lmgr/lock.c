@@ -270,8 +270,16 @@ int			FastPathLockGroupsPerBackend = 0;
  * self-conflicting, it can't use the fast-path mechanism; but it also does
  * not conflict with any of the locks that do, so we can ignore it completely.
  */
+#ifdef USE_FASTPG
+#define FastPgAllowRelationFastPathLocks() \
+	(IsUnderPostmaster || !fastpg_catalog_mode_uses_postgres())
+#else
+#define FastPgAllowRelationFastPathLocks() true
+#endif
+
 #define EligibleForRelationFastPath(locktag, mode) \
-	((locktag)->locktag_lockmethodid == DEFAULT_LOCKMETHOD && \
+	(FastPgAllowRelationFastPathLocks() && \
+	(locktag)->locktag_lockmethodid == DEFAULT_LOCKMETHOD && \
 	(locktag)->locktag_type == LOCKTAG_RELATION && \
 	(locktag)->locktag_field1 == MyDatabaseId && \
 	MyDatabaseId != InvalidOid && \

@@ -109,7 +109,11 @@ static inline dsm_handle make_main_region_dsm_handle(int slot);
 static inline bool is_main_region_dsm_handle(dsm_handle handle);
 
 /* Has this backend initialized the dynamic shared memory system yet? */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL bool dsm_init_done = false;
+#else
 static bool dsm_init_done = false;
+#endif
 
 /* Preallocated DSM space in the main shared memory region. */
 static void *dsm_main_space_begin = NULL;
@@ -140,7 +144,11 @@ const ShmemCallbacks dsm_shmem_callbacks = {
  * each new mapping would require an update to the control segment,
  * which requires locking, in which the postmaster must not be involved.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL dlist_head dsm_segment_list;
+#else
 static dlist_head dsm_segment_list = DLIST_STATIC_INIT(dsm_segment_list);
+#endif
 
 /*
  * Control segment information.
@@ -439,6 +447,9 @@ dsm_postmaster_shutdown(int code, Datum arg)
 static void
 dsm_backend_startup(void)
 {
+#ifdef USE_FASTPG
+	dlist_init(&dsm_segment_list);
+#endif
 #ifdef EXEC_BACKEND
 	if (IsUnderPostmaster)
 	{
@@ -1100,6 +1111,11 @@ dsm_find_mapping(dsm_handle handle)
 {
 	dlist_iter	iter;
 	dsm_segment *seg;
+
+#ifdef USE_FASTPG
+	if (!dsm_init_done)
+		dsm_backend_startup();
+#endif
 
 	dlist_foreach(iter, &dsm_segment_list)
 	{

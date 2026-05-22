@@ -33,7 +33,11 @@ static void AtEOXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state, bool 
 static void AtEOSubXact_PgStat_DroppedStats(PgStat_SubXactStatus *xact_state,
 											bool isCommit, int nestDepth);
 
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL PgStat_SubXactStatus *pgStatXactStack = NULL;
+#else
 static PgStat_SubXactStatus *pgStatXactStack = NULL;
+#endif
 
 
 /*

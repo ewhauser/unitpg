@@ -1,5 +1,7 @@
 use crate::*;
 
+const MAX_HOT_REDIRECT_HOPS: usize = 1_000_000;
+
 #[derive(Debug, Default)]
 pub(crate) struct StorageState {
     pub(crate) relations: HashMap<u32, RelationStorage>,
@@ -82,6 +84,12 @@ impl StorageState {
                 for tid in tids {
                     relation.mark_dead(*tid);
                 }
+            }
+        }
+
+        for (relid, redirects) in overlay.hot_redirect_inserts {
+            if let Some(relation) = self.relations.get_mut(&relid) {
+                relation.hot_redirects.extend(redirects);
             }
         }
 
@@ -223,10 +231,91 @@ impl StorageState {
         relid: u32,
         tid: Tid,
     ) -> Option<DecodedTuple<'a>> {
+        let tid = self.resolve_tid_redirect_in_overlays(overlays, relid, tid);
         decode_tuple(
             tid,
             self.visible_tuple_slice_in_overlays(overlays, relid, tid)?,
         )
+    }
+
+    pub(crate) fn resolve_tid_redirect_in_overlays(
+        &self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        mut tid: Tid,
+    ) -> Tid {
+        for _ in 0..MAX_HOT_REDIRECT_HOPS {
+            if let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) {
+                tid = next_tid;
+                continue;
+            }
+            if let Some(next_tid) = self
+                .relations
+                .get(&relid)
+                .and_then(|relation| relation.hot_redirects.get(&tid))
+                .copied()
+            {
+                tid = next_tid;
+                continue;
+            }
+            break;
+        }
+        tid
+    }
+
+    pub(crate) fn resolve_tid_redirect_in_overlays_compress(
+        &mut self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        mut tid: Tid,
+    ) -> Tid {
+        let original_tid = tid;
+        let mut first_committed_tid = None;
+        let mut rest_committed_tids = Vec::new();
+        let mut followed_overlay_redirect = false;
+
+        for _ in 0..MAX_HOT_REDIRECT_HOPS {
+            if let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) {
+                followed_overlay_redirect = true;
+                tid = next_tid;
+                continue;
+            }
+            if let Some(next_tid) = self
+                .relations
+                .get(&relid)
+                .and_then(|relation| relation.hot_redirects.get(&tid))
+                .copied()
+            {
+                if !followed_overlay_redirect {
+                    if first_committed_tid.is_some() {
+                        rest_committed_tids.push(tid);
+                    } else {
+                        first_committed_tid = Some(tid);
+                    }
+                }
+                tid = next_tid;
+                continue;
+            }
+            break;
+        }
+
+        if !followed_overlay_redirect
+            && tid != original_tid
+            && let Some(relation) = self.relations.get_mut(&relid)
+        {
+            if let Some(first_tid) = first_committed_tid
+                && first_tid != tid
+            {
+                relation.hot_redirects.insert(first_tid, tid);
+            }
+            for visited_tid in rest_committed_tids {
+                if visited_tid != tid {
+                    relation.hot_redirects.insert(visited_tid, tid);
+                }
+            }
+        }
+
+        tid
     }
 
     pub(crate) fn visible_tuple_slice_in_overlays<'a>(
@@ -235,6 +324,7 @@ impl StorageState {
         relid: u32,
         tid: Tid,
     ) -> Option<&'a [u8]> {
+        let tid = self.resolve_tid_redirect_in_overlays(overlays, relid, tid);
         if overlays_invalidate_tid(overlays, relid, tid) {
             return None;
         }
@@ -416,7 +506,7 @@ impl StorageState {
     }
 
     pub(crate) fn primary_key_lookup(
-        &self,
+        &mut self,
         session: &SessionStorage,
         relid: u32,
         key: &IndexKey,
@@ -445,17 +535,22 @@ impl StorageState {
             .primary_key_index
             .get(key)
             .copied()?;
+        let tid =
+            self.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid);
         self.find_visible_tuple(session, relid, tid).map(|_| tid)
     }
 
     pub(crate) fn find_visible_by_index_key_excluding(
-        &self,
+        &mut self,
         session: &SessionStorage,
         relid: u32,
         index_spec: &UniqueIndexSpec,
         key: &IndexKey,
         replacing_tid: Option<Tid>,
     ) -> Option<Tid> {
+        let replacing_tid = replacing_tid.map(|tid| {
+            self.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid)
+        });
         if index_spec.is_primary {
             if let Some(tid) = self.primary_key_lookup(session, relid, key)
                 && Some(tid) != replacing_tid
@@ -476,7 +571,7 @@ impl StorageState {
     }
 
     pub(crate) fn unique_index_conflict_for_input(
-        &self,
+        &mut self,
         session: &SessionStorage,
         relid: u32,
         input: &RowInput<'_>,
@@ -567,6 +662,15 @@ pub(crate) fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStor
     }
 }
 
+pub(crate) fn with_session_storage<R>(f: impl FnOnce(&mut SessionStorage) -> R) -> R {
+    let session = current_session_storage();
+    let mut session = match session.lock() {
+        Ok(session) => session,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut session)
+}
+
 pub(crate) fn relation_insert_impl(
     relid: u32,
     input: RowInput<'_>,
@@ -620,14 +724,23 @@ pub(crate) fn relation_update_impl(
     input: RowInput<'_>,
     new_tid_out: *mut u64,
     unique_check: UniqueCheck,
+    record_hot_redirect: bool,
 ) -> bool {
     let Some(old_tid) = Tid::unpack(packed_tid) else {
         return false;
     };
     let result = with_storage(|state, session| -> Result<Option<Tid>, CatalogError> {
+        let old_tid = state.resolve_tid_redirect_in_overlays_compress(
+            &session.transaction_stack,
+            relid,
+            old_tid,
+        );
         let Some(old_tuple) = state.find_visible_tuple(session, relid, old_tid) else {
             return Ok(None);
         };
+        let old_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
+            .and_then(|index_spec| index_key_for_decoded(&index_spec, &old_tuple.values));
+        drop(old_tuple);
         if matches!(unique_check, UniqueCheck::Enforce)
             && state
                 .unique_index_conflict_for_input(session, relid, &input, Some(old_tid))
@@ -635,9 +748,6 @@ pub(crate) fn relation_update_impl(
         {
             return Ok(None);
         }
-        let old_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
-            .and_then(|index_spec| index_key_for_decoded(&index_spec, &old_tuple.values));
-        drop(old_tuple);
 
         let tuple = build_tuple(&input)?;
         let new_tid = state.append_pending_tuple(session, relid, &tuple)?;
@@ -649,6 +759,9 @@ pub(crate) fn relation_update_impl(
             .last_mut()
             .expect("transaction was just ensured");
         overlay.invalidate(relid, old_tid);
+        if record_hot_redirect {
+            overlay.insert_hot_redirect(relid, old_tid, new_tid);
+        }
         if old_primary_key.is_some()
             && old_primary_key != new_primary_key
             && let Some(key) = old_primary_key

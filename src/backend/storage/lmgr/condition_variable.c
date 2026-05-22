@@ -28,7 +28,11 @@
 #include "storage/spin.h"
 
 /* Initially, we are not prepared to sleep on any condition variable. */
+#ifdef USE_FASTPG
+static _Thread_local ConditionVariable *cv_sleep_target = NULL;
+#else
 static ConditionVariable *cv_sleep_target = NULL;
+#endif
 
 /*
  * Initialize a condition variable.

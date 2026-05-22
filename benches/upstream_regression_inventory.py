@@ -1374,7 +1374,7 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--storage-engine",
         choices=["storage1", "storage2"],
-        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage1"),
+        default=os.environ.get("FASTPG_STORAGE_ENGINE", "storage2"),
     )
     parser.add_argument(
         "--catalog-mode",
@@ -1416,8 +1416,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         parser.error("--global-timeout must be positive")
     if args.fastpg_case_timeout is not None and args.fastpg_case_timeout <= 0:
         parser.error("--fastpg-case-timeout must be positive")
-    if args.catalog_mode == "postgres" and args.storage_engine == "storage2":
-        parser.error("--catalog-mode=postgres currently supports --storage-engine=storage1 only")
     if args.catalog_mode == "postgres" and args.database is not None and args.database.lower() != "postgres":
         parser.error("--catalog-mode=postgres requires --database=postgres")
     if args.database is None:

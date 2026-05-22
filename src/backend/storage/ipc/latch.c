@@ -28,7 +28,11 @@
 #include "utils/resowner.h"
 
 /* A common WaitEventSet used to implement WaitLatch() */
+#ifdef USE_FASTPG
+static _Thread_local WaitEventSet *LatchWaitSet;
+#else
 static WaitEventSet *LatchWaitSet;
+#endif
 
 /* The positions of the latch and PM death events in LatchWaitSet */
 #define LatchWaitSetLatchPos 0
@@ -180,6 +184,9 @@ WaitLatch(Latch *latch, int wakeEvents, long timeout,
 		  uint32 wait_event_info)
 {
 	WaitEvent	event;
+#ifdef USE_FASTPG
+	bool		fastpg_poll_latch;
+#endif
 
 #ifdef USE_FASTPG
 	FASTPG_FORBID_INTERNAL_IPC("WaitLatch");
@@ -204,13 +211,40 @@ WaitLatch(Latch *latch, int wakeEvents, long timeout,
 						(wakeEvents & (WL_EXIT_ON_PM_DEATH | WL_POSTMASTER_DEATH)),
 						NULL);
 
-	if (WaitEventSetWait(LatchWaitSet,
-						 (wakeEvents & WL_TIMEOUT) ? timeout : -1,
-						 &event, 1,
-						 wait_event_info) == 0)
+#ifdef USE_FASTPG
+	/*
+	 * In FastPG the PostgreSQL backend is embedded in one multithreaded process,
+	 * so a SIGURG intended to wake one session's latch can be observed by a
+	 * sibling thread instead.  Poll no-timeout latch waits so that a missed process
+	 * signal cannot leave a session parked forever.
+	 */
+	fastpg_poll_latch =
+		(wakeEvents & WL_LATCH_SET) != 0 &&
+		(wakeEvents & WL_TIMEOUT) == 0;
+#endif
+
+	for (;;)
+	{
+		long		wait_timeout = (wakeEvents & WL_TIMEOUT) ? timeout : -1;
+
+#ifdef USE_FASTPG
+		if (fastpg_poll_latch)
+			wait_timeout = 1;
+#endif
+
+		if (WaitEventSetWait(LatchWaitSet,
+							 wait_timeout,
+							 &event, 1,
+							 wait_event_info) != 0)
+			return event.events;
+
+#ifdef USE_FASTPG
+		if (fastpg_poll_latch)
+			continue;
+#endif
+
 		return WL_TIMEOUT;
-	else
-		return event.events;
+	}
 }
 
 /*

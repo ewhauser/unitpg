@@ -166,8 +166,13 @@ typedef struct LWLockHandle
 	LWLockMode	mode;
 } LWLockHandle;
 
+#ifdef USE_FASTPG
+static _Thread_local int num_held_lwlocks = 0;
+static _Thread_local LWLockHandle held_lwlocks[MAX_SIMUL_LWLOCKS];
+#else
 static int	num_held_lwlocks = 0;
 static LWLockHandle held_lwlocks[MAX_SIMUL_LWLOCKS];
+#endif
 
 /* Maximum number of LWLock tranches that can be assigned by extensions */
 #define MAX_USER_DEFINED_TRANCHES 256

@@ -801,6 +801,9 @@ extern bool pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat
 
 extern void pgstat_attach_shmem(void);
 extern void pgstat_detach_shmem(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadPgStatShmem(void);
+#endif
 
 extern PgStat_EntryRef *pgstat_get_entry_ref(PgStat_Kind kind, Oid dboid, uint64 objid,
 											 bool create, bool *created_entry);
@@ -879,10 +882,18 @@ extern void pgstat_create_transactional(PgStat_Kind kind, Oid dboid, uint64 obji
  * Statistics callbacks should never reset this flag; pgstat_report_stat()
  * is in charge of doing that.
  */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL bool pgstat_report_fixed;
+#else
 extern PGDLLIMPORT bool pgstat_report_fixed;
+#endif
 
 /* Backend-local stats state */
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL PgStat_LocalState pgStatLocal;
+#else
 extern PGDLLIMPORT PgStat_LocalState pgStatLocal;
+#endif
 
 /* Helper functions for reading and writing of on-disk stats file */
 extern void pgstat_write_chunk(FILE *fpout, void *ptr, size_t len);

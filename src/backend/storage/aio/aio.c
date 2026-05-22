@@ -81,7 +81,11 @@ int			io_max_concurrency = -1;
 PgAioCtl   *pgaio_ctl;
 
 /* current backend's per-backend state */
+#ifdef USE_FASTPG
+_Thread_local PgAioBackend *pgaio_my_backend;
+#else
 PgAioBackend *pgaio_my_backend;
+#endif
 
 
 static const IoMethodOps *const pgaio_method_ops_table[] = {

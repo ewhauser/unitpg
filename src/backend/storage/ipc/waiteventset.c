@@ -172,7 +172,11 @@ struct WaitEventSet
 
 #ifndef WIN32
 /* Are we currently in WaitLatch? The signal handler would like to know. */
+#ifdef USE_FASTPG
+static _Thread_local volatile sig_atomic_t waiting = false;
+#else
 static volatile sig_atomic_t waiting = false;
+#endif
 #endif
 
 #ifdef WAIT_USE_SIGNALFD

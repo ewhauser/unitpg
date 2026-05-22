@@ -313,13 +313,9 @@ impl PgCoreSession {
         })
     }
 
-    pub fn execute_with_params(
-        &self,
-        sql: &str,
-        params: &[PgCoreParam],
-    ) -> Result<ExecutionResult, PgCoreError> {
+    pub fn execute_simple(&self, sql: &str) -> Result<ExecutionResult, PgCoreError> {
         let _guard = self.enter_storage();
-        self.inner.execute_with_params(sql, params)
+        self.inner.execute_simple(sql)
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -670,6 +666,7 @@ mod inner {
         fn fastpg_pgcore_execute(
             prepared: *const FastPgPgCorePrepared,
         ) -> *mut FastPgPgCoreExecuteResult;
+        fn fastpg_pgcore_execute_simple(sql: *const c_char) -> *mut FastPgPgCoreExecuteResult;
         fn fastpg_pgcore_execute_params(
             prepared: *const FastPgPgCorePrepared,
             parameter_values: *const *const c_char,
@@ -1207,39 +1204,12 @@ mod inner {
             }
         }
 
-        pub fn execute_with_params(
-            &self,
-            sql: &str,
-            params: &[PgCoreParam],
-        ) -> Result<ExecutionResult, PgCoreError> {
+        pub fn execute_simple(&self, sql: &str) -> Result<ExecutionResult, PgCoreError> {
             check_sql(sql)?;
-            let encoded_params = EncodedParams::new(params)?;
-            let _guard = enter_pgcore_lane("prepare_execute");
+            let _guard = enter_pgcore_lane("execute_simple");
             self.set_database();
-            let notice_capture = NoticeCaptureGuard::begin();
-            let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
-            let Some(prepared) = NonNull::new(prepared) else {
-                let _ = notice_capture.finish();
-                return Err(PgCoreError::new(
-                    "XX000",
-                    "PostgreSQL prepare returned a null result",
-                    0,
-                ));
-            };
-
-            let result = if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
-                execute_prepared_ptr_with_params(prepared.as_ptr(), &encoded_params)
-            } else {
-                Err(prepared_error_from_ptr(prepared.as_ptr()))
-            };
-            unsafe {
-                fastpg_pgcore_prepared_free(prepared.as_ptr());
-            }
-            let notices = notice_capture.finish();
-            result.map(|mut result| {
-                result.notices = notices;
-                result
-            })
+            let result = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_execute_simple(c_sql) });
+            execution_result_from_ptr(result)
         }
 
         pub fn execute_transaction_command(&self, command: PgCoreTransactionCommand) {
@@ -1559,25 +1529,6 @@ mod inner {
                 Err(error)
             }
         }
-    }
-
-    fn prepared_error_from_ptr(prepared: *const FastPgPgCorePrepared) -> PgCoreError {
-        PgCoreError::with_fields(
-            unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared)) },
-            unsafe { c_string(fastpg_pgcore_prepared_message(prepared)) },
-            PgCoreErrorFields {
-                detail: unsafe { optional_c_string(fastpg_pgcore_prepared_detail(prepared)) },
-                hint: unsafe { optional_c_string(fastpg_pgcore_prepared_hint(prepared)) },
-                context: unsafe { optional_c_string(fastpg_pgcore_prepared_context(prepared)) },
-                cursorpos: unsafe { fastpg_pgcore_prepared_cursorpos(prepared) },
-                internal_query: unsafe {
-                    optional_c_string(fastpg_pgcore_prepared_internal_query(prepared))
-                },
-                internalpos: unsafe { fastpg_pgcore_prepared_internalpos(prepared) },
-                notices: prepared_notices_from_ptr(prepared),
-                ..Default::default()
-            },
-        )
     }
 
     fn prepared_notices_from_ptr(prepared: *const FastPgPgCorePrepared) -> Vec<PgCoreNotice> {
@@ -2096,11 +2047,7 @@ mod inner {
             ))
         }
 
-        pub fn execute_with_params(
-            &self,
-            _sql: &str,
-            _params: &[super::PgCoreParam],
-        ) -> Result<ExecutionResult, PgCoreError> {
+        pub fn execute_simple(&self, _sql: &str) -> Result<ExecutionResult, PgCoreError> {
             Err(PgCoreError::new(
                 "0A000",
                 "fastpg-pgcore was built without PostgreSQL execution",
@@ -2228,15 +2175,12 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "postgres-execution")]
+    #[cfg(all(feature = "postgres-execution", feature = "rust-catalog"))]
     #[test]
     fn current_database_uses_session_database() {
         let session = PgCoreSession::with_database("regression");
         let result = session
-            .execute_with_params(
-                "select current_database(), current_catalog = current_database()",
-                &[],
-            )
+            .execute_simple("select current_database(), current_catalog = current_database()")
             .unwrap();
         assert_eq!(
             result.statements[0].rows,
@@ -2247,9 +2191,8 @@ mod tests {
         );
 
         let result = session
-            .execute_with_params(
+            .execute_simple(
                 "select datname from pg_database where oid = (select oid from pg_database where datname = current_database())",
-                &[],
             )
             .unwrap();
         assert_eq!(
@@ -2262,16 +2205,14 @@ mod tests {
     #[test]
     fn current_schema_uses_default_public_search_path() {
         let session = PgCoreSession::new();
-        let result = session
-            .execute_with_params("select current_schema", &[])
-            .unwrap();
+        let result = session.execute_simple("select current_schema").unwrap();
         assert_eq!(
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("public".to_owned())]]
         );
     }
 
-    #[cfg(feature = "postgres-execution")]
+    #[cfg(all(feature = "postgres-execution", feature = "rust-catalog"))]
     #[test]
     fn prepared_statements_restore_their_session_database() {
         let first = PgCoreSession::with_database("fastpg_db_a");

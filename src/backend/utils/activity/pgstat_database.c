@@ -26,16 +26,30 @@
 static bool pgstat_should_report_connstat(void);
 
 
+#ifdef USE_FASTPG
+PG_THREAD_LOCAL PgStat_Counter pgStatBlockReadTime = 0;
+PG_THREAD_LOCAL PgStat_Counter pgStatBlockWriteTime = 0;
+PG_THREAD_LOCAL PgStat_Counter pgStatActiveTime = 0;
+PG_THREAD_LOCAL PgStat_Counter pgStatTransactionIdleTime = 0;
+PG_THREAD_LOCAL SessionEndType pgStatSessionEndCause = DISCONNECT_NORMAL;
+#else
 PgStat_Counter pgStatBlockReadTime = 0;
 PgStat_Counter pgStatBlockWriteTime = 0;
 PgStat_Counter pgStatActiveTime = 0;
 PgStat_Counter pgStatTransactionIdleTime = 0;
 SessionEndType pgStatSessionEndCause = DISCONNECT_NORMAL;
+#endif
 
 
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL int pgStatXactCommit = 0;
+static PG_THREAD_LOCAL int pgStatXactRollback = 0;
+static PG_THREAD_LOCAL PgStat_Counter pgLastSessionReportTime = 0;
+#else
 static int	pgStatXactCommit = 0;
 static int	pgStatXactRollback = 0;
 static PgStat_Counter pgLastSessionReportTime = 0;
+#endif
 
 
 /*

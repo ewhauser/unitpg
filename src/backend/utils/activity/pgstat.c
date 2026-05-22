@@ -212,13 +212,21 @@ int			pgstat_fetch_consistency = PGSTAT_FETCH_CONSISTENCY_CACHE;
  * ----------
  */
 
+#ifdef USE_FASTPG
+PG_THREAD_LOCAL PgStat_LocalState pgStatLocal;
+#else
 PgStat_LocalState pgStatLocal;
+#endif
 
 /*
  * Track pending reports for fixed-numbered stats, used by
  * pgstat_report_stat().
  */
+#ifdef USE_FASTPG
+PG_THREAD_LOCAL bool pgstat_report_fixed = false;
+#else
 bool		pgstat_report_fixed = false;
+#endif
 
 /* ----------
  * Local data
@@ -234,7 +242,11 @@ bool		pgstat_report_fixed = false;
  * easier to track / attribute memory usage.
  */
 
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL MemoryContext pgStatPendingContext = NULL;
+#else
 static MemoryContext pgStatPendingContext = NULL;
+#endif
 
 /*
  * Backend local list of PgStat_EntryRef with unflushed pending stats.
@@ -242,20 +254,32 @@ static MemoryContext pgStatPendingContext = NULL;
  * Newly pending entries should only ever be added to the end of the list,
  * otherwise pgstat_flush_pending_entries() might not see them immediately.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL dlist_head pgStatPending;
+#else
 static dlist_head pgStatPending = DLIST_STATIC_INIT(pgStatPending);
+#endif
 
 
 /*
  * Force the next stats flush to happen regardless of
  * PGSTAT_MIN_INTERVAL. Useful in test scripts.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL bool pgStatForceNextFlush = false;
+#else
 static bool pgStatForceNextFlush = false;
+#endif
 
 /*
  * Force-clear existing snapshot before next use when stats_fetch_consistency
  * is changed.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL bool force_stats_snapshot_clear = false;
+#else
 static bool force_stats_snapshot_clear = false;
+#endif
 
 
 /*
@@ -263,8 +287,18 @@ static bool force_stats_snapshot_clear = false;
  * shutdown.
  */
 #ifdef USE_ASSERT_CHECKING
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL bool pgstat_is_initialized = false;
+static PG_THREAD_LOCAL bool pgstat_is_shutdown = false;
+#else
 static bool pgstat_is_initialized = false;
 static bool pgstat_is_shutdown = false;
+#endif
+#endif
+
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL TimestampTz pgStatPendingSince = 0;
+static PG_THREAD_LOCAL TimestampTz pgStatLastFlush = 0;
 #endif
 
 
@@ -697,6 +731,10 @@ pgstat_initialize(void)
 		return;
 	}
 
+#ifdef USE_FASTPG
+	dlist_init(&pgStatPending);
+	FastPgEnsureThreadPgStatShmem();
+#endif
 	pgstat_attach_shmem();
 
 	pgstat_init_snapshot_fixed();
@@ -719,6 +757,17 @@ pgstat_initialize(void)
 	pgstat_is_initialized = true;
 #endif
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadPgStat(void)
+{
+	if (IsUnderPostmaster || pgStatLocal.dsa != NULL)
+		return;
+
+	pgstat_initialize();
+}
+#endif
 
 
 /* ------------------------------------------------------------
@@ -748,11 +797,17 @@ pgstat_initialize(void)
 long
 pgstat_report_stat(bool force)
 {
+#ifndef USE_FASTPG
 	static TimestampTz pending_since = 0;
 	static TimestampTz last_flush = 0;
+#endif
 	bool		partial_flush;
 	TimestampTz now;
 	bool		nowait;
+#ifdef USE_FASTPG
+	TimestampTz pending_since = pgStatPendingSince;
+	TimestampTz last_flush = pgStatLastFlush;
+#endif
 
 	if (fastpg_pgstat_noop_active())
 	{
@@ -814,6 +869,9 @@ pgstat_report_stat(bool force)
 			/* don't flush too frequently */
 			if (pending_since == 0)
 				pending_since = now;
+#ifdef USE_FASTPG
+			pgStatPendingSince = pending_since;
+#endif
 
 			return PGSTAT_IDLE_INTERVAL;
 		}
@@ -846,6 +904,9 @@ pgstat_report_stat(bool force)
 	}
 
 	last_flush = now;
+#ifdef USE_FASTPG
+	pgStatLastFlush = last_flush;
+#endif
 
 	/*
 	 * If some of the pending stats could not be flushed due to lock
@@ -859,11 +920,17 @@ pgstat_report_stat(bool force)
 		/* remember since when stats have been pending */
 		if (pending_since == 0)
 			pending_since = now;
+#ifdef USE_FASTPG
+		pgStatPendingSince = pending_since;
+#endif
 
 		return PGSTAT_IDLE_INTERVAL;
 	}
 
 	pending_since = 0;
+#ifdef USE_FASTPG
+	pgStatPendingSince = pending_since;
+#endif
 	pgstat_report_fixed = false;
 
 	return 0;

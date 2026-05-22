@@ -64,7 +64,7 @@ pub extern "C" fn fastpg_storage2_xact_begin() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_begin_implicit() {
-    with_storage(|_state, session| session.ensure_transaction());
+    with_session_storage(SessionStorage::ensure_transaction);
 }
 
 #[unsafe(no_mangle)]
@@ -79,17 +79,23 @@ pub extern "C" fn fastpg_storage2_xact_abort() {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_commit_if_implicit() {
+    if with_session_storage(SessionStorage::commit_empty_implicit_transaction) {
+        return;
+    }
     with_storage(|state, session| state.commit_implicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_abort_if_implicit() {
+    if with_session_storage(SessionStorage::abort_empty_implicit_transaction) {
+        return;
+    }
     with_storage(|state, session| state.abort_implicit_transaction(session));
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_subxact_begin() {
-    with_storage(|_state, session| {
+    with_session_storage(|session| {
         session.ensure_transaction();
         session
             .transaction_stack
@@ -196,7 +202,14 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update(
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
         return false;
     };
-    relation_update_impl(relid, packed_tid, input, new_tid_out, UniqueCheck::Enforce)
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Enforce,
+        false,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -218,7 +231,72 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_unchecked(
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
         return false;
     };
-    relation_update_impl(relid, packed_tid, input, new_tid_out, UniqueCheck::Skip)
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        false,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_update_redirect_unchecked(
+    relid: u32,
+    packed_tid: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    new_tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        true,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_unchecked(
+    relid: u32,
+    packed_tid: u64,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    new_tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        true,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -368,6 +446,8 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid(
         return false;
     };
     with_storage(|state, session| {
+        let tid =
+            state.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid);
         let Some(tuple) =
             state.visible_tuple_slice_in_overlays(&session.transaction_stack, relid, tid)
         else {
@@ -419,6 +499,65 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata arrays, key input arrays, and an
+/// optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some((values, is_null)) = key_arrays(values, is_null, nkeys) else {
+        return false;
+    };
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: true,
+            nulls_not_distinct: false,
+        })
+    }) else {
+        return false;
+    };
+    let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
+        return false;
+    };
+    let tid = with_storage(|state, session| {
+        state
+            .primary_key_lookup(session, heap_relid, &key)
+            .or_else(|| {
+                let mut scan_spec = index_spec.clone();
+                scan_spec.is_primary = false;
+                state.find_visible_by_index_key_excluding(
+                    session, heap_relid, &scan_spec, &key, None,
+                )
+            })
+    });
+    let Some(tid) = tid else {
+        return false;
+    };
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tid.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_rebuild_primary_key_index(index_relid: u32) -> bool {
     clear_last_storage_error();
     let Some(index_spec) = primary_index_spec_for_index_oid(Oid(index_relid)) else {
@@ -443,6 +582,56 @@ pub extern "C" fn fastpg_storage2_rebuild_primary_key_index(index_relid: u32) ->
             .expect("transaction was just ensured");
         for (key, tid) in entries {
             overlay.insert_primary_key(relid, key, tid);
+        }
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata arrays.
+pub unsafe extern "C" fn fastpg_storage2_rebuild_primary_key_index_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    nkeys: usize,
+) -> bool {
+    clear_last_storage_error();
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: true,
+            nulls_not_distinct: false,
+        })
+    }) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        let entries = state
+            .visible_tids(session, heap_relid)
+            .into_iter()
+            .filter_map(|tid| {
+                state
+                    .find_visible_tuple(session, heap_relid, tid)
+                    .and_then(|tuple| index_key_for_decoded(&index_spec, &tuple.values))
+                    .map(|key| (key, tid))
+            })
+            .collect::<Vec<_>>();
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        for (key, tid) in entries {
+            overlay.insert_primary_key(heap_relid, key, tid);
         }
         true
     })
@@ -490,6 +679,127 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict(
             &key,
             replacing_tid,
         )
+    });
+    let Some(tid) = conflict else {
+        return false;
+    };
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tid.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata arrays, key input arrays, and an
+/// optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    nulls_not_distinct: u8,
+    replacing_tid: u64,
+    tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some((values, is_null)) = key_arrays(values, is_null, nkeys) else {
+        return false;
+    };
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: false,
+            nulls_not_distinct: nulls_not_distinct != 0,
+        })
+    }) else {
+        return false;
+    };
+    let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
+        return false;
+    };
+    let replacing_tid = if replacing_tid == 0 {
+        None
+    } else {
+        Tid::unpack(replacing_tid)
+    };
+    let conflict = with_storage(|state, session| {
+        state.find_visible_by_index_key_excluding(
+            session,
+            heap_relid,
+            &index_spec,
+            &key,
+            replacing_tid,
+        )
+    });
+    let Some(tid) = conflict else {
+        return false;
+    };
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tid.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata arrays and an optional valid output
+/// pointer.
+pub unsafe extern "C" fn fastpg_storage2_unique_index_validate_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    nkeys: usize,
+    nulls_not_distinct: u8,
+    tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: false,
+            nulls_not_distinct: nulls_not_distinct != 0,
+        })
+    }) else {
+        return false;
+    };
+    let conflict = with_storage(|state, session| {
+        let mut seen = BTreeMap::new();
+        for tid in state.visible_tids(session, heap_relid) {
+            let Some(key) = state
+                .find_visible_tuple(session, heap_relid, tid)
+                .and_then(|tuple| index_key_for_decoded(&index_spec, &tuple.values))
+            else {
+                continue;
+            };
+            if let Some(existing_tid) = seen.get(&key).copied() {
+                return Some(existing_tid);
+            }
+            seen.insert(key, tid);
+        }
+        None
     });
     let Some(tid) = conflict else {
         return false;

@@ -7,11 +7,23 @@ pub(crate) struct TransactionOverlay {
     pub(crate) new_pages: HashMap<u32, BTreeSet<u32>>,
     pub(crate) inserted_tids: HashMap<u32, BTreeSet<Tid>>,
     pub(crate) invalidated_tids: HashMap<u32, BTreeSet<Tid>>,
+    pub(crate) hot_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
     pub(crate) primary_key_inserts: HashMap<u32, BTreeMap<IndexKey, Tid>>,
     pub(crate) primary_key_deletes: HashMap<u32, BTreeSet<IndexKey>>,
 }
 
 impl TransactionOverlay {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.relation_checkpoints.is_empty()
+            && self.page_checkpoints.is_empty()
+            && self.new_pages.is_empty()
+            && self.inserted_tids.is_empty()
+            && self.invalidated_tids.is_empty()
+            && self.hot_redirect_inserts.is_empty()
+            && self.primary_key_inserts.is_empty()
+            && self.primary_key_deletes.is_empty()
+    }
+
     pub(crate) fn checkpoint_relation(&mut self, relid: u32, relation: &RelationStorage) {
         self.relation_checkpoints
             .entry(relid)
@@ -43,6 +55,15 @@ impl TransactionOverlay {
 
     pub(crate) fn invalidate(&mut self, relid: u32, tid: Tid) {
         self.invalidated_tids.entry(relid).or_default().insert(tid);
+    }
+
+    pub(crate) fn insert_hot_redirect(&mut self, relid: u32, old_tid: Tid, new_tid: Tid) {
+        if old_tid != new_tid {
+            self.hot_redirect_inserts
+                .entry(relid)
+                .or_default()
+                .insert(old_tid, new_tid);
+        }
     }
 
     pub(crate) fn delete_primary_key(&mut self, relid: u32, key: IndexKey) {
@@ -94,6 +115,12 @@ impl TransactionOverlay {
         for (relid, tids) in other.invalidated_tids.drain() {
             self.invalidated_tids.entry(relid).or_default().extend(tids);
         }
+        for (relid, redirects) in other.hot_redirect_inserts.drain() {
+            self.hot_redirect_inserts
+                .entry(relid)
+                .or_default()
+                .extend(redirects);
+        }
         for (relid, keys) in other.primary_key_deletes.drain() {
             self.primary_key_deletes
                 .entry(relid)
@@ -136,7 +163,16 @@ impl TransactionOverlay {
             .flat_map(|keys| keys.iter())
             .map(IndexKey::accounted_bytes)
             .sum::<usize>();
-        inserts + deletes
+        let redirects = self
+            .hot_redirect_inserts
+            .values()
+            .map(|entries| {
+                entries
+                    .len()
+                    .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
+            })
+            .sum::<usize>();
+        inserts + deletes + redirects
     }
 }
 
@@ -152,6 +188,34 @@ impl SessionStorage {
         if self.transaction_stack.is_empty() {
             self.transaction_stack.push(TransactionOverlay::default());
         }
+    }
+
+    pub(crate) fn commit_empty_implicit_transaction(&mut self) -> bool {
+        if self.explicit_transaction {
+            return false;
+        }
+        if self
+            .transaction_stack
+            .last()
+            .is_some_and(TransactionOverlay::is_empty)
+        {
+            self.transaction_stack.pop();
+            return true;
+        }
+        false
+    }
+
+    pub(crate) fn abort_empty_implicit_transaction(&mut self) -> bool {
+        if self.explicit_transaction
+            || self
+                .transaction_stack
+                .iter()
+                .any(|overlay| !overlay.is_empty())
+        {
+            return false;
+        }
+        self.transaction_stack.clear();
+        true
     }
 
     pub(crate) fn allocate_scan_handle(&mut self) -> u64 {
@@ -307,6 +371,20 @@ pub(crate) fn overlays_invalidate_tid(
             .invalidated_tids
             .get(&relid)
             .is_some_and(|tids| tids.contains(&tid))
+    })
+}
+
+pub(crate) fn overlay_tid_redirect(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> Option<Tid> {
+    overlays.iter().rev().find_map(|overlay| {
+        overlay
+            .hot_redirect_inserts
+            .get(&relid)
+            .and_then(|redirects| redirects.get(&tid))
+            .copied()
     })
 }
 

@@ -413,6 +413,22 @@ extern bool fastpg_storage2_relation_update_unchecked(uint32_t relid,
 													  const size_t *value_lens,
 													  size_t natts,
 													  uint64_t *new_tid);
+extern bool fastpg_storage2_relation_update_redirect_unchecked(uint32_t relid,
+															   uint64_t tid,
+															   const uintptr_t *values,
+															   const uint8_t *isnull,
+															   const uint8_t *byval,
+															   const size_t *value_lens,
+															   size_t natts,
+															   uint64_t *new_tid);
+extern bool fastpg_storage2_relation_update_hot_unchecked(uint32_t relid,
+														  uint64_t tid,
+														  const uintptr_t *values,
+														  const uint8_t *isnull,
+														  const uint8_t *byval,
+														  const size_t *value_lens,
+														  size_t natts,
+														  uint64_t *new_tid);
 extern bool fastpg_storage2_relation_delete(uint32_t relid, uint64_t tid);
 extern uint64_t fastpg_storage2_scan_begin(uint32_t relid);
 extern void fastpg_storage2_scan_reset(uint64_t scan_handle);
@@ -433,13 +449,47 @@ extern bool fastpg_storage2_primary_key_index_lookup(uint32_t index_relid,
 													 const uint8_t *isnull,
 													 size_t nkeys,
 													 uint64_t *tid);
+extern bool fastpg_storage2_primary_key_index_lookup_with_spec(uint32_t index_relid,
+															   uint32_t heap_relid,
+															   const int16_t *attnums,
+															   const uint8_t *typbyval,
+															   const int16_t *typlen,
+															   const uintptr_t *values,
+															   const uint8_t *isnull,
+															   size_t nkeys,
+															   uint64_t *tid);
 extern bool fastpg_storage2_rebuild_primary_key_index(uint32_t index_relid);
+extern bool fastpg_storage2_rebuild_primary_key_index_with_spec(uint32_t index_relid,
+																uint32_t heap_relid,
+																const int16_t *attnums,
+																const uint8_t *typbyval,
+																const int16_t *typlen,
+																size_t nkeys);
 extern bool fastpg_storage2_unique_index_conflict(uint32_t index_relid,
 												  const uintptr_t *values,
 												  const uint8_t *isnull,
 												  size_t nkeys,
 												  uint64_t replacing_tid,
 												  uint64_t *tid);
+extern bool fastpg_storage2_unique_index_conflict_with_spec(uint32_t index_relid,
+															uint32_t heap_relid,
+															const int16_t *attnums,
+															const uint8_t *typbyval,
+															const int16_t *typlen,
+															const uintptr_t *values,
+															const uint8_t *isnull,
+															size_t nkeys,
+															uint8_t nulls_not_distinct,
+															uint64_t replacing_tid,
+															uint64_t *tid);
+extern bool fastpg_storage2_unique_index_validate_with_spec(uint32_t index_relid,
+															uint32_t heap_relid,
+															const int16_t *attnums,
+															const uint8_t *typbyval,
+															const int16_t *typlen,
+															size_t nkeys,
+															uint8_t nulls_not_distinct,
+															uint64_t *tid);
 extern bool fastpg_storage2_last_error(char *sqlstate_out,
 									   size_t sqlstate_len,
 									   char *message_out,
@@ -447,6 +497,17 @@ extern bool fastpg_storage2_last_error(char *sqlstate_out,
 
 static const TableAmRoutine fastpg_mem_methods;
 static const IndexAmRoutine fastpg_mem_index_methods;
+#ifdef USE_FASTPG
+static _Thread_local bool fastpg_mem_xact_callbacks_registered = false;
+static _Thread_local MemoryContext fastpg_mem_touched_context = NULL;
+static _Thread_local HTAB *fastpg_mem_touched_hash = NULL;
+static _Thread_local MemoryContext fastpg_mem_redirect_context = NULL;
+static _Thread_local FastPgMemRowRedirect *fastpg_mem_row_redirects = NULL;
+static _Thread_local MemoryContext fastpg_mem_visibility_context = NULL;
+static _Thread_local FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
+static _Thread_local MemoryContext fastpg_mem_block_layout_context = NULL;
+static _Thread_local FastPgMemBlockLayout *fastpg_mem_block_layouts = NULL;
+#else
 static bool fastpg_mem_xact_callbacks_registered = false;
 static MemoryContext fastpg_mem_touched_context = NULL;
 static HTAB *fastpg_mem_touched_hash = NULL;
@@ -456,6 +517,7 @@ static MemoryContext fastpg_mem_visibility_context = NULL;
 static FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
 static MemoryContext fastpg_mem_block_layout_context = NULL;
 static FastPgMemBlockLayout *fastpg_mem_block_layouts = NULL;
+#endif
 
 typedef struct FastPgMemIndexScan
 {
@@ -552,16 +614,18 @@ fastpg_mem_storage2_enabled(void)
 		return cached == 1;
 
 	engine = getenv("FASTPG_STORAGE_ENGINE");
-	cached = (engine != NULL && strcmp(engine, "storage2") == 0) ? 1 : 0;
+	cached = (engine == NULL || strcmp(engine, "storage2") == 0) ? 1 : 0;
 	return cached == 1;
 }
 
 static bool
 fastpg_mem_use_storage2_for_relid(uint32_t relid)
 {
-	return fastpg_mem_storage2_enabled() &&
-		!fastpg_catalog_mode_uses_postgres() &&
-		fastpg_rust_catalog_policy_by_relation_oid(relid) == 0;
+	if (!fastpg_mem_storage2_enabled())
+		return false;
+	if (fastpg_catalog_mode_uses_postgres())
+		return true;
+	return fastpg_rust_catalog_policy_by_relation_oid(relid) == 0;
 }
 
 static bool
@@ -2540,6 +2604,7 @@ static char *
 fastpg_mem_index_build_key_description(Relation heapRelation,
 									   Relation indexRelation,
 									   IndexInfo *indexInfo,
+									   bool storage2,
 									   uint64_t row_id)
 {
 	ItemPointerData tid;
@@ -2549,7 +2614,12 @@ fastpg_mem_index_build_key_description(Relation heapRelation,
 	bool		isnull[INDEX_MAX_KEYS];
 	char	   *key_desc = NULL;
 
-	if (!fastpg_mem_row_id_to_tid(heapRelation, row_id, &tid))
+	if (storage2)
+	{
+		if (!fastpg_mem_storage2_tid_to_tid(row_id, &tid))
+			return NULL;
+	}
+	else if (!fastpg_mem_row_id_to_tid(heapRelation, row_id, &tid))
 		return NULL;
 
 	slot = table_slot_create(heapRelation, NULL);
@@ -2685,8 +2755,10 @@ fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
 {
 	IndexBuildResult *result = palloc0_object(IndexBuildResult);
 	FastPgMemIndexBuildState buildstate;
+	bool		storage2 =
+		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation));
 
-	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation)))
+	if (storage2 && !fastpg_catalog_mode_uses_postgres())
 		(void) fastpg_storage2_rebuild_primary_key_index((uint32_t) RelationGetRelid(indexRelation));
 
 	buildstate.heap_relation = heapRelation;
@@ -2717,7 +2789,24 @@ fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
 								   fastpg_typlen))
 			fastpg_mem_index_unsupported("indexes with unsupported key metadata");
 
-		if (fastpg_rust_unique_index_validate_with_spec((uint32_t) RelationGetRelid(indexRelation),
+		if (storage2 && indexRelation->rd_index->indisprimary)
+			(void) fastpg_storage2_rebuild_primary_key_index_with_spec((uint32_t) RelationGetRelid(indexRelation),
+																	   (uint32_t) RelationGetRelid(heapRelation),
+																	   fastpg_attnums,
+																	   fastpg_typbyval,
+																	   fastpg_typlen,
+																	   (size_t) key_count);
+
+		if (storage2 ?
+			fastpg_storage2_unique_index_validate_with_spec((uint32_t) RelationGetRelid(indexRelation),
+															(uint32_t) RelationGetRelid(heapRelation),
+															fastpg_attnums,
+															fastpg_typbyval,
+															fastpg_typlen,
+															(size_t) key_count,
+															indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
+															&conflict_row_id) :
+			fastpg_rust_unique_index_validate_with_spec((uint32_t) RelationGetRelid(indexRelation),
 														(uint32_t) RelationGetRelid(heapRelation),
 														fastpg_attnums,
 														fastpg_typbyval,
@@ -2730,6 +2819,7 @@ fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
 				fastpg_mem_index_build_key_description(heapRelation,
 													   indexRelation,
 													   indexInfo,
+													   storage2,
 													   conflict_row_id);
 
 			ereport(ERROR,
@@ -2819,25 +2909,37 @@ fastpg_mem_index_insert(Relation indexRelation,
 								   fastpg_typlen))
 			fastpg_mem_index_unsupported("indexes with unsupported key metadata");
 
-		if ((fastpg_catalog_mode_uses_postgres() ?
-			 fastpg_rust_unique_index_conflict_with_spec((uint32_t) RelationGetRelid(indexRelation),
-														 (uint32_t) RelationGetRelid(heapRelation),
-														 fastpg_attnums,
-														 fastpg_typbyval,
-														 fastpg_typlen,
-														 fastpg_values,
-														 fastpg_isnull,
-														 (size_t) key_count,
-														 indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
-														 self_row_id,
-														 &conflict_row_id) :
-			 (storage2 ?
+		if ((storage2 ?
+			 (fastpg_catalog_mode_uses_postgres() ?
+			  fastpg_storage2_unique_index_conflict_with_spec((uint32_t) RelationGetRelid(indexRelation),
+															  (uint32_t) RelationGetRelid(heapRelation),
+															  fastpg_attnums,
+															  fastpg_typbyval,
+															  fastpg_typlen,
+															  fastpg_values,
+															  fastpg_isnull,
+															  (size_t) key_count,
+															  indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
+															  self_row_id,
+															  &conflict_row_id) :
 			  fastpg_storage2_unique_index_conflict((uint32_t) RelationGetRelid(indexRelation),
 													fastpg_values,
 													fastpg_isnull,
 													(size_t) key_count,
 													self_row_id,
-													&conflict_row_id) :
+													&conflict_row_id)) :
+			 (fastpg_catalog_mode_uses_postgres() ?
+			  fastpg_rust_unique_index_conflict_with_spec((uint32_t) RelationGetRelid(indexRelation),
+														  (uint32_t) RelationGetRelid(heapRelation),
+														  fastpg_attnums,
+														  fastpg_typbyval,
+														  fastpg_typlen,
+														  fastpg_values,
+														  fastpg_isnull,
+														  (size_t) key_count,
+														  indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
+														  self_row_id,
+														  &conflict_row_id) :
 			  fastpg_rust_unique_index_conflict((uint32_t) RelationGetRelid(indexRelation),
 												fastpg_values,
 												fastpg_isnull,
@@ -3075,25 +3177,37 @@ FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 							   fastpg_typlen))
 		return false;
 
-	conflict = fastpg_catalog_mode_uses_postgres() ?
-		fastpg_rust_unique_index_conflict_with_spec((uint32_t) RelationGetRelid(indexRelation),
-													(uint32_t) RelationGetRelid(heapRelation),
-													fastpg_attnums,
-													fastpg_typbyval,
-													fastpg_typlen,
-													fastpg_values,
-													fastpg_isnull,
-													(size_t) key_count,
-													indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
-													self_row_id,
-													&conflict_row_id) :
-		(storage2 ?
+	conflict = storage2 ?
+		(fastpg_catalog_mode_uses_postgres() ?
+		 fastpg_storage2_unique_index_conflict_with_spec((uint32_t) RelationGetRelid(indexRelation),
+														 (uint32_t) RelationGetRelid(heapRelation),
+														 fastpg_attnums,
+														 fastpg_typbyval,
+														 fastpg_typlen,
+														 fastpg_values,
+														 fastpg_isnull,
+														 (size_t) key_count,
+														 indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
+														 self_row_id,
+														 &conflict_row_id) :
 		 fastpg_storage2_unique_index_conflict((uint32_t) RelationGetRelid(indexRelation),
 											   fastpg_values,
 											   fastpg_isnull,
 											   (size_t) key_count,
 											   self_row_id,
-											   &conflict_row_id) :
+											   &conflict_row_id)) :
+		(fastpg_catalog_mode_uses_postgres() ?
+		 fastpg_rust_unique_index_conflict_with_spec((uint32_t) RelationGetRelid(indexRelation),
+													 (uint32_t) RelationGetRelid(heapRelation),
+													 fastpg_attnums,
+													 fastpg_typbyval,
+													 fastpg_typlen,
+													 fastpg_values,
+													 fastpg_isnull,
+													 (size_t) key_count,
+													 indexRelation->rd_index->indnullsnotdistinct ? 1 : 0,
+													 self_row_id,
+													 &conflict_row_id) :
 		 fastpg_rust_unique_index_conflict((uint32_t) RelationGetRelid(indexRelation),
 										   fastpg_values,
 										   fastpg_isnull,
@@ -3795,22 +3909,32 @@ fastpg_mem_index_get_tuple(IndexScanDesc scan, ScanDirection direction)
 		else
 			opaque->done = true;
 
-		if (fastpg_catalog_mode_uses_postgres() ?
-			fastpg_rust_primary_key_index_lookup_with_spec((uint32_t) RelationGetRelid(scan->indexRelation),
-														   (uint32_t) RelationGetRelid(scan->heapRelation),
-														   fastpg_attnums,
-														   fastpg_typbyval,
-														   fastpg_typlen,
-														   opaque->values,
-														   opaque->isnull,
-														   opaque->nkeys,
-														   &row_id) :
-			(storage2 ?
+		if (storage2 ?
+			(fastpg_catalog_mode_uses_postgres() ?
+			 fastpg_storage2_primary_key_index_lookup_with_spec((uint32_t) RelationGetRelid(scan->indexRelation),
+																(uint32_t) RelationGetRelid(scan->heapRelation),
+																fastpg_attnums,
+																fastpg_typbyval,
+																fastpg_typlen,
+																opaque->values,
+																opaque->isnull,
+																opaque->nkeys,
+																&row_id) :
 			 fastpg_storage2_primary_key_index_lookup((uint32_t) RelationGetRelid(scan->indexRelation),
 													  opaque->values,
 													  opaque->isnull,
 													  opaque->nkeys,
-													  &row_id) :
+													  &row_id)) :
+			(fastpg_catalog_mode_uses_postgres() ?
+			 fastpg_rust_primary_key_index_lookup_with_spec((uint32_t) RelationGetRelid(scan->indexRelation),
+															(uint32_t) RelationGetRelid(scan->heapRelation),
+															fastpg_attnums,
+															fastpg_typbyval,
+															fastpg_typlen,
+															opaque->values,
+															opaque->isnull,
+															opaque->nkeys,
+															&row_id) :
 			 fastpg_rust_primary_key_index_lookup((uint32_t) RelationGetRelid(scan->indexRelation),
 												  opaque->values,
 												  opaque->isnull,
@@ -4378,7 +4502,8 @@ fastpg_mem_relation_has_unique_index(Relation rel)
 static bool
 fastpg_mem_update_preserves_index_attrs(Relation rel,
 										uint64_t row_id,
-										TupleTableSlot *new_slot)
+										TupleTableSlot *new_slot,
+										bool storage2)
 {
 	Bitmapset  *attrs = NULL;
 	TupleTableSlot *old_slot;
@@ -4387,8 +4512,6 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 	bool		preserves = true;
 
 	if (!fastpg_catalog_mode_uses_postgres())
-		return false;
-	if (!fastpg_mem_relation_has_deferred_unique_index(rel))
 		return false;
 
 	attrs = bms_add_members(attrs,
@@ -4409,7 +4532,15 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 		return false;
 	}
 
-	if (!fastpg_mem_row_id_to_tid(rel, row_id, &tid))
+	if (storage2)
+	{
+		if (!fastpg_mem_storage2_tid_to_tid(row_id, &tid))
+		{
+			bms_free(attrs);
+			return false;
+		}
+	}
+	else if (!fastpg_mem_row_id_to_tid(rel, row_id, &tid))
 	{
 		bms_free(attrs);
 		return false;
@@ -4498,6 +4629,7 @@ fastpg_mem_tuple_update(Relation rel,
 	HeapTuple	old_heap_tuple = NULL;
 	TupleTableSlot *old_slot = NULL;
 	bool		preserve_update_tid = false;
+	bool		storage2_hot_update = false;
 
 	if (update_indexes != NULL)
 		*update_indexes = (storage2 || fastpg_catalog_mode_uses_postgres()) ?
@@ -4546,6 +4678,14 @@ fastpg_mem_tuple_update(Relation rel,
 			fastpg_mem_fill_self_modified_tmfd(otid, touched_cid, tmfd);
 			return TM_SelfModified;
 		}
+	}
+
+	if (storage2 && fastpg_catalog_mode_uses_postgres() &&
+		fastpg_mem_update_preserves_index_attrs(rel, row_id, slot, true))
+	{
+		storage2_hot_update = true;
+		if (update_indexes != NULL)
+			*update_indexes = TU_None;
 	}
 
 	fastpg_mem_ensure_write_xact();
@@ -4701,14 +4841,32 @@ fastpg_mem_tuple_update(Relation rel,
 										   new_row_id);
 	}
 	else if (!(storage2 ?
-			   fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
-														 row_id,
-														 values,
-														 isnull,
-														 byval,
-														 value_lens,
-														 tupdesc->natts,
-														 &row_id) :
+			   (storage2_hot_update ?
+				fastpg_storage2_relation_update_hot_unchecked(RelationGetRelid(rel),
+															  row_id,
+															  values,
+															  isnull,
+															  byval,
+															  value_lens,
+															  tupdesc->natts,
+															  &row_id) :
+				(fastpg_catalog_mode_uses_postgres() ?
+				 fastpg_storage2_relation_update_redirect_unchecked(RelationGetRelid(rel),
+																	row_id,
+																	values,
+																	isnull,
+																	byval,
+																	value_lens,
+																	tupdesc->natts,
+																	&row_id) :
+				 fastpg_storage2_relation_update_unchecked(RelationGetRelid(rel),
+														   row_id,
+														   values,
+														   isnull,
+														   byval,
+														   value_lens,
+														   tupdesc->natts,
+														   &row_id))) :
 			   fastpg_rust_relation_update_unchecked(RelationGetRelid(rel),
 													 row_id,
 													 values,
