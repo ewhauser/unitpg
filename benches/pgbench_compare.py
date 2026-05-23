@@ -30,6 +30,8 @@ LATENCY_RE = re.compile(r"^latency average =\s+([0-9.]+)\s+ms", re.MULTILINE)
 SVG_TITLE_RE = re.compile(r"<title>(.*?)</title>")
 SVG_TOTAL_SAMPLES_RE = re.compile(r'<svg id="frames"[^>]*\btotal_samples="([\d,]+)"')
 HOTSPOT_RE = re.compile(r"^(.*) \(([\d,]+) samples?, ([0-9.]+)%\)$")
+PGDATA_RELATION_STORAGE_RE = re.compile(r"^\d+(?:_(?:fsm|vm|init))?(?:\.\d+)?$")
+PGDATA_WAL_SEGMENT_RE = re.compile(r"^[0-9A-F]{24}(?:\.[A-Za-z0-9._-]+)?$")
 DEFAULT_PGBENCH_INIT_STEPS = "dtgvp"
 TIMEOUT_RETURN_CODE = 124
 PROFILE_COMPONENT_ORDER = [
@@ -55,6 +57,20 @@ class Variant:
     name: str
     fastpg: bool
     engine: str
+
+
+@dataclass(frozen=True)
+class RuntimeSkeletonStats:
+    directories: int
+    files: int
+    bytes: int
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "directories": self.directories,
+            "files": self.files,
+            "bytes": self.bytes,
+        }
 
 
 @dataclass
@@ -204,6 +220,7 @@ class PgBenchCompare:
                 "protocol": args.protocol,
                 "storage_engine": args.storage_engine,
                 "catalog_mode": args.catalog_mode,
+                "fastpg_catalog_pgdata_mode": args.fastpg_catalog_pgdata_mode,
                 "fastpg_use_mem_index_am": args.fastpg_use_mem_index_am,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
@@ -434,6 +451,7 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
         ]
         reconfigure_args = [
@@ -446,6 +464,7 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
         ]
         configure_args = [
@@ -457,6 +476,7 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
         ]
 
@@ -525,6 +545,125 @@ class PgBenchCompare:
 
         return libdir
 
+    def prepare_fastpg_catalog_seed(self, variant: str, paths: dict[str, Path], variant_dir: Path) -> Path:
+        seed_dir = variant_dir / "catalog-seed-pgdata"
+        variant_record = self.results["variants"].get(variant, {})
+        if (seed_dir / "PG_VERSION").exists():
+            variant_record["catalog_seed"] = {
+                "pgdata": str(seed_dir),
+                "reused": True,
+            }
+            self.write_results()
+            return seed_dir
+
+        if seed_dir.exists():
+            shutil.rmtree(seed_dir)
+
+        seed_output_dir = variant_dir / "catalog-seed"
+        try:
+            initdb = self.checked_command(
+                variant,
+                "initdb",
+                [
+                    str(paths["client_bindir"] / "initdb"),
+                    "-D",
+                    str(seed_dir),
+                    "-U",
+                    "postgres",
+                    "-A",
+                    "trust",
+                    "--no-locale",
+                ],
+                seed_output_dir,
+                "fastpg-catalog-seed-initdb",
+                env=postgres_env(paths["client_bindir"], paths["client_libdir"]),
+            )
+        except Exception:
+            shutil.rmtree(seed_dir, ignore_errors=True)
+            raise
+
+        variant_record["catalog_seed"] = {
+            "pgdata": str(seed_dir),
+            "reused": False,
+            "commands": {"initdb": initdb.as_json()},
+        }
+        self.write_results()
+        return seed_dir
+
+    def python_file_operation(
+        self,
+        variant: str,
+        phase: str,
+        output_dir: Path,
+        label: str,
+        command: list[str],
+        operation: Any,
+    ) -> dict[str, Any]:
+        output_dir.mkdir(parents=True, exist_ok=True)
+        started = time.monotonic()
+        stdout = ""
+        stderr = ""
+        payload: dict[str, Any] = {}
+        returncode = 0
+        try:
+            result = operation()
+            if isinstance(result, dict):
+                payload = result
+        except Exception as error:
+            returncode = 1
+            stderr = f"{type(error).__name__}: {error}"
+
+        command_result = CommandResult(
+            command=command,
+            cwd=str(self.source_root),
+            returncode=returncode,
+            stdout=stdout,
+            stderr=stderr,
+            seconds=time.monotonic() - started,
+        )
+        record = command_result.as_json()
+        if payload:
+            record["details"] = payload
+        (output_dir / f"{label}.stdout").write_text(stdout)
+        (output_dir / f"{label}.stderr").write_text(stderr)
+        (output_dir / f"{label}.command.json").write_text(json.dumps(record, indent=2) + "\n")
+        if returncode != 0:
+            raise BenchmarkFailure(variant, phase, command_result, output_dir)
+        return record
+
+    def copy_fastpg_catalog_seed(self, variant: str, seed_dir: Path, pgdata: Path, run_dir: Path) -> dict[str, Any]:
+        def operation() -> dict[str, Any]:
+            shutil.copytree(seed_dir, pgdata, symlinks=True, dirs_exist_ok=True)
+            return pgdata_tree_stats(pgdata).as_dict()
+
+        return self.python_file_operation(
+            variant,
+            "initdb",
+            run_dir,
+            "fastpg-catalog-seed-copy",
+            ["python-internal", "copytree", str(seed_dir), str(pgdata)],
+            operation,
+        )
+
+    def copy_fastpg_catalog_skeleton(
+        self,
+        variant: str,
+        seed_dir: Path,
+        pgdata: Path,
+        run_dir: Path,
+    ) -> dict[str, Any]:
+        def operation() -> dict[str, Any]:
+            return copy_pgdata_runtime_skeleton(seed_dir, pgdata).as_dict()
+
+        return self.python_file_operation(
+            variant,
+            "initdb",
+            run_dir,
+            "fastpg-catalog-seed-skeleton",
+            ["python-internal", "copy-pgdata-skeleton", str(seed_dir), str(pgdata)],
+            operation,
+        )
+
     def prepare_rust_server_catalog(
         self,
         variant: str,
@@ -551,28 +690,51 @@ class PgBenchCompare:
         pgdata = short_temp_dir("fpgcat-")
         run_record["pgdata"] = str(pgdata)
         run_record["pgdata_temporary"] = True
+        run_record["catalog_pgdata_mode"] = self.args.fastpg_catalog_pgdata_mode
         try:
-            initdb = self.checked_command(
-                variant,
-                "initdb",
-                [
-                    str(paths["client_bindir"] / "initdb"),
-                    "-D",
-                    str(pgdata),
-                    "-U",
-                    "postgres",
-                    "-A",
-                    "trust",
-                    "--no-locale",
-                ],
-                run_dir,
-                "fastpg-catalog-initdb",
-                env=postgres_env(paths["client_bindir"], paths["client_libdir"]),
-            )
+            if self.args.fastpg_catalog_pgdata_mode == "initdb":
+                initdb = self.checked_command(
+                    variant,
+                    "initdb",
+                    [
+                        str(paths["client_bindir"] / "initdb"),
+                        "-D",
+                        str(pgdata),
+                        "-U",
+                        "postgres",
+                        "-A",
+                        "trust",
+                        "--no-locale",
+                    ],
+                    run_dir,
+                    "fastpg-catalog-initdb",
+                    env=postgres_env(paths["client_bindir"], paths["client_libdir"]),
+                )
+                run_record["commands"]["catalog_initdb"] = initdb.as_json()
+            else:
+                seed_dir = self.prepare_fastpg_catalog_seed(variant, paths, run_dir.parent)
+                run_record["catalog_seed_pgdata"] = str(seed_dir)
+                if self.args.fastpg_catalog_pgdata_mode == "seed-copy":
+                    run_record["commands"]["catalog_seed_copy"] = self.copy_fastpg_catalog_seed(
+                        variant,
+                        seed_dir,
+                        pgdata,
+                        run_dir,
+                    )
+                elif self.args.fastpg_catalog_pgdata_mode == "seed-skeleton":
+                    run_record["commands"]["catalog_seed_skeleton"] = self.copy_fastpg_catalog_skeleton(
+                        variant,
+                        seed_dir,
+                        pgdata,
+                        run_dir,
+                    )
+                    server_env["FASTPG_PGDATA_SEED"] = str(seed_dir)
+                    server_env["PG_FASTFORK_SEED_DIR"] = str(seed_dir)
+                else:
+                    raise ValueError(f"unknown fastpg catalog PGDATA mode: {self.args.fastpg_catalog_pgdata_mode}")
         except Exception:
             shutil.rmtree(pgdata, ignore_errors=True)
             raise
-        run_record["commands"]["catalog_initdb"] = initdb.as_json()
         server_env["FASTPG_PGDATA"] = str(pgdata)
         return server_env, pgdata
 
@@ -1562,6 +1724,15 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="select the fastpg catalog implementation for the Rust server variant",
     )
     parser.add_argument(
+        "--fastpg-catalog-pgdata-mode",
+        choices=["initdb", "seed-copy", "seed-skeleton"],
+        default="seed-skeleton",
+        help=(
+            "prepare FASTPG_PGDATA with a fresh initdb, a full copy of one seed initdb, "
+            "or a small runtime skeleton backed by the seed relation files"
+        ),
+    )
+    parser.add_argument(
         "--fastpg-use-mem-index-am",
         action="store_true",
         help="compile fastpg with the in-memory index AM for eligible postgres-catalog indexes",
@@ -1665,6 +1836,104 @@ def short_temp_dir(prefix: str) -> Path:
         else Path(tempfile.gettempdir())
     )
     return Path(tempfile.mkdtemp(prefix=prefix, dir=base))
+
+
+def pgdata_tree_stats(pgdata: Path) -> RuntimeSkeletonStats:
+    directory_count = 0
+    file_count = 0
+    byte_count = 0
+    for root, dirs, files in os.walk(pgdata):
+        directory_count += 1 + sum(1 for dirname in dirs if (Path(root) / dirname).is_symlink())
+        for filename in files:
+            file_path = Path(root) / filename
+            file_count += 1
+            if not file_path.is_symlink():
+                byte_count += file_path.stat().st_size
+    return RuntimeSkeletonStats(
+        directories=directory_count,
+        files=file_count,
+        bytes=byte_count,
+    )
+
+
+def is_pgdata_relation_storage_file(path: Path, seed_dir: Path) -> bool:
+    rel = path.relative_to(seed_dir)
+    parts = rel.parts
+    if not parts:
+        return False
+
+    name = parts[-1]
+    if parts[0] == "global" and len(parts) == 2:
+        return bool(PGDATA_RELATION_STORAGE_RE.match(name))
+    if parts[0] == "base" and len(parts) == 3:
+        return bool(PGDATA_RELATION_STORAGE_RE.match(name))
+    if parts[0] == "pg_tblspc" and len(parts) >= 5:
+        return bool(PGDATA_RELATION_STORAGE_RE.match(name))
+    return False
+
+
+def is_pgdata_wal_payload_file(path: Path, seed_dir: Path) -> bool:
+    rel = path.relative_to(seed_dir)
+    parts = rel.parts
+    if len(parts) == 2 and parts[0] == "pg_wal":
+        return bool(PGDATA_WAL_SEGMENT_RE.match(parts[-1]))
+    if len(parts) >= 2 and parts[0] == "pg_wal" and parts[1] == "summaries":
+        return path.is_file()
+    return False
+
+
+def should_copy_pgdata_runtime_file(path: Path, seed_dir: Path) -> bool:
+    if path.name in {"postmaster.pid", "postmaster.opts", "current_logfiles"}:
+        return False
+    if is_pgdata_relation_storage_file(path, seed_dir):
+        return False
+    if is_pgdata_wal_payload_file(path, seed_dir):
+        return False
+    return True
+
+
+def copy_pgdata_runtime_skeleton(seed_dir: Path, runtime_dir: Path) -> RuntimeSkeletonStats:
+    seed_dir = seed_dir.resolve()
+
+    directory_count = 0
+    file_count = 0
+    byte_count = 0
+
+    for root, dirs, files in os.walk(seed_dir):
+        source_root = Path(root)
+        rel_root = source_root.relative_to(seed_dir)
+        target_root = runtime_dir / rel_root
+        target_root.mkdir(parents=True, exist_ok=True)
+        shutil.copystat(source_root, target_root, follow_symlinks=False)
+        directory_count += 1
+
+        for dirname in dirs:
+            source_dir = source_root / dirname
+            target_dir = target_root / dirname
+            if source_dir.is_symlink():
+                target_dir.symlink_to(os.readlink(source_dir))
+                directory_count += 1
+
+        for filename in files:
+            source_file = source_root / filename
+            if not should_copy_pgdata_runtime_file(source_file, seed_dir):
+                continue
+
+            target_file = target_root / filename
+            if source_file.is_symlink():
+                target_file.symlink_to(os.readlink(source_file))
+                file_count += 1
+                continue
+
+            shutil.copy2(source_file, target_file)
+            file_count += 1
+            byte_count += source_file.stat().st_size
+
+    return RuntimeSkeletonStats(
+        directories=directory_count,
+        files=file_count,
+        bytes=byte_count,
+    )
 
 
 def free_port() -> int:
@@ -2178,9 +2447,15 @@ def summarize_runs(runs: list[dict[str, Any]]) -> dict[str, Any]:
         for run in runs
         if run.get("metrics", {}).get("latency_average_ms") is not None
     ]
+    catalog_values = [
+        value
+        for run in runs
+        if (value := catalog_pgdata_prepare_seconds(run)) is not None
+    ]
     return {
         "median_tps": median(tps_values) if tps_values else None,
         "median_latency_average_ms": median(latency_values) if latency_values else None,
+        "median_catalog_pgdata_prepare_seconds": median(catalog_values) if catalog_values else None,
         "runs": len(runs),
     }
 
@@ -2203,6 +2478,16 @@ def run_metric_value(run: dict[str, Any] | None, path: tuple[str, ...]) -> Any:
             return None
         value = value.get(key)
     return value
+
+
+def catalog_pgdata_prepare_seconds(run: dict[str, Any] | None) -> float | None:
+    if run is None:
+        return None
+    for command_name in ("catalog_seed_skeleton", "catalog_seed_copy", "catalog_initdb"):
+        value = run_metric_value(run, ("commands", command_name, "seconds"))
+        if value is not None:
+            return value
+    return None
 
 
 def metric_delta(fastpg: float | int | None, normal: float | int | None) -> float | None:
@@ -2351,12 +2636,20 @@ def render_markdown(results: dict[str, Any], result_root: Path) -> str:
             summary = variant["summary"]
             lines.append(f"- median TPS: `{summary.get('median_tps')}`")
             lines.append(f"- median average latency ms: `{summary.get('median_latency_average_ms')}`")
+            catalog_prepare = summary.get("median_catalog_pgdata_prepare_seconds")
+            if catalog_prepare is not None:
+                lines.append(f"- median catalog PGDATA prepare seconds: `{catalog_prepare}`")
         for run in variant.get("runs", []):
             metrics = run.get("metrics", {})
             lines.append(
                 f"- run {run['run']}: TPS `{metrics.get('tps_without_initial_connection')}`, "
                 f"average latency ms `{metrics.get('latency_average_ms')}`"
             )
+            catalog_prepare = catalog_pgdata_prepare_seconds(run)
+            if catalog_prepare is not None:
+                lines.append(
+                    f"- run {run['run']} catalog PGDATA prepare seconds: `{catalog_prepare}`"
+                )
             if "profile" in run:
                 lines.append(f"- run {run['run']} profile: `{run['profile'].get('path')}`")
         lines.append("")
@@ -2539,6 +2832,12 @@ def profile_run_metric_rows(results: dict[str, Any]) -> list[dict[str, Any]]:
             "seconds",
             run_metric_value(normal_run, ("commands", "pgbench_run", "seconds")),
             run_metric_value(fastpg_run, ("commands", "pgbench_run", "seconds")),
+        ),
+        add_row(
+            "fastpg catalog PGDATA prepare",
+            "seconds",
+            None,
+            catalog_pgdata_prepare_seconds(fastpg_run),
         ),
         add_row(
             "hyperfine mean wall time",

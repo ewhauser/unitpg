@@ -1100,6 +1100,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         rust_build_profile=args.rust_build_profile,
         storage_engine=args.storage_engine,
         catalog_mode=getattr(args, "catalog_mode", "postgres"),
+        fastpg_catalog_pgdata_mode="seed-copy",
         fastpg_use_mem_index_am=args.fastpg_use_mem_index_am,
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
