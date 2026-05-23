@@ -33,13 +33,12 @@ jobs:
           persist-credentials: false
 
       - name: Run zizmor
-        uses: zizmorcore/zizmor-action@e639db99335bc9038abc0e066dfcd72e23d26fb4 # v0.3.0
-        with:
-          inputs: .github/workflows
-          version: v1.25.2
-          persona: pedantic
-          # Online audits inspect repository settings/default-branch state,
-          # which makes the hardening PR fail until after it merges.
-          online-audits: false
-          advanced-security: false
-          annotations: true
+        run: |
+          set -euo pipefail
+          docker run --rm \
+            --volume "$PWD:/workspace:ro" \
+            --workdir /workspace \
+            ghcr.io/zizmorcore/zizmor@sha256:14ea7f5cc7c67933394a35b5a38a277397818d232602635edb2010b313afb110 \
+            --persona=pedantic \
+            --offline \
+            .github/workflows
