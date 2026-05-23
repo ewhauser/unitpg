@@ -1,0 +1,42 @@
+name: Security audit
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+      - rusty
+  push:
+    branches:
+      - main
+      - master
+      - rusty
+
+permissions: {}
+
+concurrency:
+  group: security-audit-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run zizmor
+        uses: zizmorcore/zizmor-action@e639db99335bc9038abc0e066dfcd72e23d26fb4 # v0.3.0
+        with:
+          inputs: .github/workflows
+          version: v1.25.2
+          persona: pedantic
+          advanced-security: false
+          annotations: true
