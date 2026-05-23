@@ -1722,8 +1722,8 @@ fn apply_command_transaction_status(command_tag: &str, transaction_status: &mut 
                 .copied()
                 .find(|byte| !byte.is_ascii_whitespace())
                 .map(|byte| byte.to_ascii_uppercase());
-            match first {
-                Some(b'B' | b'C' | b'E' | b'R') => match command_tag.split_whitespace().next() {
+            if let Some(b'B' | b'C' | b'E' | b'R') = first {
+                match command_tag.split_whitespace().next() {
                     Some(command) if command.eq_ignore_ascii_case("BEGIN") => {
                         *transaction_status = transaction_status.to_in_transaction_state();
                     }
@@ -1735,8 +1735,7 @@ fn apply_command_transaction_status(command_tag: &str, transaction_status: &mut 
                         *transaction_status = transaction_status.to_idle_state();
                     }
                     _ => {}
-                },
-                _ => {}
+                }
             }
         }
     }
