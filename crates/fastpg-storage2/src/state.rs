@@ -635,6 +635,61 @@ impl StorageState {
         tid
     }
 
+    pub(crate) fn resolve_update_redirect_in_overlays_compress(
+        &mut self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        mut tid: Tid,
+    ) -> Tid {
+        let original_tid = tid;
+        let mut first_committed_tid = None;
+        let mut rest_committed_tids = Vec::new();
+        let mut followed_overlay_redirect = false;
+
+        for _ in 0..MAX_HOT_REDIRECT_HOPS {
+            if let Some(next_tid) = overlay_update_redirect(overlays, relid, tid) {
+                followed_overlay_redirect = true;
+                tid = next_tid;
+                continue;
+            }
+            if let Some(next_tid) = self
+                .relations
+                .get(&relid)
+                .and_then(|relation| relation.update_redirects.get(&tid))
+                .copied()
+            {
+                if !followed_overlay_redirect {
+                    if first_committed_tid.is_some() {
+                        rest_committed_tids.push(tid);
+                    } else {
+                        first_committed_tid = Some(tid);
+                    }
+                }
+                tid = next_tid;
+                continue;
+            }
+            break;
+        }
+
+        if !followed_overlay_redirect
+            && tid != original_tid
+            && let Some(relation) = self.relations.get_mut(&relid)
+        {
+            if let Some(first_tid) = first_committed_tid
+                && first_tid != tid
+            {
+                relation.update_redirects.insert(first_tid, tid);
+            }
+            for visited_tid in rest_committed_tids {
+                if visited_tid != tid {
+                    relation.update_redirects.insert(visited_tid, tid);
+                }
+            }
+        }
+
+        tid
+    }
+
     pub(crate) fn resolve_update_redirect_in_overlays(
         &self,
         overlays: &[TransactionOverlay],
@@ -657,49 +712,6 @@ impl StorageState {
             }
             break;
         }
-        tid
-    }
-
-    pub(crate) fn resolve_update_redirect_in_overlays_compress(
-        &mut self,
-        overlays: &[TransactionOverlay],
-        relid: u32,
-        mut tid: Tid,
-    ) -> Tid {
-        let original_tid = tid;
-        let mut first_committed_tid = None;
-        let mut followed_overlay_redirect = false;
-
-        for _ in 0..MAX_HOT_REDIRECT_HOPS {
-            if let Some(next_tid) = overlay_update_redirect(overlays, relid, tid) {
-                followed_overlay_redirect = true;
-                tid = next_tid;
-                continue;
-            }
-            if let Some(next_tid) = self
-                .relations
-                .get(&relid)
-                .and_then(|relation| relation.update_redirects.get(&tid))
-                .copied()
-            {
-                if !followed_overlay_redirect && first_committed_tid.is_none() {
-                    first_committed_tid = Some(tid);
-                }
-                tid = next_tid;
-                continue;
-            }
-            break;
-        }
-
-        if !followed_overlay_redirect
-            && tid != original_tid
-            && let Some(relation) = self.relations.get_mut(&relid)
-            && let Some(first_tid) = first_committed_tid
-            && first_tid != tid
-        {
-            relation.update_redirects.insert(first_tid, tid);
-        }
-
         tid
     }
 
@@ -804,7 +816,7 @@ impl StorageState {
     }
 
     pub(crate) fn next_visible_tuple_slice_in_overlays<'a>(
-        &'a self,
+        &'a mut self,
         overlays: &[TransactionOverlay],
         relid: u32,
         cursor: ScanCursor,
@@ -812,16 +824,40 @@ impl StorageState {
         forward: bool,
         curcid: Option<u32>,
     ) -> Option<(Tid, &'a [u8])> {
-        let relation = self.relations.get(&relid)?;
-        let block_count = if curcid.is_some() {
-            relation.pages.len()
-        } else {
-            high_water_offsets.len()
+        let tid = self.next_visible_tid_in_overlays(
+            overlays,
+            relid,
+            cursor,
+            high_water_offsets,
+            forward,
+            curcid,
+        )?;
+        let tuple = match curcid {
+            Some(curcid) => {
+                self.physical_visible_tuple_slice_in_overlays_at_cid(overlays, relid, tid, curcid)?
+            }
+            None => self.physical_visible_tuple_slice_in_overlays(overlays, relid, tid)?,
         };
+        Some((tid, tuple))
+    }
+
+    fn next_visible_tid_in_overlays(
+        &mut self,
+        overlays: &[TransactionOverlay],
+        relid: u32,
+        cursor: ScanCursor,
+        high_water_offsets: &[u16],
+        forward: bool,
+        curcid: Option<u32>,
+    ) -> Option<Tid> {
+        self.relations.get(&relid)?;
+        let block_count = high_water_offsets.len();
         if forward {
             let mut block = cursor.block;
             while usize::try_from(block).ok()? < block_count {
-                let page = relation
+                let page = self
+                    .relations
+                    .get(&relid)?
                     .pages
                     .get(block as usize)
                     .and_then(Option::as_ref)
@@ -830,11 +866,8 @@ impl StorageState {
                     block = block.checked_add(1)?;
                     continue;
                 };
-                let max_offset = if curcid.is_some() {
-                    u16::try_from(page_offsets).ok()?
-                } else {
-                    high_water_offsets[block as usize]
-                };
+                let max_offset =
+                    high_water_offsets[block as usize].min(u16::try_from(page_offsets).ok()?);
                 let mut offset = if block == cursor.block {
                     cursor.offset
                 } else {
@@ -842,25 +875,24 @@ impl StorageState {
                 };
                 while offset <= max_offset {
                     let tid = Tid { block, offset };
-                    let tuple = match curcid {
+                    let visible = match curcid {
                         Some(curcid) => self.physical_visible_tuple_slice_in_overlays_at_cid(
                             overlays, relid, tid, curcid,
                         ),
                         None => self.physical_visible_tuple_slice_in_overlays(overlays, relid, tid),
-                    };
-                    if let Some(tuple) = tuple {
-                        return Some((tid, tuple));
                     }
-                    if let Some((redirect_tid, tuple)) = self
-                        .visible_update_redirect_beyond_high_water(
-                            overlays,
-                            relid,
-                            tid,
-                            high_water_offsets,
-                            curcid,
-                        )
-                    {
-                        return Some((redirect_tid, tuple));
+                    .is_some();
+                    if visible {
+                        return Some(tid);
+                    }
+                    if let Some(redirect_tid) = self.visible_update_redirect_tid_beyond_high_water(
+                        overlays,
+                        relid,
+                        tid,
+                        high_water_offsets,
+                        curcid,
+                    ) {
+                        return Some(redirect_tid);
                     }
                     offset = offset.checked_add(1)?;
                 }
@@ -875,17 +907,18 @@ impl StorageState {
             cursor.block
         };
         loop {
-            let page = relation
+            let page = self
+                .relations
+                .get(&relid)?
                 .pages
                 .get(block as usize)
                 .and_then(Option::as_ref)
                 .map(|page| page.line_pointers.len());
             if let Some(page_offsets) = page {
-                let max_offset = if curcid.is_some() {
-                    u16::try_from(page_offsets).ok()?
-                } else {
-                    high_water_offsets.get(block as usize).copied()?
-                };
+                let max_offset = high_water_offsets
+                    .get(block as usize)
+                    .copied()?
+                    .min(u16::try_from(page_offsets).ok()?);
                 let mut offset = if block == cursor.block && cursor.offset != u16::MAX {
                     cursor.offset.min(max_offset)
                 } else {
@@ -893,25 +926,24 @@ impl StorageState {
                 };
                 while offset > 0 {
                     let tid = Tid { block, offset };
-                    let tuple = match curcid {
+                    let visible = match curcid {
                         Some(curcid) => self.physical_visible_tuple_slice_in_overlays_at_cid(
                             overlays, relid, tid, curcid,
                         ),
                         None => self.physical_visible_tuple_slice_in_overlays(overlays, relid, tid),
-                    };
-                    if let Some(tuple) = tuple {
-                        return Some((tid, tuple));
                     }
-                    if let Some((redirect_tid, tuple)) = self
-                        .visible_update_redirect_beyond_high_water(
-                            overlays,
-                            relid,
-                            tid,
-                            high_water_offsets,
-                            curcid,
-                        )
-                    {
-                        return Some((redirect_tid, tuple));
+                    .is_some();
+                    if visible {
+                        return Some(tid);
+                    }
+                    if let Some(redirect_tid) = self.visible_update_redirect_tid_beyond_high_water(
+                        overlays,
+                        relid,
+                        tid,
+                        high_water_offsets,
+                        curcid,
+                    ) {
+                        return Some(redirect_tid);
                     }
                     offset -= 1;
                 }
@@ -923,19 +955,29 @@ impl StorageState {
         }
     }
 
-    fn visible_update_redirect_beyond_high_water<'a>(
-        &'a self,
+    fn visible_update_redirect_tid_beyond_high_water(
+        &mut self,
         overlays: &[TransactionOverlay],
         relid: u32,
         tid: Tid,
         high_water_offsets: &[u16],
         curcid: Option<u32>,
-    ) -> Option<(Tid, &'a [u8])> {
-        let redirect_tid = self.resolve_update_redirect_in_overlays(overlays, relid, tid);
-        if redirect_tid == tid || !tid_beyond_high_water(redirect_tid, high_water_offsets) {
+    ) -> Option<Tid> {
+        let next_tid = overlay_update_redirect(overlays, relid, tid).or_else(|| {
+            self.relations
+                .get(&relid)
+                .and_then(|relation| relation.update_redirects.get(&tid))
+                .copied()
+        })?;
+        if !tid_beyond_high_water(next_tid, high_water_offsets) {
             return None;
         }
-        let tuple = match curcid {
+
+        let redirect_tid = self.resolve_update_redirect_in_overlays_compress(overlays, relid, tid);
+        if !tid_beyond_high_water(redirect_tid, high_water_offsets) {
+            return None;
+        }
+        let visible = match curcid {
             Some(curcid) => self.physical_visible_tuple_slice_in_overlays_at_cid(
                 overlays,
                 relid,
@@ -944,7 +986,8 @@ impl StorageState {
             )?,
             None => self.physical_visible_tuple_slice_in_overlays(overlays, relid, redirect_tid)?,
         };
-        Some((redirect_tid, tuple))
+        let _ = visible;
+        Some(redirect_tid)
     }
 
     pub(crate) fn next_committed_tuple_slice<'a>(
@@ -1406,6 +1449,11 @@ pub(crate) fn relation_update_impl(
     };
     let hot_unchecked = record_hot_redirect && matches!(unique_check, UniqueCheck::Skip);
     let result = with_storage(|state, session| -> Result<Option<Tid>, CatalogError> {
+        let old_tid = state.resolve_update_redirect_in_overlays_compress(
+            &session.transaction_stack,
+            relid,
+            old_tid,
+        );
         let old_tid = state.resolve_tid_redirect_in_overlays_compress(
             &session.transaction_stack,
             relid,
@@ -1536,6 +1584,11 @@ pub(crate) fn relation_update_hot_if_single_byval_preserved_impl(
     }
     let result = with_storage(
         |state, session| -> Result<Option<(Tid, bool)>, CatalogError> {
+            let old_tid = state.resolve_update_redirect_in_overlays_compress(
+                &session.transaction_stack,
+                relid,
+                old_tid,
+            );
             let old_tid = state.resolve_tid_redirect_in_overlays_compress(
                 &session.transaction_stack,
                 relid,

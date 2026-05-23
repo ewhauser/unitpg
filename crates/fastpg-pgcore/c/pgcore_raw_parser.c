@@ -322,6 +322,9 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteStatement *statement,
 														   MemoryContext context);
 static char *fastpg_pgcore_strdup(const char *value);
+static void fastpg_pgcore_lock_catalog_read(void);
+static void fastpg_pgcore_unlock_catalog_read(void);
+static void fastpg_pgcore_unlock_catalog_utility(void);
 
 static pthread_once_t fastpg_pgcore_initialized = PTHREAD_ONCE_INIT;
 static _Thread_local FastPgPgCoreExecuteResult *fastpg_pgcore_active_notice_result = NULL;
@@ -442,6 +445,9 @@ static _Thread_local struct
 } fastpg_pgcore_notice_capture;
 
 static pthread_mutex_t fastpg_pgcore_notice_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_rwlock_t fastpg_pgcore_catalog_lock = PTHREAD_RWLOCK_INITIALIZER;
+static _Thread_local int fastpg_pgcore_catalog_read_lock_depth = 0;
+static _Thread_local int fastpg_pgcore_catalog_write_lock_depth = 0;
 static emit_log_hook_type fastpg_pgcore_notice_global_previous_hook = NULL;
 static bool fastpg_pgcore_notice_hook_installed = false;
 static int fastpg_pgcore_notice_capture_counts[BACKEND_NUM_TYPES];
@@ -1129,6 +1135,7 @@ fastpg_pgcore_start_postgres_catalog_command(void)
 	fastpg_mem_ensure_xact_callbacks();
 #endif
 	SetCurrentStatementStartTimestamp();
+	fastpg_pgcore_lock_catalog_read();
 	StartTransactionCommand();
 }
 
@@ -1253,6 +1260,8 @@ fastpg_pgcore_force_idle_transaction_state(void)
 	}
 	else
 		AbortCurrentTransaction();
+	fastpg_pgcore_unlock_catalog_read();
+	fastpg_pgcore_unlock_catalog_utility();
 }
 
 static void
@@ -1359,6 +1368,11 @@ fastpg_pgcore_end_client_session(void)
 		return;
 
 	fastpg_pgcore_end_notice_capture();
+	if (IsTransactionOrTransactionBlock() ||
+		IsAbortedTransactionBlockState() ||
+		fastpg_pgcore_catalog_read_lock_depth > 0 ||
+		fastpg_pgcore_catalog_write_lock_depth > 0)
+		fastpg_pgcore_force_idle_transaction_state();
 	FastPgReleaseThreadProc();
 	fastpg_pgcore_thread_entered = false;
 #endif
@@ -1415,8 +1429,11 @@ fastpg_pgcore_finish_postgres_catalog_command(volatile bool *command_started)
 		return;
 
 	CommitTransactionCommand();
+	fastpg_pgcore_unlock_catalog_read();
 	if (!IsTransactionOrTransactionBlock() && !fastpg_pgstat_noop_active())
 		pgstat_report_stat(false);
+	if (!IsTransactionOrTransactionBlock())
+		fastpg_pgcore_unlock_catalog_utility();
 	*command_started = false;
 }
 
@@ -1427,6 +1444,8 @@ fastpg_pgcore_abort_postgres_catalog_command(volatile bool *command_started)
 		return;
 
 	AbortCurrentTransaction();
+	fastpg_pgcore_unlock_catalog_read();
+	fastpg_pgcore_unlock_catalog_utility();
 	*command_started = false;
 }
 
@@ -2343,6 +2362,74 @@ fastpg_pgcore_repair_session_authorization_reset(Node *utility_stmt)
 }
 #endif
 
+static bool
+fastpg_pgcore_utility_needs_catalog_lock(const Node *utility_stmt)
+{
+	if (!fastpg_catalog_mode_uses_postgres() || utility_stmt == NULL)
+		return false;
+
+	switch (nodeTag(utility_stmt))
+	{
+		case T_TransactionStmt:
+		case T_CopyStmt:
+		case T_VariableSetStmt:
+		case T_VariableShowStmt:
+		case T_ExplainStmt:
+		case T_DeclareCursorStmt:
+		case T_ClosePortalStmt:
+		case T_FetchStmt:
+		case T_ListenStmt:
+		case T_UnlistenStmt:
+		case T_NotifyStmt:
+			return false;
+		default:
+			return true;
+	}
+}
+
+static void
+fastpg_pgcore_lock_catalog_read(void)
+{
+	if (!fastpg_catalog_mode_uses_postgres() ||
+		fastpg_pgcore_catalog_write_lock_depth > 0)
+		return;
+
+	if (fastpg_pgcore_catalog_read_lock_depth++ == 0)
+		pthread_rwlock_rdlock(&fastpg_pgcore_catalog_lock);
+}
+
+static void
+fastpg_pgcore_unlock_catalog_read(void)
+{
+	if (fastpg_pgcore_catalog_read_lock_depth == 0)
+		return;
+
+	if (--fastpg_pgcore_catalog_read_lock_depth == 0)
+		pthread_rwlock_unlock(&fastpg_pgcore_catalog_lock);
+}
+
+static void
+fastpg_pgcore_lock_catalog_utility(void)
+{
+	if (fastpg_pgcore_catalog_write_lock_depth > 0)
+		return;
+
+	while (fastpg_pgcore_catalog_read_lock_depth > 0)
+		fastpg_pgcore_unlock_catalog_read();
+	pthread_rwlock_wrlock(&fastpg_pgcore_catalog_lock);
+	fastpg_pgcore_catalog_write_lock_depth = 1;
+}
+
+static void
+fastpg_pgcore_unlock_catalog_utility(void)
+{
+	if (fastpg_pgcore_catalog_write_lock_depth == 0)
+		return;
+
+	fastpg_pgcore_catalog_write_lock_depth = 0;
+	pthread_rwlock_unlock(&fastpg_pgcore_catalog_lock);
+}
+
 static void
 fastpg_pgcore_execute_utility(PlannedStmt *statement,
 							  const char *source_text,
@@ -2391,6 +2478,8 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 		fastpg_pgcore_push_analyze_snapshot();
 		snapshot_pushed = true;
 	}
+	if (fastpg_pgcore_utility_needs_catalog_lock(utility_stmt))
+		fastpg_pgcore_lock_catalog_utility();
 
 	PG_TRY();
 	{
