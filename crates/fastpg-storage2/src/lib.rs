@@ -786,11 +786,15 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_if_single_byval_pre
         relid,
         packed_tid,
         input,
-        key_attnum,
-        key_value,
-        key_is_null,
-        new_tid_out,
-        hot_preserved_out,
+        SingleByvalHotKey {
+            attnum: key_attnum,
+            value: key_value,
+            is_null: key_is_null,
+        },
+        HotUpdateOutputs {
+            new_tid: new_tid_out,
+            hot_preserved: hot_preserved_out,
+        },
         Some(UpdateMetadata {
             delete_xid,
             delete_cid,

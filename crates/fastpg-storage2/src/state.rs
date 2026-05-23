@@ -694,12 +694,10 @@ impl StorageState {
         if !followed_overlay_redirect
             && tid != original_tid
             && let Some(relation) = self.relations.get_mut(&relid)
+            && let Some(first_tid) = first_committed_tid
+            && first_tid != tid
         {
-            if let Some(first_tid) = first_committed_tid
-                && first_tid != tid
-            {
-                relation.update_redirects.insert(first_tid, tid);
-            }
+            relation.update_redirects.insert(first_tid, tid);
         }
 
         tid
@@ -1426,9 +1424,8 @@ pub(crate) fn relation_update_impl(
             let Some(old_tuple) = decode_tuple(old_tid, old_tuple_slice) else {
                 return Ok(None);
             };
-            let old_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
-                .and_then(|index_spec| index_key_for_decoded(&index_spec, &old_tuple.values));
-            old_primary_key
+            primary_index_spec_for_relation_oid(Oid(relid))
+                .and_then(|index_spec| index_key_for_decoded(&index_spec, &old_tuple.values))
         };
         let old_is_own_insert = !hot_unchecked && session.owns_inserted_tid(relid, old_tid);
         if matches!(unique_check, UniqueCheck::Enforce)
@@ -1510,21 +1507,31 @@ pub(crate) struct UpdateMetadata {
     pub(crate) row_xmax: u32,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SingleByvalHotKey {
+    pub(crate) attnum: usize,
+    pub(crate) value: usize,
+    pub(crate) is_null: u8,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HotUpdateOutputs {
+    pub(crate) new_tid: *mut u64,
+    pub(crate) hot_preserved: *mut bool,
+}
+
 pub(crate) fn relation_update_hot_if_single_byval_preserved_impl(
     relid: u32,
     packed_tid: u64,
     input: RowInput<'_>,
-    key_attnum: usize,
-    key_value: usize,
-    key_is_null: u8,
-    new_tid_out: *mut u64,
-    hot_preserved_out: *mut bool,
+    key: SingleByvalHotKey,
+    outputs: HotUpdateOutputs,
     metadata: Option<UpdateMetadata>,
 ) -> bool {
     let Some(old_tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    if key_attnum == 0 {
+    if key.attnum == 0 {
         return false;
     }
     let result = with_storage(
@@ -1542,7 +1549,7 @@ pub(crate) fn relation_update_hot_if_single_byval_preserved_impl(
                 return Ok(None);
             };
             let hot_preserved =
-                tuple_byval_attr_equals(old_tuple_slice, key_attnum, key_value, key_is_null)
+                tuple_byval_attr_equals(old_tuple_slice, key.attnum, key.value, key.is_null)
                     .unwrap_or(false);
             let old_primary_key = if hot_preserved {
                 None
@@ -1603,14 +1610,14 @@ pub(crate) fn relation_update_hot_if_single_byval_preserved_impl(
 
     match result {
         Ok(Some((tid, hot_preserved))) => {
-            if !new_tid_out.is_null() {
+            if !outputs.new_tid.is_null() {
                 unsafe {
-                    *new_tid_out = tid.pack();
+                    *outputs.new_tid = tid.pack();
                 }
             }
-            if !hot_preserved_out.is_null() {
+            if !outputs.hot_preserved.is_null() {
                 unsafe {
-                    *hot_preserved_out = hot_preserved;
+                    *outputs.hot_preserved = hot_preserved;
                 }
             }
             true
