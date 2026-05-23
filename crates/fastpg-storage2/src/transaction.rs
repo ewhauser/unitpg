@@ -1,21 +1,24 @@
 use crate::*;
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DeleteMetadata {
+    pub(crate) xid: u32,
+    pub(crate) cid: u32,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct TransactionOverlay {
     pub(crate) relation_checkpoints: HashMap<u32, RelationCheckpoint>,
     pub(crate) page_checkpoints: HashMap<u32, BTreeMap<u32, PageCheckpoint>>,
     pub(crate) new_pages: HashMap<u32, BTreeSet<u32>>,
     pub(crate) inserted_tids: HashMap<u32, BTreeSet<Tid>>,
-    pub(crate) inserted_xids: HashMap<u32, BTreeMap<Tid, u32>>,
     pub(crate) inserted_cids: HashMap<u32, BTreeMap<Tid, u32>>,
     pub(crate) invalidated_tids: HashMap<u32, BTreeSet<Tid>>,
-    pub(crate) invalidated_xids: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) invalidated_cids: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) row_xmaxs: HashMap<u32, BTreeMap<Tid, u32>>,
+    pub(crate) invalidated_metadata: HashMap<u32, BTreeMap<Tid, DeleteMetadata>>,
     pub(crate) hot_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
     pub(crate) update_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
-    pub(crate) primary_key_inserts: HashMap<u32, BTreeMap<IndexKey, Tid>>,
-    pub(crate) primary_key_deletes: HashMap<u32, BTreeSet<IndexKey>>,
+    pub(crate) primary_key_inserts: HashMap<u32, HashMap<IndexKey, Tid>>,
+    pub(crate) primary_key_deletes: HashMap<u32, HashSet<IndexKey>>,
     pub(crate) cleared_relations: HashMap<u32, RelationStorage>,
 }
 
@@ -25,12 +28,9 @@ impl TransactionOverlay {
             && self.page_checkpoints.is_empty()
             && self.new_pages.is_empty()
             && self.inserted_tids.is_empty()
-            && self.inserted_xids.is_empty()
             && self.inserted_cids.is_empty()
             && self.invalidated_tids.is_empty()
-            && self.invalidated_xids.is_empty()
-            && self.invalidated_cids.is_empty()
-            && self.row_xmaxs.is_empty()
+            && self.invalidated_metadata.is_empty()
             && self.hot_redirect_inserts.is_empty()
             && self.update_redirect_inserts.is_empty()
             && self.primary_key_inserts.is_empty()
@@ -67,13 +67,6 @@ impl TransactionOverlay {
         self.inserted_tids.entry(relid).or_default().insert(tid);
     }
 
-    pub(crate) fn set_insert_xid(&mut self, relid: u32, tid: Tid, xid: u32) {
-        self.inserted_xids
-            .entry(relid)
-            .or_default()
-            .insert(tid, xid);
-    }
-
     pub(crate) fn set_insert_cid(&mut self, relid: u32, tid: Tid, cid: u32) {
         self.inserted_cids
             .entry(relid)
@@ -85,22 +78,11 @@ impl TransactionOverlay {
         self.invalidated_tids.entry(relid).or_default().insert(tid);
     }
 
-    pub(crate) fn set_invalidate_xid(&mut self, relid: u32, tid: Tid, xid: u32) {
-        self.invalidated_xids
+    pub(crate) fn set_invalidate_metadata(&mut self, relid: u32, tid: Tid, xid: u32, cid: u32) {
+        self.invalidated_metadata
             .entry(relid)
             .or_default()
-            .insert(tid, xid);
-    }
-
-    pub(crate) fn set_invalidate_cid(&mut self, relid: u32, tid: Tid, cid: u32) {
-        self.invalidated_cids
-            .entry(relid)
-            .or_default()
-            .insert(tid, cid);
-    }
-
-    pub(crate) fn set_row_xmax(&mut self, relid: u32, tid: Tid, xmax: u32) {
-        self.row_xmaxs.entry(relid).or_default().insert(tid, xmax);
+            .insert(tid, DeleteMetadata { xid, cid });
     }
 
     pub(crate) fn insert_hot_redirect(&mut self, relid: u32, old_tid: Tid, new_tid: Tid) {
@@ -185,10 +167,10 @@ impl TransactionOverlay {
             return None;
         }
         Some(
-            self.invalidated_cids
+            self.invalidated_metadata
                 .get(&relid)
-                .and_then(|cids| cids.get(&tid))
-                .copied()
+                .and_then(|entries| entries.get(&tid))
+                .map(|metadata| metadata.cid)
                 .unwrap_or_default(),
         )
     }
@@ -221,14 +203,6 @@ impl TransactionOverlay {
                 .is_some_and(|tids| !tids.is_empty())
     }
 
-    pub(crate) fn visibility_delta_relids(&self) -> BTreeSet<u32> {
-        self.inserted_tids
-            .keys()
-            .chain(self.invalidated_tids.keys())
-            .copied()
-            .collect()
-    }
-
     pub(crate) fn append_from(&mut self, other: &mut Self) {
         for (relid, checkpoint) in other.relation_checkpoints.drain() {
             self.relation_checkpoints.entry(relid).or_insert(checkpoint);
@@ -251,23 +225,17 @@ impl TransactionOverlay {
         for (relid, tids) in other.inserted_tids.drain() {
             self.inserted_tids.entry(relid).or_default().extend(tids);
         }
-        for (relid, xids) in other.inserted_xids.drain() {
-            self.inserted_xids.entry(relid).or_default().extend(xids);
+        for (relid, tids) in other.invalidated_tids.drain() {
+            self.invalidated_tids.entry(relid).or_default().extend(tids);
         }
         for (relid, cids) in other.inserted_cids.drain() {
             self.inserted_cids.entry(relid).or_default().extend(cids);
         }
-        for (relid, tids) in other.invalidated_tids.drain() {
-            self.invalidated_tids.entry(relid).or_default().extend(tids);
-        }
-        for (relid, xids) in other.invalidated_xids.drain() {
-            self.invalidated_xids.entry(relid).or_default().extend(xids);
-        }
-        for (relid, cids) in other.invalidated_cids.drain() {
-            self.invalidated_cids.entry(relid).or_default().extend(cids);
-        }
-        for (relid, xmaxs) in other.row_xmaxs.drain() {
-            self.row_xmaxs.entry(relid).or_default().extend(xmaxs);
+        for (relid, entries) in other.invalidated_metadata.drain() {
+            self.invalidated_metadata
+                .entry(relid)
+                .or_default()
+                .extend(entries);
         }
         for (relid, redirects) in other.hot_redirect_inserts.drain() {
             self.hot_redirect_inserts
@@ -367,7 +335,10 @@ impl SessionStorage {
 
     pub(crate) fn commit_empty_implicit_transaction(&mut self) -> bool {
         if self.explicit_transaction {
-            return false;
+            return true;
+        }
+        if self.transaction_stack.is_empty() {
+            return true;
         }
         if self
             .transaction_stack
@@ -381,11 +352,13 @@ impl SessionStorage {
     }
 
     pub(crate) fn abort_empty_implicit_transaction(&mut self) -> bool {
-        if self.explicit_transaction
-            || self
-                .transaction_stack
-                .iter()
-                .any(|overlay| !overlay.is_empty())
+        if self.explicit_transaction {
+            return true;
+        }
+        if self
+            .transaction_stack
+            .iter()
+            .any(|overlay| !overlay.is_empty())
         {
             return false;
         }
@@ -657,6 +630,7 @@ static DEFAULT_SESSION_STORAGE: OnceLock<SessionStorageHandle> = OnceLock::new()
 
 thread_local! {
     static CURRENT_SESSION_STORAGE: RefCell<Option<SessionStorageHandle>> = const { RefCell::new(None) };
+    static BORROWED_SESSION_STORAGE: Cell<Option<NonNull<SessionStorage>>> = const { Cell::new(None) };
     pub(crate) static LAST_STORAGE_ERROR: RefCell<Option<CatalogError>> = const { RefCell::new(None) };
 }
 
@@ -688,4 +662,64 @@ pub(crate) fn current_session_storage() -> SessionStorageHandle {
     CURRENT_SESSION_STORAGE
         .with(|slot| slot.borrow().clone())
         .unwrap_or_else(default_session_storage)
+}
+
+#[derive(Debug)]
+pub struct LockedSessionStorageGuard<'a> {
+    _borrowed: BorrowedSessionStorageGuard,
+    _lock: MutexGuard<'a, SessionStorage>,
+}
+
+pub fn enter_locked_session_storage(
+    handle: &SessionStorageHandle,
+) -> LockedSessionStorageGuard<'_> {
+    let mut lock = match handle.lock() {
+        Ok(session) => session,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let borrowed = enter_borrowed_session_storage(&mut lock);
+    LockedSessionStorageGuard {
+        _borrowed: borrowed,
+        _lock: lock,
+    }
+}
+
+#[derive(Debug)]
+struct BorrowedSessionStorageGuard {
+    previous: Option<NonNull<SessionStorage>>,
+}
+
+fn enter_borrowed_session_storage(session: &mut SessionStorage) -> BorrowedSessionStorageGuard {
+    let previous = BORROWED_SESSION_STORAGE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(NonNull::from(session)));
+        previous
+    });
+    BorrowedSessionStorageGuard { previous }
+}
+
+impl Drop for BorrowedSessionStorageGuard {
+    fn drop(&mut self) {
+        BORROWED_SESSION_STORAGE.with(|slot| {
+            slot.set(self.previous.take());
+        });
+    }
+}
+
+pub(crate) fn with_current_session_storage<R>(f: impl FnOnce(&mut SessionStorage) -> R) -> R {
+    if let Some(mut borrowed) = BORROWED_SESSION_STORAGE.with(Cell::get) {
+        // SAFETY: enter_locked_session_storage installs this pointer only while
+        // holding the owning session mutex and removes it before that lock is
+        // released. PgCore execution re-enters storage2 callbacks on the same
+        // thread, so each callback observes the active exclusive session borrow.
+        let session = unsafe { borrowed.as_mut() };
+        return f(session);
+    }
+
+    let session = current_session_storage();
+    let mut session = match session.lock() {
+        Ok(session) => session,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    f(&mut session)
 }

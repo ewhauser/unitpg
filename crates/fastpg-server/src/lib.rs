@@ -5,6 +5,8 @@ use std::num::NonZeroUsize;
 #[cfg(unix)]
 use std::path::Path;
 use std::sync::Arc;
+#[cfg(unix)]
+use std::thread;
 
 use fastpg_wire::FastPgServerHandlers;
 #[cfg(unix)]
@@ -13,9 +15,13 @@ use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
 #[cfg(unix)]
 use tokio::net::UnixListener;
+#[cfg(unix)]
+use tokio::runtime;
 
 pub const DEFAULT_ADDR: &str = "127.0.0.1:55432";
 pub const EXECUTION_CONCURRENCY_ENV: &str = "FASTPG_EXECUTION_CONCURRENCY";
+#[cfg(unix)]
+const POSTGRES_SAFE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 pub async fn serve_addr(addr: &str) -> io::Result<()> {
     #[cfg(unix)]
@@ -59,11 +65,52 @@ pub async fn serve_unix_path(path: impl AsRef<Path>) -> io::Result<()> {
 
 #[cfg(unix)]
 pub async fn serve_unix_listener(listener: UnixListener) -> io::Result<()> {
-    serve_unix_listener_with_handlers(listener, default_handlers()).await
+    serve_unix_listener_with_handlers(listener, unix_default_handlers()).await
 }
 
 #[cfg(unix)]
 pub async fn serve_unix_listener_with_handlers(
+    listener: UnixListener,
+    handlers: Arc<FastPgServerHandlers>,
+) -> io::Result<()> {
+    loop {
+        let (socket, _peer_addr) = listener.accept().await?;
+        let handlers = handlers.clone();
+        let socket = socket.into_std()?;
+
+        thread::Builder::new()
+            .name("fastpg-unix-connection".to_owned())
+            .stack_size(POSTGRES_SAFE_THREAD_STACK_SIZE)
+            .spawn(move || {
+                let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
+                    Ok(runtime) => runtime,
+                    Err(error) => {
+                        eprintln!("fastpg Unix socket runtime failed: {error}");
+                        return;
+                    }
+                };
+                let result = runtime.block_on(async move {
+                    let socket = tokio::net::UnixStream::from_std(socket)?;
+                    process_socket_unix(socket, handlers).await
+                });
+                if let Err(error) = result {
+                    eprintln!("fastpg Unix socket connection closed with error: {error}");
+                }
+            })
+            .map_err(io::Error::other)?;
+    }
+}
+
+#[cfg(unix)]
+fn unix_default_handlers() -> Arc<FastPgServerHandlers> {
+    Arc::new(FastPgServerHandlers::with_inline_session_execution(
+        execution_concurrency_from_env(),
+    ))
+}
+
+#[cfg(unix)]
+#[allow(dead_code)]
+async fn serve_unix_listener_async_with_handlers(
     listener: UnixListener,
     handlers: Arc<FastPgServerHandlers>,
 ) -> io::Result<()> {

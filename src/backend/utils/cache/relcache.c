@@ -146,8 +146,7 @@ typedef struct relidcacheent
 static HTAB *RelationIdCache;
 
 #ifdef USE_FASTPG
-static pthread_once_t fastpg_catalog_cache_lock_once = PTHREAD_ONCE_INIT;
-static pthread_mutex_t fastpg_catalog_cache_lock;
+static pthread_mutex_t fastpg_catalog_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local int fastpg_catalog_cache_lock_depth = 0;
 
 typedef struct FastPgLocalRelRef
@@ -159,20 +158,11 @@ typedef struct FastPgLocalRelRef
 
 static _Thread_local FastPgLocalRelRef *fastpg_local_relrefs = NULL;
 
-static void
-FastPgInitCatalogCacheLock(void)
-{
-	pthread_mutex_init(&fastpg_catalog_cache_lock, NULL);
-}
-
 void
 FastPgCatalogCacheLock(void)
 {
 	if (fastpg_catalog_cache_lock_depth++ == 0)
-	{
-		pthread_once(&fastpg_catalog_cache_lock_once, FastPgInitCatalogCacheLock);
 		pthread_mutex_lock(&fastpg_catalog_cache_lock);
-	}
 }
 
 void

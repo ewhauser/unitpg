@@ -297,10 +297,10 @@ impl PgCoreSession {
         }
     }
 
-    fn enter_storage(&self) -> PgCoreStorageGuards {
+    fn enter_storage(&self) -> PgCoreStorageGuards<'_> {
         PgCoreStorageGuards {
             _storage1: fastpg_storage::enter_session_storage(self.storage_session.clone()),
-            _storage2: fastpg_storage2::enter_session_storage(self.storage2_session.clone()),
+            _storage2: fastpg_storage2::enter_locked_session_storage(&self.storage2_session),
         }
     }
 
@@ -398,10 +398,10 @@ impl PreparedStatement {
         self.inner.describe()
     }
 
-    fn enter_storage(&self) -> PgCoreStorageGuards {
+    fn enter_storage(&self) -> PgCoreStorageGuards<'_> {
         PgCoreStorageGuards {
             _storage1: fastpg_storage::enter_session_storage(self.storage_session.clone()),
-            _storage2: fastpg_storage2::enter_session_storage(self.storage2_session.clone()),
+            _storage2: fastpg_storage2::enter_locked_session_storage(&self.storage2_session),
         }
     }
 
@@ -419,9 +419,9 @@ impl PreparedStatement {
     }
 }
 
-struct PgCoreStorageGuards {
+struct PgCoreStorageGuards<'a> {
     _storage1: fastpg_storage::SessionStorageGuard,
-    _storage2: fastpg_storage2::SessionStorageGuard,
+    _storage2: fastpg_storage2::LockedSessionStorageGuard<'a>,
 }
 
 #[derive(Debug)]

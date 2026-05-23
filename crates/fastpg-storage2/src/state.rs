@@ -9,6 +9,17 @@ pub(crate) struct StorageState {
     pub(crate) generation: u64,
 }
 
+fn add_row_count_delta(deltas: &mut Vec<(u32, isize)>, relid: u32, delta: isize) {
+    if let Some((_, existing)) = deltas
+        .iter_mut()
+        .find(|(entry_relid, _)| *entry_relid == relid)
+    {
+        *existing += delta;
+        return;
+    }
+    deltas.push((relid, delta));
+}
+
 impl StorageState {
     pub(crate) fn relation_mut(&mut self, relid: u32) -> &mut RelationStorage {
         self.relations.entry(relid).or_default()
@@ -80,72 +91,36 @@ impl StorageState {
     }
 
     pub(crate) fn commit_overlay_to_relations(&mut self, overlay: TransactionOverlay) {
-        let affected_relids = overlay.visibility_delta_relids();
+        let has_cleared_relations = !overlay.cleared_relations.is_empty();
+        let mut row_count_deltas = Vec::new();
 
         for (relid, tids) in &overlay.inserted_tids {
             if let Some(relation) = self.relations.get_mut(relid) {
                 for tid in tids {
-                    relation.mark_live(*tid);
+                    if relation.mark_live(*tid) {
+                        add_row_count_delta(&mut row_count_deltas, *relid, 1);
+                    }
                 }
-            }
-        }
-
-        for (relid, xids) in &overlay.inserted_xids {
-            if let Some(relation) = self.relations.get_mut(relid) {
-                relation
-                    .row_xmins
-                    .extend(xids.iter().map(|(tid, xid)| (*tid, *xid)));
-            }
-        }
-
-        for (relid, cids) in &overlay.inserted_cids {
-            if let Some(relation) = self.relations.get_mut(relid) {
-                relation
-                    .row_cmins
-                    .extend(cids.iter().map(|(tid, cid)| (*tid, *cid)));
             }
         }
 
         for (relid, tids) in &overlay.invalidated_tids {
             if let Some(relation) = self.relations.get_mut(relid) {
+                let metadata = overlay.invalidated_metadata.get(relid);
                 for tid in tids {
-                    if overlay.clear_insert_shadows_invalidation(*relid, *tid) {
+                    if has_cleared_relations
+                        && overlay.clear_insert_shadows_invalidation(*relid, *tid)
+                    {
                         continue;
                     }
-                    relation.mark_dead(*tid);
+                    if relation.mark_dead(*tid) {
+                        add_row_count_delta(&mut row_count_deltas, *relid, -1);
+                    }
+                    if let Some(metadata) = metadata.and_then(|entries| entries.get(tid)) {
+                        relation.row_delete_xids.insert(*tid, metadata.xid);
+                        relation.row_delete_cids.insert(*tid, metadata.cid);
+                    }
                 }
-            }
-        }
-
-        for (relid, xids) in &overlay.invalidated_xids {
-            if let Some(relation) = self.relations.get_mut(relid) {
-                relation.row_delete_xids.extend(
-                    xids.iter()
-                        .filter(|(tid, _)| {
-                            !overlay.clear_insert_shadows_invalidation(*relid, **tid)
-                        })
-                        .map(|(tid, xid)| (*tid, *xid)),
-                );
-            }
-        }
-
-        for (relid, cids) in &overlay.invalidated_cids {
-            if let Some(relation) = self.relations.get_mut(relid) {
-                relation.row_delete_cids.extend(
-                    cids.iter()
-                        .filter(|(tid, _)| {
-                            !overlay.clear_insert_shadows_invalidation(*relid, **tid)
-                        })
-                        .map(|(tid, cid)| (*tid, *cid)),
-                );
-            }
-        }
-
-        for (relid, xmaxs) in &overlay.row_xmaxs {
-            if let Some(relation) = self.relations.get_mut(relid) {
-                relation
-                    .row_xmaxs
-                    .extend(xmaxs.iter().map(|(tid, xmax)| (*tid, *xmax)));
             }
         }
 
@@ -179,8 +154,10 @@ impl StorageState {
             }
         }
 
-        for relid in affected_relids {
-            self.refresh_cached_row_count(relid);
+        for (relid, delta) in row_count_deltas {
+            if delta != 0 {
+                self.refresh_cached_row_count(relid);
+            }
         }
     }
 
@@ -371,6 +348,18 @@ impl StorageState {
         Ok(tid)
     }
 
+    fn set_insert_metadata(&mut self, relid: u32, tid: Tid, xid: u32, cid: u32) {
+        if let Some(relation) = self.relations.get_mut(&relid) {
+            relation.set_insert_metadata(tid, xid, cid);
+        }
+    }
+
+    fn set_row_xmax(&mut self, relid: u32, tid: Tid, xmax: u32) {
+        if let Some(relation) = self.relations.get_mut(&relid) {
+            relation.set_row_xmax(tid, xmax);
+        }
+    }
+
     pub(crate) fn record_insert_metadata(
         &mut self,
         session: &mut SessionStorage,
@@ -385,8 +374,8 @@ impl StorageState {
                 .get(&relid)
                 .is_some_and(|tids| tids.contains(&tid))
         {
-            overlay.set_insert_xid(relid, tid, xid);
             overlay.set_insert_cid(relid, tid, cid);
+            self.set_insert_metadata(relid, tid, xid, cid);
         }
     }
 
@@ -404,8 +393,7 @@ impl StorageState {
                 .get(&relid)
                 .is_some_and(|tids| tids.contains(&tid))
         {
-            overlay.set_invalidate_xid(relid, tid, xid);
-            overlay.set_invalidate_cid(relid, tid, cid);
+            overlay.set_invalidate_metadata(relid, tid, xid, cid);
         }
     }
 
@@ -422,24 +410,15 @@ impl StorageState {
                 .get(&relid)
                 .is_some_and(|tids| tids.contains(&tid))
         {
-            overlay.set_row_xmax(relid, tid, xmax);
+            self.set_row_xmax(relid, tid, xmax);
         }
     }
 
     pub(crate) fn row_xmin(&self, session: &SessionStorage, relid: u32, tid: Tid) -> u32 {
-        for overlay in session.transaction_stack.iter().rev() {
-            if let Some(xid) = overlay
-                .inserted_xids
-                .get(&relid)
-                .and_then(|entries| entries.get(&tid))
-            {
-                return *xid;
-            }
-        }
+        let _ = session;
         self.relations
             .get(&relid)
-            .and_then(|relation| relation.row_xmins.get(&tid))
-            .copied()
+            .and_then(|relation| relation.row_xmin(tid))
             .unwrap_or_default()
     }
 
@@ -455,36 +434,27 @@ impl StorageState {
         }
         self.relations
             .get(&relid)
-            .and_then(|relation| relation.row_cmins.get(&tid))
-            .copied()
+            .and_then(|relation| relation.row_cmin(tid))
             .unwrap_or_default()
     }
 
     pub(crate) fn row_xmax(&self, session: &SessionStorage, relid: u32, tid: Tid) -> u32 {
-        for overlay in session.transaction_stack.iter().rev() {
-            if let Some(xmax) = overlay
-                .row_xmaxs
-                .get(&relid)
-                .and_then(|entries| entries.get(&tid))
-            {
-                return *xmax;
-            }
-        }
+        let _ = session;
         self.relations
             .get(&relid)
-            .and_then(|relation| relation.row_xmaxs.get(&tid))
-            .copied()
+            .and_then(|relation| relation.row_xmax(tid))
             .unwrap_or_default()
     }
 
     pub(crate) fn row_delete_xid(&self, session: &SessionStorage, relid: u32, tid: Tid) -> u32 {
         for overlay in session.transaction_stack.iter().rev() {
             if let Some(xid) = overlay
-                .invalidated_xids
+                .invalidated_metadata
                 .get(&relid)
                 .and_then(|entries| entries.get(&tid))
+                .map(|metadata| metadata.xid)
             {
-                return *xid;
+                return xid;
             }
         }
         self.relations
@@ -497,11 +467,12 @@ impl StorageState {
     pub(crate) fn row_delete_cid(&self, session: &SessionStorage, relid: u32, tid: Tid) -> u32 {
         for overlay in session.transaction_stack.iter().rev() {
             if let Some(cid) = overlay
-                .invalidated_cids
+                .invalidated_metadata
                 .get(&relid)
                 .and_then(|entries| entries.get(&tid))
+                .map(|metadata| metadata.cid)
             {
-                return *cid;
+                return cid;
             }
         }
         self.relations
@@ -894,24 +865,24 @@ impl StorageState {
             let mut block = cursor.block;
             while usize::try_from(block).ok()? < high_water_offsets.len() {
                 let max_offset = high_water_offsets[block as usize];
-                if relation
-                    .pages
-                    .get(block as usize)
-                    .and_then(Option::as_ref)
-                    .is_none()
-                {
+                let Some(page) = relation.pages.get(block as usize).and_then(Option::as_ref) else {
                     block = block.checked_add(1)?;
                     continue;
-                }
+                };
                 let mut offset = if block == cursor.block {
                     cursor.offset
                 } else {
                     1
                 };
                 while offset <= max_offset {
-                    let tid = Tid { block, offset };
-                    if let Some(tuple) = relation.tuple_slice(tid, false) {
-                        return Some((tid, tuple));
+                    let Some(index) = offset.checked_sub(1).map(usize::from) else {
+                        break;
+                    };
+                    let Some(line) = page.line_pointers.get(index).copied() else {
+                        break;
+                    };
+                    if let Some(tuple) = page.tuple_slice_for_line(line, false) {
+                        return Some((Tid { block, offset }, tuple));
                     }
                     offset = offset.checked_add(1)?;
                 }
@@ -927,21 +898,21 @@ impl StorageState {
         };
         loop {
             let max_offset = high_water_offsets.get(block as usize).copied()?;
-            if relation
-                .pages
-                .get(block as usize)
-                .and_then(Option::as_ref)
-                .is_some()
-            {
+            if let Some(page) = relation.pages.get(block as usize).and_then(Option::as_ref) {
                 let mut offset = if block == cursor.block && cursor.offset != u16::MAX {
                     cursor.offset.min(max_offset)
                 } else {
                     max_offset
                 };
                 while offset > 0 {
-                    let tid = Tid { block, offset };
-                    if let Some(tuple) = relation.tuple_slice(tid, false) {
-                        return Some((tid, tuple));
+                    let Some(index) = offset.checked_sub(1).map(usize::from) else {
+                        break;
+                    };
+                    let Some(line) = page.line_pointers.get(index).copied() else {
+                        break;
+                    };
+                    if let Some(tuple) = page.tuple_slice_for_line(line, false) {
+                        return Some((Tid { block, offset }, tuple));
                     }
                     offset -= 1;
                 }
@@ -988,6 +959,40 @@ impl StorageState {
         self.find_visible_tuple(session, relid, tid).map(|_| tid)
     }
 
+    pub(crate) fn primary_key_lookup_read(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        key: &IndexKey,
+    ) -> Option<Tid> {
+        for overlay in session.transaction_stack.iter().rev() {
+            if let Some(tid) = overlay
+                .primary_key_inserts
+                .get(&relid)
+                .and_then(|entries| entries.get(key))
+                .copied()
+                && self.find_visible_tuple(session, relid, tid).is_some()
+            {
+                return Some(tid);
+            }
+            if overlay
+                .primary_key_deletes
+                .get(&relid)
+                .is_some_and(|keys| keys.contains(key))
+            {
+                return None;
+            }
+        }
+        let tid = self
+            .relations
+            .get(&relid)?
+            .primary_key_index
+            .get(key)
+            .copied()?;
+        let tid = self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
+        self.find_visible_tuple(session, relid, tid).map(|_| tid)
+    }
+
     pub(crate) fn find_visible_by_index_key_excluding(
         &mut self,
         session: &SessionStorage,
@@ -1001,6 +1006,36 @@ impl StorageState {
         });
         if index_spec.is_primary {
             if let Some(tid) = self.primary_key_lookup(session, relid, key)
+                && Some(tid) != replacing_tid
+            {
+                return Some(tid);
+            }
+            return None;
+        }
+
+        self.visible_tids(session, relid).into_iter().find(|tid| {
+            Some(*tid) != replacing_tid
+                && self
+                    .find_visible_tuple(session, relid, *tid)
+                    .and_then(|tuple| index_key_for_decoded(index_spec, &tuple.values))
+                    .as_ref()
+                    == Some(key)
+        })
+    }
+
+    pub(crate) fn find_visible_by_index_key_excluding_read(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        index_spec: &UniqueIndexSpec,
+        key: &IndexKey,
+        replacing_tid: Option<Tid>,
+    ) -> Option<Tid> {
+        let replacing_tid = replacing_tid.map(|tid| {
+            self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
+        });
+        if index_spec.is_primary {
+            if let Some(tid) = self.primary_key_lookup_read(session, relid, key)
                 && Some(tid) != replacing_tid
             {
                 return Some(tid);
@@ -1089,14 +1124,20 @@ pub(crate) enum UniqueCheck {
     Skip,
 }
 
-static STORAGE: OnceLock<Mutex<StorageState>> = OnceLock::new();
+#[derive(Clone, Copy)]
+pub(crate) struct InsertMetadata {
+    pub(crate) xid: u32,
+    pub(crate) cid: u32,
+}
 
-pub(crate) fn storage() -> &'static Mutex<StorageState> {
-    STORAGE.get_or_init(|| Mutex::new(StorageState::default()))
+static STORAGE: OnceLock<RwLock<StorageState>> = OnceLock::new();
+
+pub(crate) fn storage() -> &'static RwLock<StorageState> {
+    STORAGE.get_or_init(|| RwLock::new(StorageState::default()))
 }
 
 fn row_counts() -> &'static Mutex<HashMap<u32, Arc<AtomicUsize>>> {
-    STORAGE2_ROW_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+    STORAGE2_ROW_COUNTS.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
 thread_local! {
@@ -1147,41 +1188,38 @@ fn load_committed_row_count(relid: u32) -> usize {
 
 pub(crate) fn visible_row_count_cached(relid: u32) -> usize {
     let committed = load_committed_row_count(relid);
-    let session = current_session_storage();
-    let session = match session.lock() {
-        Ok(session) => session,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    if !session.transaction_has_visibility_deltas(relid) {
-        return committed;
-    }
-    committed
-        .saturating_add(session.transaction_visible_insert_count(relid))
-        .saturating_sub(session.transaction_invalidated_live_count(relid))
+    with_current_session_storage(|session| {
+        if !session.transaction_has_visibility_deltas(relid) {
+            return committed;
+        }
+        committed
+            .saturating_add(session.transaction_visible_insert_count(relid))
+            .saturating_sub(session.transaction_invalidated_live_count(relid))
+    })
 }
 
 pub(crate) fn with_storage<R>(f: impl FnOnce(&mut StorageState, &mut SessionStorage) -> R) -> R {
-    let session = current_session_storage();
-    let mut session = match session.lock() {
-        Ok(session) => session,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    match storage().lock() {
-        Ok(mut state) => f(&mut state, &mut session),
+    with_current_session_storage(|session| match storage().write() {
+        Ok(mut state) => f(&mut state, session),
         Err(poisoned) => {
             let mut state = poisoned.into_inner();
-            f(&mut state, &mut session)
+            f(&mut state, session)
         }
-    }
+    })
+}
+
+pub(crate) fn with_storage_read<R>(f: impl FnOnce(&StorageState, &mut SessionStorage) -> R) -> R {
+    with_current_session_storage(|session| match storage().read() {
+        Ok(state) => f(&state, session),
+        Err(poisoned) => {
+            let state = poisoned.into_inner();
+            f(&state, session)
+        }
+    })
 }
 
 pub(crate) fn with_session_storage<R>(f: impl FnOnce(&mut SessionStorage) -> R) -> R {
-    let session = current_session_storage();
-    let mut session = match session.lock() {
-        Ok(session) => session,
-        Err(poisoned) => poisoned.into_inner(),
-    };
-    f(&mut session)
+    with_current_session_storage(f)
 }
 
 pub(crate) fn relation_insert_impl(
@@ -1189,7 +1227,15 @@ pub(crate) fn relation_insert_impl(
     input: RowInput<'_>,
     tid_out: *mut u64,
     unique_check: UniqueCheck,
+    metadata: Option<InsertMetadata>,
 ) -> bool {
+    let tuple = match build_tuple(&input) {
+        Ok(tuple) => tuple,
+        Err(error) => {
+            set_last_storage_error(error);
+            return false;
+        }
+    };
     let result = with_storage(|state, session| -> Result<Option<Tid>, CatalogError> {
         if matches!(unique_check, UniqueCheck::Enforce)
             && state
@@ -1199,8 +1245,15 @@ pub(crate) fn relation_insert_impl(
             return Ok(None);
         }
 
-        let tuple = build_tuple(&input)?;
         let tid = state.append_pending_tuple(session, relid, &tuple)?;
+        if let Some(metadata) = metadata {
+            let overlay = session
+                .transaction_stack
+                .last_mut()
+                .expect("transaction was just ensured");
+            overlay.set_insert_cid(relid, tid, metadata.cid);
+            state.set_insert_metadata(relid, tid, metadata.xid, metadata.cid);
+        }
 
         if let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid))
             && let Some(key) = index_key_for_input(&index_spec, &input)
@@ -1244,9 +1297,18 @@ pub(crate) fn relation_update_impl(
     new_tid_out: *mut u64,
     unique_check: UniqueCheck,
     record_hot_redirect: bool,
+    metadata: Option<UpdateMetadata>,
 ) -> bool {
     let Some(old_tid) = Tid::unpack(packed_tid) else {
         return false;
+    };
+    let hot_unchecked = record_hot_redirect && matches!(unique_check, UniqueCheck::Skip);
+    let tuple = match build_tuple(&input) {
+        Ok(tuple) => tuple,
+        Err(error) => {
+            set_last_storage_error(error);
+            return false;
+        }
     };
     let result = with_storage(|state, session| -> Result<Option<Tid>, CatalogError> {
         let old_tid = state.resolve_tid_redirect_in_overlays_compress(
@@ -1254,13 +1316,24 @@ pub(crate) fn relation_update_impl(
             relid,
             old_tid,
         );
-        let old_is_own_insert = session.owns_inserted_tid(relid, old_tid);
-        let Some(old_tuple) = state.find_visible_tuple(session, relid, old_tid) else {
+        let Some(old_tuple_slice) = state.physical_visible_tuple_slice_in_overlays(
+            &session.transaction_stack,
+            relid,
+            old_tid,
+        ) else {
             return Ok(None);
         };
-        let old_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
-            .and_then(|index_spec| index_key_for_decoded(&index_spec, &old_tuple.values));
-        drop(old_tuple);
+        let old_primary_key = if hot_unchecked {
+            None
+        } else {
+            let Some(old_tuple) = decode_tuple(old_tid, old_tuple_slice) else {
+                return Ok(None);
+            };
+            let old_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
+                .and_then(|index_spec| index_key_for_decoded(&index_spec, &old_tuple.values));
+            old_primary_key
+        };
+        let old_is_own_insert = !hot_unchecked && session.owns_inserted_tid(relid, old_tid);
         if matches!(unique_check, UniqueCheck::Enforce)
             && state
                 .unique_index_conflict_for_input(session, relid, &input, Some(old_tid))
@@ -1269,10 +1342,13 @@ pub(crate) fn relation_update_impl(
             return Ok(None);
         }
 
-        let tuple = build_tuple(&input)?;
         let new_tid = state.append_pending_tuple(session, relid, &tuple)?;
-        let new_primary_key = primary_index_spec_for_relation_oid(Oid(relid))
-            .and_then(|index_spec| index_key_for_input(&index_spec, &input));
+        let new_primary_key = if hot_unchecked {
+            None
+        } else {
+            primary_index_spec_for_relation_oid(Oid(relid))
+                .and_then(|index_spec| index_key_for_input(&index_spec, &input))
+        };
 
         let overlay = session
             .transaction_stack
@@ -1282,6 +1358,17 @@ pub(crate) fn relation_update_impl(
         overlay.insert_update_redirect(relid, old_tid, new_tid);
         if record_hot_redirect {
             overlay.insert_hot_redirect(relid, old_tid, new_tid);
+        }
+        if let Some(metadata) = metadata {
+            overlay.set_invalidate_metadata(
+                relid,
+                old_tid,
+                metadata.delete_xid,
+                metadata.delete_cid,
+            );
+            overlay.set_insert_cid(relid, new_tid, metadata.insert_cid);
+            state.set_insert_metadata(relid, new_tid, metadata.insert_xid, metadata.insert_cid);
+            state.set_row_xmax(relid, new_tid, metadata.row_xmax);
         }
         if old_primary_key.is_some()
             && old_primary_key != new_primary_key
@@ -1315,4 +1402,13 @@ pub(crate) fn relation_update_impl(
             false
         }
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct UpdateMetadata {
+    pub(crate) delete_xid: u32,
+    pub(crate) delete_cid: u32,
+    pub(crate) insert_xid: u32,
+    pub(crate) insert_cid: u32,
+    pub(crate) row_xmax: u32,
 }

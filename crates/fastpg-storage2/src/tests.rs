@@ -145,9 +145,7 @@ fn hot_redirect_target(relid: u32, tid: u64) -> Option<u64> {
 }
 
 fn byval_key(value: i32) -> IndexKey {
-    IndexKey {
-        parts: vec![IndexKeyPart::ByValue(value as usize)],
-    }
+    IndexKey::single(IndexKeyPart::ByValue(value as usize))
 }
 
 fn transaction_stack_len() -> usize {

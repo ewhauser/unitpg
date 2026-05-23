@@ -68,6 +68,12 @@
  * For each block reference registered with XLogRegisterBuffer, we fill in
  * a registered_buffer struct.
  */
+#ifdef USE_FASTPG
+#define FASTPG_XLOGINSERT_LOCAL PG_THREAD_LOCAL
+#else
+#define FASTPG_XLOGINSERT_LOCAL
+#endif
+
 typedef struct
 {
 	bool		in_use;			/* is this slot in use? */
@@ -89,21 +95,25 @@ typedef struct
 	char		compressed_page[COMPRESS_BUFSIZE];
 } registered_buffer;
 
-static registered_buffer *registered_buffers;
-static int	max_registered_buffers; /* allocated size */
-static int	max_registered_block_id = 0;	/* highest block_id + 1 currently
-											 * registered */
+static FASTPG_XLOGINSERT_LOCAL registered_buffer *registered_buffers;
+static FASTPG_XLOGINSERT_LOCAL int max_registered_buffers;	/* allocated size */
+static FASTPG_XLOGINSERT_LOCAL int max_registered_block_id = 0;	/* highest block_id + 1 currently
+																 * registered */
 
 /*
  * A chain of XLogRecDatas to hold the "main data" of a WAL record, registered
  * with XLogRegisterData(...).
  */
-static XLogRecData *mainrdata_head;
+static FASTPG_XLOGINSERT_LOCAL XLogRecData *mainrdata_head;
+#ifdef USE_FASTPG
+static FASTPG_XLOGINSERT_LOCAL XLogRecData *mainrdata_last;
+#else
 static XLogRecData *mainrdata_last = (XLogRecData *) &mainrdata_head;
-static uint64 mainrdata_len;	/* total # of bytes in chain */
+#endif
+static FASTPG_XLOGINSERT_LOCAL uint64 mainrdata_len;	/* total # of bytes in chain */
 
 /* flags for the in-progress insertion */
-static uint8 curinsert_flags = 0;
+static FASTPG_XLOGINSERT_LOCAL uint8 curinsert_flags = 0;
 
 /*
  * These are used to hold the record header while constructing a record.
@@ -113,8 +123,8 @@ static uint8 curinsert_flags = 0;
  * For simplicity, it's allocated large enough to hold the headers for any
  * WAL record.
  */
-static XLogRecData hdr_rdt;
-static char *hdr_scratch = NULL;
+static FASTPG_XLOGINSERT_LOCAL XLogRecData hdr_rdt;
+static FASTPG_XLOGINSERT_LOCAL char *hdr_scratch = NULL;
 
 #define SizeOfXlogOrigin	(sizeof(ReplOriginId) + sizeof(char))
 #define SizeOfXLogTransactionId	(sizeof(TransactionId) + sizeof(char))
@@ -128,14 +138,14 @@ static char *hdr_scratch = NULL;
 /*
  * An array of XLogRecData structs, to hold registered data.
  */
-static XLogRecData *rdatas;
-static int	num_rdatas;			/* entries currently used */
-static int	max_rdatas;			/* allocated size */
+static FASTPG_XLOGINSERT_LOCAL XLogRecData *rdatas;
+static FASTPG_XLOGINSERT_LOCAL int num_rdatas; /* entries currently used */
+static FASTPG_XLOGINSERT_LOCAL int max_rdatas; /* allocated size */
 
-static bool begininsert_called = false;
+static FASTPG_XLOGINSERT_LOCAL bool begininsert_called = false;
 
 /* Memory context to hold the registered buffer and data references. */
-static MemoryContext xloginsert_cxt;
+static FASTPG_XLOGINSERT_LOCAL MemoryContext xloginsert_cxt;
 
 static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 									   XLogRecPtr RedoRecPtr, bool doPageWrites,
@@ -145,6 +155,15 @@ static XLogRecData *XLogRecordAssemble(RmgrId rmid, uint8 info,
 static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 									uint16 hole_length, void *dest, uint16 *dlen);
 
+#ifdef USE_FASTPG
+static inline void
+FastPgEnsureXLogInsertChainState(void)
+{
+	if (mainrdata_last == NULL)
+		mainrdata_last = (XLogRecData *) &mainrdata_head;
+}
+#endif
+
 /*
  * Begin constructing a WAL record. This must be called before the
  * XLogRegister* functions and XLogInsert().
@@ -152,6 +171,12 @@ static bool XLogCompressBackupBlock(const PageData *page, uint16 hole_offset,
 void
 XLogBeginInsert(void)
 {
+#ifdef USE_FASTPG
+	if (xloginsert_cxt == NULL || registered_buffers == NULL ||
+		rdatas == NULL || hdr_scratch == NULL)
+		InitXLogInsert();
+	FastPgEnsureXLogInsertChainState();
+#endif
 	Assert(max_registered_block_id == 0);
 	Assert(mainrdata_last == (XLogRecData *) &mainrdata_head);
 	Assert(mainrdata_len == 0);
@@ -1438,4 +1463,16 @@ InitXLogInsert(void)
 	if (hdr_scratch == NULL)
 		hdr_scratch = MemoryContextAllocZero(xloginsert_cxt,
 											 HEADER_SCRATCH_SIZE);
+
+#ifdef USE_FASTPG
+	FastPgEnsureXLogInsertChainState();
+#endif
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadXLogInsert(void)
+{
+	InitXLogInsert();
+}
+#endif

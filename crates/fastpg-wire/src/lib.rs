@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::fmt::Debug;
+use std::fmt::Write;
 use std::io;
 #[cfg(unix)]
 use std::net::SocketAddr;
@@ -22,9 +23,11 @@ use fastpg_session::{
     COPY_ERROR_CONTEXT_PREFIX, Column, PgType, QueryDescription, QueryExecution, QueryNotice,
     QueryResult, ServerState, SessionState, StartupParameters, Value,
 };
-use futures::{Sink, SinkExt, stream};
 #[cfg(unix)]
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use futures::channel::oneshot as futures_oneshot;
+use futures::future::{Either, select};
+use futures::{Sink, SinkExt, StreamExt, stream};
 #[cfg(unix)]
 use pgwire::api::DefaultClient;
 use pgwire::api::auth::{DefaultServerParameterProvider, StartupHandler};
@@ -42,16 +45,16 @@ use pgwire::api::results::{
     FieldInfo, QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
-use pgwire::api::{ClientInfo, ClientPortalStore, PgWireServerHandlers, Type};
+use pgwire::api::store::PortalStore;
+use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionHandle, PgWireServerHandlers, Type};
 use pgwire::api::{PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
-use pgwire::messages::data::DataRow;
-use pgwire::messages::response::EmptyQueryResponse;
-#[cfg(not(unix))]
-use pgwire::messages::response::NoticeResponse;
-#[cfg(unix)]
-use pgwire::messages::response::{NoticeResponse, ReadyForQuery, TransactionStatus};
+use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
+use pgwire::messages::response::{
+    CommandComplete, EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
+};
+use pgwire::messages::simplequery::Query;
 #[cfg(unix)]
 use pgwire::messages::{DecodeContext, ProtocolVersion};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
@@ -98,6 +101,18 @@ impl FastPgServerHandlers {
                 FastPgWireHandler::with_server_version_and_execution_concurrency(
                     fastpg_compat::DEFAULT_SERVER_VERSION,
                     max_concurrency,
+                ),
+            ),
+        }
+    }
+
+    pub fn with_inline_session_execution(max_concurrency: NonZeroUsize) -> Self {
+        Self {
+            handler: Arc::new(
+                FastPgWireHandler::with_server_version_execution_concurrency_and_mode(
+                    fastpg_compat::DEFAULT_SERVER_VERSION,
+                    max_concurrency,
+                    true,
                 ),
             ),
         }
@@ -163,6 +178,7 @@ pub struct FastPgWireHandler {
     server: Arc<ServerState>,
     query_parser: Arc<NoopQueryParser>,
     execution: ExecutionDispatcher,
+    inline_session_execution: bool,
 }
 
 impl FastPgWireHandler {
@@ -181,9 +197,22 @@ impl FastPgWireHandler {
         server_version: impl Into<String>,
         max_concurrency: NonZeroUsize,
     ) -> Self {
-        Self::with_server_state_and_execution_concurrency(
+        Self::with_server_version_execution_concurrency_and_mode(
+            server_version,
+            max_concurrency,
+            false,
+        )
+    }
+
+    fn with_server_version_execution_concurrency_and_mode(
+        server_version: impl Into<String>,
+        max_concurrency: NonZeroUsize,
+        inline_session_execution: bool,
+    ) -> Self {
+        Self::with_server_state_execution_concurrency_and_mode(
             Arc::new(ServerState::new(server_version)),
             max_concurrency,
+            inline_session_execution,
         )
     }
 
@@ -191,10 +220,19 @@ impl FastPgWireHandler {
         server: Arc<ServerState>,
         max_concurrency: NonZeroUsize,
     ) -> Self {
+        Self::with_server_state_execution_concurrency_and_mode(server, max_concurrency, false)
+    }
+
+    fn with_server_state_execution_concurrency_and_mode(
+        server: Arc<ServerState>,
+        max_concurrency: NonZeroUsize,
+        inline_session_execution: bool,
+    ) -> Self {
         Self {
             server,
             query_parser: Arc::new(NoopQueryParser::new()),
-            execution: ExecutionDispatcher::new(max_concurrency),
+            execution: ExecutionDispatcher::new(max_concurrency, inline_session_execution),
+            inline_session_execution,
         }
     }
 
@@ -221,6 +259,71 @@ impl FastPgWireHandler {
                 (execution, notices)
             })
             .await
+    }
+
+    async fn execute_simple_query(
+        &self,
+        session: Arc<SessionState>,
+        query: String,
+    ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
+        self.execution
+            .run_session_blocking(session, move |session| {
+                let execution = session.execute(&query, &[]);
+                let notices = session.take_notices();
+                (execution, notices)
+            })
+            .await
+    }
+
+    async fn execute_simple_message<C>(
+        &self,
+        client: &mut C,
+        query: String,
+    ) -> PgWireResult<QueryExecution>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        let session = session_for_client(client)?;
+        if postgres_catalog_enabled() && !simple_query_may_copy_from_stdin(&query) {
+            let (execution, notices) = self.execute_simple_query(session.clone(), query).await?;
+            send_notices(client, notices).await?;
+            remember_copy_target(&session, &execution);
+            return Ok(execution);
+        }
+
+        let statements = split_simple_query_statements(&query);
+        if statements.len() > 1 && should_split_simple_query(&statements) {
+            let mut executions = Vec::with_capacity(statements.len());
+            for (statement_index, statement) in statements.iter().enumerate() {
+                let (execution, notices) = self
+                    .execute_simple_query(session.clone(), (*statement).to_owned())
+                    .await?;
+                send_notices(client, notices).await?;
+                let enters_copy = execution_enters_copy(&execution);
+                let stop_batch = enters_copy || execution_is_error(&execution);
+                if enters_copy {
+                    session.set_pending_simple_statements(
+                        statements[statement_index + 1..]
+                            .iter()
+                            .map(|statement| (*statement).to_owned())
+                            .collect(),
+                    );
+                }
+                remember_copy_target(&session, &execution);
+                executions.push(execution);
+                if stop_batch {
+                    break;
+                }
+            }
+            return Ok(QueryExecution::Batch(executions));
+        }
+
+        let (execution, notices) = self.execute_simple_query(session.clone(), query).await?;
+        send_notices(client, notices).await?;
+        remember_copy_target(&session, &execution);
+        Ok(execution)
     }
 
     async fn push_copy_data(&self, session: Arc<SessionState>, data: Vec<u8>) -> PgWireResult<()> {
@@ -349,6 +452,246 @@ where
     Ok(())
 }
 
+fn simple_query_is_empty(query: &str) -> bool {
+    let trimmed = query.trim();
+    trimmed.is_empty() || trimmed == ";"
+}
+
+async fn cancel_receiver<C>(client: &mut C) -> Option<futures_oneshot::Receiver<()>>
+where
+    C: ClientInfo + ClientPortalStore + Unpin + Send + Sync,
+{
+    let handle = client.session_extensions().get::<Arc<ConnectionHandle>>()?;
+    Some(handle.start_query().await)
+}
+
+fn row_description(fields: &[FieldInfo]) -> RowDescription {
+    RowDescription::new(
+        fields
+            .iter()
+            .map(|field| {
+                FieldDescription::new(
+                    field.name().to_owned(),
+                    field.table_id().unwrap_or(0),
+                    field.column_id().unwrap_or(0),
+                    field.datatype().oid(),
+                    0,
+                    0,
+                    field.format().value(),
+                )
+            })
+            .collect(),
+    )
+}
+
+async fn feed_simple_execution<C>(
+    client: &mut C,
+    execution: QueryExecution,
+    transaction_status: &mut TransactionStatus,
+) -> PgWireResult<()>
+where
+    C: ClientInfo + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let mut current = Some(execution);
+    let mut pending = Vec::new();
+    while let Some(execution) = current.take().or_else(|| pending.pop()) {
+        match execution {
+            QueryExecution::WithNotices { notices, execution } => {
+                send_notices(client, notices).await?;
+                current = Some(*execution);
+            }
+            QueryExecution::Empty => {
+                client
+                    .feed(PgWireBackendMessage::EmptyQueryResponse(
+                        EmptyQueryResponse::new(),
+                    ))
+                    .await?;
+            }
+            QueryExecution::Batch(executions) => {
+                pending.extend(executions.into_iter().rev());
+            }
+            QueryExecution::Rows(result) => {
+                feed_query_result(client, result, FieldFormat::Text, true).await?;
+            }
+            QueryExecution::Command { tag, rows } => {
+                feed_command_complete(client, tag.as_ref(), rows, transaction_status).await?;
+            }
+            QueryExecution::CopyIn(target) => {
+                send_copy_in_response(
+                    client,
+                    CopyResponse::new(0, target.columns, stream::empty()),
+                )
+                .await?;
+                client.set_state(PgWireConnectionState::CopyInProgress(false));
+            }
+            QueryExecution::CopyOut(output) => {
+                send_copy_out_response(
+                    client,
+                    CopyResponse::new(
+                        output.format,
+                        output.columns,
+                        stream::iter(
+                            output
+                                .chunks
+                                .into_iter()
+                                .map(|chunk| Ok(CopyData::new(Bytes::from(chunk)))),
+                        ),
+                    ),
+                )
+                .await?;
+            }
+            QueryExecution::Unsupported { query } => {
+                feed_error_response(client, unsupported_response(&query)).await?;
+                *transaction_status = transaction_status.to_error_state();
+            }
+            QueryExecution::InvalidParameters { message } => {
+                feed_error_response(client, invalid_parameter_response(&message)).await?;
+                *transaction_status = transaction_status.to_error_state();
+            }
+            QueryExecution::Error {
+                sqlstate,
+                message,
+                detail,
+                hint,
+                context,
+                cursorpos,
+                internal_query,
+                internalpos,
+            } => {
+                feed_error_response(
+                    client,
+                    error_response(
+                        &sqlstate,
+                        &message,
+                        WireErrorFields {
+                            detail,
+                            hint,
+                            context,
+                            cursorpos,
+                            internal_query,
+                            internalpos,
+                        },
+                    ),
+                )
+                .await?;
+                *transaction_status = transaction_status.to_error_state();
+            }
+        }
+    }
+    Ok(())
+}
+
+async fn feed_query_result<C>(
+    client: &mut C,
+    result: QueryResult,
+    format: FieldFormat,
+    send_describe: bool,
+) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    let schema = Arc::new(field_infos(&result.fields, format));
+    if send_describe {
+        client
+            .feed(PgWireBackendMessage::RowDescription(row_description(
+                &schema,
+            )))
+            .await?;
+    }
+
+    let fields = result.fields;
+    let command_tag = result
+        .command_tag
+        .as_deref()
+        .map(query_response_command_tag)
+        .unwrap_or_else(|| "SELECT".to_owned());
+    let mut rows = 0;
+    for row in result.rows {
+        client
+            .feed(PgWireBackendMessage::DataRow(encode_row(
+                schema.clone(),
+                &fields,
+                &row,
+            )?))
+            .await?;
+        rows += 1;
+    }
+    client
+        .feed(PgWireBackendMessage::CommandComplete(
+            command_complete_message(&command_tag, Some(rows)),
+        ))
+        .await?;
+    Ok(())
+}
+
+async fn feed_command_complete<C>(
+    client: &mut C,
+    command_tag: &str,
+    rows: Option<usize>,
+    transaction_status: &mut TransactionStatus,
+) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    client
+        .feed(PgWireBackendMessage::CommandComplete(
+            command_complete_message(command_tag, rows),
+        ))
+        .await?;
+
+    match command_tag.split_whitespace().next() {
+        Some(command) if command.eq_ignore_ascii_case("BEGIN") => {
+            *transaction_status = transaction_status.to_in_transaction_state();
+        }
+        Some(command)
+            if command.eq_ignore_ascii_case("COMMIT")
+                || command.eq_ignore_ascii_case("END")
+                || command.eq_ignore_ascii_case("ROLLBACK") =>
+        {
+            *transaction_status = transaction_status.to_idle_state();
+        }
+        _ => {}
+    }
+
+    Ok(())
+}
+
+fn command_complete_message(command_tag: &str, rows: Option<usize>) -> CommandComplete {
+    let tag = if let Some(rows) = rows {
+        let mut tag = String::with_capacity(command_tag.len() + 24);
+        tag.push_str(command_tag);
+        if command_tag == "INSERT" {
+            tag.push_str(" 0");
+        }
+        tag.push(' ');
+        write!(&mut tag, "{rows}").expect("writing CommandComplete tag to String cannot fail");
+        tag
+    } else {
+        command_tag.to_owned()
+    };
+    CommandComplete::new(tag)
+}
+
+async fn feed_error_response<C>(client: &mut C, response: Response) -> PgWireResult<()>
+where
+    C: Sink<PgWireBackendMessage> + Unpin,
+    C::Error: Debug,
+    PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+{
+    if let Response::Error(error) = response {
+        client
+            .feed(PgWireBackendMessage::ErrorResponse((*error).into()))
+            .await?;
+    }
+    Ok(())
+}
+
 impl Default for FastPgWireHandler {
     fn default() -> Self {
         Self::new(fastpg_compat::DEFAULT_SERVER_VERSION)
@@ -377,10 +720,13 @@ impl StartupHandler for FastPgWireHandler {
             let mut parameters = DefaultServerParameterProvider::default();
             parameters.server_version = self.server.server_version().to_owned();
 
-            client.session_extensions().insert(SessionState::new(
-                self.server.clone(),
-                startup_parameters(client, &message),
-            ));
+            let startup = startup_parameters(client, &message);
+            let session = if self.inline_session_execution {
+                SessionState::new_inline_execution(self.server.clone(), startup)
+            } else {
+                SessionState::new(self.server.clone(), startup)
+            };
+            client.session_extensions().insert(session);
 
             pgwire::api::auth::finish_authentication(client, &parameters).await?;
         }
@@ -390,55 +736,70 @@ impl StartupHandler for FastPgWireHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for FastPgWireHandler {
+    async fn on_query<C>(&self, client: &mut C, query: Query) -> PgWireResult<()>
+    where
+        C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
+        C::PortalStore: PortalStore,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        if !matches!(client.state(), PgWireConnectionState::ReadyForQuery) {
+            return Err(PgWireError::NotReadyForQuery);
+        }
+
+        let mut transaction_status = client.transaction_status();
+        client.set_state(PgWireConnectionState::QueryInProgress);
+
+        let query = query.query;
+        if simple_query_is_empty(&query) {
+            client
+                .feed(PgWireBackendMessage::EmptyQueryResponse(
+                    EmptyQueryResponse::new(),
+                ))
+                .await?;
+        } else {
+            let cancel_rx = cancel_receiver(client).await;
+            let execution = if let Some(cancel_rx) = cancel_rx {
+                match select(
+                    Box::pin(self.execute_simple_message(client, query)),
+                    cancel_rx,
+                )
+                .await
+                {
+                    Either::Left((result, _)) => result,
+                    Either::Right(_) => Err(PgWireError::QueryCanceled),
+                }
+            } else {
+                self.execute_simple_message(client, query).await
+            }?;
+            feed_simple_execution(client, execution, &mut transaction_status).await?;
+        }
+
+        if !matches!(client.state(), PgWireConnectionState::CopyInProgress(_)) {
+            client.set_state(PgWireConnectionState::ReadyForQuery);
+            client.set_transaction_status(transaction_status);
+            client
+                .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                    transaction_status,
+                )))
+                .await?;
+            client.flush().await?;
+        }
+
+        Ok(())
+    }
+
     async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let session = session_for_client(client)?;
-        if postgres_catalog_enabled() && !simple_query_may_copy_from_stdin(query) {
-            let (execution, notices) = self
-                .execute_query(session.clone(), query.to_owned(), vec![])
-                .await?;
-            send_notices(client, notices).await?;
-            remember_copy_target(&session, &execution);
-            return execution_to_responses(execution, FieldFormat::Text);
-        }
-
-        let statements = split_simple_query_statements(query);
-        if statements.len() > 1 && should_split_simple_query(&statements) {
-            let mut responses = Vec::with_capacity(statements.len());
-            for (statement_index, statement) in statements.iter().enumerate() {
-                let (execution, notices) = self
-                    .execute_query(session.clone(), (*statement).to_owned(), vec![])
-                    .await?;
-                send_notices(client, notices).await?;
-                let stop_batch =
-                    execution_enters_copy(&execution) || execution_is_error(&execution);
-                if execution_enters_copy(&execution) {
-                    session.set_pending_simple_statements(
-                        statements[statement_index + 1..]
-                            .iter()
-                            .map(|statement| (*statement).to_owned())
-                            .collect(),
-                    );
-                }
-                remember_copy_target(&session, &execution);
-                responses.extend(execution_to_responses(execution, FieldFormat::Text)?);
-                if stop_batch {
-                    break;
-                }
-            }
-            return Ok(responses);
-        }
-
-        let (execution, notices) = self
-            .execute_query(session.clone(), query.to_owned(), vec![])
-            .await?;
-        send_notices(client, notices).await?;
-        remember_copy_target(&session, &execution);
-        execution_to_responses(execution, FieldFormat::Text)
+        execution_to_responses(
+            self.execute_simple_message(client, query.to_owned())
+                .await?,
+            FieldFormat::Text,
+        )
     }
 }
 
@@ -1627,12 +1988,14 @@ fn default_execution_concurrency() -> NonZeroUsize {
 #[derive(Clone, Debug)]
 struct ExecutionDispatcher {
     permits: Arc<Semaphore>,
+    inline_session_execution: bool,
 }
 
 impl ExecutionDispatcher {
-    fn new(max_concurrency: NonZeroUsize) -> Self {
+    fn new(max_concurrency: NonZeroUsize, inline_session_execution: bool) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrency.get())),
+            inline_session_execution,
         }
     }
 
@@ -1670,6 +2033,14 @@ impl ExecutionDispatcher {
             .acquire_owned()
             .await
             .map_err(api_io_error)?;
+        if self.inline_session_execution {
+            let _permit = permit;
+            let result = catch_unwind(AssertUnwindSafe(|| operation(session)));
+            return match result {
+                Ok(result) => Ok(result),
+                Err(payload) => resume_unwind(payload),
+            };
+        }
         let (sender, receiver) = oneshot::channel::<Result<R, Box<dyn Any + Send + 'static>>>();
         let operation_session = session.clone();
         session.enqueue_on_backend(move || {

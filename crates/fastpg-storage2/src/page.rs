@@ -12,6 +12,9 @@ pub(crate) struct LinePointer {
     pub(crate) offset: u32,
     pub(crate) len: u32,
     pub(crate) state: LinePointerState,
+    pub(crate) xmin: u32,
+    pub(crate) cmin: u32,
+    pub(crate) xmax: u32,
 }
 
 #[derive(Clone, Debug)]
@@ -74,6 +77,9 @@ impl Page {
             offset: offset.try_into().ok()?,
             len: tuple.len().try_into().ok()?,
             state,
+            xmin: 0,
+            cmin: 0,
+            xmax: 0,
         });
         match state {
             LinePointerState::Pending => {
@@ -108,6 +114,21 @@ impl Page {
     pub(crate) fn tuple_slice_any(&self, offset: u16) -> Option<&[u8]> {
         let index = usize::from(offset.checked_sub(1)?);
         let line = self.line_pointers.get(index)?;
+        let start = line.offset as usize;
+        let end = start.checked_add(line.len as usize)?;
+        self.bytes.get(start..end)
+    }
+
+    pub(crate) fn tuple_slice_for_line(
+        &self,
+        line: LinePointer,
+        include_pending: bool,
+    ) -> Option<&[u8]> {
+        if line.state == LinePointerState::Dead
+            || (line.state == LinePointerState::Pending && !include_pending)
+        {
+            return None;
+        }
         let start = line.offset as usize;
         let end = start.checked_add(line.len as usize)?;
         self.bytes.get(start..end)
@@ -160,7 +181,7 @@ impl Page {
         PageCheckpoint {
             used: self.used,
             line_count: self.line_pointers.len(),
-            line_states: self.line_pointers.iter().map(|line| line.state).collect(),
+            line_states: Vec::new(),
             pending_tuple_bytes: self.pending_tuple_bytes,
             live_tuple_bytes: self.live_tuple_bytes,
             dead_tuple_bytes: self.dead_tuple_bytes,
@@ -169,13 +190,15 @@ impl Page {
 
     pub(crate) fn restore_to_preserving_tid_space(&mut self, checkpoint: &PageCheckpoint) {
         let checkpoint_line_count = checkpoint.line_count.min(self.line_pointers.len());
-        for (line, state) in self
-            .line_pointers
-            .iter_mut()
-            .take(checkpoint_line_count)
-            .zip(checkpoint.line_states.iter().copied())
-        {
-            line.state = state;
+        if !checkpoint.line_states.is_empty() {
+            for (line, state) in self
+                .line_pointers
+                .iter_mut()
+                .take(checkpoint_line_count)
+                .zip(checkpoint.line_states.iter().copied())
+            {
+                line.state = state;
+            }
         }
         for line in self.line_pointers.iter_mut().skip(checkpoint_line_count) {
             line.state = LinePointerState::Dead;

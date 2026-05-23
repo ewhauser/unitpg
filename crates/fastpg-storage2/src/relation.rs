@@ -3,14 +3,11 @@ use crate::*;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RelationStorage {
     pub(crate) pages: Vec<Option<Page>>,
-    pub(crate) primary_key_index: BTreeMap<IndexKey, Tid>,
-    pub(crate) hot_redirects: BTreeMap<Tid, Tid>,
-    pub(crate) update_redirects: BTreeMap<Tid, Tid>,
-    pub(crate) row_xmins: BTreeMap<Tid, u32>,
-    pub(crate) row_cmins: BTreeMap<Tid, u32>,
-    pub(crate) row_xmaxs: BTreeMap<Tid, u32>,
-    pub(crate) row_delete_xids: BTreeMap<Tid, u32>,
-    pub(crate) row_delete_cids: BTreeMap<Tid, u32>,
+    pub(crate) primary_key_index: HashMap<IndexKey, Tid>,
+    pub(crate) hot_redirects: HashMap<Tid, Tid>,
+    pub(crate) update_redirects: HashMap<Tid, Tid>,
+    pub(crate) row_delete_xids: HashMap<Tid, u32>,
+    pub(crate) row_delete_cids: HashMap<Tid, u32>,
     pub(crate) next_block: u32,
     pub(crate) append_hint: Option<u32>,
     pub(crate) live_tuple_count: usize,
@@ -92,6 +89,45 @@ impl RelationStorage {
 
     pub(crate) fn tuple_slice_any(&self, tid: Tid) -> Option<&[u8]> {
         self.page(tid.block)?.tuple_slice_any(tid.offset)
+    }
+
+    fn line_pointer(&self, tid: Tid) -> Option<&LinePointer> {
+        let index = usize::from(tid.offset.checked_sub(1)?);
+        self.page(tid.block)?.line_pointers.get(index)
+    }
+
+    fn line_pointer_mut(&mut self, tid: Tid) -> Option<&mut LinePointer> {
+        let index = usize::from(tid.offset.checked_sub(1)?);
+        self.page_mut(tid.block)?.line_pointers.get_mut(index)
+    }
+
+    pub(crate) fn set_insert_metadata(&mut self, tid: Tid, xmin: u32, cmin: u32) -> bool {
+        let Some(line) = self.line_pointer_mut(tid) else {
+            return false;
+        };
+        line.xmin = xmin;
+        line.cmin = cmin;
+        true
+    }
+
+    pub(crate) fn set_row_xmax(&mut self, tid: Tid, xmax: u32) -> bool {
+        let Some(line) = self.line_pointer_mut(tid) else {
+            return false;
+        };
+        line.xmax = xmax;
+        true
+    }
+
+    pub(crate) fn row_xmin(&self, tid: Tid) -> Option<u32> {
+        Some(self.line_pointer(tid)?.xmin)
+    }
+
+    pub(crate) fn row_cmin(&self, tid: Tid) -> Option<u32> {
+        Some(self.line_pointer(tid)?.cmin)
+    }
+
+    pub(crate) fn row_xmax(&self, tid: Tid) -> Option<u32> {
+        Some(self.line_pointer(tid)?.xmax)
     }
 
     pub(crate) fn mark_dead(&mut self, tid: Tid) -> bool {

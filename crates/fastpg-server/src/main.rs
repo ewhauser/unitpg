@@ -6,13 +6,32 @@ use fastpg_server::{DEFAULT_ADDR, serve_addr};
 use tokio::signal;
 
 const POSTGRES_SAFE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+const TOKIO_WORKER_THREADS_ENV: &str = "FASTPG_TOKIO_WORKER_THREADS";
+const DEFAULT_TOKIO_WORKER_THREADS: usize = 1;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .thread_stack_size(POSTGRES_SAFE_THREAD_STACK_SIZE)
-        .build()?
-        .block_on(run())
+    let worker_threads = tokio_worker_threads();
+    let runtime = if worker_threads == 1 {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .thread_stack_size(POSTGRES_SAFE_THREAD_STACK_SIZE)
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .thread_stack_size(POSTGRES_SAFE_THREAD_STACK_SIZE)
+            .worker_threads(worker_threads)
+            .build()?
+    };
+    runtime.block_on(run())
+}
+
+fn tokio_worker_threads() -> usize {
+    std::env::var(TOKIO_WORKER_THREADS_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|threads| *threads > 0)
+        .unwrap_or(DEFAULT_TOKIO_WORKER_THREADS)
 }
 
 async fn run() -> Result<(), Box<dyn Error>> {

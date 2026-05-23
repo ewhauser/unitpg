@@ -190,7 +190,8 @@ pub struct SessionState {
     id: SessionId,
     server: Arc<ServerState>,
     executor: QueryExecutor,
-    backend: SessionBackendExecutor,
+    backend: Option<SessionBackendExecutor>,
+    inline_execution: bool,
     startup: StartupParameters,
     copy: Mutex<Option<SessionCopyState>>,
     pending_simple: Mutex<VecDeque<String>>,
@@ -198,6 +199,18 @@ pub struct SessionState {
 
 impl SessionState {
     pub fn new(server: Arc<ServerState>, startup: StartupParameters) -> Self {
+        Self::with_inline_execution(server, startup, false)
+    }
+
+    pub fn new_inline_execution(server: Arc<ServerState>, startup: StartupParameters) -> Self {
+        Self::with_inline_execution(server, startup, true)
+    }
+
+    fn with_inline_execution(
+        server: Arc<ServerState>,
+        startup: StartupParameters,
+        inline_execution: bool,
+    ) -> Self {
         let id = server.allocate_session_id();
         let executor =
             QueryExecutor::with_shared_for_database(server.executor.clone(), startup.database());
@@ -205,7 +218,8 @@ impl SessionState {
             id,
             server,
             executor,
-            backend: SessionBackendExecutor::new(id),
+            backend: (!inline_execution).then(|| SessionBackendExecutor::new(id)),
+            inline_execution,
             startup,
             copy: Mutex::new(None),
             pending_simple: Mutex::new(VecDeque::new()),
@@ -255,11 +269,19 @@ impl SessionState {
     where
         R: Send + 'static,
     {
-        self.backend.run(operation)
+        if let Some(backend) = &self.backend {
+            backend.run(operation)
+        } else {
+            operation()
+        }
     }
 
     pub fn enqueue_on_backend(&self, operation: impl FnOnce() + Send + 'static) {
-        self.backend.enqueue(operation);
+        if let Some(backend) = &self.backend {
+            backend.enqueue(operation);
+        } else {
+            operation();
+        }
     }
 
     pub fn take_notices(&self) -> Vec<QueryNotice> {
@@ -369,7 +391,11 @@ impl Drop for SessionState {
         {
             let active_copy_owned_transaction = self.take_active_copy_owned_transaction();
             if let Some(close_work) = self.executor.close_work(active_copy_owned_transaction) {
-                self.backend.run(move || close_work.run());
+                if self.inline_execution {
+                    close_work.run();
+                } else if let Some(backend) = &self.backend {
+                    backend.run(move || close_work.run());
+                }
             }
         }
 

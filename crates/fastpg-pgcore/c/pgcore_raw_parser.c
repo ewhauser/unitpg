@@ -23,6 +23,7 @@
 #include "access/transam.h"
 #include "access/tupdesc.h"
 #include "access/xlog.h"
+#include "access/xloginsert.h"
 #include "access/xact.h"
 #include "catalog/heap.h"
 #include "catalog/index.h"
@@ -296,6 +297,7 @@ static _Thread_local emit_log_hook_type fastpg_pgcore_previous_client_message_ho
 static _Thread_local bool fastpg_pgcore_notice_capture_active = false;
 static _Thread_local FastPgPgCoreExecuteStatement *fastpg_pgcore_active_copy_out_statement = NULL;
 static _Thread_local MemoryContext fastpg_pgcore_active_copy_out_context = NULL;
+static _Thread_local MemoryContext fastpg_pgcore_simple_work_context = NULL;
 typedef struct FastPgPgCoreCopyBuffer
 {
 	const char *data;
@@ -813,6 +815,7 @@ fastpg_pgcore_enter(void)
 	FastPgEnsureThreadProc();
 	FastPgEnsureThreadPgStat();
 	FastPgEnsureThreadBufferManagerAccess();
+	FastPgEnsureThreadXLogInsert();
 	FastPgEnsureThreadNamespaceState();
 	FastPgEnsureThreadLockManagerAccess();
 #endif
@@ -1535,6 +1538,7 @@ fastpg_pgcore_next_execute_statement(FastPgPgCoreExecuteResult *result,
 									 int *statement_index)
 {
 	FastPgPgCoreExecuteStatement *summary;
+	MemoryContext oldcontext;
 	int			old_capacity;
 	int			new_capacity;
 
@@ -1544,6 +1548,7 @@ fastpg_pgcore_next_execute_statement(FastPgPgCoreExecuteResult *result,
 		new_capacity = old_capacity > 0 ? old_capacity * 2 : 8;
 		while (*statement_index >= new_capacity)
 			new_capacity *= 2;
+		oldcontext = MemoryContextSwitchTo(result->context);
 		if (result->statements == NULL)
 			result->statements =
 				palloc0_array(FastPgPgCoreExecuteStatement, new_capacity);
@@ -1558,12 +1563,25 @@ fastpg_pgcore_next_execute_statement(FastPgPgCoreExecuteResult *result,
 				   sizeof(FastPgPgCoreExecuteStatement) *
 				   (new_capacity - old_capacity));
 		}
+		MemoryContextSwitchTo(oldcontext);
 		*statement_capacity = new_capacity;
 	}
 
 	summary = &result->statements[*statement_index];
 	(*statement_index)++;
 	return summary;
+}
+
+static MemoryContext
+fastpg_pgcore_get_simple_work_context(void)
+{
+	if (fastpg_pgcore_simple_work_context == NULL)
+		fastpg_pgcore_simple_work_context =
+			AllocSetContextCreate(TopMemoryContext,
+								  "fastpg pgcore simple work",
+								  ALLOCSET_DEFAULT_SIZES);
+	MemoryContextReset(fastpg_pgcore_simple_work_context);
+	return fastpg_pgcore_simple_work_context;
 }
 
 static const char *
@@ -3582,6 +3600,7 @@ fastpg_pgcore_execute_simple(const char *query)
 {
 	FastPgPgCoreExecuteResult *result;
 	MemoryContext oldcontext;
+	MemoryContext work_context;
 	QueryDesc  *query_desc = NULL;
 	DestReceiver *dest = NULL;
 	MemoryContext save_portal_context = NULL;
@@ -3591,7 +3610,7 @@ fastpg_pgcore_execute_simple(const char *query)
 	volatile bool postgres_command_started = false;
 	bool		postgres_finish_at_end = true;
 	volatile int completed_statement_count = 0;
-	char	   *source_text = NULL;
+	const char *source_text = NULL;
 
 	result = (FastPgPgCoreExecuteResult *) calloc(1, sizeof(FastPgPgCoreExecuteResult));
 	if (result == NULL)
@@ -3599,9 +3618,10 @@ fastpg_pgcore_execute_simple(const char *query)
 
 	fastpg_pgcore_enter();
 	oldcontext = CurrentMemoryContext;
+	work_context = fastpg_pgcore_get_simple_work_context();
 	result->context = AllocSetContextCreate(TopMemoryContext,
 											"fastpg pgcore simple execute result",
-											ALLOCSET_DEFAULT_SIZES);
+											ALLOCSET_START_SMALL_SIZES);
 	save_portal_context = PortalContext;
 	if (PortalContext == NULL)
 	{
@@ -3635,8 +3655,8 @@ fastpg_pgcore_execute_simple(const char *query)
 		else
 			fastpg_pgcore_start_statement_timestamp();
 
-		MemoryContextSwitchTo(result->context);
-		source_text = pstrdup(query);
+		source_text = query;
+		MemoryContextSwitchTo(work_context);
 		raw_parsetrees = raw_parser(source_text, RAW_PARSE_DEFAULT);
 		raw_count = list_length(raw_parsetrees);
 		if (raw_count == 0)
@@ -3883,6 +3903,7 @@ simple_execute_done:
 	if (portal_context_set)
 		PortalContext = save_portal_context;
 	MemoryContextSwitchTo(oldcontext);
+	MemoryContextReset(work_context);
 	return result;
 }
 

@@ -67,5 +67,8 @@ extern XLogRecPtr XLogSaveBufferForHint(Buffer buffer, bool buffer_std);
 extern XLogRecPtr XLogGetFakeLSN(Relation rel);
 
 extern void InitXLogInsert(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadXLogInsert(void);
+#endif
 
 #endif							/* XLOGINSERT_H */
