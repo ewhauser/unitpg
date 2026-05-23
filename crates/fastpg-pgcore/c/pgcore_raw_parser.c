@@ -10,6 +10,7 @@
 
 #include <pthread.h>
 #include <stdint.h>
+#include <stddef.h>
 #include <unistd.h>
 #ifdef __APPLE__
 #include <mach-o/dyld.h>
@@ -207,6 +208,8 @@ typedef struct FastPgPgCoreCopyOutChunk
 	char	   *data;
 	int			len;
 } FastPgPgCoreCopyOutChunk;
+#define FASTPG_PGCORE_INLINE_CELLS 8
+
 typedef struct FastPgPgCoreExecuteStatement
 {
 	CmdType		command_type;
@@ -241,13 +244,18 @@ typedef struct FastPgPgCoreExecuteStatement
 	FastPgPgCoreField *columns;
 	int			row_count;
 	FastPgPgCoreExecuteRow *rows;
+	FastPgPgCoreExecuteRow inline_rows[1];
+	FastPgPgCoreExecuteCell inline_cells[FASTPG_PGCORE_INLINE_CELLS];
 	bool		has_processed_count;
 	uint64		processed_count;
 } FastPgPgCoreExecuteStatement;
 
+#define FASTPG_PGCORE_INLINE_STATEMENTS 8
+
 typedef struct FastPgPgCoreExecuteResult
 {
 	MemoryContext context;
+	bool		owns_context;
 	bool		ok;
 	char		sqlstate[6];
 	char	   *message;
@@ -261,7 +269,20 @@ typedef struct FastPgPgCoreExecuteResult
 	FastPgPgCoreNotice *notices;
 	int			statement_count;
 	FastPgPgCoreExecuteStatement *statements;
+	FastPgPgCoreExecuteStatement inline_statements[FASTPG_PGCORE_INLINE_STATEMENTS];
 } FastPgPgCoreExecuteResult;
+
+typedef struct FastPgPgCoreExecuteStatementSummary
+{
+	const char *command_tag;
+	bool		is_select;
+	int			column_count;
+	int			row_count;
+	bool		has_processed_count;
+	uint64		processed_count;
+	bool		copy_in;
+	bool		copy_out;
+} FastPgPgCoreExecuteStatementSummary;
 
 typedef struct FastPgPgCoreInputDatumResult
 {
@@ -278,6 +299,18 @@ typedef struct FastPgPgCoreInputDatumResult
 	size_t		value_len;
 	unsigned char *payload;
 } FastPgPgCoreInputDatumResult;
+
+static FastPgPgCoreExecuteResult *
+fastpg_pgcore_execute_result_alloc(void)
+{
+	FastPgPgCoreExecuteResult *result;
+
+	result = (FastPgPgCoreExecuteResult *) malloc(sizeof(FastPgPgCoreExecuteResult));
+	if (result == NULL)
+		return NULL;
+	memset(result, 0, offsetof(FastPgPgCoreExecuteResult, inline_statements));
+	return result;
+}
 
 typedef struct FastPgPgCoreCaptureDestReceiver
 {
@@ -298,6 +331,9 @@ static _Thread_local bool fastpg_pgcore_notice_capture_active = false;
 static _Thread_local FastPgPgCoreExecuteStatement *fastpg_pgcore_active_copy_out_statement = NULL;
 static _Thread_local MemoryContext fastpg_pgcore_active_copy_out_context = NULL;
 static _Thread_local MemoryContext fastpg_pgcore_simple_work_context = NULL;
+static _Thread_local MemoryContext fastpg_pgcore_simple_result_context = NULL;
+static _Thread_local bool fastpg_pgcore_thread_entered = false;
+static _Thread_local bool fastpg_pgcore_stack_base_set = false;
 typedef struct FastPgPgCoreCopyBuffer
 {
 	const char *data;
@@ -808,6 +844,9 @@ fastpg_pgcore_init_once(void)
 static void
 fastpg_pgcore_enter(void)
 {
+	if (fastpg_pgcore_thread_entered)
+		return;
+
 	pthread_once(&fastpg_pgcore_initialized, fastpg_pgcore_init_once);
 #ifdef USE_FASTPG
 	FastPgEnsureThreadMemoryContexts();
@@ -819,7 +858,12 @@ fastpg_pgcore_enter(void)
 	FastPgEnsureThreadNamespaceState();
 	FastPgEnsureThreadLockManagerAccess();
 #endif
-	(void) set_stack_base();
+	if (!fastpg_pgcore_stack_base_set)
+	{
+		(void) set_stack_base();
+		fastpg_pgcore_stack_base_set = true;
+	}
+	fastpg_pgcore_thread_entered = true;
 }
 
 static void
@@ -1075,11 +1119,7 @@ fastpg_pgcore_start_statement_timestamp(void)
 static void
 fastpg_pgcore_push_analyze_snapshot(void)
 {
-	/*
-	 * In the embedded multithreaded server, keep this short-lived analyze/planner
-	 * snapshot independent from the transaction's reusable CurrentSnapshotData.
-	 */
-	PushCopiedSnapshot(GetTransactionSnapshot());
+	PushActiveSnapshot(GetTransactionSnapshot());
 }
 
 static void
@@ -1218,7 +1258,7 @@ fastpg_pgcore_force_idle_transaction_state(void)
 static void
 fastpg_pgcore_report_activity_running(const char *source_text)
 {
-	if (fastpg_catalog_mode_uses_postgres())
+	if (fastpg_catalog_mode_uses_postgres() && !fastpg_pgstat_noop_active())
 		pgstat_report_activity(STATE_RUNNING, source_text);
 }
 
@@ -1285,7 +1325,7 @@ fastpg_pgcore_reset_session_state(void)
 		SetCurrentRoleId(InvalidOid, false);
 		FastPgEnsureStandaloneUserId();
 		fastpg_pgcore_finish_postgres_catalog_command(&postgres_command_started);
-		if (!IsTransactionOrTransactionBlock())
+		if (!IsTransactionOrTransactionBlock() && !fastpg_pgstat_noop_active())
 			pgstat_report_stat(true);
 	}
 	PG_CATCH();
@@ -1320,6 +1360,7 @@ fastpg_pgcore_end_client_session(void)
 
 	fastpg_pgcore_end_notice_capture();
 	FastPgReleaseThreadProc();
+	fastpg_pgcore_thread_entered = false;
 #endif
 }
 
@@ -1374,11 +1415,7 @@ fastpg_pgcore_finish_postgres_catalog_command(volatile bool *command_started)
 		return;
 
 	CommitTransactionCommand();
-#ifdef USE_FASTPG
-	if (fastpg_catalog_mode_uses_postgres())
-		FastPgResetRoleMembershipCache();
-#endif
-	if (!IsTransactionOrTransactionBlock())
+	if (!IsTransactionOrTransactionBlock() && !fastpg_pgstat_noop_active())
 		pgstat_report_stat(false);
 	*command_started = false;
 }
@@ -1548,26 +1585,47 @@ fastpg_pgcore_next_execute_statement(FastPgPgCoreExecuteResult *result,
 		new_capacity = old_capacity > 0 ? old_capacity * 2 : 8;
 		while (*statement_index >= new_capacity)
 			new_capacity *= 2;
-		oldcontext = MemoryContextSwitchTo(result->context);
-		if (result->statements == NULL)
-			result->statements =
-				palloc0_array(FastPgPgCoreExecuteStatement, new_capacity);
+		if (result->statements == NULL &&
+			new_capacity <= FASTPG_PGCORE_INLINE_STATEMENTS)
+		{
+			result->statements = result->inline_statements;
+			*statement_capacity = FASTPG_PGCORE_INLINE_STATEMENTS;
+		}
 		else
 		{
-			result->statements =
-				repalloc_array(result->statements,
-							  FastPgPgCoreExecuteStatement,
-							  new_capacity);
-			memset(result->statements + old_capacity,
-				   0,
-				   sizeof(FastPgPgCoreExecuteStatement) *
-				   (new_capacity - old_capacity));
+			FastPgPgCoreExecuteStatement *old_statements = result->statements;
+
+			oldcontext = MemoryContextSwitchTo(result->context);
+			if (old_statements == NULL)
+				result->statements =
+					palloc0_array(FastPgPgCoreExecuteStatement, new_capacity);
+			else if (old_statements == result->inline_statements)
+			{
+				result->statements =
+					palloc0_array(FastPgPgCoreExecuteStatement, new_capacity);
+				memcpy(result->statements,
+					   result->inline_statements,
+					   sizeof(FastPgPgCoreExecuteStatement) * old_capacity);
+			}
+			else
+			{
+				result->statements =
+					repalloc_array(result->statements,
+								  FastPgPgCoreExecuteStatement,
+								  new_capacity);
+				memset(result->statements + old_capacity,
+					   0,
+					   sizeof(FastPgPgCoreExecuteStatement) *
+					   (new_capacity - old_capacity));
+			}
+			MemoryContextSwitchTo(oldcontext);
+			*statement_capacity = new_capacity;
 		}
-		MemoryContextSwitchTo(oldcontext);
-		*statement_capacity = new_capacity;
 	}
 
 	summary = &result->statements[*statement_index];
+	if (result->statements == result->inline_statements)
+		memset(summary, 0, sizeof(FastPgPgCoreExecuteStatement));
 	(*statement_index)++;
 	return summary;
 }
@@ -1582,6 +1640,18 @@ fastpg_pgcore_get_simple_work_context(void)
 								  ALLOCSET_DEFAULT_SIZES);
 	MemoryContextReset(fastpg_pgcore_simple_work_context);
 	return fastpg_pgcore_simple_work_context;
+}
+
+static MemoryContext
+fastpg_pgcore_get_simple_result_context(void)
+{
+	if (fastpg_pgcore_simple_result_context == NULL)
+		fastpg_pgcore_simple_result_context =
+			AllocSetContextCreate(TopMemoryContext,
+								  "fastpg pgcore simple result",
+								  ALLOCSET_START_SMALL_SIZES);
+	MemoryContextReset(fastpg_pgcore_simple_result_context);
+	return fastpg_pgcore_simple_result_context;
 }
 
 static const char *
@@ -2072,6 +2142,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 				ListCell   *lc;
 
 				BeginTransactionBlock();
+				fastpg_storage2_xact_begin();
 				foreach(lc, stmt->options)
 				{
 					DefElem    *item = (DefElem *) lfirst(lc);
@@ -2107,7 +2178,13 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 
 #ifdef USE_FASTPG
 			if (fastpg_catalog_mode_uses_postgres())
+			{
 				committed = EndTransactionBlock(stmt->chain);
+				if (committed)
+					fastpg_storage2_xact_commit();
+				else
+					fastpg_storage2_xact_abort();
+			}
 			else if (committed)
 			{
 				fastpg_xid_commit();
@@ -2127,7 +2204,10 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 		case TRANS_STMT_ROLLBACK:
 #ifdef USE_FASTPG
 			if (fastpg_catalog_mode_uses_postgres())
+			{
 				UserAbortTransactionBlock(stmt->chain);
+				fastpg_storage2_xact_abort();
+			}
 			else
 			{
 				fastpg_xid_rollback();
@@ -2143,6 +2223,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			{
 				RequireTransactionBlock(true, "SAVEPOINT");
 				DefineSavepoint(stmt->savepoint_name);
+				fastpg_storage2_subxact_begin();
 			}
 			else
 			{
@@ -2158,6 +2239,7 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			{
 				RequireTransactionBlock(true, "RELEASE SAVEPOINT");
 				ReleaseSavepoint(stmt->savepoint_name);
+				fastpg_storage2_subxact_commit();
 			}
 			else
 			{
@@ -2173,6 +2255,8 @@ fastpg_pgcore_execute_transaction_stmt(const TransactionStmt *stmt,
 			{
 				RequireTransactionBlock(true, "ROLLBACK TO SAVEPOINT");
 				RollbackToSavepoint(stmt->savepoint_name);
+				fastpg_storage2_subxact_abort();
+				fastpg_storage2_subxact_begin();
 			}
 			else
 			{
@@ -2282,12 +2366,14 @@ fastpg_pgcore_execute_utility(PlannedStmt *statement,
 		return;
 	}
 
-	if (fastpg_use_rust_catalog() && IsA(utility_stmt, TransactionStmt))
+#ifdef USE_FASTPG
+	if (IsA(utility_stmt, TransactionStmt))
 	{
 		fastpg_pgcore_execute_transaction_stmt((const TransactionStmt *) utility_stmt,
 											   summary);
 		return;
 	}
+#endif
 
 	if (fastpg_use_rust_catalog() &&
 		fastpg_pgcore_should_noop_utility(utility_stmt))
@@ -2513,14 +2599,31 @@ fastpg_pgcore_capture_receive_slot(TupleTableSlot *slot, DestReceiver *self)
 
 	oldcontext = MemoryContextSwitchTo(receiver->context);
 
-	if (statement->rows == NULL)
+	if (statement->rows == NULL && statement->column_count <= FASTPG_PGCORE_INLINE_CELLS)
+	{
+		statement->rows = statement->inline_rows;
+		statement->inline_rows[0].cells = statement->inline_cells;
+		memset(statement->inline_cells,
+			   0,
+			   sizeof(FastPgPgCoreExecuteCell) * statement->column_count);
+	}
+	else if (statement->rows == NULL)
 		statement->rows = palloc0_array(FastPgPgCoreExecuteRow, 1);
+	else if (statement->rows == statement->inline_rows)
+	{
+		statement->rows = palloc0_array(FastPgPgCoreExecuteRow,
+										statement->row_count + 1);
+		memcpy(statement->rows,
+			   statement->inline_rows,
+			   sizeof(FastPgPgCoreExecuteRow) * statement->row_count);
+	}
 	else
 		statement->rows = repalloc_array(statement->rows,
 										 FastPgPgCoreExecuteRow,
 										 statement->row_count + 1);
 	row = &statement->rows[statement->row_count];
-	row->cells = palloc0_array(FastPgPgCoreExecuteCell, statement->column_count);
+	if (row->cells == NULL)
+		row->cells = palloc0_array(FastPgPgCoreExecuteCell, statement->column_count);
 
 	for (int index = 0; index < statement->column_count; index++)
 	{
@@ -3187,7 +3290,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 	bool		postgres_finish_at_end = true;
 	volatile int completed_statement_count = 0;
 
-	result = (FastPgPgCoreExecuteResult *) calloc(1, sizeof(FastPgPgCoreExecuteResult));
+	result = fastpg_pgcore_execute_result_alloc();
 	if (result == NULL)
 		return NULL;
 
@@ -3196,6 +3299,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 	result->context = AllocSetContextCreate(TopMemoryContext,
 											"fastpg pgcore execute result",
 											ALLOCSET_DEFAULT_SIZES);
+	result->owns_context = true;
 
 	if (!fastpg_pgcore_prepared_ok(prepared))
 	{
@@ -3611,17 +3715,20 @@ fastpg_pgcore_execute_simple(const char *query)
 	bool		postgres_finish_at_end = true;
 	volatile int completed_statement_count = 0;
 	const char *source_text = NULL;
+	const bool	postgres_catalog = fastpg_catalog_mode_uses_postgres();
+#ifdef USE_FASTPG
+	const bool	rust_catalog = fastpg_use_rust_catalog();
+#endif
 
-	result = (FastPgPgCoreExecuteResult *) calloc(1, sizeof(FastPgPgCoreExecuteResult));
+	result = fastpg_pgcore_execute_result_alloc();
 	if (result == NULL)
 		return NULL;
 
 	fastpg_pgcore_enter();
 	oldcontext = CurrentMemoryContext;
 	work_context = fastpg_pgcore_get_simple_work_context();
-	result->context = AllocSetContextCreate(TopMemoryContext,
-											"fastpg pgcore simple execute result",
-											ALLOCSET_START_SMALL_SIZES);
+	result->context = fastpg_pgcore_get_simple_result_context();
+	result->owns_context = false;
 	save_portal_context = PortalContext;
 	if (PortalContext == NULL)
 	{
@@ -3644,7 +3751,7 @@ fastpg_pgcore_execute_simple(const char *query)
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("fastpg simple execution requires a query")));
 
-		if (fastpg_catalog_mode_uses_postgres())
+		if (postgres_catalog)
 		{
 			fastpg_pgcore_start_postgres_catalog_command();
 			postgres_command_started = true;
@@ -3667,7 +3774,7 @@ fastpg_pgcore_execute_simple(const char *query)
 		}
 
 #ifdef USE_FASTPG
-		cursor_options = fastpg_catalog_mode_uses_postgres() ?
+		cursor_options = postgres_catalog ?
 			CURSOR_OPT_PARALLEL_OK : 0;
 #else
 		cursor_options = CURSOR_OPT_PARALLEL_OK;
@@ -3685,14 +3792,14 @@ fastpg_pgcore_execute_simple(const char *query)
 			bool		is_last_raw = lnext(raw_parsetrees, raw_lc) == NULL;
 			bool		is_transaction_stmt =
 				rawstmt->stmt != NULL && IsA(rawstmt->stmt, TransactionStmt);
-			bool		use_implicit_block = fastpg_catalog_mode_uses_postgres() &&
+			bool		use_implicit_block = postgres_catalog &&
 				raw_count > 1;
 			Query	   *querytree;
 			List	   *rewritten;
 			List	   *planned;
 			ListCell   *planned_lc;
 
-			if (fastpg_catalog_mode_uses_postgres() && !postgres_command_started)
+			if (postgres_catalog && !postgres_command_started)
 			{
 				fastpg_pgcore_start_postgres_catalog_command();
 				postgres_command_started = true;
@@ -3702,15 +3809,15 @@ fastpg_pgcore_execute_simple(const char *query)
 			}
 
 			fastpg_pgcore_report_activity_running(source_text);
-			if (fastpg_catalog_mode_uses_postgres())
+			if (postgres_catalog)
 				fastpg_pgcore_reject_if_aborted_transaction(rawstmt->stmt);
 			if (use_implicit_block)
 				BeginImplicitTransactionBlock();
 #ifdef USE_FASTPG
-			if (fastpg_use_rust_catalog() && !is_transaction_stmt)
+			if (rust_catalog && !is_transaction_stmt)
 				fastpg_pgcore_ensure_execution_owner();
 #endif
-			if (fastpg_catalog_mode_uses_postgres() &&
+			if (postgres_catalog &&
 				analyze_requires_snapshot(rawstmt))
 			{
 				fastpg_pgcore_push_analyze_snapshot();
@@ -3754,33 +3861,33 @@ fastpg_pgcore_execute_simple(const char *query)
 												  summary,
 												  result->context);
 #ifdef USE_FASTPG
-					if (fastpg_use_rust_catalog() && !fastpg_rust_xact_is_explicit())
+					if (rust_catalog && !fastpg_rust_xact_is_explicit())
 					{
 						fastpg_xid_commit();
 						fastpg_rust_xact_commit_if_implicit();
 						fastpg_storage2_xact_commit_if_implicit();
 					}
 #endif
-					if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+					if (postgres_catalog && !is_last_planned)
 						CommandCounterIncrement();
 					continue;
 				}
 
 #ifdef USE_FASTPG
-				if (fastpg_use_rust_catalog() &&
+				if (rust_catalog &&
 					fastpg_pgcore_should_noop_system_catalog_write(statement))
 				{
 					summary->command_tag =
 						(char *) fastpg_pgcore_command_tag_name(statement->commandType);
 #ifdef USE_FASTPG
-					if (fastpg_use_rust_catalog() && !fastpg_rust_xact_is_explicit())
+					if (rust_catalog && !fastpg_rust_xact_is_explicit())
 					{
 						fastpg_xid_commit();
 						fastpg_rust_xact_commit_if_implicit();
 						fastpg_storage2_xact_commit_if_implicit();
 					}
 #endif
-					if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+					if (postgres_catalog && !is_last_planned)
 						CommandCounterIncrement();
 					continue;
 				}
@@ -3817,7 +3924,7 @@ fastpg_pgcore_execute_simple(const char *query)
 				PopActiveSnapshot();
 				snapshot_pushed = false;
 #ifdef USE_FASTPG
-				if (fastpg_use_rust_catalog() && !fastpg_rust_xact_is_explicit())
+				if (rust_catalog && !fastpg_rust_xact_is_explicit())
 				{
 					fastpg_xid_commit();
 					fastpg_rust_xact_commit_if_implicit();
@@ -3827,18 +3934,16 @@ fastpg_pgcore_execute_simple(const char *query)
 
 				dest->rDestroy(dest);
 				dest = NULL;
-				if (fastpg_catalog_mode_uses_postgres() && !is_last_planned)
+				if (postgres_catalog && !is_last_planned)
 					CommandCounterIncrement();
 			}
 
-			if (fastpg_catalog_mode_uses_postgres())
+			if (postgres_catalog)
 			{
 				if (is_last_raw)
 				{
 					if (use_implicit_block)
 						EndImplicitTransactionBlock();
-					if (!is_transaction_stmt)
-						CommandCounterIncrement();
 					fastpg_pgcore_finish_postgres_catalog_command(&postgres_command_started);
 					postgres_finish_at_end = false;
 				}
@@ -3870,7 +3975,7 @@ simple_execute_done:
 			dest->rDestroy(dest);
 		result->statement_count = completed_statement_count;
 #ifdef USE_FASTPG
-		if (fastpg_use_rust_catalog() && !fastpg_rust_xact_is_explicit())
+		if (rust_catalog && !fastpg_rust_xact_is_explicit())
 		{
 			fastpg_xid_rollback();
 			fastpg_rust_xact_abort_if_implicit();
@@ -3892,7 +3997,7 @@ simple_execute_done:
 										edata,
 										source_text != NULL ? source_text : query);
 		FreeErrorData(edata);
-		if (fastpg_catalog_mode_uses_postgres())
+		if (postgres_catalog)
 			fastpg_pgcore_abort_postgres_catalog_command(&postgres_command_started);
 		else
 			fastpg_pgcore_release_error_resources();
@@ -3974,7 +4079,7 @@ fastpg_pgcore_execute_copy_from_stdin(const char *query,
 	ParseState *pstate = NULL;
 	FastPgPgCoreCopyBuffer buffer;
 
-	result = (FastPgPgCoreExecuteResult *) calloc(1, sizeof(FastPgPgCoreExecuteResult));
+	result = fastpg_pgcore_execute_result_alloc();
 	if (result == NULL)
 		return NULL;
 
@@ -3983,6 +4088,7 @@ fastpg_pgcore_execute_copy_from_stdin(const char *query,
 	result->context = AllocSetContextCreate(TopMemoryContext,
 											"fastpg pgcore copy stdin result",
 											ALLOCSET_DEFAULT_SIZES);
+	result->owns_context = true;
 	save_portal_context = PortalContext;
 	if (PortalContext == NULL)
 	{
@@ -4122,7 +4228,10 @@ fastpg_pgcore_execute_result_free(FastPgPgCoreExecuteResult *result)
 		return;
 
 	if (result->context != NULL)
-		fastpg_pgcore_memory_context_delete(result->context);
+	{
+		if (result->owns_context)
+			fastpg_pgcore_memory_context_delete(result->context);
+	}
 	free(result->message);
 	free(result->detail);
 	free(result->hint);
@@ -4534,6 +4643,44 @@ fastpg_pgcore_execute_statement_count(const FastPgPgCoreExecuteResult *result)
 	if (result == NULL || result->statement_count < 0)
 		return 0;
 	return result->statement_count;
+}
+
+int
+fastpg_pgcore_execute_statement_summaries(const FastPgPgCoreExecuteResult *result,
+										  FastPgPgCoreExecuteStatementSummary *summaries,
+										  int summary_capacity)
+{
+	int			statement_count;
+	int			index;
+
+	statement_count = fastpg_pgcore_execute_statement_count(result);
+	if (summaries == NULL || summary_capacity <= 0)
+		return 0;
+	if (summary_capacity < statement_count)
+		statement_count = summary_capacity;
+
+	for (index = 0; index < statement_count; index++)
+	{
+		FastPgPgCoreExecuteStatement *statement = &result->statements[index];
+		FastPgPgCoreExecuteStatementSummary *summary = &summaries[index];
+		CmdType		command_type = statement->command_type;
+
+		if (command_type != CMD_UTILITY)
+			summary->command_tag = fastpg_pgcore_command_tag_name(command_type);
+		else if (statement->command_tag != NULL)
+			summary->command_tag = statement->command_tag;
+		else
+			summary->command_tag = fastpg_pgcore_command_tag_name(command_type);
+		summary->is_select = command_type == CMD_SELECT;
+		summary->column_count = statement->column_count;
+		summary->row_count = statement->row_count;
+		summary->has_processed_count = statement->has_processed_count;
+		summary->processed_count = statement->processed_count;
+		summary->copy_in = statement->copy_in;
+		summary->copy_out = statement->copy_out;
+	}
+
+	return statement_count;
 }
 
 const char *

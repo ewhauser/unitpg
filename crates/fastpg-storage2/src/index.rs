@@ -62,6 +62,7 @@ pub(crate) struct Storage2MetadataCache {
     pub(crate) generation: u64,
     pub(crate) unique_specs_by_relation: HashMap<u32, Vec<UniqueIndexSpec>>,
     pub(crate) primary_specs_by_index: HashMap<u32, Option<UniqueIndexSpec>>,
+    pub(crate) primary_specs_by_relation: HashMap<u32, Option<UniqueIndexSpec>>,
 }
 
 impl Default for Storage2MetadataCache {
@@ -70,6 +71,7 @@ impl Default for Storage2MetadataCache {
             generation: current_generation(),
             unique_specs_by_relation: HashMap::default(),
             primary_specs_by_index: HashMap::default(),
+            primary_specs_by_relation: HashMap::default(),
         }
     }
 }
@@ -110,13 +112,12 @@ pub(crate) fn with_storage2_metadata_cache<R>(
     f: impl FnOnce(&mut Storage2MetadataCache) -> R,
 ) -> R {
     let generation = current_generation();
-    let mut cache = storage2_metadata_cache()
-        .lock()
-        .expect("storage2 metadata cache mutex poisoned");
+    let mut cache = storage2_metadata_cache().lock();
     if cache.generation != generation {
         cache.generation = generation;
         cache.unique_specs_by_relation.clear();
         cache.primary_specs_by_index.clear();
+        cache.primary_specs_by_relation.clear();
     }
     f(&mut cache)
 }
@@ -173,8 +174,27 @@ pub(crate) fn primary_index_spec_for_index_oid(index_oid: Oid) -> Option<UniqueI
 }
 
 pub(crate) fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
-    let primary_index_oid = primary_key_index_oid_for_relation_oid(relation_oid)?;
-    primary_index_spec_for_index_oid(primary_index_oid)
+    if !has_uncommitted_catalog_changes()
+        && let Some(cached) = with_storage2_metadata_cache(|cache| {
+            cache
+                .primary_specs_by_relation
+                .get(&relation_oid.0)
+                .cloned()
+        })
+    {
+        return cached;
+    }
+
+    let spec = primary_key_index_oid_for_relation_oid(relation_oid)
+        .and_then(primary_index_spec_for_index_oid);
+    if !has_uncommitted_catalog_changes() {
+        with_storage2_metadata_cache(|cache| {
+            cache
+                .primary_specs_by_relation
+                .insert(relation_oid.0, spec.clone());
+        });
+    }
+    spec
 }
 
 pub(crate) struct UniqueIndexFfiSpecArgs {

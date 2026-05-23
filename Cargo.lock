@@ -487,6 +487,8 @@ version = "0.1.0"
 dependencies = [
  "fastpg-catalog",
  "fastpg-types",
+ "parking_lot",
+ "smallvec",
 ]
 
 [[package]]

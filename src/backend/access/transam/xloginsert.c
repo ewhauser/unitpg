@@ -1473,6 +1473,15 @@ InitXLogInsert(void)
 void
 FastPgEnsureThreadXLogInsert(void)
 {
+	if (xloginsert_cxt != NULL &&
+		registered_buffers != NULL &&
+		rdatas != NULL &&
+		hdr_scratch != NULL)
+	{
+		FastPgEnsureXLogInsertChainState();
+		return;
+	}
+
 	InitXLogInsert();
 }
 #endif

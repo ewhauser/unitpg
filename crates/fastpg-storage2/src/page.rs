@@ -33,13 +33,14 @@ pub(crate) struct Page {
 impl Page {
     pub(crate) fn new(block: u32, epoch: u64, generation: u64, min_capacity: usize) -> Self {
         let capacity = PAGE_SIZE.max(min_capacity.next_power_of_two());
+        let line_pointer_capacity = initial_line_pointer_capacity(capacity, min_capacity);
         Self {
             block,
             epoch,
             generation,
             bytes: vec![0; capacity].into_boxed_slice(),
             used: 0,
-            line_pointers: Vec::new(),
+            line_pointers: Vec::with_capacity(line_pointer_capacity),
             pending_tuple_bytes: 0,
             live_tuple_bytes: 0,
             dead_tuple_bytes: 0,
@@ -98,6 +99,57 @@ impl Page {
         })
     }
 
+    pub(crate) fn append_input_tuple_with_state(
+        &mut self,
+        input: &RowInput<'_>,
+        tuple_len: usize,
+        state: LinePointerState,
+    ) -> Result<Option<Tid>, CatalogError> {
+        if tuple_len > self.remaining() || self.line_pointers.len() >= MAX_CTID_OFFSET {
+            return Ok(None);
+        }
+        let offset = self.aligned_used();
+        let Some(end) = offset.checked_add(tuple_len) else {
+            return Ok(None);
+        };
+        if end > self.bytes.len() {
+            return Ok(None);
+        }
+        write_tuple_to_slice_known_len(input, &mut self.bytes[offset..end], tuple_len)?;
+        self.used = end;
+        self.line_pointers.push(LinePointer {
+            offset: offset
+                .try_into()
+                .map_err(|_| storage_limit_error("storage2 tuple offset is too large"))?,
+            len: tuple_len
+                .try_into()
+                .map_err(|_| storage_limit_error("storage2 tuple is too large"))?,
+            state,
+            xmin: 0,
+            cmin: 0,
+            xmax: 0,
+        });
+        match state {
+            LinePointerState::Pending => {
+                self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(tuple_len)
+            }
+            LinePointerState::Live => {
+                self.live_tuple_bytes = self.live_tuple_bytes.saturating_add(tuple_len)
+            }
+            LinePointerState::Dead => {
+                self.dead_tuple_bytes = self.dead_tuple_bytes.saturating_add(tuple_len)
+            }
+        }
+        Ok(Some(Tid {
+            block: self.block,
+            offset: self
+                .line_pointers
+                .len()
+                .try_into()
+                .map_err(|_| storage_limit_error("storage2 tuple offset is too large"))?,
+        }))
+    }
+
     pub(crate) fn tuple_slice(&self, offset: u16, include_pending: bool) -> Option<&[u8]> {
         let index = usize::from(offset.checked_sub(1)?);
         let line = self.line_pointers.get(index)?;
@@ -114,21 +166,6 @@ impl Page {
     pub(crate) fn tuple_slice_any(&self, offset: u16) -> Option<&[u8]> {
         let index = usize::from(offset.checked_sub(1)?);
         let line = self.line_pointers.get(index)?;
-        let start = line.offset as usize;
-        let end = start.checked_add(line.len as usize)?;
-        self.bytes.get(start..end)
-    }
-
-    pub(crate) fn tuple_slice_for_line(
-        &self,
-        line: LinePointer,
-        include_pending: bool,
-    ) -> Option<&[u8]> {
-        if line.state == LinePointerState::Dead
-            || (line.state == LinePointerState::Pending && !include_pending)
-        {
-            return None;
-        }
         let start = line.offset as usize;
         let end = start.checked_add(line.len as usize)?;
         self.bytes.get(start..end)
@@ -233,20 +270,6 @@ impl Page {
         }
     }
 
-    pub(crate) fn live_tids(&self) -> impl Iterator<Item = Tid> + '_ {
-        self.line_pointers
-            .iter()
-            .enumerate()
-            .filter(|(_, line)| line.state == LinePointerState::Live)
-            .filter_map(|(index, _)| {
-                let offset = u16::try_from(index + 1).ok()?;
-                Some(Tid {
-                    block: self.block,
-                    offset,
-                })
-            })
-    }
-
     pub(crate) fn accounted_bytes(&self) -> usize {
         self.bytes.len()
             + self
@@ -256,6 +279,13 @@ impl Page {
             + std::mem::size_of_val(&self.epoch)
             + std::mem::size_of_val(&self.generation)
     }
+}
+
+fn initial_line_pointer_capacity(page_capacity: usize, min_tuple_len: usize) -> usize {
+    let tuple_len = min_tuple_len.max(1).next_multiple_of(DATUM_ALIGNMENT);
+    (page_capacity / tuple_len)
+        .clamp(1, MAX_CTID_OFFSET)
+        .min(128)
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]

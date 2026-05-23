@@ -81,7 +81,7 @@ pub(crate) fn key_arrays<'a>(
     ))
 }
 
-pub(crate) fn build_tuple(input: &RowInput<'_>) -> Result<Vec<u8>, CatalogError> {
+fn validate_input(input: &RowInput<'_>) -> Result<(), CatalogError> {
     if input.values.len() != input.is_null.len()
         || input.values.len() != input.byval.len()
         || input.values.len() != input.value_lens.len()
@@ -91,35 +91,94 @@ pub(crate) fn build_tuple(input: &RowInput<'_>) -> Result<Vec<u8>, CatalogError>
         ));
     }
 
+    Ok(())
+}
+
+pub(crate) fn tuple_storage_len(input: &RowInput<'_>) -> Result<usize, CatalogError> {
+    validate_input(input)?;
     let natts = input.values.len();
     let null_bitmap_len = natts.div_ceil(8);
     let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
     let payload_offset = attr_dir_offset + natts.saturating_mul(ATTR_ENTRY_LEN);
-    let mut bytes = vec![0; payload_offset];
+    let _natts: u16 = natts.try_into().map_err(|_| {
+        invalid_ffi_argument("row input has too many attributes for storage2 tuple")
+    })?;
+    let _null_bitmap_len: u16 = null_bitmap_len
+        .try_into()
+        .map_err(|_| invalid_ffi_argument("null bitmap is too large"))?;
+    let _attr_dir_offset: u32 = attr_dir_offset
+        .try_into()
+        .map_err(|_| invalid_ffi_argument("attribute directory offset is too large"))?;
+    let _payload_offset: u32 = payload_offset
+        .try_into()
+        .map_err(|_| invalid_ffi_argument("tuple payload offset is too large"))?;
+    let mut len = payload_offset;
+
+    for index in 0..natts {
+        if input.is_null[index] != 0 || input.byval[index] != 0 {
+            continue;
+        }
+
+        let value_len = input.value_lens[index];
+        if input.values[index] == 0 && value_len > 0 {
+            return Err(invalid_ffi_argument(
+                "non-null by-reference value has null pointer",
+            ));
+        }
+        len = len.next_multiple_of(DATUM_ALIGNMENT);
+        len = len
+            .checked_add(value_len)
+            .ok_or_else(|| storage_limit_error("storage2 tuple is too large"))?;
+    }
+
+    if len > u32::MAX as usize {
+        return Err(storage_limit_error("storage2 tuple is too large"));
+    }
+    Ok(len)
+}
+
+pub(crate) fn write_tuple_to_slice_known_len(
+    input: &RowInput<'_>,
+    bytes: &mut [u8],
+    expected_len: usize,
+) -> Result<(), CatalogError> {
+    if bytes.len() != expected_len {
+        return Err(invalid_ffi_argument(
+            "tuple output buffer has the wrong length",
+        ));
+    }
+
+    bytes.fill(0);
+    let natts = input.values.len();
+    let null_bitmap_len = natts.div_ceil(8);
+    let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
+    let payload_offset = attr_dir_offset + natts.saturating_mul(ATTR_ENTRY_LEN);
+    let mut payload_len: usize = 0;
+
     bytes[0..4].copy_from_slice(TUPLE_MAGIC);
     write_u16(
-        &mut bytes,
+        bytes,
         4,
         natts.try_into().map_err(|_| {
             invalid_ffi_argument("row input has too many attributes for storage2 tuple")
         })?,
     );
     write_u16(
-        &mut bytes,
+        bytes,
         6,
         null_bitmap_len
             .try_into()
             .map_err(|_| invalid_ffi_argument("null bitmap is too large"))?,
     );
     write_u32(
-        &mut bytes,
+        bytes,
         8,
         attr_dir_offset
             .try_into()
             .map_err(|_| invalid_ffi_argument("attribute directory offset is too large"))?,
     );
     write_u32(
-        &mut bytes,
+        bytes,
         12,
         payload_offset
             .try_into()
@@ -136,7 +195,7 @@ pub(crate) fn build_tuple(input: &RowInput<'_>) -> Result<Vec<u8>, CatalogError>
 
         if input.byval[index] != 0 {
             bytes[entry] = 1;
-            write_u64(&mut bytes, entry + 8, input.values[index] as u64);
+            write_u64(bytes, entry + 8, input.values[index] as u64);
             continue;
         }
 
@@ -151,19 +210,17 @@ pub(crate) fn build_tuple(input: &RowInput<'_>) -> Result<Vec<u8>, CatalogError>
         } else {
             unsafe { slice::from_raw_parts(input.values[index] as *const u8, len) }
         };
-        let aligned_len = bytes.len().next_multiple_of(DATUM_ALIGNMENT);
-        bytes.resize(aligned_len, 0);
-        let offset = bytes.len() - payload_offset;
-        bytes.extend_from_slice(source);
+        payload_len = payload_len.next_multiple_of(DATUM_ALIGNMENT);
+        let start = payload_offset + payload_len;
+        let end = start + len;
+        bytes[start..end].copy_from_slice(source);
         bytes[entry] = 2;
-        write_u64(&mut bytes, entry + 8, offset as u64);
-        write_u64(&mut bytes, entry + 16, len as u64);
+        write_u64(bytes, entry + 8, payload_len as u64);
+        write_u64(bytes, entry + 16, len as u64);
+        payload_len += len;
     }
 
-    if bytes.len() > u32::MAX as usize {
-        return Err(storage_limit_error("storage2 tuple is too large"));
-    }
-    Ok(bytes)
+    Ok(())
 }
 
 pub(crate) fn decode_tuple(tid: Tid, tuple: &[u8]) -> Option<DecodedTuple<'_>> {
@@ -208,6 +265,47 @@ pub(crate) fn decode_tuple(tid: Tid, tuple: &[u8]) -> Option<DecodedTuple<'_>> {
         }
     }
     Some(DecodedTuple { tid, values })
+}
+
+pub(crate) fn tuple_byval_attr_equals(
+    tuple: &[u8],
+    attnum: usize,
+    value: usize,
+    is_null: u8,
+) -> Option<bool> {
+    if attnum == 0 || tuple.len() < TUPLE_HEADER_LEN || tuple.get(0..4)? != TUPLE_MAGIC {
+        return None;
+    }
+    let index = attnum - 1;
+    let base = tuple.as_ptr();
+    let natts = unsafe { std::ptr::read_unaligned(base.add(4) as *const u16) } as usize;
+    if index >= natts {
+        return Some(is_null != 0);
+    }
+
+    let null_bitmap_len = natts.div_ceil(8);
+    let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
+    let payload_offset = attr_dir_offset.checked_add(natts.checked_mul(ATTR_ENTRY_LEN)?)?;
+    if payload_offset > tuple.len() {
+        return None;
+    }
+
+    let old_null = unsafe { *base.add(TUPLE_HEADER_LEN + index / 8) } & (1 << (index % 8)) != 0;
+    let new_null = is_null != 0;
+    if old_null || new_null {
+        return Some(old_null == new_null);
+    }
+
+    let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
+    if entry.checked_add(ATTR_ENTRY_LEN)? > tuple.len() {
+        return None;
+    }
+    let entry_ptr = unsafe { base.add(entry) };
+    if unsafe { *entry_ptr } != 1 {
+        return Some(false);
+    }
+    let old_value = unsafe { std::ptr::read_unaligned(entry_ptr.add(8) as *const u64) };
+    Some(old_value as usize == value)
 }
 
 pub(crate) fn byref_len(typlen: i16, value: usize, fallback_len: Option<usize>) -> Option<usize> {

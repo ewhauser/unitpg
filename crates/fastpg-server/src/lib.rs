@@ -82,7 +82,12 @@ pub async fn serve_unix_listener_with_handlers(
             .name("fastpg-unix-connection".to_owned())
             .stack_size(POSTGRES_SAFE_THREAD_STACK_SIZE)
             .spawn(move || {
-                let runtime = match runtime::Builder::new_current_thread().enable_all().build() {
+                let runtime = match runtime::Builder::new_current_thread()
+                    .enable_io()
+                    .global_queue_interval(1024)
+                    .event_interval(1024)
+                    .build()
+                {
                     Ok(runtime) => runtime,
                     Err(error) => {
                         eprintln!("fastpg Unix socket runtime failed: {error}");

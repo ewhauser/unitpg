@@ -48,6 +48,7 @@
 #include "catalog/pg_type.h"
 #include "miscadmin.h"
 #include "nodes/makefuncs.h"
+#include "storage/sinval.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/catcache.h"
@@ -63,9 +64,132 @@ get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
 #ifdef USE_FASTPG
 #define FASTPG_INT2_EQ_OP 94
 #define FASTPG_INT8_EQ_OP 410
+#define FASTPG_INT8_NE_OP 411
+#define FASTPG_INT4_NE_OP 518
+#define FASTPG_INT2_NE_OP 519
+#define FASTPG_TEXT_NE_OP 531
 #define FASTPG_OID_EQ_OP 607
+#define FASTPG_OID_NE_OP 608
 #define FASTPG_INT4_GT_OP 521
+#define FASTPG_INT2EQ_PROC 63
+#define FASTPG_INT4EQ_PROC 65
+#define FASTPG_INT4LT_PROC 66
+#define FASTPG_TEXTEQ_PROC 67
+#define FASTPG_INT4GT_PROC 147
+#define FASTPG_INT4PL_PROC 177
+#define FASTPG_OIDEQ_PROC 184
 #define FASTPG_BTINT4CMP_PROC 351
+#define FASTPG_INT8EQ_PROC 467
+#define FASTPG_EQSEL_PROC 101
+#define FASTPG_NEQSEL_PROC 102
+#define FASTPG_SCALARLTSEL_PROC 103
+#define FASTPG_SCALARGTSEL_PROC 104
+#define FASTPG_EQJOINSEL_PROC 105
+#define FASTPG_NEQJOINSEL_PROC 106
+#define FASTPG_SCALARLTJOINSEL_PROC 107
+#define FASTPG_SCALARGTJOINSEL_PROC 108
+#define FASTPG_RELNAME_RELID_CACHE_SIZE 32
+
+typedef struct FastPgBuiltinTypeInfo
+{
+	int16		typlen;
+	bool		typbyval;
+	char		typalign;
+	Oid			typcollation;
+} FastPgBuiltinTypeInfo;
+
+typedef struct FastPgRelnameRelidCacheEntry
+{
+	bool		valid;
+	uint64		inval_count;
+	Oid			relnamespace;
+	Oid			relid;
+	char		relname[NAMEDATALEN];
+} FastPgRelnameRelidCacheEntry;
+
+static _Thread_local FastPgRelnameRelidCacheEntry fastpg_relname_relid_cache[FASTPG_RELNAME_RELID_CACHE_SIZE];
+static _Thread_local int fastpg_relname_relid_cache_next = 0;
+
+static bool
+fastpg_builtin_type_info(Oid typid, FastPgBuiltinTypeInfo *type)
+{
+	switch (typid)
+	{
+		case BOOLOID:
+		case CHAROID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = 1,
+				.typbyval = true,
+				.typalign = TYPALIGN_CHAR,
+				.typcollation = InvalidOid
+			};
+			return true;
+		case INT2OID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = 2,
+				.typbyval = true,
+				.typalign = TYPALIGN_SHORT,
+				.typcollation = InvalidOid
+			};
+			return true;
+		case INT4OID:
+		case OIDOID:
+		case XIDOID:
+		case CIDOID:
+		case FLOAT4OID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = 4,
+				.typbyval = true,
+				.typalign = TYPALIGN_INT,
+				.typcollation = InvalidOid
+			};
+			return true;
+		case INT8OID:
+		case FLOAT8OID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = 8,
+				.typbyval = FLOAT8PASSBYVAL,
+				.typalign = TYPALIGN_DOUBLE,
+				.typcollation = InvalidOid
+			};
+			return true;
+		case NAMEOID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = NAMEDATALEN,
+				.typbyval = false,
+				.typalign = TYPALIGN_CHAR,
+				.typcollation = C_COLLATION_OID
+			};
+			return true;
+		case TEXTOID:
+		case VARCHAROID:
+		case BPCHAROID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = -1,
+				.typbyval = false,
+				.typalign = TYPALIGN_INT,
+				.typcollation = DEFAULT_COLLATION_OID
+			};
+			return true;
+		case BYTEAOID:
+			*type = (FastPgBuiltinTypeInfo)
+			{
+				.typlen = -1,
+				.typbyval = false,
+				.typalign = TYPALIGN_INT,
+				.typcollation = InvalidOid
+			};
+			return true;
+		default:
+			return false;
+	}
+}
 
 static bool
 fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
@@ -74,6 +198,46 @@ fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
 		return false;
 
 	return fastpg_rust_catalog_type_by_oid((uint32_t) typid, type);
+}
+
+static bool
+fastpg_relname_relid_cache_lookup(const char *relname, Oid relnamespace,
+								  Oid *relid_out)
+{
+	int			index;
+	uint64		inval_count = SharedInvalidMessageCounter;
+
+	for (index = 0; index < FASTPG_RELNAME_RELID_CACHE_SIZE; index++)
+	{
+		FastPgRelnameRelidCacheEntry *entry = &fastpg_relname_relid_cache[index];
+
+		if (entry->valid &&
+			entry->inval_count == inval_count &&
+			entry->relnamespace == relnamespace &&
+			strncmp(entry->relname, relname, NAMEDATALEN) == 0)
+		{
+			*relid_out = entry->relid;
+			return true;
+		}
+	}
+	return false;
+}
+
+static void
+fastpg_relname_relid_cache_store(const char *relname, Oid relnamespace,
+								 Oid relid)
+{
+	FastPgRelnameRelidCacheEntry *entry;
+
+	entry = &fastpg_relname_relid_cache[fastpg_relname_relid_cache_next];
+	fastpg_relname_relid_cache_next =
+		(fastpg_relname_relid_cache_next + 1) % FASTPG_RELNAME_RELID_CACHE_SIZE;
+
+	entry->valid = true;
+	entry->inval_count = SharedInvalidMessageCounter;
+	entry->relnamespace = relnamespace;
+	entry->relid = relid;
+	strlcpy(entry->relname, relname, NAMEDATALEN);
 }
 
 static bool
@@ -205,6 +369,185 @@ fastpg_opclass_info(Oid opclass, Oid *opfamily, Oid *opcintype)
 		case TEXT_BTREE_OPS_OID:
 			*opfamily = TEXT_BTREE_FAM_OID;
 			*opcintype = TEXTOID;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_builtin_default_proc(Oid funcid)
+{
+	switch (funcid)
+	{
+		case FASTPG_INT2EQ_PROC:
+		case FASTPG_INT4EQ_PROC:
+		case FASTPG_INT4LT_PROC:
+		case FASTPG_TEXTEQ_PROC:
+		case FASTPG_INT4GT_PROC:
+		case FASTPG_INT4PL_PROC:
+		case FASTPG_OIDEQ_PROC:
+		case FASTPG_BTINT4CMP_PROC:
+		case FASTPG_INT8EQ_PROC:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_builtin_leakproof_proc(Oid funcid)
+{
+	switch (funcid)
+	{
+		case FASTPG_INT2EQ_PROC:
+		case FASTPG_INT4EQ_PROC:
+		case FASTPG_INT4LT_PROC:
+		case FASTPG_TEXTEQ_PROC:
+		case FASTPG_INT4GT_PROC:
+		case FASTPG_OIDEQ_PROC:
+		case FASTPG_BTINT4CMP_PROC:
+		case FASTPG_INT8EQ_PROC:
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_operator_proc(Oid opno, RegProcedure *result)
+{
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+			*result = FASTPG_INT2EQ_PROC;
+			return true;
+		case Int4EqualOperator:
+			*result = FASTPG_INT4EQ_PROC;
+			return true;
+		case Int4LessOperator:
+			*result = FASTPG_INT4LT_PROC;
+			return true;
+		case TextEqualOperator:
+			*result = FASTPG_TEXTEQ_PROC;
+			return true;
+		case FASTPG_INT8_EQ_OP:
+			*result = FASTPG_INT8EQ_PROC;
+			return true;
+		case FASTPG_OID_EQ_OP:
+			*result = FASTPG_OIDEQ_PROC;
+			return true;
+		case FASTPG_INT4_GT_OP:
+			*result = FASTPG_INT4GT_PROC;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_operator_commutator(Oid opno, Oid *result)
+{
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+		case Int4EqualOperator:
+		case TextEqualOperator:
+		case FASTPG_INT8_EQ_OP:
+		case FASTPG_OID_EQ_OP:
+			*result = opno;
+			return true;
+		case Int4LessOperator:
+			*result = FASTPG_INT4_GT_OP;
+			return true;
+		case FASTPG_INT4_GT_OP:
+			*result = Int4LessOperator;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_operator_negator(Oid opno, Oid *result)
+{
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+			*result = FASTPG_INT2_NE_OP;
+			return true;
+		case Int4EqualOperator:
+			*result = FASTPG_INT4_NE_OP;
+			return true;
+		case TextEqualOperator:
+			*result = FASTPG_TEXT_NE_OP;
+			return true;
+		case FASTPG_INT8_EQ_OP:
+			*result = FASTPG_INT8_NE_OP;
+			return true;
+		case FASTPG_OID_EQ_OP:
+			*result = FASTPG_OID_NE_OP;
+			return true;
+		case FASTPG_INT2_NE_OP:
+			*result = FASTPG_INT2_EQ_OP;
+			return true;
+		case FASTPG_INT4_NE_OP:
+			*result = Int4EqualOperator;
+			return true;
+		case FASTPG_TEXT_NE_OP:
+			*result = TextEqualOperator;
+			return true;
+		case FASTPG_INT8_NE_OP:
+			*result = FASTPG_INT8_EQ_OP;
+			return true;
+		case FASTPG_OID_NE_OP:
+			*result = FASTPG_OID_EQ_OP;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_operator_join_proc(Oid opno, RegProcedure *result)
+{
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+		case Int4EqualOperator:
+		case FASTPG_INT8_EQ_OP:
+		case FASTPG_OID_EQ_OP:
+		case TextEqualOperator:
+			*result = FASTPG_EQJOINSEL_PROC;
+			return true;
+		case FASTPG_INT2_NE_OP:
+		case FASTPG_INT4_NE_OP:
+		case FASTPG_INT8_NE_OP:
+		case FASTPG_OID_NE_OP:
+		case FASTPG_TEXT_NE_OP:
+			*result = FASTPG_NEQJOINSEL_PROC;
+			return true;
+		case Int4LessOperator:
+			*result = FASTPG_SCALARLTJOINSEL_PROC;
+			return true;
+		case FASTPG_INT4_GT_OP:
+			*result = FASTPG_SCALARGTJOINSEL_PROC;
+			return true;
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_operator_mergejoinable(Oid opno)
+{
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+		case Int4EqualOperator:
+		case FASTPG_INT8_EQ_OP:
+		case FASTPG_OID_EQ_OP:
+		case TextEqualOperator:
 			return true;
 		default:
 			return false;
@@ -629,8 +972,19 @@ get_mergejoin_opfamilies(Oid opno)
 	int			i;
 
 #ifdef USE_FASTPG
-	if (opno == Int4EqualOperator)
-		return list_make1_oid(INTEGER_BTREE_FAM_OID);
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+		case Int4EqualOperator:
+		case FASTPG_INT8_EQ_OP:
+			return list_make1_oid(INTEGER_BTREE_FAM_OID);
+		case FASTPG_OID_EQ_OP:
+			return list_make1_oid(OID_BTREE_FAM_OID);
+		case TextEqualOperator:
+			return list_make1_oid(TEXT_BTREE_FAM_OID);
+		default:
+			break;
+	}
 #endif
 
 	/*
@@ -1757,6 +2111,13 @@ get_opcode(Oid opno)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	RegProcedure result;
+
+	if (fastpg_operator_proc(opno, &result))
+		return result;
+#endif
+
 	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
 	if (HeapTupleIsValid(tp))
 	{
@@ -1860,6 +2221,11 @@ op_mergejoinable(Oid opno, Oid inputtype)
 	HeapTuple	tp;
 	TypeCacheEntry *typentry;
 
+#ifdef USE_FASTPG
+	if (fastpg_operator_mergejoinable(opno))
+		return true;
+#endif
+
 	/*
 	 * For array_eq or record_eq, we can sort if the element or field types
 	 * are all sortable.  We could implement all the checks for that here, but
@@ -1910,6 +2276,11 @@ op_hashjoinable(Oid opno, Oid inputtype)
 	bool		result = false;
 	HeapTuple	tp;
 	TypeCacheEntry *typentry;
+
+#ifdef USE_FASTPG
+	if (fastpg_operator_mergejoinable(opno))
+		return true;
+#endif
 
 	/* As in op_mergejoinable, let the typcache handle the hard cases */
 	if (opno == ARRAY_EQ_OP)
@@ -1981,6 +2352,13 @@ get_commutator(Oid opno)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	Oid			result;
+
+	if (fastpg_operator_commutator(opno, &result))
+		return result;
+#endif
+
 	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
 	if (HeapTupleIsValid(tp))
 	{
@@ -2004,6 +2382,13 @@ Oid
 get_negator(Oid opno)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	Oid			result;
+
+	if (fastpg_operator_negator(opno, &result))
+		return result;
+#endif
 
 	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
 	if (HeapTupleIsValid(tp))
@@ -2029,6 +2414,24 @@ get_oprrest(Oid opno)
 {
 	HeapTuple	tp;
 
+#ifdef USE_FASTPG
+	switch (opno)
+	{
+		case FASTPG_INT2_EQ_OP:
+		case Int4EqualOperator:
+		case FASTPG_INT8_EQ_OP:
+		case FASTPG_OID_EQ_OP:
+		case TextEqualOperator:
+			return FASTPG_EQSEL_PROC;
+		case Int4LessOperator:
+			return FASTPG_SCALARLTSEL_PROC;
+		case FASTPG_INT4_GT_OP:
+			return FASTPG_SCALARGTSEL_PROC;
+		default:
+			break;
+	}
+#endif
+
 	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
 	if (HeapTupleIsValid(tp))
 	{
@@ -2052,6 +2455,13 @@ RegProcedure
 get_oprjoin(Oid opno)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	RegProcedure result;
+
+	if (fastpg_operator_join_proc(opno, &result))
+		return result;
+#endif
 
 	tp = SearchSysCache1(OPEROID, ObjectIdGetDatum(opno));
 	if (HeapTupleIsValid(tp))
@@ -2215,6 +2625,11 @@ get_func_retset(Oid funcid)
 	HeapTuple	tp;
 	bool		result;
 
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_proc(funcid))
+		return false;
+#endif
+
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for function %u", funcid);
@@ -2233,6 +2648,11 @@ func_strict(Oid funcid)
 {
 	HeapTuple	tp;
 	bool		result;
+
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_proc(funcid))
+		return true;
+#endif
 
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(tp))
@@ -2253,6 +2673,11 @@ func_volatile(Oid funcid)
 	HeapTuple	tp;
 	char		result;
 
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_proc(funcid))
+		return PROVOLATILE_IMMUTABLE;
+#endif
+
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for function %u", funcid);
@@ -2271,6 +2696,11 @@ func_parallel(Oid funcid)
 {
 	HeapTuple	tp;
 	char		result;
+
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_proc(funcid))
+		return PROPARALLEL_SAFE;
+#endif
 
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(tp))
@@ -2291,6 +2721,11 @@ get_func_prokind(Oid funcid)
 	HeapTuple	tp;
 	char		result;
 
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_proc(funcid))
+		return PROKIND_FUNCTION;
+#endif
+
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(tp))
 		elog(ERROR, "cache lookup failed for function %u", funcid);
@@ -2309,6 +2744,13 @@ get_func_leakproof(Oid funcid)
 {
 	HeapTuple	tp;
 	bool		result;
+
+#ifdef USE_FASTPG
+	if (fastpg_builtin_leakproof_proc(funcid))
+		return true;
+	if (fastpg_builtin_default_proc(funcid))
+		return false;
+#endif
 
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(tp))
@@ -2329,6 +2771,11 @@ RegProcedure
 get_func_support(Oid funcid)
 {
 	HeapTuple	tp;
+
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_proc(funcid))
+		return (RegProcedure) InvalidOid;
+#endif
 
 	tp = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (HeapTupleIsValid(tp))
@@ -2357,6 +2804,7 @@ get_relname_relid(const char *relname, Oid relnamespace)
 {
 #ifdef USE_FASTPG
 	uint32_t	fastpg_oid;
+	Oid			cached_oid;
 
 	if (fastpg_use_rust_catalog() &&
 		fastpg_rust_catalog_relation_oid_by_name(relname,
@@ -2372,11 +2820,24 @@ get_relname_relid(const char *relname, Oid relnamespace)
 	 */
 	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 		return InvalidOid;
+
+	if (fastpg_catalog_mode_uses_postgres() &&
+		fastpg_relname_relid_cache_lookup(relname, relnamespace, &cached_oid))
+		return cached_oid;
 #endif
 
-	return GetSysCacheOid2(RELNAMENSP, Anum_pg_class_oid,
-						   PointerGetDatum(relname),
-						   ObjectIdGetDatum(relnamespace));
+	{
+		Oid			relid;
+
+		relid = GetSysCacheOid2(RELNAMENSP, Anum_pg_class_oid,
+								PointerGetDatum(relname),
+								ObjectIdGetDatum(relnamespace));
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres())
+			fastpg_relname_relid_cache_store(relname, relnamespace, relid);
+#endif
+		return relid;
+	}
 }
 
 #ifdef NOT_USED
@@ -2731,8 +3192,11 @@ get_typlen(Oid typid)
 	HeapTuple	tp;
 
 #ifdef USE_FASTPG
+	FastPgBuiltinTypeInfo builtin_type;
 	FastPgRustCatalogType fastpg_type;
 
+	if (fastpg_builtin_type_info(typid, &builtin_type))
+		return builtin_type.typlen;
 	if (fastpg_lookup_type(typid, &fastpg_type))
 		return fastpg_type.typlen;
 #endif
@@ -2763,8 +3227,11 @@ get_typbyval(Oid typid)
 	HeapTuple	tp;
 
 #ifdef USE_FASTPG
+	FastPgBuiltinTypeInfo builtin_type;
 	FastPgRustCatalogType fastpg_type;
 
+	if (fastpg_builtin_type_info(typid, &builtin_type))
+		return builtin_type.typbyval;
 	if (fastpg_lookup_type(typid, &fastpg_type))
 		return fastpg_type.typbyval != 0;
 #endif
@@ -2800,8 +3267,15 @@ get_typlenbyval(Oid typid, int16 *typlen, bool *typbyval)
 	Form_pg_type typtup;
 
 #ifdef USE_FASTPG
+	FastPgBuiltinTypeInfo builtin_type;
 	FastPgRustCatalogType fastpg_type;
 
+	if (fastpg_builtin_type_info(typid, &builtin_type))
+	{
+		*typlen = builtin_type.typlen;
+		*typbyval = builtin_type.typbyval;
+		return;
+	}
 	if (fastpg_lookup_type(typid, &fastpg_type))
 	{
 		*typlen = fastpg_type.typlen;
@@ -2832,8 +3306,16 @@ get_typlenbyvalalign(Oid typid, int16 *typlen, bool *typbyval,
 	Form_pg_type typtup;
 
 #ifdef USE_FASTPG
+	FastPgBuiltinTypeInfo builtin_type;
 	FastPgRustCatalogType fastpg_type;
 
+	if (fastpg_builtin_type_info(typid, &builtin_type))
+	{
+		*typlen = builtin_type.typlen;
+		*typbyval = builtin_type.typbyval;
+		*typalign = builtin_type.typalign;
+		return;
+	}
 	if (fastpg_lookup_type(typid, &fastpg_type))
 	{
 		*typlen = fastpg_type.typlen;
@@ -3786,8 +4268,11 @@ get_typcollation(Oid typid)
 	HeapTuple	tp;
 
 #ifdef USE_FASTPG
+	FastPgBuiltinTypeInfo builtin_type;
 	FastPgRustCatalogType fastpg_type;
 
+	if (fastpg_builtin_type_info(typid, &builtin_type))
+		return builtin_type.typcollation;
 	if (fastpg_lookup_type(typid, &fastpg_type))
 		return fastpg_type.typcollation;
 #endif
@@ -3988,6 +4473,9 @@ get_attstatsslot(AttStatsSlot *sslot, HeapTuple statstuple,
 	int			narrayelem;
 	HeapTuple	typeTuple;
 	Form_pg_type typeForm;
+#ifdef USE_FASTPG
+	FastPgBuiltinTypeInfo builtin_type;
+#endif
 
 	/* initialize *sslot properly */
 	memset(sslot, 0, sizeof(AttStatsSlot));
@@ -4022,31 +4510,59 @@ get_attstatsslot(AttStatsSlot *sslot, HeapTuple statstuple,
 		sslot->valuetype = arrayelemtype = ARR_ELEMTYPE(statarray);
 
 		/* Need info about element type */
-		typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(arrayelemtype));
-		if (!HeapTupleIsValid(typeTuple))
-			elog(ERROR, "cache lookup failed for type %u", arrayelemtype);
-		typeForm = (Form_pg_type) GETSTRUCT(typeTuple);
+#ifdef USE_FASTPG
+		if (fastpg_builtin_type_info(arrayelemtype, &builtin_type))
+		{
+			/* Deconstruct array into Datum elements; NULLs not expected */
+			deconstruct_array(statarray,
+							  arrayelemtype,
+							  builtin_type.typlen,
+							  builtin_type.typbyval,
+							  builtin_type.typalign,
+							  &sslot->values, NULL, &sslot->nvalues);
 
-		/* Deconstruct array into Datum elements; NULLs not expected */
-		deconstruct_array(statarray,
-						  arrayelemtype,
-						  typeForm->typlen,
-						  typeForm->typbyval,
-						  typeForm->typalign,
-						  &sslot->values, NULL, &sslot->nvalues);
-
-		/*
-		 * If the element type is pass-by-reference, we now have a bunch of
-		 * Datums that are pointers into the statarray, so we need to keep
-		 * that until free_attstatsslot.  Otherwise, all the useful info is in
-		 * sslot->values[], so we can free the array object immediately.
-		 */
-		if (!typeForm->typbyval)
-			sslot->values_arr = statarray;
+			/*
+			 * If the element type is pass-by-reference, we now have a bunch
+			 * of Datums that are pointers into the statarray, so we need to
+			 * keep that until free_attstatsslot.  Otherwise, all the useful
+			 * info is in sslot->values[], so we can free the array object
+			 * immediately.
+			 */
+			if (!builtin_type.typbyval)
+				sslot->values_arr = statarray;
+			else
+				pfree(statarray);
+		}
 		else
-			pfree(statarray);
+#endif
+		{
+			typeTuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(arrayelemtype));
+			if (!HeapTupleIsValid(typeTuple))
+				elog(ERROR, "cache lookup failed for type %u", arrayelemtype);
+			typeForm = (Form_pg_type) GETSTRUCT(typeTuple);
 
-		ReleaseSysCache(typeTuple);
+			/* Deconstruct array into Datum elements; NULLs not expected */
+			deconstruct_array(statarray,
+							  arrayelemtype,
+							  typeForm->typlen,
+							  typeForm->typbyval,
+							  typeForm->typalign,
+							  &sslot->values, NULL, &sslot->nvalues);
+
+			/*
+			 * If the element type is pass-by-reference, we now have a bunch
+			 * of Datums that are pointers into the statarray, so we need to
+			 * keep that until free_attstatsslot.  Otherwise, all the useful
+			 * info is in sslot->values[], so we can free the array object
+			 * immediately.
+			 */
+			if (!typeForm->typbyval)
+				sslot->values_arr = statarray;
+			else
+				pfree(statarray);
+
+			ReleaseSysCache(typeTuple);
+		}
 	}
 
 	if (flags & ATTSTATSSLOT_NUMBERS)

@@ -669,16 +669,67 @@ fn hot_update_redirects_follow_long_committed_chains() {
         current_tid = new_tid;
     }
 
+    let mut resolved_tid = 0u64;
+    assert!(unsafe { fastpg_storage2_relation_resolve_tid(relid, first_tid, &mut resolved_tid) });
+    assert_eq!(resolved_tid, current_tid);
     assert_eq!(fetch_i32(relid, first_tid), Some(96));
     assert_eq!(fetch_i32(relid, current_tid), Some(96));
     assert_eq!(hot_redirect_target(relid, first_tid), Some(current_tid));
 }
 
 #[test]
+fn update_redirect_resolution_compresses_long_committed_chains() {
+    let _guard = test_guard();
+    let relid = 148;
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 0);
+    fastpg_storage2_xact_commit();
+
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut current_tid = first_tid;
+    for value in 1..=96usize {
+        let values = [value];
+        let mut new_tid = 0;
+        fastpg_storage2_xact_begin();
+        assert!(unsafe {
+            fastpg_storage2_relation_update_unchecked(
+                relid,
+                current_tid,
+                values.as_ptr(),
+                nulls.as_ptr(),
+                byval.as_ptr(),
+                lens.as_ptr(),
+                values.len(),
+                &mut new_tid,
+            )
+        });
+        fastpg_storage2_xact_commit();
+        current_tid = new_tid;
+    }
+
+    let mut resolved_tid = 0u64;
+    assert!(unsafe {
+        fastpg_storage2_relation_resolve_update_tid(relid, first_tid, &mut resolved_tid)
+    });
+    assert_eq!(resolved_tid, current_tid);
+    with_storage_read(|state, _session| {
+        let relation = state.relations.get(&relid).expect("relation exists");
+        let first_tid = Tid::unpack(first_tid).expect("packed first tid");
+        let current_tid = Tid::unpack(current_tid).expect("packed current tid");
+        assert_eq!(
+            relation.update_redirects.get(&first_tid),
+            Some(&current_tid)
+        );
+    });
+}
+
+#[test]
 fn primary_lookup_with_spec_uses_primary_index_not_full_scan() {
     let _guard = test_guard();
-    let relid = 147;
-    let index_relid = 1470;
+    let relid = 149;
+    let index_relid = 1490;
     fastpg_storage2_xact_begin();
     let tid = insert_i32(relid, 20);
     fastpg_storage2_xact_commit();
@@ -711,6 +762,82 @@ fn primary_lookup_with_spec_uses_primary_index_not_full_scan() {
         )
     });
     assert_eq!(found_tid, tid);
+}
+
+#[test]
+fn hot_primary_lookup_keeps_primary_index_at_root_tid() {
+    let _guard = test_guard();
+    let relid = 150;
+    let index_relid = 1500;
+    fastpg_storage2_xact_begin();
+    let root_tid = insert_i32(relid, 10);
+    fastpg_storage2_xact_commit();
+
+    with_storage(|state, _session| {
+        state.relation_mut(relid).primary_key_index.insert(
+            byval_key(10),
+            Tid::unpack(root_tid).expect("packed root tid"),
+        );
+    });
+
+    let values = [20usize];
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut hot_tid = 0;
+    fastpg_storage2_xact_begin();
+    assert!(unsafe {
+        fastpg_storage2_relation_update_hot_if_single_byval_preserved_with_metadata(
+            relid,
+            root_tid,
+            1,
+            10,
+            0,
+            1,
+            0,
+            1,
+            1,
+            1,
+            values.as_ptr(),
+            nulls.as_ptr(),
+            byval.as_ptr(),
+            lens.as_ptr(),
+            values.len(),
+            &mut hot_tid,
+            std::ptr::null_mut(),
+        )
+    });
+    fastpg_storage2_xact_commit();
+
+    with_storage_read(|state, _session| {
+        let relation = state.relations.get(&relid).expect("relation");
+        assert_eq!(
+            relation.primary_key_index.get(&byval_key(10)),
+            Some(&Tid::unpack(root_tid).expect("packed root tid"))
+        );
+    });
+
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let typlen = [4i16];
+    let lookup_values = [10usize];
+    let lookup_nulls = [0u8];
+    let mut found_tid = 0u64;
+
+    assert!(unsafe {
+        fastpg_storage2_primary_key_index_lookup_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            lookup_values.as_ptr(),
+            lookup_nulls.as_ptr(),
+            lookup_values.len(),
+            &mut found_tid,
+        )
+    });
+    assert_eq!(found_tid, hot_tid);
 }
 
 #[test]

@@ -7,6 +7,8 @@ pub use fastpg_types::{Column, PgType, Value};
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
+#[cfg(feature = "postgres-execution")]
+use std::ffi::CStr;
 use std::fmt;
 use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::sync::Arc;
@@ -263,6 +265,15 @@ impl SessionState {
 
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
         self.executor.execute(sql, parameters)
+    }
+
+    pub fn execute_simple_text(&self, sql: &str) -> QueryExecution {
+        self.executor.execute_simple_text(sql)
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    pub fn execute_simple_cstr(&self, sql: &CStr) -> QueryExecution {
+        self.executor.execute_simple_cstr(sql)
     }
 
     pub fn run_on_backend<R>(&self, operation: impl FnOnce() -> R + Send + 'static) -> R

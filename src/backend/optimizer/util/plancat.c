@@ -20,6 +20,7 @@
 #include "access/genam.h"
 #ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
+#include "access/fastpg_tableam.h"
 #endif
 #include "access/htup_details.h"
 #include "access/nbtree.h"
@@ -51,6 +52,7 @@
 #include "storage/bufmgr.h"
 #include "tcop/tcopprot.h"
 #include "utils/builtins.h"
+#include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
 #include "utils/partcache.h"
 #include "utils/rel.h"
@@ -59,6 +61,138 @@
 
 /* GUC parameter */
 int			constraint_exclusion = CONSTRAINT_EXCLUSION_PARTITION;
+
+#ifdef USE_FASTPG
+#define FASTPG_INT2EQ_PROC 63
+#define FASTPG_INT4EQ_PROC 65
+#define FASTPG_INT4LT_PROC 66
+#define FASTPG_TEXTEQ_PROC 67
+#define FASTPG_INT4GT_PROC 147
+#define FASTPG_INT4PL_PROC 177
+#define FASTPG_OIDEQ_PROC 184
+#define FASTPG_BTINT4CMP_PROC 351
+#define FASTPG_INT8EQ_PROC 467
+
+static inline Datum
+fastpg_call_builtin_restriction_selectivity(RegProcedure oprrest,
+											Oid inputcollid,
+											PlannerInfo *root,
+											Oid operatorid,
+											List *args,
+											int varRelid)
+{
+	switch (oprrest)
+	{
+		case F_EQSEL:
+			return DirectFunctionCall4Coll(eqsel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int32GetDatum(varRelid));
+		case F_NEQSEL:
+			return DirectFunctionCall4Coll(neqsel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int32GetDatum(varRelid));
+		case F_SCALARLTSEL:
+			return DirectFunctionCall4Coll(scalarltsel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int32GetDatum(varRelid));
+		case F_SCALARLESEL:
+			return DirectFunctionCall4Coll(scalarlesel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int32GetDatum(varRelid));
+		case F_SCALARGTSEL:
+			return DirectFunctionCall4Coll(scalargtsel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int32GetDatum(varRelid));
+		case F_SCALARGESEL:
+			return DirectFunctionCall4Coll(scalargesel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int32GetDatum(varRelid));
+		default:
+			return OidFunctionCall4Coll(oprrest,
+										inputcollid,
+										PointerGetDatum(root),
+										ObjectIdGetDatum(operatorid),
+										PointerGetDatum(args),
+										Int32GetDatum(varRelid));
+	}
+}
+
+static inline Datum
+fastpg_call_builtin_join_selectivity(RegProcedure oprjoin,
+									 Oid inputcollid,
+									 PlannerInfo *root,
+									 Oid operatorid,
+									 List *args,
+									 JoinType jointype,
+									 SpecialJoinInfo *sjinfo)
+{
+	switch (oprjoin)
+	{
+		case F_EQJOINSEL:
+			return DirectFunctionCall5Coll(eqjoinsel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int16GetDatum(jointype),
+										   PointerGetDatum(sjinfo));
+		case F_NEQJOINSEL:
+			return DirectFunctionCall5Coll(neqjoinsel,
+										   inputcollid,
+										   PointerGetDatum(root),
+										   ObjectIdGetDatum(operatorid),
+										   PointerGetDatum(args),
+										   Int16GetDatum(jointype),
+										   PointerGetDatum(sjinfo));
+		default:
+			return OidFunctionCall5Coll(oprjoin,
+										inputcollid,
+										PointerGetDatum(root),
+										ObjectIdGetDatum(operatorid),
+										PointerGetDatum(args),
+										Int16GetDatum(jointype),
+										PointerGetDatum(sjinfo));
+	}
+}
+
+static bool
+fastpg_builtin_default_function_cost(Oid funcid)
+{
+	switch (funcid)
+	{
+		case FASTPG_INT2EQ_PROC:
+		case FASTPG_INT4EQ_PROC:
+		case FASTPG_INT4LT_PROC:
+		case FASTPG_TEXTEQ_PROC:
+		case FASTPG_INT4GT_PROC:
+		case FASTPG_INT4PL_PROC:
+		case FASTPG_OIDEQ_PROC:
+		case FASTPG_BTINT4CMP_PROC:
+		case FASTPG_INT8EQ_PROC:
+			return true;
+		default:
+			return false;
+	}
+}
+#endif
 
 typedef struct NotnullHashEntry
 {
@@ -479,9 +613,10 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 				if (info->indpred == NIL)
 				{
 #ifdef USE_FASTPG
-					if (!IsUnderPostmaster &&
-						fastpg_use_rust_catalog() &&
-						RelationGetRelid(indexRelation) >= (Oid) FirstNormalObjectId)
+					if ((!IsUnderPostmaster &&
+						 fastpg_use_rust_catalog() &&
+						 RelationGetRelid(indexRelation) >= (Oid) FirstNormalObjectId) ||
+						indexRelation->rd_indam == GetFastPgMemIndexAmRoutine())
 					{
 						info->pages = 1;
 						info->tuples = rel->tuples;
@@ -1334,9 +1469,10 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 	else if (rel->rd_rel->relkind == RELKIND_INDEX)
 	{
 #ifdef USE_FASTPG
-		if (!IsUnderPostmaster &&
-			fastpg_use_rust_catalog() &&
-			RelationGetRelid(rel) >= (Oid) FirstNormalObjectId)
+		if ((!IsUnderPostmaster &&
+			 fastpg_use_rust_catalog() &&
+			 RelationGetRelid(rel) >= (Oid) FirstNormalObjectId) ||
+			rel->rd_indam == GetFastPgMemIndexAmRoutine())
 		{
 			*pages = 1;
 			*tuples = rel->rd_rel->reltuples >= 0 ?
@@ -2265,12 +2401,23 @@ restriction_selectivity(PlannerInfo *root,
 	if (!oprrest)
 		return (Selectivity) 0.5;
 
-	result = DatumGetFloat8(OidFunctionCall4Coll(oprrest,
+	result = DatumGetFloat8(
+#ifdef USE_FASTPG
+							fastpg_call_builtin_restriction_selectivity(oprrest,
+																		inputcollid,
+																		root,
+																		operatorid,
+																		args,
+																		varRelid)
+#else
+							OidFunctionCall4Coll(oprrest,
 												 inputcollid,
 												 PointerGetDatum(root),
 												 ObjectIdGetDatum(operatorid),
 												 PointerGetDatum(args),
-												 Int32GetDatum(varRelid)));
+												 Int32GetDatum(varRelid))
+#endif
+		);
 
 	if (result < 0.0 || result > 1.0)
 		elog(ERROR, "invalid restriction selectivity: %f", result);
@@ -2305,13 +2452,25 @@ join_selectivity(PlannerInfo *root,
 	if (!oprjoin)
 		return (Selectivity) 0.5;
 
-	result = DatumGetFloat8(OidFunctionCall5Coll(oprjoin,
+	result = DatumGetFloat8(
+#ifdef USE_FASTPG
+							fastpg_call_builtin_join_selectivity(oprjoin,
+																inputcollid,
+																root,
+																operatorid,
+																args,
+																jointype,
+																sjinfo)
+#else
+							OidFunctionCall5Coll(oprjoin,
 												 inputcollid,
 												 PointerGetDatum(root),
 												 ObjectIdGetDatum(operatorid),
 												 PointerGetDatum(args),
 												 Int16GetDatum(jointype),
-												 PointerGetDatum(sjinfo)));
+												 PointerGetDatum(sjinfo))
+#endif
+		);
 
 	if (result < 0.0 || result > 1.0)
 		elog(ERROR, "invalid join selectivity: %f", result);
@@ -2387,6 +2546,14 @@ add_function_cost(PlannerInfo *root, Oid funcid, Node *node,
 {
 	HeapTuple	proctup;
 	Form_pg_proc procform;
+
+#ifdef USE_FASTPG
+	if (fastpg_builtin_default_function_cost(funcid))
+	{
+		cost->per_tuple += cpu_operator_cost;
+		return;
+	}
+#endif
 
 	proctup = SearchSysCache1(PROCOID, ObjectIdGetDatum(funcid));
 	if (!HeapTupleIsValid(proctup))

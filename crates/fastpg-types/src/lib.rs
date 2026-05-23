@@ -60,5 +60,6 @@ pub enum Value {
     Int4(i32),
     Int8(i64),
     Text(String),
+    RawText(String),
     Null,
 }

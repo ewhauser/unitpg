@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::any::Any;
+use std::ffi::CStr;
 use std::fmt::Debug;
 use std::fmt::Write;
 use std::io;
@@ -63,9 +64,8 @@ use postgres_types::Kind;
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
 use tokio::net::UnixStream;
-use tokio::sync::{Semaphore, oneshot};
 #[cfg(unix)]
-use tokio::time::{Duration, sleep};
+use tokio::sync::{Semaphore, TryAcquireError, oneshot};
 #[cfg(unix)]
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -268,11 +268,36 @@ impl FastPgWireHandler {
     ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
         self.execution
             .run_session_blocking(session, move |session| {
-                let execution = session.execute(&query, &[]);
+                let execution = session.execute_simple_text(&query);
                 let notices = session.take_notices();
                 (execution, notices)
             })
             .await
+    }
+
+    fn try_execute_simple_query_inline(
+        &self,
+        session: Arc<SessionState>,
+        query: &str,
+    ) -> Option<PgWireResult<(QueryExecution, Vec<QueryNotice>)>> {
+        self.execution.try_run_session_inline(session, |session| {
+            let execution = session.execute_simple_text(query);
+            let notices = session.take_notices();
+            (execution, notices)
+        })
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn try_execute_simple_query_cstr_inline(
+        &self,
+        session: Arc<SessionState>,
+        query: &CStr,
+    ) -> Option<PgWireResult<(QueryExecution, Vec<QueryNotice>)>> {
+        self.execution.try_run_session_inline(session, |session| {
+            let execution = session.execute_simple_cstr(query);
+            let notices = session.take_notices();
+            (execution, notices)
+        })
     }
 
     async fn execute_simple_message<C>(
@@ -453,8 +478,22 @@ where
 }
 
 fn simple_query_is_empty(query: &str) -> bool {
-    let trimmed = query.trim();
-    trimmed.is_empty() || trimmed == ";"
+    if query.as_bytes().iter().any(|byte| !byte.is_ascii()) {
+        let trimmed = query.trim();
+        return trimmed.is_empty() || trimmed == ";";
+    }
+
+    let bytes = query.as_bytes();
+    let mut start = 0;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let trimmed = &bytes[start..end];
+    trimmed.is_empty() || trimmed == b";"
 }
 
 async fn cancel_receiver<C>(client: &mut C) -> Option<futures_oneshot::Receiver<()>>
@@ -645,35 +684,31 @@ where
         ))
         .await?;
 
-    match command_tag.split_whitespace().next() {
-        Some(command) if command.eq_ignore_ascii_case("BEGIN") => {
-            *transaction_status = transaction_status.to_in_transaction_state();
-        }
-        Some(command)
-            if command.eq_ignore_ascii_case("COMMIT")
-                || command.eq_ignore_ascii_case("END")
-                || command.eq_ignore_ascii_case("ROLLBACK") =>
-        {
-            *transaction_status = transaction_status.to_idle_state();
-        }
-        _ => {}
-    }
+    apply_command_transaction_status(command_tag, transaction_status);
 
     Ok(())
 }
 
 fn command_complete_message(command_tag: &str, rows: Option<usize>) -> CommandComplete {
-    let tag = if let Some(rows) = rows {
-        let mut tag = String::with_capacity(command_tag.len() + 24);
-        tag.push_str(command_tag);
-        if command_tag == "INSERT" {
-            tag.push_str(" 0");
+    let tag = match (command_tag, rows) {
+        ("BEGIN", None) => "BEGIN".to_owned(),
+        ("COMMIT", None) => "COMMIT".to_owned(),
+        ("END", None) => "END".to_owned(),
+        ("ROLLBACK", None) => "ROLLBACK".to_owned(),
+        ("SELECT", Some(1)) => "SELECT 1".to_owned(),
+        ("UPDATE", Some(1)) => "UPDATE 1".to_owned(),
+        ("INSERT", Some(1)) => "INSERT 0 1".to_owned(),
+        (_, Some(rows)) => {
+            let mut tag = String::with_capacity(command_tag.len() + 24);
+            tag.push_str(command_tag);
+            if command_tag == "INSERT" {
+                tag.push_str(" 0");
+            }
+            tag.push(' ');
+            write!(&mut tag, "{rows}").expect("writing CommandComplete tag to String cannot fail");
+            tag
         }
-        tag.push(' ');
-        write!(&mut tag, "{rows}").expect("writing CommandComplete tag to String cannot fail");
-        tag
-    } else {
-        command_tag.to_owned()
+        (_, None) => command_tag.to_owned(),
     };
     CommandComplete::new(tag)
 }
@@ -946,12 +981,12 @@ impl CopyHandler for FastPgWireHandler {
 }
 
 #[cfg(unix)]
-const STARTUP_TIMEOUT_MILLIS: u64 = 60_000;
-
 #[cfg(unix)]
 #[derive(Debug)]
 struct FastPgUnixSocket {
     framed: Framed<UnixStream, FastPgUnixServerCodec>,
+    cached_session: Option<Arc<SessionState>>,
+    response_buffer: BytesMut,
 }
 
 #[cfg(unix)]
@@ -959,6 +994,8 @@ impl FastPgUnixSocket {
     fn new(unix_socket: UnixStream, codec: FastPgUnixServerCodec) -> Self {
         Self {
             framed: Framed::new(unix_socket, codec),
+            cached_session: None,
+            response_buffer: BytesMut::with_capacity(512),
         }
     }
 
@@ -972,6 +1009,30 @@ impl FastPgUnixSocket {
 
     fn stream_mut(&mut self) -> &mut UnixStream {
         self.framed.get_mut()
+    }
+
+    fn cache_session_from_extensions(&mut self) {
+        self.cached_session = self.session_extensions().get::<SessionState>();
+    }
+
+    fn cached_session(&self) -> PgWireResult<Arc<SessionState>> {
+        self.cached_session
+            .clone()
+            .ok_or_else(missing_session_error)
+    }
+
+    fn take_response_buffer(&mut self) -> BytesMut {
+        let mut response = std::mem::take(&mut self.response_buffer);
+        response.clear();
+        if response.capacity() < 512 {
+            response.reserve(512 - response.capacity());
+        }
+        response
+    }
+
+    fn put_response_buffer(&mut self, mut response: BytesMut) {
+        response.clear();
+        self.response_buffer = response;
     }
 }
 
@@ -1015,6 +1076,7 @@ impl Sink<PgWireBackendMessage> for FastPgUnixSocket {
 enum FastPgFrontendMessage {
     PgWire(PgWireFrontendMessage),
     FunctionCall(FunctionCall),
+    ReadySimpleQuery(Bytes),
 }
 
 #[cfg(unix)]
@@ -1031,6 +1093,43 @@ impl FastPgUnixServerCodec {
             client_info,
             decode_context: DecodeContext::default(),
         }
+    }
+
+    fn decode_ready_simple_query(
+        &self,
+        src: &mut BytesMut,
+    ) -> PgWireResult<Option<FastPgFrontendMessage>> {
+        if !matches!(
+            self.client_info.state(),
+            PgWireConnectionState::ReadyForQuery
+        ) || src.remaining() < 5
+            || src[0] != b'Q'
+        {
+            return Ok(None);
+        }
+
+        let len = i32::from_be_bytes([src[1], src[2], src[3], src[4]]);
+        if len < 5 {
+            return Ok(None);
+        }
+        let Ok(len) = usize::try_from(len) else {
+            return Ok(None);
+        };
+        let frame_len = len.saturating_add(1);
+        if src.len() < frame_len {
+            return Ok(None);
+        }
+        let query_end = frame_len - 1;
+        if src[query_end] != 0 {
+            return Ok(None);
+        }
+        if src[5..query_end].contains(&0) {
+            return Ok(None);
+        }
+        let frame = src.split_to(frame_len).freeze();
+        Ok(Some(FastPgFrontendMessage::ReadySimpleQuery(
+            frame.slice(5..frame_len),
+        )))
     }
 }
 
@@ -1052,6 +1151,10 @@ impl Decoder for FastPgUnixServerCodec {
                 self.decode_context.awaiting_frontend_ssl = false;
                 self.decode_context.awaiting_frontend_startup = false;
             }
+        }
+
+        if let Some(message) = self.decode_ready_simple_query(src)? {
+            return Ok(Some(message));
         }
 
         if !self.decode_context.awaiting_frontend_startup
@@ -1157,27 +1260,13 @@ pub async fn process_socket_unix(
     unix_socket: UnixStream,
     handlers: Arc<FastPgServerHandlers>,
 ) -> Result<(), io::Error> {
-    let startup_timeout = sleep(Duration::from_millis(STARTUP_TIMEOUT_MILLIS));
-    tokio::pin!(startup_timeout);
-
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let client_info = DefaultClient::new(addr, false);
     let mut socket = FastPgUnixSocket::new(unix_socket, FastPgUnixServerCodec::new(client_info));
     socket.set_state(PgWireConnectionState::AwaitingStartup);
 
     loop {
-        let message = if matches!(
-            socket.state(),
-            PgWireConnectionState::AwaitingStartup
-                | PgWireConnectionState::AuthenticationInProgress
-        ) {
-            tokio::select! {
-                _ = &mut startup_timeout => None,
-                message = socket.next() => message,
-            }
-        } else {
-            socket.next().await
-        };
+        let message = socket.next().await;
 
         let Some(message) = message else {
             break;
@@ -1192,6 +1281,11 @@ pub async fn process_socket_unix(
                 process_pgwire_message(&handlers, &mut socket, message)
                     .await
                     .map_err(|error| (error, wait_for_sync))
+            }
+            Ok(FastPgFrontendMessage::ReadySimpleQuery(query)) => {
+                process_ready_simple_query_unix_fast_path(&handlers, &mut socket, query)
+                    .await
+                    .map_err(|error| (error, false))
             }
             Ok(FastPgFrontendMessage::FunctionCall(function_call)) => {
                 process_function_call(&handlers, &mut socket, function_call)
@@ -1224,6 +1318,7 @@ async fn process_pgwire_message(
         PgWireConnectionState::AwaitingStartup
         | PgWireConnectionState::AuthenticationInProgress => {
             handlers.handler.on_startup(socket, message).await?;
+            socket.cache_session_from_extensions();
         }
         PgWireConnectionState::AwaitingSync => {
             if let PgWireFrontendMessage::Sync(sync) = message {
@@ -1267,7 +1362,11 @@ async fn process_pgwire_message(
         },
         _ => match message {
             PgWireFrontendMessage::Query(query) => {
-                handlers.handler.on_query(socket, query).await?;
+                if let Some(query) =
+                    process_simple_query_unix_fast_path(handlers, socket, query).await?
+                {
+                    handlers.handler.on_query(socket, query).await?;
+                }
             }
             PgWireFrontendMessage::Parse(parse) => {
                 handlers.handler.on_parse(socket, parse).await?;
@@ -1295,6 +1394,352 @@ async fn process_pgwire_message(
     }
 
     Ok(())
+}
+
+#[cfg(unix)]
+async fn process_simple_query_unix_fast_path(
+    handlers: &FastPgServerHandlers,
+    socket: &mut FastPgUnixSocket,
+    query: Query,
+) -> PgWireResult<Option<Query>> {
+    let query = query.query;
+    match process_simple_query_unix_fast_path_str(handlers, socket, &query, None).await? {
+        SimpleQueryFastPathResult::Handled => Ok(None),
+        SimpleQueryFastPathResult::Fallback => Ok(Some(Query::new(query))),
+    }
+}
+
+#[cfg(unix)]
+async fn process_ready_simple_query_unix_fast_path(
+    handlers: &FastPgServerHandlers,
+    socket: &mut FastPgUnixSocket,
+    query: Bytes,
+) -> PgWireResult<()> {
+    let query_len = query
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| protocol_error("simple query frame missing trailing NUL byte".to_owned()))?;
+    let c_query = CStr::from_bytes_with_nul(&query)
+        .map_err(|error| protocol_error(format!("invalid simple query C string: {error}")))?;
+    let query = std::str::from_utf8(&query[..query_len])
+        .map_err(|error| protocol_error(format!("invalid simple query UTF-8: {error}")))?;
+    match process_simple_query_unix_fast_path_str(handlers, socket, query, Some(c_query)).await? {
+        SimpleQueryFastPathResult::Handled => Ok(()),
+        SimpleQueryFastPathResult::Fallback => {
+            handlers
+                .handler
+                .on_query(socket, Query::new(query.to_owned()))
+                .await
+        }
+    }
+}
+
+#[cfg(unix)]
+enum SimpleQueryFastPathResult {
+    Handled,
+    Fallback,
+}
+
+#[cfg(unix)]
+async fn process_simple_query_unix_fast_path_str(
+    handlers: &FastPgServerHandlers,
+    socket: &mut FastPgUnixSocket,
+    query: &str,
+    query_cstr: Option<&CStr>,
+) -> PgWireResult<SimpleQueryFastPathResult> {
+    if !matches!(socket.state(), PgWireConnectionState::ReadyForQuery) {
+        return Ok(SimpleQueryFastPathResult::Fallback);
+    }
+
+    let mut transaction_status = socket.transaction_status();
+    socket.set_state(PgWireConnectionState::QueryInProgress);
+
+    let execution = if simple_query_is_empty(query) {
+        QueryExecution::Empty
+    } else {
+        if !postgres_catalog_enabled() || simple_query_may_copy_from_stdin(query) {
+            socket.set_state(PgWireConnectionState::ReadyForQuery);
+            return Ok(SimpleQueryFastPathResult::Fallback);
+        }
+
+        let session = socket.cached_session()?;
+        let inline_result = if let Some(query_cstr) = query_cstr {
+            #[cfg(feature = "postgres-execution")]
+            {
+                handlers
+                    .handler
+                    .try_execute_simple_query_cstr_inline(session.clone(), query_cstr)
+            }
+            #[cfg(not(feature = "postgres-execution"))]
+            {
+                let _ = query_cstr;
+                None
+            }
+        } else {
+            handlers
+                .handler
+                .try_execute_simple_query_inline(session.clone(), query)
+        };
+        let (execution, notices) = match inline_result {
+            Some(result) => result?,
+            None => {
+                handlers
+                    .handler
+                    .execute_simple_query(session.clone(), query.to_owned())
+                    .await?
+            }
+        };
+
+        if !notices.is_empty() {
+            send_notices(socket, notices).await?;
+            feed_simple_execution(socket, execution, &mut transaction_status).await?;
+            if !matches!(socket.state(), PgWireConnectionState::CopyInProgress(_)) {
+                socket.set_state(PgWireConnectionState::ReadyForQuery);
+                socket.set_transaction_status(transaction_status);
+                socket
+                    .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                        transaction_status,
+                    )))
+                    .await?;
+                socket.flush().await?;
+            }
+            return Ok(SimpleQueryFastPathResult::Handled);
+        }
+
+        remember_copy_target(&session, &execution);
+        execution
+    };
+
+    let mut response = socket.take_response_buffer();
+    if encode_simple_execution_unix_response(&execution, &mut transaction_status, &mut response)? {
+        socket.set_state(PgWireConnectionState::ReadyForQuery);
+        socket.set_transaction_status(transaction_status);
+        encode_ready_for_query_unix(&mut response, transaction_status);
+        socket.stream_mut().write_all(&response).await?;
+        socket.put_response_buffer(response);
+    } else {
+        feed_simple_execution(socket, execution, &mut transaction_status).await?;
+        if !matches!(socket.state(), PgWireConnectionState::CopyInProgress(_)) {
+            socket.set_state(PgWireConnectionState::ReadyForQuery);
+            socket.set_transaction_status(transaction_status);
+            socket
+                .feed(PgWireBackendMessage::ReadyForQuery(ReadyForQuery::new(
+                    transaction_status,
+                )))
+                .await?;
+            socket.flush().await?;
+        }
+    }
+
+    Ok(SimpleQueryFastPathResult::Handled)
+}
+
+#[cfg(unix)]
+fn encode_simple_execution_unix_response(
+    execution: &QueryExecution,
+    transaction_status: &mut TransactionStatus,
+    response: &mut BytesMut,
+) -> PgWireResult<bool> {
+    match execution {
+        QueryExecution::Empty => {
+            encode_empty_query_unix(response);
+            Ok(true)
+        }
+        QueryExecution::Command { tag, rows } => {
+            encode_command_complete_unix(response, tag.as_ref(), *rows);
+            apply_command_transaction_status(tag.as_ref(), transaction_status);
+            Ok(true)
+        }
+        QueryExecution::Rows(result) => {
+            encode_row_description_unix(response, &result.fields)?;
+            for row in &result.rows {
+                encode_data_row_unix(response, row);
+            }
+            let command_tag = result.command_tag.as_deref().unwrap_or("SELECT");
+            encode_command_complete_unix(
+                response,
+                command_tag,
+                Some(result.command_rows.unwrap_or(result.rows.len())),
+            );
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+#[cfg(unix)]
+fn encode_message_header_unix(response: &mut BytesMut, tag: u8, body_len: usize) {
+    response.put_u8(tag);
+    response.put_i32((body_len + 4) as i32);
+}
+
+#[cfg(unix)]
+fn encode_empty_query_unix(response: &mut BytesMut) {
+    encode_message_header_unix(response, b'I', 0);
+}
+
+#[cfg(unix)]
+fn encode_ready_for_query_unix(response: &mut BytesMut, status: TransactionStatus) {
+    encode_message_header_unix(response, b'Z', 1);
+    response.put_u8(status as u8);
+}
+
+#[cfg(unix)]
+fn encode_command_complete_unix(response: &mut BytesMut, command_tag: &str, rows: Option<usize>) {
+    let body_len = command_complete_tag_len(command_tag, rows) + 1;
+    encode_message_header_unix(response, b'C', body_len);
+    put_command_complete_tag_unix(response, command_tag, rows);
+    response.put_u8(0);
+}
+
+#[cfg(unix)]
+fn command_complete_tag_len(command_tag: &str, rows: Option<usize>) -> usize {
+    match (command_tag, rows) {
+        ("BEGIN", None) => 5,
+        ("COMMIT", None) => 6,
+        ("END", None) => 3,
+        ("ROLLBACK", None) => 8,
+        ("SELECT", Some(1)) => 8,
+        ("UPDATE", Some(1)) => 8,
+        ("INSERT", Some(1)) => 10,
+        (_, Some(rows)) => {
+            command_tag.len() + if command_tag == "INSERT" { 3 } else { 1 } + decimal_len(rows)
+        }
+        (_, None) => command_tag.len(),
+    }
+}
+
+#[cfg(unix)]
+fn put_command_complete_tag_unix(response: &mut BytesMut, command_tag: &str, rows: Option<usize>) {
+    match (command_tag, rows) {
+        ("BEGIN", None) => response.put_slice(b"BEGIN"),
+        ("COMMIT", None) => response.put_slice(b"COMMIT"),
+        ("END", None) => response.put_slice(b"END"),
+        ("ROLLBACK", None) => response.put_slice(b"ROLLBACK"),
+        ("SELECT", Some(1)) => response.put_slice(b"SELECT 1"),
+        ("UPDATE", Some(1)) => response.put_slice(b"UPDATE 1"),
+        ("INSERT", Some(1)) => response.put_slice(b"INSERT 0 1"),
+        (_, Some(rows)) => {
+            response.put_slice(command_tag.as_bytes());
+            if command_tag == "INSERT" {
+                response.put_slice(b" 0");
+            }
+            response.put_u8(b' ');
+            put_decimal_unix(response, rows);
+        }
+        (_, None) => response.put_slice(command_tag.as_bytes()),
+    }
+}
+
+#[cfg(unix)]
+fn decimal_len(mut value: usize) -> usize {
+    let mut len = 1;
+    while value >= 10 {
+        value /= 10;
+        len += 1;
+    }
+    len
+}
+
+#[cfg(unix)]
+fn put_decimal_unix(response: &mut BytesMut, mut value: usize) {
+    let mut digits = [0u8; 20];
+    let mut index = digits.len();
+    loop {
+        index -= 1;
+        digits[index] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    response.put_slice(&digits[index..]);
+}
+
+#[cfg(unix)]
+fn encode_row_description_unix(response: &mut BytesMut, fields: &[Column]) -> PgWireResult<()> {
+    let mut body_len = 2;
+    for field in fields {
+        body_len += field.name.len() + 1 + 18;
+    }
+    encode_message_header_unix(response, b'T', body_len);
+    response.put_i16(fields.len() as i16);
+    for field in fields {
+        response.put_slice(field.name.as_bytes());
+        response.put_u8(0);
+        response.put_u32(0);
+        response.put_i16(0);
+        response.put_u32(field.type_oid);
+        response.put_i16(0);
+        response.put_i32(0);
+        response.put_i16(0);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn encode_data_row_unix(response: &mut BytesMut, row: &[Value]) {
+    let body_len = 2 + row.iter().map(encoded_text_field_len).sum::<usize>();
+    encode_message_header_unix(response, b'D', body_len);
+    response.put_i16(row.len() as i16);
+    for value in row {
+        encode_text_field(response, value);
+    }
+}
+
+#[cfg(unix)]
+fn encoded_text_field_len(value: &Value) -> usize {
+    match value {
+        Value::Null => 4,
+        Value::Int2(value) => 4 + decimal_i64_len(i64::from(*value)),
+        Value::Int4(value) => 4 + decimal_i64_len(i64::from(*value)),
+        Value::Int8(value) => 4 + decimal_i64_len(*value),
+        Value::Text(value) | Value::RawText(value) => 4 + value.len(),
+    }
+}
+
+#[cfg(unix)]
+fn decimal_i64_len(value: i64) -> usize {
+    if value < 0 {
+        1 + decimal_len(value.unsigned_abs() as usize)
+    } else {
+        decimal_len(value as usize)
+    }
+}
+
+fn apply_command_transaction_status(command_tag: &str, transaction_status: &mut TransactionStatus) {
+    match command_tag {
+        "BEGIN" => {
+            *transaction_status = transaction_status.to_in_transaction_state();
+        }
+        "COMMIT" | "END" | "ROLLBACK" => {
+            *transaction_status = transaction_status.to_idle_state();
+        }
+        _ => {
+            let first = command_tag
+                .as_bytes()
+                .iter()
+                .copied()
+                .find(|byte| !byte.is_ascii_whitespace())
+                .map(|byte| byte.to_ascii_uppercase());
+            match first {
+                Some(b'B' | b'C' | b'E' | b'R') => match command_tag.split_whitespace().next() {
+                    Some(command) if command.eq_ignore_ascii_case("BEGIN") => {
+                        *transaction_status = transaction_status.to_in_transaction_state();
+                    }
+                    Some(command)
+                        if command.eq_ignore_ascii_case("COMMIT")
+                            || command.eq_ignore_ascii_case("END")
+                            || command.eq_ignore_ascii_case("ROLLBACK") =>
+                    {
+                        *transaction_status = transaction_status.to_idle_state();
+                    }
+                    _ => {}
+                },
+                _ => {}
+            }
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -1743,16 +2188,18 @@ fn encode_function_result(
 
     match (result_type, value) {
         (_, Value::Null) => Ok(None),
-        (FastpathReturnType::Bytea, Value::Text(value)) => parse_bytea_text(&value).map(Some),
+        (FastpathReturnType::Bytea, Value::Text(value) | Value::RawText(value)) => {
+            parse_bytea_text(&value).map(Some)
+        }
         (FastpathReturnType::Int4, Value::Int4(value)) => Ok(Some(value.to_be_bytes().to_vec())),
-        (FastpathReturnType::Int4, Value::Text(value)) => {
+        (FastpathReturnType::Int4, Value::Text(value) | Value::RawText(value)) => {
             let value = value
                 .parse::<i32>()
                 .map_err(|error| protocol_error(format!("invalid int4 result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
         (FastpathReturnType::Int8, Value::Int8(value)) => Ok(Some(value.to_be_bytes().to_vec())),
-        (FastpathReturnType::Int8, Value::Text(value)) => {
+        (FastpathReturnType::Int8, Value::Text(value) | Value::RawText(value)) => {
             let value = value
                 .parse::<i64>()
                 .map_err(|error| protocol_error(format!("invalid int8 result: {error}")))?;
@@ -1761,7 +2208,7 @@ fn encode_function_result(
         (FastpathReturnType::Oid, Value::Int4(value)) => {
             Ok(Some((value as u32).to_be_bytes().to_vec()))
         }
-        (FastpathReturnType::Oid, Value::Text(value)) => {
+        (FastpathReturnType::Oid, Value::Text(value) | Value::RawText(value)) => {
             let value = value
                 .parse::<u32>()
                 .map_err(|error| protocol_error(format!("invalid oid result: {error}")))?;
@@ -2027,20 +2474,34 @@ impl ExecutionDispatcher {
     where
         R: Send + 'static,
     {
+        if self.inline_session_execution {
+            let run = || {
+                let result = catch_unwind(AssertUnwindSafe(|| operation(session)));
+                match result {
+                    Ok(result) => Ok(result),
+                    Err(payload) => resume_unwind(payload),
+                }
+            };
+            match self.permits.try_acquire() {
+                Ok(permit) => {
+                    let _permit = permit;
+                    return run();
+                }
+                Err(TryAcquireError::NoPermits) => {
+                    let permit = self.permits.acquire().await.map_err(api_io_error)?;
+                    let _permit = permit;
+                    return run();
+                }
+                Err(error) => return Err(api_io_error(error)),
+            }
+        }
+
         let permit = self
             .permits
             .clone()
             .acquire_owned()
             .await
             .map_err(api_io_error)?;
-        if self.inline_session_execution {
-            let _permit = permit;
-            let result = catch_unwind(AssertUnwindSafe(|| operation(session)));
-            return match result {
-                Ok(result) => Ok(result),
-                Err(payload) => resume_unwind(payload),
-            };
-        }
         let (sender, receiver) = oneshot::channel::<Result<R, Box<dyn Any + Send + 'static>>>();
         let operation_session = session.clone();
         session.enqueue_on_backend(move || {
@@ -2052,6 +2513,29 @@ impl ExecutionDispatcher {
         match receiver.await.map_err(api_io_error)? {
             Ok(result) => Ok(result),
             Err(payload) => resume_unwind(payload),
+        }
+    }
+
+    fn try_run_session_inline<R>(
+        &self,
+        session: Arc<SessionState>,
+        operation: impl FnOnce(Arc<SessionState>) -> R,
+    ) -> Option<PgWireResult<R>> {
+        if !self.inline_session_execution {
+            return None;
+        }
+
+        match self.permits.try_acquire() {
+            Ok(permit) => {
+                let _permit = permit;
+                let result = catch_unwind(AssertUnwindSafe(|| operation(session)));
+                match result {
+                    Ok(result) => Some(Ok(result)),
+                    Err(payload) => resume_unwind(payload),
+                }
+            }
+            Err(TryAcquireError::NoPermits) => None,
+            Err(error) => Some(Err(api_io_error(error))),
         }
     }
 }
@@ -2197,6 +2681,18 @@ fn simple_statement_is_copy_from_stdin(statement: &str) -> bool {
 }
 
 fn simple_query_may_copy_from_stdin(query: &str) -> bool {
+    let bytes = query.as_bytes();
+    let mut index = 0;
+
+    while index < bytes.len() {
+        match bytes[index] {
+            byte if byte.is_ascii_whitespace() || byte == b';' => index += 1,
+            b'c' | b'C' => break,
+            b'-' | b'/' => break,
+            _ => return false,
+        }
+    }
+
     contains_ascii_case_insensitive(query.as_bytes(), b"copy")
         && contains_ascii_case_insensitive(query.as_bytes(), b"from stdin")
 }
@@ -2549,7 +3045,7 @@ fn encode_text_field(row: &mut BytesMut, value: &Value) {
         Value::Int2(value) => encode_text_bytes(row, value.to_string().as_bytes()),
         Value::Int4(value) => encode_text_bytes(row, value.to_string().as_bytes()),
         Value::Int8(value) => encode_text_bytes(row, value.to_string().as_bytes()),
-        Value::Text(value) => encode_text_bytes(row, value.as_bytes()),
+        Value::Text(value) | Value::RawText(value) => encode_text_bytes(row, value.as_bytes()),
     }
 }
 
@@ -2568,6 +3064,19 @@ fn encode_value(
         (PgType::Int4, Value::Int4(value)) => encoder.encode_field(&Some(*value)),
         (PgType::Int8, Value::Int8(value)) => encoder.encode_field(&Some(*value)),
         (PgType::Varchar, Value::Text(value)) => encoder.encode_field(&Some(value.as_str())),
+        (PgType::Varchar, Value::RawText(value)) => encoder.encode_field(&Some(value.as_str())),
+        (PgType::Int2, Value::RawText(value)) => {
+            let value = parse_binary_text_value::<i16>(value, "int2")?;
+            encoder.encode_field(&Some(value))
+        }
+        (PgType::Int4, Value::RawText(value)) => {
+            let value = parse_binary_text_value::<i32>(value, "int4")?;
+            encoder.encode_field(&Some(value))
+        }
+        (PgType::Int8, Value::RawText(value)) => {
+            let value = parse_binary_text_value::<i64>(value, "int8")?;
+            encoder.encode_field(&Some(value))
+        }
         (PgType::Int2, Value::Null) => encoder.encode_field(&Option::<i16>::None),
         (PgType::Int4, Value::Null) => encoder.encode_field(&Option::<i32>::None),
         (PgType::Int8, Value::Null) => encoder.encode_field(&Option::<i64>::None),
@@ -2577,6 +3086,19 @@ fn encode_value(
             format!("cannot encode {actual:?} as {expected:?}"),
         )))),
     }
+}
+
+fn parse_binary_text_value<T>(value: &str, type_name: &'static str) -> PgWireResult<T>
+where
+    T: std::str::FromStr,
+    T::Err: std::fmt::Display,
+{
+    value.parse::<T>().map_err(|error| {
+        PgWireError::ApiError(Box::new(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("cannot encode text value {value:?} as {type_name}: {error}"),
+        )))
+    })
 }
 
 fn unsupported_response(query: &str) -> Response {
@@ -2801,7 +3323,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn execution_dispatcher_caps_concurrent_blocking_work() {
-        let dispatcher = ExecutionDispatcher::new(NonZeroUsize::new(2).unwrap());
+        let dispatcher = ExecutionDispatcher::new(NonZeroUsize::new(2).unwrap(), false);
         let active = Arc::new(AtomicUsize::new(0));
         let max_active = Arc::new(AtomicUsize::new(0));
         let mut tasks = Vec::new();
