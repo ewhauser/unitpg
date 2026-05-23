@@ -114,8 +114,8 @@ profile-side-by-side:
 		--init-steps "default" \
 		--scale "$(SCALE)" \
 		--transactions "$(PROFILE_TRANSACTIONS)" \
-		--clients "1" \
-		--jobs "1" \
+		--clients "$(CLIENTS)" \
+		--jobs "$(JOBS)" \
 		--runs "1" \
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \

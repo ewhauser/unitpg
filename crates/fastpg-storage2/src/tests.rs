@@ -184,6 +184,19 @@ fn hot_redirect_target(relid: u32, tid: u64) -> Option<u64> {
     })
 }
 
+fn update_redirect_target(relid: u32, tid: u64) -> Option<u64> {
+    let tid = Tid::unpack(tid)?;
+    with_storage(|state, _session| {
+        state
+            .relations
+            .get(&relid)?
+            .update_redirects
+            .get(&tid)
+            .copied()
+            .map(Tid::pack)
+    })
+}
+
 fn byval_key(value: i32) -> IndexKey {
     IndexKey::single(IndexKeyPart::ByValue(value as usize))
 }
@@ -689,6 +702,7 @@ fn update_redirect_resolution_compresses_long_committed_chains() {
     let byval = [1u8];
     let lens = [0usize];
     let mut current_tid = first_tid;
+    let mut tids = vec![first_tid];
     for value in 1..=96usize {
         let values = [value];
         let mut new_tid = 0;
@@ -707,6 +721,7 @@ fn update_redirect_resolution_compresses_long_committed_chains() {
         });
         fastpg_storage2_xact_commit();
         current_tid = new_tid;
+        tids.push(new_tid);
     }
 
     let mut resolved_tid = 0u64;
@@ -714,6 +729,8 @@ fn update_redirect_resolution_compresses_long_committed_chains() {
         fastpg_storage2_relation_resolve_update_tid(relid, first_tid, &mut resolved_tid)
     });
     assert_eq!(resolved_tid, current_tid);
+    assert_eq!(update_redirect_target(relid, tids[32]), Some(current_tid));
+    assert_eq!(update_redirect_target(relid, tids[64]), Some(current_tid));
     with_storage_read(|state, _session| {
         let relation = state.relations.get(&relid).expect("relation exists");
         let first_tid = Tid::unpack(first_tid).expect("packed first tid");
@@ -838,6 +855,73 @@ fn hot_primary_lookup_keeps_primary_index_at_root_tid() {
         )
     });
     assert_eq!(found_tid, hot_tid);
+}
+
+#[test]
+fn primary_lookup_compresses_hot_redirect_chain_from_root_tid() {
+    let _guard = test_guard();
+    let relid = 151;
+    let index_relid = 1510;
+    fastpg_storage2_xact_begin();
+    let root_tid = insert_i32(relid, 10);
+    fastpg_storage2_xact_commit();
+
+    with_storage(|state, _session| {
+        state.relation_mut(relid).primary_key_index.insert(
+            byval_key(10),
+            Tid::unpack(root_tid).expect("packed root tid"),
+        );
+    });
+
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut current_tid = root_tid;
+    let mut tids = vec![root_tid];
+    for _ in 0..96usize {
+        let values = [10usize];
+        let mut hot_tid = 0;
+        fastpg_storage2_xact_begin();
+        assert!(unsafe {
+            fastpg_storage2_relation_update_hot_if_single_byval_preserved_with_metadata(
+                relid,
+                current_tid,
+                1,
+                10,
+                0,
+                1,
+                0,
+                1,
+                1,
+                1,
+                values.as_ptr(),
+                nulls.as_ptr(),
+                byval.as_ptr(),
+                lens.as_ptr(),
+                values.len(),
+                &mut hot_tid,
+                std::ptr::null_mut(),
+            )
+        });
+        fastpg_storage2_xact_commit();
+        current_tid = hot_tid;
+        tids.push(hot_tid);
+    }
+
+    let mut found_tid = 0u64;
+    assert!(unsafe {
+        fastpg_storage2_primary_key_index_lookup_single_byval_with_spec(
+            index_relid,
+            relid,
+            10,
+            0,
+            &mut found_tid,
+        )
+    });
+    assert_eq!(found_tid, current_tid);
+    assert_eq!(hot_redirect_target(relid, root_tid), Some(current_tid));
+    assert_eq!(hot_redirect_target(relid, tids[32]), Some(current_tid));
+    assert_eq!(hot_redirect_target(relid, tids[64]), Some(current_tid));
 }
 
 #[test]

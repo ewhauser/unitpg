@@ -359,6 +359,29 @@ pub unsafe extern "C" fn fastpg_storage2_relation_resolve_update_tid(
 }
 
 #[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_resolve_update_tid_read(
+    relid: u32,
+    packed_tid: u64,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let resolved = with_storage_read(|state, session| {
+        state.resolve_update_redirect_in_overlays(&session.transaction_stack, relid, tid)
+    });
+    if !resolved_tid_out.is_null() {
+        unsafe {
+            *resolved_tid_out = resolved.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_record_insert_metadata(
     relid: u32,
     packed_tid: u64,
@@ -976,7 +999,96 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
         return 0;
     }
 
-    with_storage_read(|state, session| {
+    let has_visibility_deltas = with_session_storage(|session| {
+        session
+            .scan_slot(scan_handle)
+            .is_some_and(|scan| scan.has_visibility_deltas)
+    });
+    if !has_visibility_deltas {
+        return with_storage_read(|state, session| {
+            let (written, forward_cursor, backward_cursor) = {
+                let Some(scan) = session.scan_slot(scan_handle) else {
+                    return 0;
+                };
+                let is_forward = forward != 0;
+                let relid = scan.relid;
+                let mut forward_cursor = scan.forward_cursor;
+                let mut backward_cursor = scan.backward_cursor;
+                let mut written = 0;
+
+                while written < max_rows {
+                    let cursor = if is_forward {
+                        forward_cursor
+                    } else {
+                        backward_cursor
+                    };
+                    let Some((tid, tuple)) = state.next_committed_tuple_slice(
+                        relid,
+                        cursor,
+                        &scan.high_water_offsets,
+                        is_forward,
+                    ) else {
+                        if is_forward {
+                            backward_cursor = ScanCursor::before_cursor(forward_cursor);
+                        } else {
+                            forward_cursor = ScanCursor::after_cursor(backward_cursor);
+                        }
+                        break;
+                    };
+
+                    let row_values_out = if natts == 0 {
+                        std::ptr::null_mut()
+                    } else {
+                        // SAFETY: caller provided `natts * max_rows` entries and
+                        // `written < max_rows`, so this row's segment is in bounds.
+                        unsafe { values_out.add(written * natts) }
+                    };
+                    let row_is_null_out = if natts == 0 {
+                        std::ptr::null_mut()
+                    } else {
+                        // SAFETY: caller provided `natts * max_rows` entries and
+                        // `written < max_rows`, so this row's segment is in bounds.
+                        unsafe { is_null_out.add(written * natts) }
+                    };
+                    // SAFETY: caller provided `max_rows` TID/stored-natts entries and
+                    // `written < max_rows`.
+                    let row_tid_out = unsafe { tids_out.add(written) };
+                    let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
+                    if !copy_tuple_to_outputs(
+                        tid,
+                        tuple,
+                        row_values_out,
+                        row_is_null_out,
+                        natts,
+                        row_tid_out,
+                        row_stored_natts_out,
+                    ) {
+                        break;
+                    }
+
+                    if is_forward {
+                        forward_cursor = ScanCursor::after(tid);
+                        backward_cursor = ScanCursor::before(tid);
+                    } else {
+                        backward_cursor = ScanCursor::before(tid);
+                        forward_cursor = ScanCursor::after(tid);
+                    }
+                    written += 1;
+                }
+
+                (written, forward_cursor, backward_cursor)
+            };
+
+            if let Some(scan) = session.scan_slot_mut(scan_handle) {
+                scan.forward_cursor = forward_cursor;
+                scan.backward_cursor = backward_cursor;
+            }
+
+            written
+        });
+    }
+
+    with_storage(|state, session| {
         let (written, forward_cursor, backward_cursor) = {
             let Some(scan) = session.scan_slot(scan_handle) else {
                 return 0;
@@ -1080,7 +1192,60 @@ fn scan_next_impl(
     tid_out: *mut u64,
     stored_natts_out: *mut usize,
 ) -> bool {
-    with_storage_read(|state, session| {
+    let has_visibility_deltas = with_session_storage(|session| {
+        session
+            .scan_slot(scan_handle)
+            .is_some_and(|scan| scan.has_visibility_deltas)
+    });
+    if !has_visibility_deltas {
+        return with_storage_read(|state, session| {
+            let Some(scan) = session.scan_slot(scan_handle) else {
+                return false;
+            };
+            let is_forward = forward != 0;
+            let cursor = if is_forward {
+                scan.forward_cursor
+            } else {
+                scan.backward_cursor
+            };
+            let relid = scan.relid;
+            let Some((tid, tuple)) = state.next_committed_tuple_slice(
+                relid,
+                cursor,
+                &scan.high_water_offsets,
+                is_forward,
+            ) else {
+                if let Some(scan) = session.scan_slot_mut(scan_handle) {
+                    if is_forward {
+                        scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
+                    } else {
+                        scan.forward_cursor = ScanCursor::after_cursor(scan.backward_cursor);
+                    }
+                }
+                return false;
+            };
+            if let Some(scan) = session.scan_slot_mut(scan_handle) {
+                if is_forward {
+                    scan.forward_cursor = ScanCursor::after(tid);
+                    scan.backward_cursor = ScanCursor::before(tid);
+                } else {
+                    scan.backward_cursor = ScanCursor::before(tid);
+                    scan.forward_cursor = ScanCursor::after(tid);
+                }
+            }
+            copy_tuple_to_outputs(
+                tid,
+                tuple,
+                values_out,
+                is_null_out,
+                natts,
+                tid_out,
+                stored_natts_out,
+            )
+        });
+    }
+
+    with_storage(|state, session| {
         let Some(scan) = session.scan_slot(scan_handle) else {
             return false;
         };
@@ -1416,8 +1581,8 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup(
     let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
         return false;
     };
-    let tid = with_storage_read(|state, session| {
-        state.primary_key_lookup_read(session, index_spec.relation_oid.0, &key)
+    let tid = with_storage(|state, session| {
+        state.primary_key_lookup(session, index_spec.relation_oid.0, &key)
     });
     let Some(tid) = tid else {
         return false;
@@ -1467,13 +1632,13 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
     let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
         return false;
     };
-    let tid = with_storage_read(|state, session| {
+    let tid = with_storage(|state, session| {
         state
-            .primary_key_lookup_read(session, heap_relid, &key)
+            .primary_key_lookup(session, heap_relid, &key)
             .or_else(|| {
                 let mut scan_spec = index_spec.clone();
                 scan_spec.is_primary = false;
-                state.find_visible_by_index_key_excluding_read(
+                state.find_visible_by_index_key_excluding(
                     session, heap_relid, &scan_spec, &key, None,
                 )
             })
@@ -1506,9 +1671,7 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_single_byval_w
     }
 
     let key = IndexKey::single(IndexKeyPart::ByValue(value));
-    let tid = with_storage_read(|state, session| {
-        state.primary_key_lookup_read(session, heap_relid, &key)
-    });
+    let tid = with_storage(|state, session| state.primary_key_lookup(session, heap_relid, &key));
     let Some(tid) = tid else {
         return false;
     };

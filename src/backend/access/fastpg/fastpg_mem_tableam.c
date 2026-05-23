@@ -82,6 +82,7 @@
 #define FASTPG_MEM_STACK_NATTS 64
 #define FASTPG_MEM_SCAN_BATCH_ROWS 128
 #define FASTPG_MEM_INLINE_TOUCHED_ROWS 16
+#define FASTPG_MEM_ROW_LOCK_BUCKETS 4096
 #define FASTPG_MEM_MAX_ROWS_PER_BLOCK ((uint64_t) TBM_MAX_TUPLES_PER_PAGE)
 #define FASTPG_MEM_HEAP_OVERHEAD_BYTES_PER_TUPLE \
 	(MAXALIGN(SizeofHeapTupleHeader) + sizeof(ItemIdData))
@@ -172,6 +173,14 @@ typedef struct FastPgMemVisibilityState
 	TransactionId touched_xid;
 	CommandId	max_touched_cid;
 } FastPgMemVisibilityState;
+
+typedef struct FastPgMemRowLockEntry
+{
+	struct FastPgMemRowLockEntry *next;
+	pthread_mutex_t mutex;
+	uint64_t	row_id;
+	uint32_t	relid;
+} FastPgMemRowLockEntry;
 
 typedef struct FastPgMemBlockLayout
 {
@@ -445,6 +454,9 @@ extern bool fastpg_storage2_relation_resolve_tid(uint32_t relid,
 extern bool fastpg_storage2_relation_resolve_update_tid(uint32_t relid,
 														uint64_t tid,
 														uint64_t *resolved_tid);
+extern bool fastpg_storage2_relation_resolve_update_tid_read(uint32_t relid,
+															 uint64_t tid,
+															 uint64_t *resolved_tid);
 extern bool fastpg_storage2_relation_record_insert_metadata(uint32_t relid,
 															uint64_t tid,
 															uint32_t xid,
@@ -684,6 +696,11 @@ static _Thread_local FastPgMemVisibilityState *fastpg_mem_visibility_states = NU
 static _Thread_local MemoryContext fastpg_mem_block_layout_context = NULL;
 static _Thread_local FastPgMemBlockLayout *fastpg_mem_block_layouts = NULL;
 static _Thread_local FastPgMemLastIndexKey fastpg_mem_last_index_key = {0};
+static _Thread_local FastPgMemRowLockEntry **fastpg_mem_held_row_locks = NULL;
+static _Thread_local int fastpg_mem_held_row_lock_count = 0;
+static _Thread_local int fastpg_mem_held_row_lock_capacity = 0;
+static pthread_mutex_t fastpg_mem_row_lock_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+static FastPgMemRowLockEntry *fastpg_mem_row_lock_buckets[FASTPG_MEM_ROW_LOCK_BUCKETS];
 static pthread_mutex_t fastpg_mem_toast_state_lock = PTHREAD_MUTEX_INITIALIZER;
 static FastPgMemToastState *fastpg_mem_toast_states = NULL;
 #else
@@ -699,6 +716,11 @@ static FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
 static MemoryContext fastpg_mem_block_layout_context = NULL;
 static FastPgMemBlockLayout *fastpg_mem_block_layouts = NULL;
 static FastPgMemLastIndexKey fastpg_mem_last_index_key = {0};
+static FastPgMemRowLockEntry **fastpg_mem_held_row_locks = NULL;
+static int	fastpg_mem_held_row_lock_count = 0;
+static int	fastpg_mem_held_row_lock_capacity = 0;
+static pthread_mutex_t fastpg_mem_row_lock_table_mutex = PTHREAD_MUTEX_INITIALIZER;
+static FastPgMemRowLockEntry *fastpg_mem_row_lock_buckets[FASTPG_MEM_ROW_LOCK_BUCKETS];
 #endif
 
 typedef struct FastPgMemIndexScan
@@ -782,6 +804,9 @@ static bool fastpg_mem_relation_may_have_external_toast(uint32_t relid);
 static void fastpg_mem_note_relation_external_toast(uint32_t relid);
 static void fastpg_mem_clear_relation_external_toast(uint32_t relid);
 void		fastpg_mem_ensure_xact_callbacks(void);
+static void fastpg_mem_acquire_storage2_update_row_lock(uint32_t relid,
+														uint64_t *row_id);
+static void fastpg_mem_release_row_locks(void);
 bool		fastpg_mem_tableoid_tid_to_row_id(uint32_t relid,
 											  ItemPointer tid,
 											  uint64_t *row_id);
@@ -1359,6 +1384,7 @@ fastpg_mem_xact_callback(XactEvent event, void *arg)
 				else
 					fastpg_storage2_xact_commit();
 			}
+			fastpg_mem_release_row_locks();
 			fastpg_mem_reset_touched_rows();
 			fastpg_mem_reset_row_redirects();
 			break;
@@ -1373,6 +1399,7 @@ fastpg_mem_xact_callback(XactEvent event, void *arg)
 				else
 					fastpg_storage2_xact_abort();
 			}
+			fastpg_mem_release_row_locks();
 			fastpg_mem_reset_touched_rows();
 			fastpg_mem_reset_row_redirects();
 			break;
@@ -1648,6 +1675,155 @@ fastpg_mem_storage2_resolve_update_row_id(uint32_t relid, uint64_t row_id)
 	if (fastpg_storage2_relation_resolve_update_tid(relid, row_id, &resolved_row_id))
 		return resolved_row_id;
 	return row_id;
+}
+
+static uint64_t
+fastpg_mem_storage2_resolve_update_row_id_read(uint32_t relid, uint64_t row_id)
+{
+	uint64_t	resolved_row_id = row_id;
+
+	if (row_id == 0)
+		return 0;
+	if (fastpg_storage2_relation_resolve_update_tid_read(relid,
+														 row_id,
+														 &resolved_row_id))
+		return resolved_row_id;
+	return row_id;
+}
+
+static uint32_t
+fastpg_mem_row_lock_hash(uint32_t relid, uint64_t row_id)
+{
+	uint64_t	hash = row_id ^ (((uint64_t) relid) << 32);
+
+	hash ^= hash >> 33;
+	hash *= UINT64CONST(0xff51afd7ed558ccd);
+	hash ^= hash >> 33;
+	return (uint32_t) (hash % FASTPG_MEM_ROW_LOCK_BUCKETS);
+}
+
+static FastPgMemRowLockEntry *
+fastpg_mem_row_lock_entry(uint32_t relid, uint64_t row_id)
+{
+	FastPgMemRowLockEntry *entry;
+	uint32_t	bucket = fastpg_mem_row_lock_hash(relid, row_id);
+
+	pthread_mutex_lock(&fastpg_mem_row_lock_table_mutex);
+	for (entry = fastpg_mem_row_lock_buckets[bucket]; entry != NULL;
+		 entry = entry->next)
+	{
+		if (entry->relid == relid && entry->row_id == row_id)
+		{
+			pthread_mutex_unlock(&fastpg_mem_row_lock_table_mutex);
+			return entry;
+		}
+	}
+
+	entry = malloc(sizeof(*entry));
+	if (entry == NULL)
+	{
+		pthread_mutex_unlock(&fastpg_mem_row_lock_table_mutex);
+		ereport(ERROR,
+				(errcode(ERRCODE_OUT_OF_MEMORY),
+				 errmsg("out of memory allocating fastpg row lock")));
+	}
+	memset(entry, 0, sizeof(*entry));
+	entry->relid = relid;
+	entry->row_id = row_id;
+	if (pthread_mutex_init(&entry->mutex, NULL) != 0)
+	{
+		free(entry);
+		pthread_mutex_unlock(&fastpg_mem_row_lock_table_mutex);
+		elog(ERROR, "failed to initialize fastpg row lock");
+	}
+	entry->next = fastpg_mem_row_lock_buckets[bucket];
+	fastpg_mem_row_lock_buckets[bucket] = entry;
+	pthread_mutex_unlock(&fastpg_mem_row_lock_table_mutex);
+	return entry;
+}
+
+static bool
+fastpg_mem_row_lock_held(FastPgMemRowLockEntry *entry)
+{
+	for (int index = 0; index < fastpg_mem_held_row_lock_count; index++)
+	{
+		if (fastpg_mem_held_row_locks[index] == entry)
+			return true;
+	}
+	return false;
+}
+
+static void
+fastpg_mem_remember_held_row_lock(FastPgMemRowLockEntry *entry)
+{
+	if (fastpg_mem_held_row_lock_count >= fastpg_mem_held_row_lock_capacity)
+	{
+		int			new_capacity =
+			fastpg_mem_held_row_lock_capacity == 0 ? 8 :
+			fastpg_mem_held_row_lock_capacity * 2;
+		FastPgMemRowLockEntry **new_locks =
+			realloc(fastpg_mem_held_row_locks,
+					sizeof(*new_locks) * new_capacity);
+
+		if (new_locks == NULL)
+		{
+			pthread_mutex_unlock(&entry->mutex);
+			ereport(ERROR,
+					(errcode(ERRCODE_OUT_OF_MEMORY),
+					 errmsg("out of memory tracking fastpg row lock")));
+		}
+		fastpg_mem_held_row_locks = new_locks;
+		fastpg_mem_held_row_lock_capacity = new_capacity;
+	}
+	fastpg_mem_held_row_locks[fastpg_mem_held_row_lock_count++] = entry;
+}
+
+static void
+fastpg_mem_acquire_row_lock(uint32_t relid, uint64_t row_id)
+{
+	FastPgMemRowLockEntry *entry;
+
+	if (row_id == 0)
+		return;
+	entry = fastpg_mem_row_lock_entry(relid, row_id);
+	if (fastpg_mem_row_lock_held(entry))
+		return;
+	pthread_mutex_lock(&entry->mutex);
+	fastpg_mem_remember_held_row_lock(entry);
+}
+
+static void
+fastpg_mem_acquire_storage2_update_row_lock(uint32_t relid, uint64_t *row_id)
+{
+	uint64_t	current_row_id;
+
+	if (row_id == NULL || *row_id == 0)
+		return;
+
+	fastpg_mem_ensure_xact_callbacks();
+	current_row_id = *row_id;
+	for (;;)
+	{
+		uint64_t	resolved_row_id;
+
+		fastpg_mem_acquire_row_lock(relid, current_row_id);
+		resolved_row_id =
+			fastpg_mem_storage2_resolve_update_row_id_read(relid, current_row_id);
+		if (resolved_row_id == 0 || resolved_row_id == current_row_id)
+		{
+			*row_id = current_row_id;
+			return;
+		}
+		current_row_id = resolved_row_id;
+	}
+}
+
+static void
+fastpg_mem_release_row_locks(void)
+{
+	for (int index = fastpg_mem_held_row_lock_count - 1; index >= 0; index--)
+		pthread_mutex_unlock(&fastpg_mem_held_row_locks[index]->mutex);
+	fastpg_mem_held_row_lock_count = 0;
 }
 
 static size_t
@@ -5221,6 +5397,8 @@ fastpg_mem_tuple_delete(Relation rel,
 			uint64_t	resolved_row_id;
 			CommandId	delete_cid;
 
+			fastpg_mem_acquire_storage2_update_row_lock((uint32_t) RelationGetRelid(rel),
+														&row_id);
 			if (fastpg_mem_row_deleted_by_current_xact((uint32_t) RelationGetRelid(rel),
 													   row_id,
 													   cid,
@@ -5846,6 +6024,7 @@ fastpg_mem_tuple_update(Relation rel,
 	size_t	   *value_lens = stack_value_lens;
 	uint8_t    *owned = stack_owned;
 	uint64_t	row_id;
+	uint64_t	input_row_id = 0;
 	bool		storage2 = fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(rel));
 	bool		heap_buffers = tupdesc->natts > FASTPG_MEM_STACK_NATTS;
 	bool		used_toasted_tuple = false;
@@ -5881,27 +6060,9 @@ fastpg_mem_tuple_update(Relation rel,
 			fastpg_mem_fill_deleted_tmfd(otid, tmfd);
 			return TM_Deleted;
 		}
-		if (fastpg_catalog_mode_uses_postgres() &&
-			fastpg_mem_relation_touched_by_current_xact(relid))
-		{
-			uint64_t	resolved_row_id;
-			CommandId	delete_cid;
-
-			resolved_row_id =
-				fastpg_mem_storage2_resolve_update_row_id(relid, row_id);
-			if (resolved_row_id != row_id)
-				row_id = resolved_row_id;
-			else
-			if (fastpg_mem_row_deleted_by_current_xact(relid,
-													   row_id,
-													   cid,
-													   true,
-													   &delete_cid))
-			{
-				fastpg_mem_fill_self_modified_tmfd(otid, delete_cid, tmfd);
-				return TM_SelfModified;
-			}
-		}
+		input_row_id = row_id;
+		if (fastpg_catalog_mode_uses_postgres())
+			fastpg_mem_acquire_storage2_update_row_lock(relid, &row_id);
 	}
 	else if (!fastpg_mem_tid_to_row_id(rel, otid, &row_id))
 	{
@@ -6325,6 +6486,10 @@ fastpg_mem_tuple_update(Relation rel,
 		pfree(owned);
 	}
 
+	if (storage2 && input_row_id != 0 && input_row_id != row_id)
+		fastpg_mem_mark_row_touched((uint32_t) RelationGetRelid(rel),
+									input_row_id,
+									cid);
 	fastpg_mem_mark_row_touched((uint32_t) RelationGetRelid(rel), row_id, cid);
 	fastpg_mem_note_relation_changed((uint32_t) RelationGetRelid(rel));
 	return TM_Ok;
