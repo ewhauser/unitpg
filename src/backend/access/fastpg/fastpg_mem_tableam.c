@@ -164,6 +164,14 @@ typedef struct FastPgMemRowRedirect
 	TransactionId xid;
 } FastPgMemRowRedirect;
 
+typedef struct FastPgMemStorage2LockRoot
+{
+	struct FastPgMemStorage2LockRoot *next;
+	uint32_t	relid;
+	uint64_t	root_row_id;
+	uint64_t	resolved_row_id;
+} FastPgMemStorage2LockRoot;
+
 typedef struct FastPgMemVisibilityState
 {
 	struct FastPgMemVisibilityState *next;
@@ -584,6 +592,8 @@ extern uint64_t fastpg_storage2_scan_begin(uint32_t relid);
 extern uint64_t fastpg_storage2_scan_begin_with_snapshot(uint32_t relid,
 														 uint32_t curcid);
 extern void fastpg_storage2_scan_reset(uint64_t scan_handle);
+extern bool fastpg_storage2_scan_set_position(uint64_t scan_handle,
+											  uint64_t packed_tid);
 extern void fastpg_storage2_scan_end(uint64_t scan_handle);
 extern bool fastpg_storage2_scan_next_with_stored_natts(uint64_t scan_handle,
 														uint8_t forward,
@@ -691,6 +701,8 @@ static _Thread_local FastPgMemTouchedRowHashEntry fastpg_mem_touched_inline[FAST
 static _Thread_local int fastpg_mem_touched_inline_count = 0;
 static _Thread_local MemoryContext fastpg_mem_redirect_context = NULL;
 static _Thread_local FastPgMemRowRedirect *fastpg_mem_row_redirects = NULL;
+static _Thread_local MemoryContext fastpg_mem_storage2_lock_root_context = NULL;
+static _Thread_local FastPgMemStorage2LockRoot *fastpg_mem_storage2_lock_roots = NULL;
 static _Thread_local MemoryContext fastpg_mem_visibility_context = NULL;
 static _Thread_local FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
 static _Thread_local MemoryContext fastpg_mem_block_layout_context = NULL;
@@ -711,6 +723,8 @@ static FastPgMemTouchedRowHashEntry fastpg_mem_touched_inline[FASTPG_MEM_INLINE_
 static int	fastpg_mem_touched_inline_count = 0;
 static MemoryContext fastpg_mem_redirect_context = NULL;
 static FastPgMemRowRedirect *fastpg_mem_row_redirects = NULL;
+static MemoryContext fastpg_mem_storage2_lock_root_context = NULL;
+static FastPgMemStorage2LockRoot *fastpg_mem_storage2_lock_roots = NULL;
 static MemoryContext fastpg_mem_visibility_context = NULL;
 static FastPgMemVisibilityState *fastpg_mem_visibility_states = NULL;
 static MemoryContext fastpg_mem_block_layout_context = NULL;
@@ -806,7 +820,7 @@ static void fastpg_mem_clear_relation_external_toast(uint32_t relid);
 void		fastpg_mem_ensure_xact_callbacks(void);
 static void fastpg_mem_acquire_storage2_update_row_lock(uint32_t relid,
 														uint64_t *row_id);
-static void fastpg_mem_release_row_locks(void);
+void		fastpg_mem_release_row_locks(void);
 bool		fastpg_mem_tableoid_tid_to_row_id(uint32_t relid,
 											  ItemPointer tid,
 											  uint64_t *row_id);
@@ -975,6 +989,75 @@ fastpg_mem_reset_row_redirects(void)
 	if (fastpg_mem_redirect_context != NULL)
 		MemoryContextReset(fastpg_mem_redirect_context);
 	fastpg_mem_row_redirects = NULL;
+}
+
+static void
+fastpg_mem_reset_storage2_lock_roots(void)
+{
+	if (fastpg_mem_storage2_lock_root_context != NULL)
+		MemoryContextReset(fastpg_mem_storage2_lock_root_context);
+	fastpg_mem_storage2_lock_roots = NULL;
+}
+
+static void
+fastpg_mem_record_storage2_lock_root(uint32_t relid, uint64_t root_row_id,
+									 uint64_t resolved_row_id)
+{
+	MemoryContext oldcontext;
+	FastPgMemStorage2LockRoot *entry;
+
+	if (root_row_id == 0 ||
+		resolved_row_id == 0 ||
+		root_row_id == resolved_row_id)
+		return;
+
+	for (entry = fastpg_mem_storage2_lock_roots; entry != NULL; entry = entry->next)
+	{
+		if (entry->relid == relid && entry->resolved_row_id == resolved_row_id)
+		{
+			entry->root_row_id = root_row_id;
+			return;
+		}
+	}
+
+	if (fastpg_mem_storage2_lock_root_context == NULL)
+		fastpg_mem_storage2_lock_root_context =
+			AllocSetContextCreate(TopMemoryContext,
+								  "fastpg storage2 lock roots",
+								  ALLOCSET_SMALL_SIZES);
+
+	oldcontext = MemoryContextSwitchTo(fastpg_mem_storage2_lock_root_context);
+	entry = palloc0_object(FastPgMemStorage2LockRoot);
+	entry->relid = relid;
+	entry->root_row_id = root_row_id;
+	entry->resolved_row_id = resolved_row_id;
+	entry->next = fastpg_mem_storage2_lock_roots;
+	fastpg_mem_storage2_lock_roots = entry;
+	MemoryContextSwitchTo(oldcontext);
+}
+
+static uint64_t
+fastpg_mem_storage2_lock_root(uint32_t relid, uint64_t row_id)
+{
+	for (int depth = 0; depth < 32; depth++)
+	{
+		FastPgMemStorage2LockRoot *entry;
+		bool		found = false;
+
+		for (entry = fastpg_mem_storage2_lock_roots; entry != NULL; entry = entry->next)
+		{
+			if (entry->relid == relid && entry->resolved_row_id == row_id)
+			{
+				row_id = entry->root_row_id;
+				found = true;
+				break;
+			}
+		}
+		if (!found)
+			break;
+	}
+
+	return row_id;
 }
 
 static void
@@ -1273,6 +1356,7 @@ void
 FastPgMemResetCommandTouchedRows(void)
 {
 	fastpg_mem_reset_touched_rows();
+	fastpg_mem_reset_storage2_lock_roots();
 }
 
 static void
@@ -1387,6 +1471,7 @@ fastpg_mem_xact_callback(XactEvent event, void *arg)
 			fastpg_mem_release_row_locks();
 			fastpg_mem_reset_touched_rows();
 			fastpg_mem_reset_row_redirects();
+			fastpg_mem_reset_storage2_lock_roots();
 			break;
 		case XACT_EVENT_ABORT:
 		case XACT_EVENT_PARALLEL_ABORT:
@@ -1402,6 +1487,7 @@ fastpg_mem_xact_callback(XactEvent event, void *arg)
 			fastpg_mem_release_row_locks();
 			fastpg_mem_reset_touched_rows();
 			fastpg_mem_reset_row_redirects();
+			fastpg_mem_reset_storage2_lock_roots();
 			break;
 		default:
 			break;
@@ -1778,47 +1864,46 @@ fastpg_mem_remember_held_row_lock(FastPgMemRowLockEntry *entry)
 	fastpg_mem_held_row_locks[fastpg_mem_held_row_lock_count++] = entry;
 }
 
-static void
-fastpg_mem_acquire_row_lock(uint32_t relid, uint64_t row_id)
+static bool
+fastpg_mem_acquire_row_lock(uint32_t relid, uint64_t row_id,
+							FastPgMemRowLockEntry **entry_out)
 {
 	FastPgMemRowLockEntry *entry;
 
 	if (row_id == 0)
-		return;
+	{
+		if (entry_out != NULL)
+			*entry_out = NULL;
+		return false;
+	}
 	entry = fastpg_mem_row_lock_entry(relid, row_id);
+	if (entry_out != NULL)
+		*entry_out = entry;
 	if (fastpg_mem_row_lock_held(entry))
-		return;
+		return false;
 	pthread_mutex_lock(&entry->mutex);
 	fastpg_mem_remember_held_row_lock(entry);
+	return true;
 }
 
 static void
 fastpg_mem_acquire_storage2_update_row_lock(uint32_t relid, uint64_t *row_id)
 {
-	uint64_t	current_row_id;
+	uint64_t	lock_row_id;
+	uint64_t	resolved_row_id;
 
 	if (row_id == NULL || *row_id == 0)
 		return;
 
 	fastpg_mem_ensure_xact_callbacks();
-	current_row_id = *row_id;
-	for (;;)
-	{
-		uint64_t	resolved_row_id;
-
-		fastpg_mem_acquire_row_lock(relid, current_row_id);
-		resolved_row_id =
-			fastpg_mem_storage2_resolve_update_row_id_read(relid, current_row_id);
-		if (resolved_row_id == 0 || resolved_row_id == current_row_id)
-		{
-			*row_id = current_row_id;
-			return;
-		}
-		current_row_id = resolved_row_id;
-	}
+	lock_row_id = fastpg_mem_storage2_lock_root(relid, *row_id);
+	(void) fastpg_mem_acquire_row_lock(relid, lock_row_id, NULL);
+	resolved_row_id = fastpg_mem_storage2_resolve_update_row_id(relid, *row_id);
+	if (resolved_row_id != 0)
+		*row_id = resolved_row_id;
 }
 
-static void
+void
 fastpg_mem_release_row_locks(void)
 {
 	for (int index = fastpg_mem_held_row_lock_count - 1; index >= 0; index--)
@@ -2254,15 +2339,26 @@ fastpg_mem_fill_slot_values_internal(Relation rel,
 		{
 			if (attr->attlen == -1)
 			{
+				Pointer		raw = DatumGetPointer(slot->tts_values[index]);
 				struct varlena *flat;
 
-				if (owned == NULL)
+				if (raw != NULL && !VARATT_IS_EXTERNAL(raw))
+				{
+					Size		len = VARSIZE_ANY(raw);
+
+					if (owned == NULL)
+					{
+						flat = (struct varlena *) palloc(len);
+						memcpy(flat, raw, len);
+					}
+					else
+						flat = (struct varlena *) raw;
+				}
+				else if (owned == NULL)
 					flat =
 						(struct varlena *) PG_DETOAST_DATUM_COPY(slot->tts_values[index]);
 				else
 				{
-					Pointer		raw = DatumGetPointer(slot->tts_values[index]);
-
 					flat =
 						(struct varlena *) PG_DETOAST_DATUM_PACKED(slot->tts_values[index]);
 					if ((Pointer) flat != raw)
@@ -3006,19 +3102,39 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 	bool		found;
 	bool		heap_buffers = natts > FASTPG_MEM_STACK_NATTS;
 	bool		forward = ScanDirectionIsBackward(direction) ? false : true;
+	bool		use_batch;
 	bool		needs_row_metadata;
 
 	ExecClearTuple(slot);
 
-	if (!scan->batch_enabled)
+	if (scan->batch_count > scan->batch_index &&
+		scan->batch_forward != forward)
+	{
+		if (scan->storage2 && scan->batch_index > 0)
+			(void) fastpg_storage2_scan_set_position(scan->scan_handle,
+													 scan->batch_row_ids[scan->batch_index - 1]);
+		fastpg_mem_scan_discard_batch(scan);
+	}
+
+	use_batch = scan->batch_enabled && !(scan->storage2 && !forward);
+	if (!use_batch)
 	{
 		values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
 		isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
 		needs_row_metadata =
+			!scan->storage2 &&
 			fastpg_mem_scan_needs_row_metadata(scan->base.rs_rd,
 											   scan->base.rs_snapshot);
 
 		while ((found =
+				scan->storage2 ?
+				fastpg_storage2_scan_next_with_stored_natts(scan->scan_handle,
+															forward ? 1 : 0,
+															values,
+															isnull,
+															natts,
+															&row_id,
+															&stored_natts) :
 				needs_row_metadata ?
 				fastpg_rust_scan_next_with_metadata(scan->scan_handle,
 													forward ? 1 : 0,
@@ -3037,12 +3153,31 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 														&row_id,
 														&stored_natts)))
 		{
-			fastpg_mem_store_virtual_tuple(scan->base.rs_rd,
-										   slot,
-										   values,
-										   isnull,
-										   stored_natts,
-										   row_id);
+			if (scan->storage2)
+			{
+				fastpg_mem_maybe_remember_scan_single_index_key(scan,
+																row_id,
+																values,
+																isnull,
+																stored_natts);
+				fastpg_mem_fill_virtual_tuple_attrs(scan->base.rs_rd,
+													slot,
+													values,
+													isnull,
+													stored_natts);
+				if (!fastpg_mem_storage2_tid_to_tid(row_id, &slot->tts_tid))
+					elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+						 (unsigned long long) row_id);
+				slot->tts_tableOid = RelationGetRelid(scan->base.rs_rd);
+				ExecStoreVirtualTuple(slot);
+			}
+			else
+				fastpg_mem_store_virtual_tuple(scan->base.rs_rd,
+											   slot,
+											   values,
+											   isnull,
+											   stored_natts,
+											   row_id);
 			if (needs_row_metadata &&
 				!fastpg_mem_row_metadata_visible_to_snapshot((TransactionId) row_xmin,
 															 (CommandId) row_cmin,
@@ -3079,9 +3214,6 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 		!scan->storage2 &&
 		fastpg_mem_scan_needs_row_metadata(scan->base.rs_rd,
 										   scan->base.rs_snapshot);
-	if (scan->batch_count > scan->batch_index &&
-		scan->batch_forward != forward)
-		fastpg_mem_scan_discard_batch(scan);
 
 	while (true)
 	{
@@ -3443,13 +3575,22 @@ fastpg_mem_index_fetch_tuple(IndexFetchTableData *scan,
 	*call_again = false;
 	if (all_dead != NULL)
 		*all_dead = false;
-	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->rel)))
-		return fastpg_mem_tuple_fetch_row_version(scan->rel, tid, snapshot, slot);
-	if (FastPgMemResolveIndexFetchTid(scan->rel, tid, &resolved_tid))
+	if (fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(scan->rel)) &&
+		FastPgMemResolveIndexFetchTid(scan->rel, tid, &resolved_tid))
+	{
+		uint32_t	relid = (uint32_t) RelationGetRelid(scan->rel);
+		uint64_t	root_row_id = fastpg_mem_tid_to_storage2_tid(tid);
+		uint64_t	resolved_row_id = fastpg_mem_tid_to_storage2_tid(&resolved_tid);
+
+		if (fastpg_catalog_mode_uses_postgres())
+			fastpg_mem_record_storage2_lock_root(relid,
+												 root_row_id,
+												 resolved_row_id);
 		return fastpg_mem_tuple_fetch_row_version(scan->rel,
 												  &resolved_tid,
 												  snapshot,
 												  slot);
+	}
 	return fastpg_mem_tuple_fetch_row_version(scan->rel, tid, snapshot, slot);
 }
 
@@ -5947,6 +6088,7 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 		bool		cached_preserves;
 
 		if (fastpg_mem_single_update_index_attr(rel, tupdesc, &single_attnum) &&
+			!TupleDescAttr(tupdesc, single_attnum - 1)->atthasmissing &&
 			fastpg_mem_cached_single_index_key_preserves(rel,
 														 row_id,
 														 new_slot,
@@ -6105,6 +6247,7 @@ fastpg_mem_tuple_update(Relation rel,
 
 		fastpg_mem_ensure_index_attr_bitmaps(rel);
 		if (fastpg_mem_single_update_index_attr(rel, tupdesc, &single_attnum) &&
+			!TupleDescAttr(tupdesc, single_attnum - 1)->atthasmissing &&
 			TupleDescAttr(tupdesc, single_attnum - 1)->attbyval)
 		{
 			bool		cached_preserves;

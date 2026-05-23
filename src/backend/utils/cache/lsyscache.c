@@ -110,6 +110,13 @@ typedef struct FastPgRelnameRelidCacheEntry
 static _Thread_local FastPgRelnameRelidCacheEntry fastpg_relname_relid_cache[FASTPG_RELNAME_RELID_CACHE_SIZE];
 static _Thread_local int fastpg_relname_relid_cache_next = 0;
 
+void
+fastpg_relname_relid_cache_reset(void)
+{
+	memset(fastpg_relname_relid_cache, 0, sizeof(fastpg_relname_relid_cache));
+	fastpg_relname_relid_cache_next = 0;
+}
+
 static bool
 fastpg_builtin_type_info(Oid typid, FastPgBuiltinTypeInfo *type)
 {
@@ -228,6 +235,9 @@ fastpg_relname_relid_cache_store(const char *relname, Oid relnamespace,
 								 Oid relid)
 {
 	FastPgRelnameRelidCacheEntry *entry;
+
+	if (!OidIsValid(relid))
+		return;
 
 	entry = &fastpg_relname_relid_cache[fastpg_relname_relid_cache_next];
 	fastpg_relname_relid_cache_next =

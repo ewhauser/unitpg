@@ -26,6 +26,9 @@
 #include <fcntl.h>
 #include <sys/file.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/xlogutils.h"
 #include "commands/tablespace.h"
 #include "common/file_utils.h"
@@ -95,7 +98,13 @@ typedef struct _MdfdVec
 	BlockNumber mdfd_segno;		/* segment number, from 0 */
 } MdfdVec;
 
-static MemoryContext MdCxt;		/* context for all MdfdVec objects */
+#ifdef USE_FASTPG
+#define FASTPG_MD_BACKEND_LOCAL _Thread_local
+#else
+#define FASTPG_MD_BACKEND_LOCAL
+#endif
+
+static FASTPG_MD_BACKEND_LOCAL MemoryContext MdCxt; /* context for all MdfdVec objects */
 
 
 /* Populate a file tag describing an md.c segment file. */
@@ -190,9 +199,10 @@ _mdfd_open_flags(void)
 void
 mdinit(void)
 {
-	MdCxt = AllocSetContextCreate(TopMemoryContext,
-								  "MdSmgr",
-								  ALLOCSET_DEFAULT_SIZES);
+	if (MdCxt == NULL)
+		MdCxt = AllocSetContextCreate(TopMemoryContext,
+									  "MdSmgr",
+									  ALLOCSET_DEFAULT_SIZES);
 }
 
 /*
@@ -377,6 +387,9 @@ mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	RelPathStr	path;
 	int			ret;
 	int			save_errno;
+#ifdef USE_FASTPG
+	bool		fastpg_immediate_unlink = fastpg_catalog_mode_uses_postgres();
+#endif
 
 	path = relpath(rlocator, forknum);
 
@@ -385,6 +398,9 @@ mdunlinkfork(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 	 * to unlink it later, as described in the comments for mdunlink().
 	 */
 	if (isRedo || IsBinaryUpgrade || forknum != MAIN_FORKNUM ||
+#ifdef USE_FASTPG
+		fastpg_immediate_unlink ||
+#endif
 		RelFileLocatorBackendIsTemp(rlocator))
 	{
 		if (!RelFileLocatorBackendIsTemp(rlocator))

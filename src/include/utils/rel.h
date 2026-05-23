@@ -581,12 +581,21 @@ typedef struct ViewOptions
 static inline SMgrRelation
 RelationGetSmgr(Relation rel)
 {
+#ifdef USE_FASTPG
+	/*
+	 * FastPG shares relcache entries across logical backends, while smgr and
+	 * fd state are backend-local.  Do not store a backend-local SMgrRelation
+	 * in the shared RelationData; each worker finds its own smgr entry.
+	 */
+	return smgropen(rel->rd_locator, rel->rd_backend);
+#else
 	if (unlikely(rel->rd_smgr == NULL))
 	{
 		rel->rd_smgr = smgropen(rel->rd_locator, rel->rd_backend);
 		smgrpin(rel->rd_smgr);
 	}
 	return rel->rd_smgr;
+#endif
 }
 
 /*
@@ -596,12 +605,20 @@ RelationGetSmgr(Relation rel)
 static inline void
 RelationCloseSmgr(Relation relation)
 {
+#ifdef USE_FASTPG
+	/*
+	 * See RelationGetSmgr().  FastPG keeps smgr references backend-local, so
+	 * there is no shared RelationData pointer to close here.
+	 */
+	relation->rd_smgr = NULL;
+#else
 	if (relation->rd_smgr != NULL)
 	{
 		smgrunpin(relation->rd_smgr);
 		smgrclose(relation->rd_smgr);
 		relation->rd_smgr = NULL;
 	}
+#endif
 }
 #endif							/* !FRONTEND */
 
@@ -613,8 +630,13 @@ RelationCloseSmgr(Relation relation)
  * that the target block status is discarded on any smgr-level invalidation,
  * so there's no need to re-open the smgr handle if it's not currently open.
  */
+#ifdef USE_FASTPG
+#define RelationGetTargetBlock(relation) \
+	( RelationGetSmgr(relation)->smgr_targblock )
+#else
 #define RelationGetTargetBlock(relation) \
 	( (relation)->rd_smgr != NULL ? (relation)->rd_smgr->smgr_targblock : InvalidBlockNumber )
+#endif
 
 /*
  * RelationSetTargetBlock

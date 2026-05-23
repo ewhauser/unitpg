@@ -2605,6 +2605,80 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_simple_create_table_is_visible_to_following_query() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_simple_create_{}", std::process::id());
+        let _ = session.execute_simple(&format!("drop table if exists {table}"));
+
+        let create = session
+            .execute_simple(&format!("create table {table}(id int not null)"))
+            .unwrap();
+        assert_eq!(create.statements[0].command_tag, "CREATE TABLE");
+
+        let insert = session
+            .execute_simple(&format!("insert into {table} values (1), (2)"))
+            .unwrap();
+        assert_eq!(insert.statements[0].command_tag, "INSERT");
+
+        let count = session
+            .execute_simple(&format!("select count(*) from {table}"))
+            .unwrap();
+        assert_eq!(
+            count.statements[0].rows,
+            vec![vec![PgCoreValue::Text("2".to_owned())]]
+        );
+
+        session
+            .execute_simple(&format!("drop table if exists {table}"))
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_simple_multi_statement_sees_prior_ddl() {
+        let session = PgCoreSession::new();
+        let table = format!("fastpg_pgcore_simple_multi_{}", std::process::id());
+        let _ = session.execute_simple(&format!("drop table if exists {table}"));
+
+        let result = session
+            .execute_simple(&format!(
+                "create table {table}(id int not null); \
+                 insert into {table} values (1), (2); \
+                 select count(*) from {table};"
+            ))
+            .unwrap();
+        assert_eq!(result.statements[0].command_tag, "CREATE TABLE");
+        assert_eq!(result.statements[1].command_tag, "INSERT");
+        assert_eq!(
+            result.statements[2].rows,
+            vec![vec![PgCoreValue::Text("2".to_owned())]]
+        );
+
+        session
+            .execute_simple(&format!("drop table if exists {table}"))
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_simple_captures_more_than_two_rows() {
+        let session = PgCoreSession::new();
+        let result = session
+            .execute_simple("select * from (values (1), (2), (3)) as rows(id)")
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![
+                vec![PgCoreValue::Text("1".to_owned())],
+                vec![PgCoreValue::Text("2".to_owned())],
+                vec![PgCoreValue::Text("3".to_owned())],
+            ]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_current_timestamp_assignment_to_timestamp_column() {
         let session = PgCoreSession::new();
         let table = format!("fastpg_pgcore_mtime_{}", std::process::id());

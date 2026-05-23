@@ -324,8 +324,8 @@ pub unsafe extern "C" fn fastpg_storage2_relation_resolve_tid(
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    let resolved = with_storage_read(|state, session| {
-        state.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
+    let resolved = with_storage(|state, session| {
+        state.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid)
     });
     if !resolved_tid_out.is_null() {
         unsafe {
@@ -918,6 +918,22 @@ pub extern "C" fn fastpg_storage2_scan_reset(scan_handle: u64) {
             }
         }
     });
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_scan_set_position(scan_handle: u64, packed_tid: u64) -> bool {
+    clear_last_storage_error();
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_session_storage(|session| {
+        let Some(scan) = session.scan_slot_mut(scan_handle) else {
+            return false;
+        };
+        scan.forward_cursor = ScanCursor::after(tid);
+        scan.backward_cursor = ScanCursor::before(tid);
+        true
+    })
 }
 
 #[unsafe(no_mangle)]

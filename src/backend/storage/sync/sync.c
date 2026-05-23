@@ -68,12 +68,18 @@ typedef struct
 	bool		canceled;		/* true if request has been canceled */
 } PendingUnlinkEntry;
 
-static HTAB *pendingOps = NULL;
-static List *pendingUnlinks = NIL;
-static MemoryContext pendingOpsCxt; /* context for the above  */
+#ifdef USE_FASTPG
+#define FASTPG_SYNC_BACKEND_LOCAL _Thread_local
+#else
+#define FASTPG_SYNC_BACKEND_LOCAL
+#endif
 
-static CycleCtr sync_cycle_ctr = 0;
-static CycleCtr checkpoint_cycle_ctr = 0;
+static FASTPG_SYNC_BACKEND_LOCAL HTAB *pendingOps = NULL;
+static FASTPG_SYNC_BACKEND_LOCAL List *pendingUnlinks = NIL;
+static FASTPG_SYNC_BACKEND_LOCAL MemoryContext pendingOpsCxt; /* context for the above  */
+
+static FASTPG_SYNC_BACKEND_LOCAL CycleCtr sync_cycle_ctr = 0;
+static FASTPG_SYNC_BACKEND_LOCAL CycleCtr checkpoint_cycle_ctr = 0;
 
 /* Intervals for calling AbsorbSyncRequests */
 #define FSYNCS_PER_ABSORB		10
@@ -124,6 +130,9 @@ static const SyncOps syncsw[] = {
 void
 InitSync(void)
 {
+	if (pendingOpsCxt != NULL)
+		return;
+
 	/*
 	 * Create pending-operations hashtable if we need it.  Currently, we need
 	 * it if we are standalone (not under a postmaster) or if we are a
@@ -157,6 +166,14 @@ InitSync(void)
 		pendingUnlinks = NIL;
 	}
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadSync(void)
+{
+	InitSync();
+}
+#endif
 
 /*
  * SyncPreCheckpoint() -- Do pre-checkpoint work

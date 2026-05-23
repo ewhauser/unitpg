@@ -77,6 +77,9 @@ typedef SMgrRelationData *SMgrRelation;
 extern PGDLLIMPORT const PgAioTargetInfo aio_smgr_target_info;
 
 extern void smgrinit(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadSmgr(void);
+#endif
 extern SMgrRelation smgropen(RelFileLocator rlocator, ProcNumber backend);
 extern bool smgrexists(SMgrRelation reln, ForkNumber forknum);
 extern void smgrpin(SMgrRelation reln);
