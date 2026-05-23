@@ -748,6 +748,12 @@ static XLogRecPtr XLogBytePosToRecPtr(uint64 bytepos);
 static XLogRecPtr XLogBytePosToEndRecPtr(uint64 bytepos);
 static uint64 XLogRecPtrToBytePos(XLogRecPtr ptr);
 
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+static void FastPgSkipRecoveryRejectRecoveryInputs(void);
+static bool FastPgSkipRecoveryFileExists(const char *path);
+static EndOfWalRecoveryInfo *FastPgSkipRecoveryFinishFromControlFile(const CheckPoint *checkPoint);
+#endif
+
 static void WALInsertLockAcquire(void);
 static void WALInsertLockAcquireExclusive(void);
 static void WALInsertLockRelease(void);
@@ -5887,7 +5893,9 @@ StartupXLOG(void)
 	XLogCtlInsert *Insert;
 	CheckPoint	checkPoint;
 	bool		wasShutdown;
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	bool		didCrash;
+#endif
 	bool		haveTblspcMap;
 	bool		haveBackupLabel;
 	XLogRecPtr	EndOfLog;
@@ -5909,6 +5917,10 @@ StartupXLOG(void)
 	Assert(CurrentResourceOwner == NULL ||
 		   CurrentResourceOwner == AuxProcessResourceOwner);
 	CurrentResourceOwner = AuxProcessResourceOwner;
+
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+	FastPgSkipRecoveryRejectRecoveryInputs();
+#endif
 
 	/*
 	 * Check that contents look valid.
@@ -5988,7 +6000,9 @@ StartupXLOG(void)
 	 * In cases where someone has performed a copy for PITR, these directories
 	 * may have been excluded and need to be re-created.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	ValidateXLOGDirectoryStructure();
+#endif
 
 	/* Set up timeout handler needed to report startup progress. */
 	if (!IsBootstrapProcessingMode())
@@ -6009,6 +6023,15 @@ StartupXLOG(void)
 	 *   though more recent data written to disk from here on would be
 	 *   persisted.  To avoid that, fsync the entire data directory.
 	 */
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+	if (ControlFile->state != DB_SHUTDOWNED &&
+		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
+	{
+		ereport(LOG,
+				(errmsg("fastpg startup is ignoring previous unclean shutdown state")));
+		ControlFile->state = DB_SHUTDOWNED;
+	}
+#else
 	if (ControlFile->state != DB_SHUTDOWNED &&
 		ControlFile->state != DB_SHUTDOWNED_IN_RECOVERY)
 	{
@@ -6018,6 +6041,7 @@ StartupXLOG(void)
 	}
 	else
 		didCrash = false;
+#endif
 
 	/*
 	 * Prepare for WAL recovery if needed.
@@ -6027,8 +6051,19 @@ StartupXLOG(void)
 	 * starting checkpoint, and sets InRecovery and ArchiveRecoveryRequested.
 	 * It also applies the tablespace map file, if any.
 	 */
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+	wasShutdown = true;
+	haveBackupLabel = false;
+	haveTblspcMap = false;
+	InRecovery = false;
+	InArchiveRecovery = false;
+	ArchiveRecoveryRequested = false;
+	ereport(DEBUG1,
+			(errmsg_internal("fastpg startup bypassing WAL recovery initialization")));
+#else
 	InitWalRecovery(ControlFile, &wasShutdown,
 					&haveBackupLabel, &haveTblspcMap);
+#endif
 	checkPoint = ControlFile->checkPointCopy;
 
 	/* initialize shared memory variables from the checkpoint record */
@@ -6060,6 +6095,7 @@ StartupXLOG(void)
 	 * Initialize replication slots, before there's a chance to remove
 	 * required resources.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	StartupReplicationSlots();
 
 	/*
@@ -6073,6 +6109,10 @@ StartupXLOG(void)
 	 * during crash recovery.
 	 */
 	StartupReorderBuffer();
+#else
+	if (wal_level != WAL_LEVEL_MINIMAL)
+		StartupLogicalDecodingStatus(false);
+#endif
 
 	/*
 	 * Startup CLOG. This must be done after TransamVariables->nextXid has
@@ -6098,7 +6138,9 @@ StartupXLOG(void)
 	/*
 	 * Recover knowledge about replay progress of known replication partners.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	StartupReplicationOrigin();
+#endif
 
 	/*
 	 * Initialize unlogged LSN. On a clean shutdown, it's restored from the
@@ -6124,7 +6166,9 @@ StartupXLOG(void)
 	 * are small, so it's better to copy them unnecessarily than not copy them
 	 * and regret later.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	restoreTimeLineHistoryFiles(checkPoint.ThisTimeLineID, recoveryTargetTLI);
+#endif
 
 	/*
 	 * Before running in recovery, scan pg_twophase and fill in its status to
@@ -6134,7 +6178,9 @@ StartupXLOG(void)
 	 * replay.  This avoids as well any subsequent scans when doing recovery
 	 * of the on-disk two-phase data.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	restoreTwoPhaseData();
+#endif
 
 	/*
 	 * When starting with crash recovery, reset pgstat data - it might not be
@@ -6147,10 +6193,12 @@ StartupXLOG(void)
 	 * TODO: With a bit of extra work we could just start with a pgstat file
 	 * associated with the checkpoint redo location we're starting from.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	if (didCrash)
 		pgstat_discard_stats();
 	else
 		pgstat_restore_stats();
+#endif
 
 	lastFullPageWrites = checkPoint.fullPageWrites;
 
@@ -6322,7 +6370,11 @@ StartupXLOG(void)
 	/*
 	 * Finish WAL recovery.
 	 */
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+	endOfRecoveryInfo = FastPgSkipRecoveryFinishFromControlFile(&checkPoint);
+#else
 	endOfRecoveryInfo = FinishWalRecovery();
+#endif
 	EndOfLog = endOfRecoveryInfo->endOfLog;
 	EndOfLogTLI = endOfRecoveryInfo->endOfLogTLI;
 	abortedRecPtr = endOfRecoveryInfo->abortedRecPtr;
@@ -6391,7 +6443,11 @@ StartupXLOG(void)
 	 * This information is not quite needed yet, but it is positioned here so
 	 * as potential problems are detected before any on-disk change is done.
 	 */
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+	oldestActiveXID = XidFromFullTransactionId(TransamVariables->nextXid);
+#else
 	oldestActiveXID = PrescanPreparedTransactions(NULL, NULL);
+#endif
 
 	/*
 	 * Allow ordinary WAL segment creation before possibly switching to a new
@@ -6536,7 +6592,9 @@ StartupXLOG(void)
 	/*
 	 * Preallocate additional log files, if wanted.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	PreallocXlogFiles(EndOfLog, newTLI);
+#endif
 
 	/*
 	 * Okay, we're officially UP.
@@ -6571,10 +6629,14 @@ StartupXLOG(void)
 	 * happen before renaming the last partial segment of the old timeline as
 	 * it may be possible that we have to recover some transactions from it.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	RecoverPreparedTransactions();
+#endif
 
 	/* Shut down xlogreader */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	ShutdownWalRecovery();
+#endif
 
 	/* Enable WAL writes for this backend only. */
 	LocalSetXLogInsertAllowed();
@@ -6620,7 +6682,9 @@ StartupXLOG(void)
 	 * Update logical decoding status in shared memory and write an
 	 * XLOG_LOGICAL_DECODING_STATUS_CHANGE, if necessary.
 	 */
+#ifndef FASTPG_SKIP_RECOVERY_STARTUP
 	UpdateLogicalDecodingStatusEndOfRecovery();
+#endif
 
 	/* Clean up EndOfWalRecoveryInfo data to appease Valgrind leak checking */
 	if (endOfRecoveryInfo->lastPage)
@@ -9302,6 +9366,83 @@ xlog2_redo(XLogReaderState *record)
 		EmitAndWaitDataChecksumsBarrier(state.new_checksum_state);
 	}
 }
+
+#ifdef FASTPG_SKIP_RECOVERY_STARTUP
+static bool
+FastPgSkipRecoveryFileExists(const char *path)
+{
+	struct stat stat_buf;
+
+	return stat(path, &stat_buf) == 0;
+}
+
+static void
+FastPgSkipRecoveryRejectRecoveryInputs(void)
+{
+	if (FastPgSkipRecoveryFileExists(STANDBY_SIGNAL_FILE) ||
+		FastPgSkipRecoveryFileExists(RECOVERY_SIGNAL_FILE) ||
+		FastPgSkipRecoveryFileExists(BACKUP_LABEL_FILE))
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("WAL recovery startup is disabled by FASTPG_SKIP_RECOVERY_STARTUP"),
+				 errdetail("The Rust server treats PGDATA as disposable catalog state and does not run standby, archive recovery, or backup recovery.")));
+
+	if (recoveryRestoreCommand != NULL && recoveryRestoreCommand[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("restore_command is not supported by FASTPG_SKIP_RECOVERY_STARTUP")));
+
+	if (recoveryEndCommand != NULL && recoveryEndCommand[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("recovery_end_command is not supported by FASTPG_SKIP_RECOVERY_STARTUP")));
+
+	if (archiveCleanupCommand != NULL && archiveCleanupCommand[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("archive_cleanup_command is not supported by FASTPG_SKIP_RECOVERY_STARTUP")));
+
+	if (PrimaryConnInfo != NULL && PrimaryConnInfo[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("primary_conninfo is not supported by FASTPG_SKIP_RECOVERY_STARTUP")));
+
+	if (PrimarySlotName != NULL && PrimarySlotName[0] != '\0')
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("primary_slot_name is not supported by FASTPG_SKIP_RECOVERY_STARTUP")));
+
+	if (recoveryTarget != RECOVERY_TARGET_UNSET ||
+		recoveryTargetAction != RECOVERY_TARGET_ACTION_PAUSE)
+		ereport(FATAL,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("recovery targets are not supported by FASTPG_SKIP_RECOVERY_STARTUP")));
+}
+
+static EndOfWalRecoveryInfo *
+FastPgSkipRecoveryFinishFromControlFile(const CheckPoint *checkPoint)
+{
+	EndOfWalRecoveryInfo *result = palloc0_object(EndOfWalRecoveryInfo);
+	XLogRecPtr	endOfLog = ControlFile->checkPoint;
+
+	if (endOfLog % XLOG_BLCKSZ != 0)
+		endOfLog += XLOG_BLCKSZ - (endOfLog % XLOG_BLCKSZ);
+
+	result->lastRec = ControlFile->checkPoint;
+	result->lastRecTLI = checkPoint->ThisTimeLineID;
+	result->endOfLog = endOfLog;
+	result->endOfLogTLI = checkPoint->ThisTimeLineID;
+	result->lastPageBeginPtr = endOfLog;
+	result->lastPage = NULL;
+	result->abortedRecPtr = InvalidXLogRecPtr;
+	result->missingContrecPtr = InvalidXLogRecPtr;
+	result->recoveryStopReason = pstrdup("fastpg skip recovery startup");
+	result->standby_signal_file_found = false;
+	result->recovery_signal_file_found = false;
+
+	return result;
+}
+#endif
 
 /*
  * Return the extra open flags used for opening a file, depending on the

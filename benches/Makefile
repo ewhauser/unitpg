@@ -14,6 +14,7 @@ MESON_BUILDTYPE ?= release
 RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage2
 CATALOG_MODE ?= postgres
+CATALOG_PGDATA_MODE ?= seed-skeleton
 FASTPG_USE_MEM_INDEX_AM ?= 0
 UPSTREAM_REGRESSION_CASES ?=
 UPSTREAM_REGRESSION_LIMIT ?=
@@ -50,6 +51,7 @@ PGBENCH_COMMON_ARGS = \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
+	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
 	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG)
 
@@ -63,6 +65,7 @@ PGBENCH_PROFILE_ARGS = \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
+	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
 	--rust-build-profile "release" \
 	--profile-fastpg-rust-server \
 	--profile-tool "$(PROFILE_TOOL)" \
