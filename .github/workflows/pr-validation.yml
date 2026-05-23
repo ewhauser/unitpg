@@ -66,6 +66,47 @@ jobs:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
         run: make -C benches lint CLIPPY_ARGS="--workspace --all-targets --all-features"
 
+  regression:
+    name: Upstream SQL regression inventory
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            flex \
+            libipc-run-perl \
+            meson \
+            ninja-build \
+            patchelf \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Install Rust toolchain
+        run: |
+          cargo --version
+          rustfmt --version
+
+      - name: Run upstream SQL regression inventory
+        run: make -C benches regression REGRESSION_FAIL_ON_DIFFERENCES=1
+
+      - name: Upload regression inventory results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: upstream-regression-inventory
+          path: benches/results/upstream-regression/**
+          if-no-files-found: ignore
+          retention-days: 7
+
   validate:
     name: Validate ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
