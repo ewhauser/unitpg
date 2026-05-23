@@ -8,20 +8,36 @@ pub(crate) enum IndexKeyPart {
 }
 
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-pub(crate) struct IndexKey {
-    pub(crate) parts: Vec<IndexKeyPart>,
+pub(crate) enum IndexKey {
+    Single(IndexKeyPart),
+    Parts(Vec<IndexKeyPart>),
 }
 
 impl IndexKey {
+    pub(crate) fn single(part: IndexKeyPart) -> Self {
+        Self::Single(part)
+    }
+
+    pub(crate) fn parts(parts: Vec<IndexKeyPart>) -> Self {
+        match parts.as_slice() {
+            [part] => Self::Single(part.clone()),
+            _ => Self::Parts(parts),
+        }
+    }
+
     pub(crate) fn accounted_bytes(&self) -> usize {
-        self.parts
-            .iter()
-            .map(|part| match part {
-                IndexKeyPart::Null => 1,
-                IndexKeyPart::ByValue(_) => std::mem::size_of::<usize>(),
-                IndexKeyPart::Bytes(bytes) => bytes.len(),
-            })
-            .sum()
+        match self {
+            Self::Single(part) => index_key_part_bytes(part),
+            Self::Parts(parts) => parts.iter().map(index_key_part_bytes).sum(),
+        }
+    }
+}
+
+fn index_key_part_bytes(part: &IndexKeyPart) -> usize {
+    match part {
+        IndexKeyPart::Null => 1,
+        IndexKeyPart::ByValue(_) => std::mem::size_of::<usize>(),
+        IndexKeyPart::Bytes(bytes) => bytes.len(),
     }
 }
 
@@ -46,14 +62,16 @@ pub(crate) struct Storage2MetadataCache {
     pub(crate) generation: u64,
     pub(crate) unique_specs_by_relation: HashMap<u32, Vec<UniqueIndexSpec>>,
     pub(crate) primary_specs_by_index: HashMap<u32, Option<UniqueIndexSpec>>,
+    pub(crate) primary_specs_by_relation: HashMap<u32, Option<UniqueIndexSpec>>,
 }
 
 impl Default for Storage2MetadataCache {
     fn default() -> Self {
         Self {
             generation: current_generation(),
-            unique_specs_by_relation: HashMap::new(),
-            primary_specs_by_index: HashMap::new(),
+            unique_specs_by_relation: HashMap::default(),
+            primary_specs_by_index: HashMap::default(),
+            primary_specs_by_relation: HashMap::default(),
         }
     }
 }
@@ -94,13 +112,12 @@ pub(crate) fn with_storage2_metadata_cache<R>(
     f: impl FnOnce(&mut Storage2MetadataCache) -> R,
 ) -> R {
     let generation = current_generation();
-    let mut cache = storage2_metadata_cache()
-        .lock()
-        .expect("storage2 metadata cache mutex poisoned");
+    let mut cache = storage2_metadata_cache().lock();
     if cache.generation != generation {
         cache.generation = generation;
         cache.unique_specs_by_relation.clear();
         cache.primary_specs_by_index.clear();
+        cache.primary_specs_by_relation.clear();
     }
     f(&mut cache)
 }
@@ -157,8 +174,27 @@ pub(crate) fn primary_index_spec_for_index_oid(index_oid: Oid) -> Option<UniqueI
 }
 
 pub(crate) fn primary_index_spec_for_relation_oid(relation_oid: Oid) -> Option<UniqueIndexSpec> {
-    let primary_index_oid = primary_key_index_oid_for_relation_oid(relation_oid)?;
-    primary_index_spec_for_index_oid(primary_index_oid)
+    if !has_uncommitted_catalog_changes()
+        && let Some(cached) = with_storage2_metadata_cache(|cache| {
+            cache
+                .primary_specs_by_relation
+                .get(&relation_oid.0)
+                .cloned()
+        })
+    {
+        return cached;
+    }
+
+    let spec = primary_key_index_oid_for_relation_oid(relation_oid)
+        .and_then(primary_index_spec_for_index_oid);
+    if !has_uncommitted_catalog_changes() {
+        with_storage2_metadata_cache(|cache| {
+            cache
+                .primary_specs_by_relation
+                .insert(relation_oid.0, spec.clone());
+        });
+    }
+    spec
 }
 
 pub(crate) struct UniqueIndexFfiSpecArgs {
@@ -218,59 +254,30 @@ pub(crate) fn index_key_for_input(
     index_spec: &UniqueIndexSpec,
     input: &RowInput<'_>,
 ) -> Option<IndexKey> {
+    if let [column] = index_spec.columns.as_slice() {
+        return index_key_part_for_input(index_spec, column, input).map(IndexKey::single);
+    }
+
     let mut parts = Vec::with_capacity(index_spec.columns.len());
     for column in &index_spec.columns {
-        let index = column.column_index;
-        if *input.is_null.get(index)? != 0 {
-            if !index_spec.nulls_not_distinct {
-                return None;
-            }
-            parts.push(IndexKeyPart::Null);
-            continue;
-        }
-        if column.typbyval || *input.byval.get(index)? != 0 {
-            parts.push(IndexKeyPart::ByValue(*input.values.get(index)?));
-            continue;
-        }
-        let value = *input.values.get(index)?;
-        let len = byref_len(column.typlen, value, Some(*input.value_lens.get(index)?))?;
-        let bytes = if len == 0 {
-            Vec::new()
-        } else {
-            if value == 0 {
-                return None;
-            }
-            unsafe { slice::from_raw_parts(value as *const u8, len) }.to_vec()
-        };
-        parts.push(IndexKeyPart::Bytes(bytes));
+        parts.push(index_key_part_for_input(index_spec, column, input)?);
     }
-    Some(IndexKey { parts })
+    Some(IndexKey::parts(parts))
 }
 
 pub(crate) fn index_key_for_decoded(
     index_spec: &UniqueIndexSpec,
     values: &[DecodedDatum<'_>],
 ) -> Option<IndexKey> {
+    if let [column] = index_spec.columns.as_slice() {
+        return index_key_part_for_decoded(index_spec, column, values).map(IndexKey::single);
+    }
+
     let mut parts = Vec::with_capacity(index_spec.columns.len());
     for column in &index_spec.columns {
-        match values.get(column.column_index)? {
-            DecodedDatum::Null => {
-                if !index_spec.nulls_not_distinct {
-                    return None;
-                }
-                parts.push(IndexKeyPart::Null);
-            }
-            DecodedDatum::ByValue(value) => parts.push(IndexKeyPart::ByValue(*value)),
-            DecodedDatum::ByRef(bytes) => {
-                if column.typbyval {
-                    return None;
-                }
-                let len = byref_len_from_bytes(column.typlen, bytes)?;
-                parts.push(IndexKeyPart::Bytes(bytes.get(..len)?.to_vec()));
-            }
-        }
+        parts.push(index_key_part_for_decoded(index_spec, column, values)?);
     }
-    Some(IndexKey { parts })
+    Some(IndexKey::parts(parts))
 }
 
 pub(crate) fn index_key_for_key_datums(
@@ -281,26 +288,82 @@ pub(crate) fn index_key_for_key_datums(
     if values.len() != index_spec.columns.len() || values.len() != is_null.len() {
         return None;
     }
+
+    if let [column] = index_spec.columns.as_slice() {
+        return index_key_part_for_key_datum(index_spec, column, values, is_null, 0)
+            .map(IndexKey::single);
+    }
+
     let mut parts = Vec::with_capacity(values.len());
     for (key_index, column) in index_spec.columns.iter().enumerate() {
-        if is_null[key_index] != 0 {
-            if !index_spec.nulls_not_distinct {
+        parts.push(index_key_part_for_key_datum(
+            index_spec, column, values, is_null, key_index,
+        )?);
+    }
+    Some(IndexKey::parts(parts))
+}
+
+fn index_key_part_for_input(
+    index_spec: &UniqueIndexSpec,
+    column: &IndexColumnSpec,
+    input: &RowInput<'_>,
+) -> Option<IndexKeyPart> {
+    let index = column.column_index;
+    if *input.is_null.get(index)? != 0 {
+        return index_spec.nulls_not_distinct.then_some(IndexKeyPart::Null);
+    }
+    if column.typbyval || *input.byval.get(index)? != 0 {
+        return Some(IndexKeyPart::ByValue(*input.values.get(index)?));
+    }
+    let value = *input.values.get(index)?;
+    let len = byref_len(column.typlen, value, Some(*input.value_lens.get(index)?))?;
+    let bytes = if len == 0 {
+        Vec::new()
+    } else {
+        if value == 0 {
+            return None;
+        }
+        unsafe { slice::from_raw_parts(value as *const u8, len) }.to_vec()
+    };
+    Some(IndexKeyPart::Bytes(bytes))
+}
+
+fn index_key_part_for_decoded(
+    index_spec: &UniqueIndexSpec,
+    column: &IndexColumnSpec,
+    values: &[DecodedDatum<'_>],
+) -> Option<IndexKeyPart> {
+    match values.get(column.column_index)? {
+        DecodedDatum::Null => index_spec.nulls_not_distinct.then_some(IndexKeyPart::Null),
+        DecodedDatum::ByValue(value) => Some(IndexKeyPart::ByValue(*value)),
+        DecodedDatum::ByRef(bytes) => {
+            if column.typbyval {
                 return None;
             }
-            parts.push(IndexKeyPart::Null);
-            continue;
+            let len = byref_len_from_bytes(column.typlen, bytes)?;
+            Some(IndexKeyPart::Bytes(bytes.get(..len)?.to_vec()))
         }
-        if column.typbyval {
-            parts.push(IndexKeyPart::ByValue(values[key_index]));
-            continue;
-        }
-        let len = byref_len(column.typlen, values[key_index], None)?;
-        let bytes = if len == 0 {
-            Vec::new()
-        } else {
-            unsafe { slice::from_raw_parts(values[key_index] as *const u8, len) }.to_vec()
-        };
-        parts.push(IndexKeyPart::Bytes(bytes));
     }
-    Some(IndexKey { parts })
+}
+
+fn index_key_part_for_key_datum(
+    index_spec: &UniqueIndexSpec,
+    column: &IndexColumnSpec,
+    values: &[usize],
+    is_null: &[u8],
+    key_index: usize,
+) -> Option<IndexKeyPart> {
+    if is_null[key_index] != 0 {
+        return index_spec.nulls_not_distinct.then_some(IndexKeyPart::Null);
+    }
+    if column.typbyval {
+        return Some(IndexKeyPart::ByValue(values[key_index]));
+    }
+    let len = byref_len(column.typlen, values[key_index], None)?;
+    let bytes = if len == 0 {
+        Vec::new()
+    } else {
+        unsafe { slice::from_raw_parts(values[key_index] as *const u8, len) }.to_vec()
+    };
+    Some(IndexKeyPart::Bytes(bytes))
 }

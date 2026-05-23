@@ -1,7 +1,9 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::borrow::Cow;
+use std::ffi::CStr;
 use std::ops::{Deref, DerefMut};
+use std::sync::OnceLock;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RawParseSummary {
@@ -225,6 +227,16 @@ pub struct ExecutionResult {
     pub statements: Vec<ExecutionStatement>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SimpleExecutionResult {
+    Command {
+        notices: Vec<PgCoreNotice>,
+        tag: Cow<'static, str>,
+        rows: Option<usize>,
+    },
+    Full(ExecutionResult),
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PgCoreTransactionCommand {
     Begin,
@@ -297,10 +309,16 @@ impl PgCoreSession {
         }
     }
 
-    fn enter_storage(&self) -> PgCoreStorageGuards {
+    fn enter_storage(&self) -> PgCoreStorageGuards<'_> {
         PgCoreStorageGuards {
-            _storage1: fastpg_storage::enter_session_storage(self.storage_session.clone()),
-            _storage2: fastpg_storage2::enter_session_storage(self.storage2_session.clone()),
+            _storage1: if storage2_enabled() {
+                None
+            } else {
+                Some(fastpg_storage::enter_session_storage(
+                    self.storage_session.clone(),
+                ))
+            },
+            _storage2: fastpg_storage2::enter_locked_session_storage(&self.storage2_session),
         }
     }
 
@@ -316,6 +334,21 @@ impl PgCoreSession {
     pub fn execute_simple(&self, sql: &str) -> Result<ExecutionResult, PgCoreError> {
         let _guard = self.enter_storage();
         self.inner.execute_simple(sql)
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    pub fn execute_simple_cstr(&self, sql: &CStr) -> Result<ExecutionResult, PgCoreError> {
+        let _guard = self.enter_storage();
+        self.inner.execute_simple_cstr(sql)
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    pub fn execute_simple_cstr_fast(
+        &self,
+        sql: &CStr,
+    ) -> Result<SimpleExecutionResult, PgCoreError> {
+        let _guard = self.enter_storage();
+        self.inner.execute_simple_cstr_fast(sql)
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -398,10 +431,16 @@ impl PreparedStatement {
         self.inner.describe()
     }
 
-    fn enter_storage(&self) -> PgCoreStorageGuards {
+    fn enter_storage(&self) -> PgCoreStorageGuards<'_> {
         PgCoreStorageGuards {
-            _storage1: fastpg_storage::enter_session_storage(self.storage_session.clone()),
-            _storage2: fastpg_storage2::enter_session_storage(self.storage2_session.clone()),
+            _storage1: if storage2_enabled() {
+                None
+            } else {
+                Some(fastpg_storage::enter_session_storage(
+                    self.storage_session.clone(),
+                ))
+            },
+            _storage2: fastpg_storage2::enter_locked_session_storage(&self.storage2_session),
         }
     }
 
@@ -419,9 +458,19 @@ impl PreparedStatement {
     }
 }
 
-struct PgCoreStorageGuards {
-    _storage1: fastpg_storage::SessionStorageGuard,
-    _storage2: fastpg_storage2::SessionStorageGuard,
+struct PgCoreStorageGuards<'a> {
+    _storage1: Option<fastpg_storage::SessionStorageGuard>,
+    _storage2: fastpg_storage2::LockedSessionStorageGuard<'a>,
+}
+
+fn storage2_enabled() -> bool {
+    static STORAGE2_ENABLED: OnceLock<bool> = OnceLock::new();
+
+    *STORAGE2_ENABLED.get_or_init(|| {
+        std::env::var("FASTPG_STORAGE_ENGINE")
+            .map(|value| value.eq_ignore_ascii_case("storage2"))
+            .unwrap_or(false)
+    })
 }
 
 #[derive(Debug)]
@@ -451,16 +500,16 @@ mod inner {
     use std::borrow::Cow;
     use std::cell::Cell;
     use std::ffi::{CStr, CString, c_char};
+    use std::mem::MaybeUninit;
     use std::ptr;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyColumn, PgCoreCopyIn, PgCoreCopyOut,
         PgCoreError, PgCoreErrorFields, PgCoreField, PgCoreInputDatum, PgCoreLaneMetrics,
         PgCoreNotice, PgCoreParam, PgCoreTransactionCommand, PgCoreValue, RawParseSummary,
-        StatementDescription,
+        SimpleExecutionResult, StatementDescription,
     };
 
     static PGCORE_OPERATIONS: AtomicU64 = AtomicU64::new(0);
@@ -484,39 +533,19 @@ mod inner {
         }
     }
 
-    struct PgCoreLaneGuard {
-        started_at: Instant,
-    }
+    struct PgCoreLaneGuard;
 
     fn enter_pgcore_lane(_operation: &'static str) -> PgCoreLaneGuard {
-        let started_at = Instant::now();
-        let active = PGCORE_ACTIVE.fetch_add(1, Ordering::SeqCst) + 1;
+        let active = PGCORE_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
         PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         update_max_active(active);
         refresh_pgcore_caches_if_catalog_changed();
-        PgCoreLaneGuard { started_at }
+        PgCoreLaneGuard
     }
 
     impl Drop for PgCoreLaneGuard {
         fn drop(&mut self) {
-            add_duration(
-                &PGCORE_EXECUTION_NANOS,
-                self.started_at.elapsed().as_nanos(),
-            );
-            PGCORE_ACTIVE.fetch_sub(1, Ordering::SeqCst);
-        }
-    }
-
-    fn add_duration(counter: &AtomicU64, nanos: u128) {
-        let addition = u64::try_from(nanos).unwrap_or(u64::MAX);
-        let mut current = counter.load(Ordering::Relaxed);
-        loop {
-            let next = current.saturating_add(addition);
-            match counter.compare_exchange_weak(current, next, Ordering::Relaxed, Ordering::Relaxed)
-            {
-                Ok(_) => return,
-                Err(actual) => current = actual,
-            }
+            PGCORE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
         }
     }
 
@@ -580,6 +609,34 @@ mod inner {
     #[repr(C)]
     struct FastPgPgCoreExecuteResult {
         _private: [u8; 0],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct FastPgPgCoreExecuteStatementSummary {
+        command_tag: *const c_char,
+        is_select: bool,
+        column_count: i32,
+        row_count: i32,
+        has_processed_count: bool,
+        processed_count: u64,
+        copy_in: bool,
+        copy_out: bool,
+    }
+
+    impl Default for FastPgPgCoreExecuteStatementSummary {
+        fn default() -> Self {
+            Self {
+                command_tag: std::ptr::null(),
+                is_select: false,
+                column_count: 0,
+                row_count: 0,
+                has_processed_count: false,
+                processed_count: 0,
+                copy_in: false,
+                copy_out: false,
+            }
+        }
     }
 
     #[repr(C)]
@@ -759,6 +816,11 @@ mod inner {
             notice_index: i32,
         ) -> i32;
         fn fastpg_pgcore_execute_statement_count(result: *const FastPgPgCoreExecuteResult) -> i32;
+        fn fastpg_pgcore_execute_statement_summaries(
+            result: *const FastPgPgCoreExecuteResult,
+            summaries: *mut FastPgPgCoreExecuteStatementSummary,
+            summary_capacity: i32,
+        ) -> i32;
         fn fastpg_pgcore_execute_statement_command_tag(
             result: *const FastPgPgCoreExecuteResult,
             statement_index: i32,
@@ -981,9 +1043,13 @@ mod inner {
     fn with_c_sql<R>(sql: &str, f: impl FnOnce(*const c_char) -> R) -> R {
         let bytes = sql.as_bytes();
         if bytes.len() < STACK_SQL_BUFFER_LEN {
-            let mut buffer = [0u8; STACK_SQL_BUFFER_LEN];
-            buffer[..bytes.len()].copy_from_slice(bytes);
-            return f(buffer.as_ptr().cast());
+            let mut buffer = MaybeUninit::<[u8; STACK_SQL_BUFFER_LEN]>::uninit();
+            let buffer_ptr = buffer.as_mut_ptr().cast::<u8>();
+            unsafe {
+                ptr::copy_nonoverlapping(bytes.as_ptr(), buffer_ptr, bytes.len());
+                *buffer_ptr.add(bytes.len()) = 0;
+            }
+            return f(buffer_ptr.cast());
         }
         let c_sql = CString::new(sql).expect("checked SQL string does not contain embedded NULs");
         f(c_sql.as_ptr())
@@ -1240,6 +1306,23 @@ mod inner {
             self.set_database();
             let result = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_execute_simple(c_sql) });
             execution_result_from_ptr(result)
+        }
+
+        pub fn execute_simple_cstr(&self, sql: &CStr) -> Result<ExecutionResult, PgCoreError> {
+            let _guard = enter_pgcore_lane("execute_simple");
+            self.set_database();
+            let result = unsafe { fastpg_pgcore_execute_simple(sql.as_ptr()) };
+            execution_result_from_ptr(result)
+        }
+
+        pub fn execute_simple_cstr_fast(
+            &self,
+            sql: &CStr,
+        ) -> Result<SimpleExecutionResult, PgCoreError> {
+            let _guard = enter_pgcore_lane("execute_simple");
+            self.set_database();
+            let result = unsafe { fastpg_pgcore_execute_simple(sql.as_ptr()) };
+            simple_execution_result_from_ptr(result)
         }
 
         pub fn execute_transaction_command(&self, command: PgCoreTransactionCommand) {
@@ -1648,6 +1731,57 @@ mod inner {
         }
     }
 
+    fn simple_execution_result_from_ptr(
+        result: *mut FastPgPgCoreExecuteResult,
+    ) -> Result<SimpleExecutionResult, PgCoreError> {
+        let Some(result) = NonNull::new(result) else {
+            return Err(PgCoreError::new(
+                "XX000",
+                "PostgreSQL execute returned a null result",
+                0,
+            ));
+        };
+        let result = ExecuteResult(result);
+        if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
+            if let Some((tag, rows)) = result.to_single_command() {
+                let notices = result.to_notices();
+                Ok(SimpleExecutionResult::Command { notices, tag, rows })
+            } else {
+                Ok(SimpleExecutionResult::Full(result.to_execution_result()))
+            }
+        } else {
+            let partial = result.to_execution_result().statements;
+            let mut error = PgCoreError::with_fields(
+                unsafe { c_string(fastpg_pgcore_execute_result_sqlstate(result.as_ptr())) },
+                unsafe { c_string(fastpg_pgcore_execute_result_message(result.as_ptr())) },
+                PgCoreErrorFields {
+                    detail: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_detail(result.as_ptr()))
+                    },
+                    hint: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_hint(result.as_ptr()))
+                    },
+                    context: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_context(result.as_ptr()))
+                    },
+                    cursorpos: unsafe { fastpg_pgcore_execute_result_cursorpos(result.as_ptr()) },
+                    internal_query: unsafe {
+                        optional_c_string(fastpg_pgcore_execute_result_internal_query(
+                            result.as_ptr(),
+                        ))
+                    },
+                    internalpos: unsafe {
+                        fastpg_pgcore_execute_result_internalpos(result.as_ptr())
+                    },
+                    notices: result.to_notices(),
+                    ..Default::default()
+                },
+            );
+            error.partial = partial;
+            Err(error)
+        }
+    }
+
     impl Drop for PreparedStatement {
         fn drop(&mut self) {
             let _guard = enter_pgcore_lane("prepared_free");
@@ -1660,6 +1794,8 @@ mod inner {
     struct ExecuteResult(NonNull<FastPgPgCoreExecuteResult>);
 
     impl ExecuteResult {
+        const INLINE_STATEMENT_SUMMARIES: usize = 8;
+
         fn as_ptr(&self) -> *const FastPgPgCoreExecuteResult {
             self.0.as_ptr()
         }
@@ -1713,39 +1849,125 @@ mod inner {
             notices
         }
 
+        fn to_single_command(&self) -> Option<(Cow<'static, str>, Option<usize>)> {
+            let statement_count =
+                unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
+            if statement_count != 1 {
+                return None;
+            }
+
+            let mut summary = FastPgPgCoreExecuteStatementSummary::default();
+            let summary_count = unsafe {
+                fastpg_pgcore_execute_statement_summaries(self.as_ptr(), &mut summary, 1)
+            };
+            if summary_count != 1
+                || summary.is_select
+                || summary.column_count != 0
+                || summary.row_count != 0
+                || summary.copy_in
+                || summary.copy_out
+            {
+                return None;
+            }
+
+            let rows = summary
+                .has_processed_count
+                .then(|| usize::try_from(summary.processed_count).unwrap_or(usize::MAX));
+            Some((unsafe { command_tag(summary.command_tag) }, rows))
+        }
+
         fn to_execution_result(&self) -> ExecutionResult {
             let notices = self.to_notices();
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
-            let mut statements = Vec::with_capacity(statement_count as usize);
-            for statement_index in 0..statement_count {
-                let field_count = unsafe {
-                    fastpg_pgcore_execute_statement_column_count(self.as_ptr(), statement_index)
-                }
-                .max(0);
-                let row_count = unsafe {
-                    fastpg_pgcore_execute_statement_row_count(self.as_ptr(), statement_index)
-                }
-                .max(0);
-                let command_rows = unsafe {
-                    fastpg_pgcore_execute_statement_has_processed_count(
+            let statement_len = statement_count as usize;
+            let mut inline_summaries =
+                [FastPgPgCoreExecuteStatementSummary::default(); Self::INLINE_STATEMENT_SUMMARIES];
+            let mut heap_summaries = Vec::new();
+            let summaries = if statement_len <= Self::INLINE_STATEMENT_SUMMARIES {
+                &mut inline_summaries[..statement_len]
+            } else {
+                heap_summaries.resize(
+                    statement_len,
+                    FastPgPgCoreExecuteStatementSummary::default(),
+                );
+                heap_summaries.as_mut_slice()
+            };
+            let summary_count = if statement_count == 0 {
+                0
+            } else {
+                unsafe {
+                    fastpg_pgcore_execute_statement_summaries(
                         self.as_ptr(),
-                        statement_index,
+                        summaries.as_mut_ptr(),
+                        statement_count,
                     )
                 }
-                .then(|| {
-                    let rows = unsafe {
-                        fastpg_pgcore_execute_statement_processed_count(
-                            self.as_ptr(),
-                            statement_index,
-                        )
-                    };
-                    usize::try_from(rows).unwrap_or(usize::MAX)
-                });
-                let copy_in = unsafe {
-                    fastpg_pgcore_execute_statement_is_copy_in(self.as_ptr(), statement_index)
-                }
-                .then(|| {
+                .max(0)
+                .min(statement_count)
+            };
+            let mut statements = Vec::with_capacity(statement_count as usize);
+            for statement_index in 0..statement_count {
+                let summary = if statement_index < summary_count {
+                    summaries[statement_index as usize]
+                } else {
+                    FastPgPgCoreExecuteStatementSummary {
+                        command_tag: unsafe {
+                            fastpg_pgcore_execute_statement_command_tag(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        is_select: unsafe {
+                            fastpg_pgcore_execute_statement_is_select(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        column_count: unsafe {
+                            fastpg_pgcore_execute_statement_column_count(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        row_count: unsafe {
+                            fastpg_pgcore_execute_statement_row_count(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        has_processed_count: unsafe {
+                            fastpg_pgcore_execute_statement_has_processed_count(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        processed_count: unsafe {
+                            fastpg_pgcore_execute_statement_processed_count(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        copy_in: unsafe {
+                            fastpg_pgcore_execute_statement_is_copy_in(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                        copy_out: unsafe {
+                            fastpg_pgcore_execute_statement_is_copy_out(
+                                self.as_ptr(),
+                                statement_index,
+                            )
+                        },
+                    }
+                };
+                let field_count = summary.column_count.max(0);
+                let row_count = summary.row_count.max(0);
+                let command_rows = summary
+                    .has_processed_count
+                    .then(|| usize::try_from(summary.processed_count).unwrap_or(usize::MAX));
+                let copy_in = summary.copy_in.then(|| {
                     let columns = unsafe {
                         fastpg_pgcore_execute_statement_copy_column_count(
                             self.as_ptr(),
@@ -1900,10 +2122,7 @@ mod inner {
                         column_metadata,
                     }
                 });
-                let copy_out = unsafe {
-                    fastpg_pgcore_execute_statement_is_copy_out(self.as_ptr(), statement_index)
-                }
-                .then(|| {
+                let copy_out = summary.copy_out.then(|| {
                     let chunk_count = unsafe {
                         fastpg_pgcore_execute_statement_copy_out_chunk_count(
                             self.as_ptr(),
@@ -2008,16 +2227,9 @@ mod inner {
                     rows.push(row);
                 }
                 statements.push(ExecutionStatement {
-                    command_tag: unsafe {
-                        command_tag(fastpg_pgcore_execute_statement_command_tag(
-                            self.as_ptr(),
-                            statement_index,
-                        ))
-                    },
+                    command_tag: unsafe { command_tag(summary.command_tag) },
                     command_rows,
-                    is_select: unsafe {
-                        fastpg_pgcore_execute_statement_is_select(self.as_ptr(), statement_index)
-                    },
+                    is_select: summary.is_select,
                     fields,
                     rows,
                     copy_in,

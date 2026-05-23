@@ -1,11 +1,15 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
-use std::cell::RefCell;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
+use std::hash::{BuildHasherDefault, Hasher};
+use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, OnceLock};
+use std::{collections::BTreeMap, collections::BTreeSet};
+
+use parking_lot::{Mutex, MutexGuard, RwLock};
 
 use fastpg_catalog::{
     BPCHAR_OID, CatalogError, INT2_OID, INT4_OID, INT8_OID, IndexRecord, OID_OID, TEXT_OID,
@@ -21,6 +25,87 @@ pub(crate) const TUPLE_MAGIC: &[u8; 4] = b"FP2T";
 pub(crate) const TUPLE_HEADER_LEN: usize = 16;
 pub(crate) const ATTR_ENTRY_LEN: usize = 24;
 pub(crate) const SQLSTATE_PROGRAM_LIMIT_EXCEEDED: &str = "54000";
+
+pub(crate) type HashMap<K, V> =
+    std::collections::HashMap<K, V, BuildHasherDefault<FastPgStorageHasher>>;
+pub(crate) type HashSet<T> = std::collections::HashSet<T, BuildHasherDefault<FastPgStorageHasher>>;
+
+#[derive(Default)]
+pub(crate) struct FastPgStorageHasher {
+    state: u64,
+}
+
+impl FastPgStorageHasher {
+    fn mix(&mut self, mut value: u64) {
+        value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        value ^= value >> 31;
+        self.state ^= value;
+        self.state = self
+            .state
+            .rotate_left(27)
+            .wrapping_mul(0x3c79_ac49_2ba7_b653)
+            .wrapping_add(0x1c69_b3f7_4ac4_ae35);
+    }
+}
+
+impl Hasher for FastPgStorageHasher {
+    fn finish(&self) -> u64 {
+        self.state
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        let mut chunks = bytes.chunks_exact(8);
+        for chunk in &mut chunks {
+            self.mix(u64::from_ne_bytes(chunk.try_into().expect("u64 chunk")));
+        }
+        let mut tail = [0u8; 8];
+        let remainder = chunks.remainder();
+        tail[..remainder.len()].copy_from_slice(remainder);
+        self.mix(u64::from_ne_bytes(tail) ^ ((bytes.len() as u64) << 56));
+    }
+
+    fn write_u8(&mut self, i: u8) {
+        self.mix(u64::from(i));
+    }
+
+    fn write_u16(&mut self, i: u16) {
+        self.mix(u64::from(i));
+    }
+
+    fn write_u32(&mut self, i: u32) {
+        self.mix(u64::from(i));
+    }
+
+    fn write_u64(&mut self, i: u64) {
+        self.mix(i);
+    }
+
+    fn write_usize(&mut self, i: usize) {
+        self.mix(i as u64);
+    }
+
+    fn write_i8(&mut self, i: i8) {
+        self.write_u8(i as u8);
+    }
+
+    fn write_i16(&mut self, i: i16) {
+        self.write_u16(i as u16);
+    }
+
+    fn write_i32(&mut self, i: i32) {
+        self.write_u32(i as u32);
+    }
+
+    fn write_i64(&mut self, i: i64) {
+        self.write_u64(i as u64);
+    }
+
+    fn write_isize(&mut self, i: isize) {
+        self.write_usize(i as usize);
+    }
+}
 
 pub(crate) static STORAGE2_ARENA_REWINDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static STORAGE2_ARENA_DROPS: AtomicU64 = AtomicU64::new(0);
@@ -47,7 +132,8 @@ pub use copy::{CopyDatum, copy_text_line, insert_copy_datums};
 pub use metrics::FastPgStorage2Metrics;
 pub use tid::Tid;
 pub use transaction::{
-    SessionStorageGuard, SessionStorageHandle, enter_session_storage, new_session_storage,
+    LockedSessionStorageGuard, SessionStorageGuard, SessionStorageHandle,
+    enter_locked_session_storage, enter_session_storage, new_session_storage,
 };
 
 pub(crate) use error::*;
@@ -151,7 +237,7 @@ pub extern "C" fn fastpg_storage2_relation_row_count(relid: u32) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_page_count(relid: u32) -> usize {
-    with_storage(|state, _session| {
+    with_storage_read(|state, _session| {
         state
             .relations
             .get(&relid)
@@ -162,7 +248,7 @@ pub extern "C" fn fastpg_storage2_relation_page_count(relid: u32) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_block_count(relid: u32) -> usize {
-    with_storage(|state, _session| {
+    with_storage_read(|state, _session| {
         state
             .relations
             .get(&relid)
@@ -182,7 +268,7 @@ pub extern "C" fn fastpg_storage2_relation_set_max_tuples_per_block(relid: u32, 
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_block_max_offset(relid: u32, block: u32) -> u16 {
-    with_storage(|state, _session| {
+    with_storage_read(|state, _session| {
         state
             .relations
             .get(&relid)
@@ -201,7 +287,7 @@ pub unsafe extern "C" fn fastpg_storage2_relation_visible_tid_at(
     zero_based_index: usize,
     tid_out: *mut u64,
 ) -> bool {
-    let tid = with_storage(|state, session| {
+    let tid = with_storage_read(|state, session| {
         state
             .visible_tids(session, relid)
             .get(zero_based_index)
@@ -223,7 +309,7 @@ pub extern "C" fn fastpg_storage2_relation_contains_tid(relid: u32, packed_tid: 
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    with_storage(|state, session| state.find_visible_tuple(session, relid, tid).is_some())
+    with_storage_read(|state, session| state.find_visible_tuple(session, relid, tid).is_some())
 }
 
 #[unsafe(no_mangle)]
@@ -238,8 +324,8 @@ pub unsafe extern "C" fn fastpg_storage2_relation_resolve_tid(
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    let resolved = with_storage(|state, session| {
-        state.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid)
+    let resolved = with_storage_read(|state, session| {
+        state.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
     });
     if !resolved_tid_out.is_null() {
         unsafe {
@@ -262,7 +348,7 @@ pub unsafe extern "C" fn fastpg_storage2_relation_resolve_update_tid(
         return false;
     };
     let resolved = with_storage(|state, session| {
-        state.resolve_update_redirect_in_overlays(&session.transaction_stack, relid, tid)
+        state.resolve_update_redirect_in_overlays_compress(&session.transaction_stack, relid, tid)
     });
     if !resolved_tid_out.is_null() {
         unsafe {
@@ -324,7 +410,7 @@ pub extern "C" fn fastpg_storage2_relation_row_xmin(relid: u32, packed_tid: u64)
     let Some(tid) = Tid::unpack(packed_tid) else {
         return 0;
     };
-    with_storage(|state, session| state.row_xmin(session, relid, tid))
+    with_storage_read(|state, session| state.row_xmin(session, relid, tid))
 }
 
 #[unsafe(no_mangle)]
@@ -332,7 +418,7 @@ pub extern "C" fn fastpg_storage2_relation_row_cmin(relid: u32, packed_tid: u64)
     let Some(tid) = Tid::unpack(packed_tid) else {
         return 0;
     };
-    with_storage(|state, session| state.row_cmin(session, relid, tid))
+    with_storage_read(|state, session| state.row_cmin(session, relid, tid))
 }
 
 #[unsafe(no_mangle)]
@@ -340,7 +426,7 @@ pub extern "C" fn fastpg_storage2_relation_row_xmax(relid: u32, packed_tid: u64)
     let Some(tid) = Tid::unpack(packed_tid) else {
         return 0;
     };
-    with_storage(|state, session| state.row_xmax(session, relid, tid))
+    with_storage_read(|state, session| state.row_xmax(session, relid, tid))
 }
 
 #[unsafe(no_mangle)]
@@ -348,7 +434,7 @@ pub extern "C" fn fastpg_storage2_relation_row_delete_xid(relid: u32, packed_tid
     let Some(tid) = Tid::unpack(packed_tid) else {
         return 0;
     };
-    with_storage(|state, session| state.row_delete_xid(session, relid, tid))
+    with_storage_read(|state, session| state.row_delete_xid(session, relid, tid))
 }
 
 #[unsafe(no_mangle)]
@@ -356,7 +442,7 @@ pub extern "C" fn fastpg_storage2_relation_row_delete_cid(relid: u32, packed_tid
     let Some(tid) = Tid::unpack(packed_tid) else {
         return 0;
     };
-    with_storage(|state, session| state.row_delete_cid(session, relid, tid))
+    with_storage_read(|state, session| state.row_delete_cid(session, relid, tid))
 }
 
 #[unsafe(no_mangle)]
@@ -377,7 +463,7 @@ pub unsafe extern "C" fn fastpg_storage2_relation_insert(
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
         return false;
     };
-    relation_insert_impl(relid, input, tid_out, UniqueCheck::Enforce)
+    relation_insert_impl(relid, input, tid_out, UniqueCheck::Enforce, None, true)
 }
 
 #[unsafe(no_mangle)]
@@ -398,7 +484,67 @@ pub unsafe extern "C" fn fastpg_storage2_relation_insert_unchecked(
         set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
         return false;
     };
-    relation_insert_impl(relid, input, tid_out, UniqueCheck::Skip)
+    relation_insert_impl(relid, input, tid_out, UniqueCheck::Skip, None, true)
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_insert_unchecked_with_metadata(
+    relid: u32,
+    xid: u32,
+    cid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_insert_impl(
+        relid,
+        input,
+        tid_out,
+        UniqueCheck::Skip,
+        Some(InsertMetadata { xid, cid }),
+        true,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_insert_unchecked_no_index_with_metadata(
+    relid: u32,
+    xid: u32,
+    cid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_insert_impl(
+        relid,
+        input,
+        tid_out,
+        UniqueCheck::Skip,
+        Some(InsertMetadata { xid, cid }),
+        false,
+    )
 }
 
 #[unsafe(no_mangle)]
@@ -427,6 +573,7 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update(
         new_tid_out,
         UniqueCheck::Enforce,
         false,
+        None,
     )
 }
 
@@ -456,6 +603,48 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_unchecked(
         new_tid_out,
         UniqueCheck::Skip,
         false,
+        None,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_update_unchecked_with_metadata(
+    relid: u32,
+    packed_tid: u64,
+    delete_xid: u32,
+    delete_cid: u32,
+    insert_xid: u32,
+    insert_cid: u32,
+    row_xmax: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    new_tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        false,
+        Some(UpdateMetadata {
+            delete_xid,
+            delete_cid,
+            insert_xid,
+            insert_cid,
+            row_xmax,
+        }),
     )
 }
 
@@ -485,6 +674,7 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_redirect_unchecked(
         new_tid_out,
         UniqueCheck::Skip,
         true,
+        None,
     )
 }
 
@@ -514,6 +704,104 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_unchecked(
         new_tid_out,
         UniqueCheck::Skip,
         true,
+        None,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_unchecked_with_metadata(
+    relid: u32,
+    packed_tid: u64,
+    delete_xid: u32,
+    delete_cid: u32,
+    insert_xid: u32,
+    insert_cid: u32,
+    row_xmax: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    new_tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_update_impl(
+        relid,
+        packed_tid,
+        input,
+        new_tid_out,
+        UniqueCheck::Skip,
+        true,
+        Some(UpdateMetadata {
+            delete_xid,
+            delete_cid,
+            insert_xid,
+            insert_cid,
+            row_xmax,
+        }),
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and optional valid output pointers.
+pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_if_single_byval_preserved_with_metadata(
+    relid: u32,
+    packed_tid: u64,
+    key_attnum: usize,
+    key_value: usize,
+    key_is_null: u8,
+    delete_xid: u32,
+    delete_cid: u32,
+    insert_xid: u32,
+    insert_cid: u32,
+    row_xmax: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    new_tid_out: *mut u64,
+    hot_preserved_out: *mut bool,
+) -> bool {
+    clear_last_storage_error();
+    if !hot_preserved_out.is_null() {
+        unsafe {
+            *hot_preserved_out = false;
+        }
+    }
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_update_hot_if_single_byval_preserved_impl(
+        relid,
+        packed_tid,
+        input,
+        SingleByvalHotKey {
+            attnum: key_attnum,
+            value: key_value,
+            is_null: key_is_null,
+        },
+        HotUpdateOutputs {
+            new_tid: new_tid_out,
+            hot_preserved: hot_preserved_out,
+        },
+        Some(UpdateMetadata {
+            delete_xid,
+            delete_cid,
+            insert_xid,
+            insert_cid,
+            row_xmax,
+        }),
     )
 }
 
@@ -561,7 +849,7 @@ pub extern "C" fn fastpg_storage2_scan_begin_with_snapshot(relid: u32, curcid: u
 
 fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
     clear_last_storage_error();
-    with_storage(|state, session| {
+    with_storage_read(|state, session| {
         let high_water_offsets = state
             .relations
             .get(&relid)
@@ -574,7 +862,7 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
                             .and_then(|page| u16::try_from(page.line_pointers.len()).ok())
                             .unwrap_or_default()
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<HighWaterOffsets>()
             })
             .unwrap_or_default();
         let handle = session.allocate_scan_handle();
@@ -595,7 +883,7 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_scan_reset(scan_handle: u64) {
-    with_storage(|_state, session| {
+    with_session_storage(|session| {
         let has_visibility_deltas = session
             .scan_slot(scan_handle)
             .map(|scan| session.transaction_has_visibility_deltas(scan.relid));
@@ -611,7 +899,7 @@ pub extern "C" fn fastpg_storage2_scan_reset(scan_handle: u64) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_scan_end(scan_handle: u64) {
-    with_storage(|_state, session| {
+    with_session_storage(|session| {
         session.remove_scan(scan_handle);
     });
 }
@@ -663,6 +951,126 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_with_stored_natts(
     )
 }
 
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts * max_rows` value/null
+/// entries and `max_rows` TID/stored-natts entries.
+pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    max_rows: usize,
+    tids_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
+    if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
+        return 0;
+    }
+    if tids_out.is_null() || stored_natts_out.is_null() {
+        return 0;
+    }
+
+    with_storage_read(|state, session| {
+        let (written, forward_cursor, backward_cursor) = {
+            let Some(scan) = session.scan_slot(scan_handle) else {
+                return 0;
+            };
+            let is_forward = forward != 0;
+            let relid = scan.relid;
+            let mut forward_cursor = scan.forward_cursor;
+            let mut backward_cursor = scan.backward_cursor;
+            let mut written = 0;
+
+            while written < max_rows {
+                let cursor = if is_forward {
+                    forward_cursor
+                } else {
+                    backward_cursor
+                };
+                let tuple = if scan.has_visibility_deltas {
+                    state.next_visible_tuple_slice_in_overlays(
+                        &session.transaction_stack,
+                        relid,
+                        cursor,
+                        &scan.high_water_offsets,
+                        is_forward,
+                        scan.snapshot_curcid,
+                    )
+                } else {
+                    state.next_committed_tuple_slice(
+                        relid,
+                        cursor,
+                        &scan.high_water_offsets,
+                        is_forward,
+                    )
+                };
+                let Some((tid, tuple)) = tuple else {
+                    if is_forward {
+                        backward_cursor = ScanCursor::before_cursor(forward_cursor);
+                    } else {
+                        forward_cursor = ScanCursor::after_cursor(backward_cursor);
+                    }
+                    break;
+                };
+
+                let row_values_out = if natts == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: caller provided `natts * max_rows` entries and
+                    // `written < max_rows`, so this row's segment is in bounds.
+                    unsafe { values_out.add(written * natts) }
+                };
+                let row_is_null_out = if natts == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: caller provided `natts * max_rows` entries and
+                    // `written < max_rows`, so this row's segment is in bounds.
+                    unsafe { is_null_out.add(written * natts) }
+                };
+                // SAFETY: caller provided `max_rows` TID/stored-natts entries and
+                // `written < max_rows`.
+                let row_tid_out = unsafe { tids_out.add(written) };
+                let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
+                if !copy_tuple_to_outputs(
+                    tid,
+                    tuple,
+                    row_values_out,
+                    row_is_null_out,
+                    natts,
+                    row_tid_out,
+                    row_stored_natts_out,
+                ) {
+                    break;
+                }
+
+                if is_forward {
+                    forward_cursor = ScanCursor::after(tid);
+                    backward_cursor = ScanCursor::before(tid);
+                } else {
+                    backward_cursor = ScanCursor::before(tid);
+                    forward_cursor = ScanCursor::after(tid);
+                }
+                written += 1;
+            }
+
+            (written, forward_cursor, backward_cursor)
+        };
+
+        if let Some(scan) = session.scan_slot_mut(scan_handle) {
+            scan.forward_cursor = forward_cursor;
+            scan.backward_cursor = backward_cursor;
+        }
+
+        written
+    })
+}
+
 fn scan_next_impl(
     scan_handle: u64,
     forward: u8,
@@ -672,7 +1080,7 @@ fn scan_next_impl(
     tid_out: *mut u64,
     stored_natts_out: *mut usize,
 ) -> bool {
-    with_storage(|state, session| {
+    with_storage_read(|state, session| {
         let Some(scan) = session.scan_slot(scan_handle) else {
             return false;
         };
@@ -785,7 +1193,7 @@ fn fetch_tid_snapshot_impl(
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    with_storage(|state, session| {
+    with_storage_read(|state, session| {
         let Some(tuple) = state.visible_tuple_slice_in_overlays_at_cid(
             &session.transaction_stack,
             relid,
@@ -847,6 +1255,40 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid_with_stored_natts(
         natts,
         stored_natts_out,
     )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a TID that has already been resolved through storage2
+/// redirects, plus valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_fetch_resolved_tid_with_stored_natts(
+    relid: u32,
+    packed_tid: u64,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage_read(|state, session| {
+        let Some(tuple) =
+            state.visible_tuple_slice_in_overlays(&session.transaction_stack, relid, tid)
+        else {
+            return false;
+        };
+        copy_tuple_to_outputs(
+            tid,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            std::ptr::null_mut(),
+            stored_natts_out,
+        )
+    })
 }
 
 fn fetch_tid_impl(
@@ -934,7 +1376,7 @@ fn fetch_tid_any_impl(
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    with_storage(|state, _session| {
+    with_storage_read(|state, _session| {
         let Some(tuple) = state
             .relations
             .get(&relid)
@@ -974,8 +1416,8 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup(
     let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
         return false;
     };
-    let tid = with_storage(|state, session| {
-        state.primary_key_lookup(session, index_spec.relation_oid.0, &key)
+    let tid = with_storage_read(|state, session| {
+        state.primary_key_lookup_read(session, index_spec.relation_oid.0, &key)
     });
     let Some(tid) = tid else {
         return false;
@@ -1025,16 +1467,47 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
     let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
         return false;
     };
-    let tid = with_storage(|state, session| {
+    let tid = with_storage_read(|state, session| {
         state
-            .primary_key_lookup(session, heap_relid, &key)
+            .primary_key_lookup_read(session, heap_relid, &key)
             .or_else(|| {
                 let mut scan_spec = index_spec.clone();
                 scan_spec.is_primary = false;
-                state.find_visible_by_index_key_excluding(
+                state.find_visible_by_index_key_excluding_read(
                     session, heap_relid, &scan_spec, &key, None,
                 )
             })
+    });
+    let Some(tid) = tid else {
+        return false;
+    };
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tid.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_single_byval_with_spec(
+    _index_relid: u32,
+    heap_relid: u32,
+    value: usize,
+    is_null: u8,
+    tid_out: *mut u64,
+) -> bool {
+    clear_last_storage_error();
+    if is_null != 0 {
+        return false;
+    }
+
+    let key = IndexKey::single(IndexKeyPart::ByValue(value));
+    let tid = with_storage_read(|state, session| {
+        state.primary_key_lookup_read(session, heap_relid, &key)
     });
     let Some(tid) = tid else {
         return false;
@@ -1053,7 +1526,7 @@ pub extern "C" fn fastpg_storage2_rebuild_primary_key_index(index_relid: u32) ->
     let Some(index_spec) = primary_index_spec_for_index_oid(Oid(index_relid)) else {
         return false;
     };
-    with_storage(|state, session| {
+    with_storage_read(|state, session| {
         let relid = index_spec.relation_oid.0;
         let entries = state
             .visible_tids(session, relid)
@@ -1104,7 +1577,7 @@ pub unsafe extern "C" fn fastpg_storage2_rebuild_primary_key_index_with_spec(
     }) else {
         return false;
     };
-    with_storage(|state, session| {
+    with_storage_read(|state, session| {
         let entries = state
             .visible_tids(session, heap_relid)
             .into_iter()
@@ -1161,8 +1634,8 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict(
     } else {
         Tid::unpack(replacing_tid)
     };
-    let conflict = with_storage(|state, session| {
-        state.find_visible_by_index_key_excluding(
+    let conflict = with_storage_read(|state, session| {
+        state.find_visible_by_index_key_excluding_read(
             session,
             relid.0,
             &index_spec,
@@ -1225,8 +1698,8 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
     } else {
         Tid::unpack(replacing_tid)
     };
-    let conflict = with_storage(|state, session| {
-        state.find_visible_by_index_key_excluding(
+    let conflict = with_storage_read(|state, session| {
+        state.find_visible_by_index_key_excluding_read(
             session,
             heap_relid,
             &index_spec,
@@ -1275,7 +1748,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_validate_with_spec(
     }) else {
         return false;
     };
-    let conflict = with_storage(|state, session| {
+    let conflict = with_storage_read(|state, session| {
         let mut seen = BTreeMap::new();
         for tid in state.visible_tids(session, heap_relid) {
             let Some(key) = state
@@ -1310,7 +1783,7 @@ pub unsafe extern "C" fn fastpg_storage2_metrics(out: *mut FastPgStorage2Metrics
     if out.is_null() {
         return false;
     }
-    let metrics = with_storage(|state, session| state.metrics(session));
+    let metrics = with_storage_read(|state, session| state.metrics(session));
     unsafe {
         *out = metrics;
     }
@@ -1319,17 +1792,17 @@ pub unsafe extern "C" fn fastpg_storage2_metrics(out: *mut FastPgStorage2Metrics
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_committed_page_bytes() -> usize {
-    with_storage(|state, session| state.metrics(session).committed_page_bytes)
+    with_storage_read(|state, session| state.metrics(session).committed_page_bytes)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_transaction_page_bytes() -> usize {
-    with_storage(|state, session| state.metrics(session).transaction_page_bytes)
+    with_storage_read(|state, session| state.metrics(session).transaction_page_bytes)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_index_bytes() -> usize {
-    with_storage(|state, session| state.metrics(session).index_bytes)
+    with_storage_read(|state, session| state.metrics(session).index_bytes)
 }
 
 #[unsafe(no_mangle)]

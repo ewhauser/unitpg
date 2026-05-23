@@ -2,13 +2,15 @@
 
 use std::borrow::Cow;
 #[cfg(feature = "postgres-execution")]
+use std::ffi::CStr;
+#[cfg(feature = "postgres-execution")]
 use std::fs;
 #[cfg(feature = "postgres-execution")]
 use std::io::Write;
 #[cfg(feature = "postgres-execution")]
 use std::path::{Path, PathBuf};
 #[cfg(feature = "postgres-execution")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 #[cfg(feature = "postgres-execution")]
@@ -16,8 +18,8 @@ use fastpg_catalog::relation_by_name;
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
     ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreNotice,
-    PgCoreParam, PgCoreSession, PgCoreTransactionCommand, PgCoreValue, PreparedStatement, TEXT_OID,
-    VARCHAR_OID,
+    PgCoreParam, PgCoreSession, PgCoreTransactionCommand, PgCoreValue, PreparedStatement,
+    SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
 };
 use fastpg_types::{Column, PgType, Value};
 
@@ -271,7 +273,11 @@ pub struct QueryExecutor {
     #[cfg(feature = "postgres-execution")]
     storage2_session: fastpg_storage2::SessionStorageHandle,
     #[cfg(feature = "postgres-execution")]
-    pgcore_started: Mutex<bool>,
+    pgcore_started: AtomicBool,
+    #[cfg(feature = "postgres-execution")]
+    pgcore_start_lock: Mutex<()>,
+    #[cfg(feature = "postgres-execution")]
+    notice_count: AtomicUsize,
     notices: Mutex<Vec<QueryNotice>>,
 }
 
@@ -341,7 +347,9 @@ impl QueryExecutor {
                 pgcore_session,
                 storage_session,
                 storage2_session,
-                pgcore_started: Mutex::new(false),
+                pgcore_started: AtomicBool::new(false),
+                pgcore_start_lock: Mutex::new(()),
+                notice_count: AtomicUsize::new(0),
                 notices: Mutex::new(Vec::new()),
             }
         }
@@ -370,7 +378,7 @@ impl QueryExecutor {
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
         #[cfg(feature = "postgres-execution")]
         {
-            self.execute_pgcore(sql, parameters)
+            self.execute_pgcore(sql, parameters, PgCoreRowConversion::Typed)
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
@@ -382,17 +390,90 @@ impl QueryExecutor {
         }
     }
 
+    pub fn execute_simple_text(&self, sql: &str) -> QueryExecution {
+        #[cfg(feature = "postgres-execution")]
+        {
+            self.execute_pgcore(sql, &[], PgCoreRowConversion::PreserveText)
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            let _ = sql;
+            execution_error(
+                "0A000",
+                "fastpg-exec was built without PostgreSQL execution",
+            )
+        }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    pub fn execute_simple_cstr(&self, sql: &CStr) -> QueryExecution {
+        self.ensure_pgcore_session_started();
+        match self.pgcore_session.execute_simple_cstr_fast(sql) {
+            Ok(PgCoreSimpleExecutionResult::Command { notices, tag, rows }) => {
+                if !notices.is_empty() {
+                    self.replace_notices(
+                        notices
+                            .into_iter()
+                            .map(pgcore_notice_to_query_notice)
+                            .collect(),
+                    );
+                }
+                QueryExecution::Command { tag, rows }
+            }
+            Ok(PgCoreSimpleExecutionResult::Full(result)) => {
+                let PgCoreExecutionResult {
+                    notices,
+                    statements,
+                } = result;
+                if !notices.is_empty() {
+                    self.replace_notices(
+                        notices
+                            .into_iter()
+                            .map(pgcore_notice_to_query_notice)
+                            .collect(),
+                    );
+                }
+                pgcore_statements_to_query_execution(statements, PgCoreRowConversion::PreserveText)
+            }
+            Err(error) => {
+                if !error.notices.is_empty() {
+                    self.replace_notices(
+                        error
+                            .notices
+                            .iter()
+                            .cloned()
+                            .map(pgcore_notice_to_query_notice)
+                            .collect(),
+                    );
+                }
+                pgcore_error_execution(error)
+            }
+        }
+    }
+
     pub fn take_notices(&self) -> Vec<QueryNotice> {
-        std::mem::take(
+        #[cfg(feature = "postgres-execution")]
+        if self.notice_count.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+
+        let notices = std::mem::take(
             &mut *self
                 .notices
                 .lock()
                 .expect("fastpg executor notice mutex poisoned"),
-        )
+        );
+        #[cfg(feature = "postgres-execution")]
+        self.notice_count.store(0, Ordering::Relaxed);
+        notices
     }
 
     #[cfg(feature = "postgres-execution")]
     fn replace_notices(&self, notices: Vec<QueryNotice>) {
+        if notices.is_empty() {
+            return;
+        }
+
         let mut stored_notices = self
             .notices
             .lock()
@@ -402,15 +483,21 @@ impl QueryExecutor {
         } else {
             stored_notices.extend(notices);
         }
+        self.notice_count
+            .store(stored_notices.len(), Ordering::Relaxed);
     }
 
     #[cfg(feature = "postgres-execution")]
     fn ensure_pgcore_session_started(&self) {
-        let mut started = self
-            .pgcore_started
+        if self.pgcore_started.load(Ordering::Acquire) {
+            return;
+        }
+
+        let _guard = self
+            .pgcore_start_lock
             .lock()
             .expect("fastpg executor pgcore-start mutex poisoned");
-        if !*started {
+        if !self.pgcore_started.load(Ordering::Relaxed) {
             let notices = self
                 .pgcore_session
                 .start_client_session()
@@ -418,7 +505,7 @@ impl QueryExecutor {
                 .map(pgcore_notice_to_query_notice)
                 .collect();
             self.replace_notices(notices);
-            *started = true;
+            self.pgcore_started.store(true, Ordering::Release);
         }
     }
 
@@ -628,7 +715,7 @@ impl QueryExecutor {
 
         let path = write_copy_temp_file(lines)?;
         let sql = copy_from_file_sql(target, &path);
-        let execution = self.execute_pgcore(&sql, &[]);
+        let execution = self.execute_pgcore(&sql, &[], PgCoreRowConversion::Typed);
         let _ = fs::remove_file(&path);
         match execution {
             QueryExecution::Error {
@@ -763,11 +850,7 @@ impl QueryExecutor {
         &self,
         active_copy_owned_transaction: Option<bool>,
     ) -> Option<QueryExecutorCloseWork> {
-        if !*self
-            .pgcore_started
-            .lock()
-            .expect("fastpg executor pgcore-start mutex poisoned")
-        {
+        if !self.pgcore_started.load(Ordering::Acquire) {
             return None;
         }
 
@@ -788,7 +871,12 @@ impl QueryExecutor {
     }
 
     #[cfg(feature = "postgres-execution")]
-    fn execute_pgcore(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
+    fn execute_pgcore(
+        &self,
+        sql: &str,
+        parameters: &[Value],
+        row_conversion: PgCoreRowConversion,
+    ) -> QueryExecution {
         self.ensure_pgcore_session_started();
         if !postgres_catalog_enabled()
             && parameters.is_empty()
@@ -796,6 +884,7 @@ impl QueryExecutor {
         {
             return pgcore_execution_to_query_execution(
                 self.pgcore_session.execute_transaction_command(command),
+                row_conversion,
             );
         }
 
@@ -813,25 +902,31 @@ impl QueryExecutor {
 
         match execution_result {
             Ok(result) => {
-                self.replace_notices(
-                    result
-                        .notices
-                        .iter()
-                        .cloned()
-                        .map(pgcore_notice_to_query_notice)
-                        .collect(),
-                );
-                pgcore_execution_to_query_execution(result)
+                let PgCoreExecutionResult {
+                    notices,
+                    statements,
+                } = result;
+                if !notices.is_empty() {
+                    self.replace_notices(
+                        notices
+                            .into_iter()
+                            .map(pgcore_notice_to_query_notice)
+                            .collect(),
+                    );
+                }
+                pgcore_statements_to_query_execution(statements, row_conversion)
             }
             Err(error) => {
-                self.replace_notices(
-                    error
-                        .notices
-                        .iter()
-                        .cloned()
-                        .map(pgcore_notice_to_query_notice)
-                        .collect(),
-                );
+                if !error.notices.is_empty() {
+                    self.replace_notices(
+                        error
+                            .notices
+                            .iter()
+                            .cloned()
+                            .map(pgcore_notice_to_query_notice)
+                            .collect(),
+                    );
+                }
                 pgcore_error_execution(error)
             }
         }
@@ -906,11 +1001,20 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
         let mut executions = error
             .partial
             .into_iter()
-            .map(pgcore_statement_to_query_execution)
+            .map(|statement| {
+                pgcore_statement_to_query_execution(statement, PgCoreRowConversion::Typed)
+            })
             .collect::<Vec<_>>();
         executions.push(error_execution);
         QueryExecution::Batch(executions)
     }
+}
+
+#[cfg(feature = "postgres-execution")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PgCoreRowConversion {
+    Typed,
+    PreserveText,
 }
 
 #[cfg(feature = "postgres-execution")]
@@ -953,29 +1057,40 @@ fn query_description_from_pgcore(statement: &PreparedStatement) -> QueryDescript
 }
 
 #[cfg(feature = "postgres-execution")]
-fn pgcore_execution_to_query_execution(result: PgCoreExecutionResult) -> QueryExecution {
-    pgcore_statements_to_query_execution(result.statements)
+fn pgcore_execution_to_query_execution(
+    result: PgCoreExecutionResult,
+    row_conversion: PgCoreRowConversion,
+) -> QueryExecution {
+    pgcore_statements_to_query_execution(result.statements, row_conversion)
 }
 
 #[cfg(feature = "postgres-execution")]
-#[cfg(feature = "postgres-execution")]
 fn pgcore_statements_to_query_execution(
     statements: Vec<fastpg_pgcore::ExecutionStatement>,
+    row_conversion: PgCoreRowConversion,
 ) -> QueryExecution {
-    let mut executions = statements
-        .into_iter()
-        .map(pgcore_statement_to_query_execution)
-        .collect::<Vec<_>>();
-    match executions.len() {
+    match statements.len() {
         0 => QueryExecution::Empty,
-        1 => executions.remove(0),
-        _ => QueryExecution::Batch(executions),
+        1 => {
+            let statement = statements
+                .into_iter()
+                .next()
+                .expect("single-statement result contains one statement");
+            pgcore_statement_to_query_execution(statement, row_conversion)
+        }
+        _ => QueryExecution::Batch(
+            statements
+                .into_iter()
+                .map(|statement| pgcore_statement_to_query_execution(statement, row_conversion))
+                .collect(),
+        ),
     }
 }
 
 #[cfg(feature = "postgres-execution")]
 fn pgcore_statement_to_query_execution(
     statement: fastpg_pgcore::ExecutionStatement,
+    row_conversion: PgCoreRowConversion,
 ) -> QueryExecution {
     if let Some(copy_in) = statement.copy_in {
         return QueryExecution::CopyIn(CopyTarget {
@@ -1052,7 +1167,7 @@ fn pgcore_statement_to_query_execution(
         .map(|row| {
             row.into_iter()
                 .zip(fields.iter())
-                .map(|(value, field)| pgcore_value_to_value(value, field.data_type))
+                .map(|(value, field)| pgcore_value_to_value(value, field.data_type, row_conversion))
                 .collect::<Result<Vec<_>, _>>()
         })
         .collect::<Result<Vec<_>, _>>();
@@ -1081,7 +1196,7 @@ fn pgcore_param_value(value: &Value) -> PgCoreParam {
         Value::Int2(value) => PgCoreParam::Datum(*value as usize),
         Value::Int4(value) => PgCoreParam::Datum(*value as usize),
         Value::Int8(value) => PgCoreParam::Datum(*value as usize),
-        Value::Text(value) => PgCoreParam::Text(value.clone()),
+        Value::Text(value) | Value::RawText(value) => PgCoreParam::Text(value.clone()),
         Value::Null => PgCoreParam::Null,
     }
 }
@@ -1098,22 +1213,32 @@ fn pg_type_for_oid(type_oid: u32) -> PgType {
 }
 
 #[cfg(feature = "postgres-execution")]
-fn pgcore_value_to_value(value: PgCoreValue, data_type: PgType) -> Result<Value, String> {
-    match (value, data_type) {
-        (PgCoreValue::Null, _) => Ok(Value::Null),
-        (PgCoreValue::Text(value), PgType::Int2) => value
+fn pgcore_value_to_value(
+    value: PgCoreValue,
+    data_type: PgType,
+    row_conversion: PgCoreRowConversion,
+) -> Result<Value, String> {
+    match (value, data_type, row_conversion) {
+        (PgCoreValue::Text(value), _, PgCoreRowConversion::PreserveText) => {
+            Ok(Value::RawText(value))
+        }
+        (PgCoreValue::Null, _, PgCoreRowConversion::PreserveText) => Ok(Value::Null),
+        (PgCoreValue::Null, _, PgCoreRowConversion::Typed) => Ok(Value::Null),
+        (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::Typed) => value
             .parse::<i16>()
             .map(Value::Int2)
             .map_err(|error| format!("cannot decode PostgreSQL int2 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Int4) => value
+        (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::Typed) => value
             .parse::<i32>()
             .map(Value::Int4)
             .map_err(|error| format!("cannot decode PostgreSQL int4 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Int8) => value
+        (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::Typed) => value
             .parse::<i64>()
             .map(Value::Int8)
             .map_err(|error| format!("cannot decode PostgreSQL int8 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Varchar) => Ok(Value::Text(value)),
+        (PgCoreValue::Text(value), PgType::Varchar, PgCoreRowConversion::Typed) => {
+            Ok(Value::Text(value))
+        }
     }
 }
 

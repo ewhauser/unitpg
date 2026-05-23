@@ -3,14 +3,12 @@ use crate::*;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RelationStorage {
     pub(crate) pages: Vec<Option<Page>>,
-    pub(crate) primary_key_index: BTreeMap<IndexKey, Tid>,
-    pub(crate) hot_redirects: BTreeMap<Tid, Tid>,
-    pub(crate) update_redirects: BTreeMap<Tid, Tid>,
-    pub(crate) row_xmins: BTreeMap<Tid, u32>,
-    pub(crate) row_cmins: BTreeMap<Tid, u32>,
-    pub(crate) row_xmaxs: BTreeMap<Tid, u32>,
-    pub(crate) row_delete_xids: BTreeMap<Tid, u32>,
-    pub(crate) row_delete_cids: BTreeMap<Tid, u32>,
+    pub(crate) primary_key_index: HashMap<IndexKey, Tid>,
+    pub(crate) hot_redirects: HashMap<Tid, Tid>,
+    pub(crate) update_redirects: HashMap<Tid, Tid>,
+    pub(crate) row_delete_xids: HashMap<Tid, u32>,
+    pub(crate) row_delete_cids: HashMap<Tid, u32>,
+    pub(crate) live_tids: BTreeSet<Tid>,
     pub(crate) next_block: u32,
     pub(crate) append_hint: Option<u32>,
     pub(crate) live_tuple_count: usize,
@@ -94,6 +92,45 @@ impl RelationStorage {
         self.page(tid.block)?.tuple_slice_any(tid.offset)
     }
 
+    fn line_pointer(&self, tid: Tid) -> Option<&LinePointer> {
+        let index = usize::from(tid.offset.checked_sub(1)?);
+        self.page(tid.block)?.line_pointers.get(index)
+    }
+
+    fn line_pointer_mut(&mut self, tid: Tid) -> Option<&mut LinePointer> {
+        let index = usize::from(tid.offset.checked_sub(1)?);
+        self.page_mut(tid.block)?.line_pointers.get_mut(index)
+    }
+
+    pub(crate) fn set_insert_metadata(&mut self, tid: Tid, xmin: u32, cmin: u32) -> bool {
+        let Some(line) = self.line_pointer_mut(tid) else {
+            return false;
+        };
+        line.xmin = xmin;
+        line.cmin = cmin;
+        true
+    }
+
+    pub(crate) fn set_row_xmax(&mut self, tid: Tid, xmax: u32) -> bool {
+        let Some(line) = self.line_pointer_mut(tid) else {
+            return false;
+        };
+        line.xmax = xmax;
+        true
+    }
+
+    pub(crate) fn row_xmin(&self, tid: Tid) -> Option<u32> {
+        Some(self.line_pointer(tid)?.xmin)
+    }
+
+    pub(crate) fn row_cmin(&self, tid: Tid) -> Option<u32> {
+        Some(self.line_pointer(tid)?.cmin)
+    }
+
+    pub(crate) fn row_xmax(&self, tid: Tid) -> Option<u32> {
+        Some(self.line_pointer(tid)?.xmax)
+    }
+
     pub(crate) fn mark_dead(&mut self, tid: Tid) -> bool {
         let Some(page) = self.page_mut(tid.block) else {
             return false;
@@ -116,6 +153,7 @@ impl RelationStorage {
             LinePointerState::Live => {
                 self.live_tuple_count = self.live_tuple_count.saturating_sub(1);
                 self.live_tuple_bytes = self.live_tuple_bytes.saturating_sub(len);
+                self.live_tids.remove(&tid);
             }
             LinePointerState::Dead => return false,
         }
@@ -142,6 +180,7 @@ impl RelationStorage {
         self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_sub(len);
         self.live_tuple_count = self.live_tuple_count.saturating_add(1);
         self.live_tuple_bytes = self.live_tuple_bytes.saturating_add(len);
+        self.live_tids.insert(tid);
         true
     }
 
@@ -193,11 +232,35 @@ impl RelationStorage {
         Some(tid)
     }
 
+    pub(crate) fn append_pending_input_tuple(
+        &mut self,
+        block: u32,
+        input: &RowInput<'_>,
+        tuple_len: usize,
+    ) -> Result<Option<Tid>, CatalogError> {
+        let max_tuples_per_block = self.max_tuples_per_block;
+        let (tid, can_fit_more) = {
+            let Some(page) = self.page_mut(block) else {
+                return Ok(None);
+            };
+            let Some(tid) =
+                page.append_input_tuple_with_state(input, tuple_len, LinePointerState::Pending)?
+            else {
+                return Ok(None);
+            };
+            let can_fit_more = page.can_fit(1)
+                && max_tuples_per_block
+                    .is_none_or(|max| page.line_pointers.len() < usize::from(max));
+            (tid, can_fit_more)
+        };
+        self.pending_tuple_count = self.pending_tuple_count.saturating_add(1);
+        self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(tuple_len);
+        self.append_hint = if can_fit_more { Some(block) } else { None };
+        Ok(Some(tid))
+    }
+
     pub(crate) fn live_tids(&self) -> impl Iterator<Item = Tid> + '_ {
-        self.pages
-            .iter()
-            .filter_map(Option::as_ref)
-            .flat_map(Page::live_tids)
+        self.live_tids.iter().copied()
     }
 
     pub(crate) fn accounted_bytes(&self) -> usize {
@@ -247,9 +310,10 @@ impl RelationStorage {
         self.live_tuple_bytes = 0;
         self.pending_tuple_bytes = 0;
         self.dead_tuple_bytes = 0;
+        self.live_tids.clear();
 
         for page in self.pages.iter().filter_map(Option::as_ref) {
-            for line in &page.line_pointers {
+            for (index, line) in page.line_pointers.iter().enumerate() {
                 let len = line.len as usize;
                 match line.state {
                     LinePointerState::Pending => {
@@ -259,6 +323,12 @@ impl RelationStorage {
                     LinePointerState::Live => {
                         self.live_tuple_count = self.live_tuple_count.saturating_add(1);
                         self.live_tuple_bytes = self.live_tuple_bytes.saturating_add(len);
+                        if let Ok(offset) = u16::try_from(index + 1) {
+                            self.live_tids.insert(Tid {
+                                block: page.block,
+                                offset,
+                            });
+                        }
                     }
                     LinePointerState::Dead => {
                         self.dead_tuple_count = self.dead_tuple_count.saturating_add(1);

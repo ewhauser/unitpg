@@ -11,3 +11,5 @@ crate-type = ["rlib", "staticlib"]
 [dependencies]
 fastpg-catalog.workspace = true
 fastpg-types.workspace = true
+parking_lot.workspace = true
+smallvec.workspace = true

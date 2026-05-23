@@ -1,22 +1,232 @@
 use crate::*;
+use smallvec::SmallVec;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct DeleteMetadata {
+    pub(crate) xid: u32,
+    pub(crate) cid: u32,
+}
+
+pub(crate) type TidList = SmallVec<[Tid; 4]>;
+pub(crate) type TidCidList = SmallVec<[(Tid, u32); 4]>;
+pub(crate) type TidMetadataList = SmallVec<[(Tid, DeleteMetadata); 4]>;
+pub(crate) type RedirectList = SmallVec<[(Tid, Tid); 4]>;
+pub(crate) type BlockList = SmallVec<[u32; 4]>;
+pub(crate) type PageCheckpointList = SmallVec<[(u32, PageCheckpoint); 4]>;
+
+#[derive(Debug, Default)]
+pub(crate) struct RelidMap<V> {
+    entries: SmallVec<[(u32, V); 4]>,
+}
+
+impl<V> RelidMap<V> {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub(crate) fn get(&self, relid: &u32) -> Option<&V> {
+        self.entries
+            .iter()
+            .find(|(entry_relid, _)| entry_relid == relid)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn get_mut(&mut self, relid: &u32) -> Option<&mut V> {
+        self.entries
+            .iter_mut()
+            .find(|(entry_relid, _)| entry_relid == relid)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn contains_key(&self, relid: &u32) -> bool {
+        self.get(relid).is_some()
+    }
+
+    pub(crate) fn insert(&mut self, relid: u32, value: V) -> Option<V> {
+        if let Some((_, existing)) = self
+            .entries
+            .iter_mut()
+            .find(|(entry_relid, _)| *entry_relid == relid)
+        {
+            return Some(std::mem::replace(existing, value));
+        }
+        self.entries.push((relid, value));
+        None
+    }
+
+    pub(crate) fn remove(&mut self, relid: &u32) -> Option<V> {
+        let index = self
+            .entries
+            .iter()
+            .position(|(entry_relid, _)| entry_relid == relid)?;
+        Some(self.entries.swap_remove(index).1)
+    }
+
+    pub(crate) fn entry(&mut self, relid: u32) -> RelidEntry<'_, V> {
+        if let Some(index) = self
+            .entries
+            .iter()
+            .position(|(entry_relid, _)| *entry_relid == relid)
+        {
+            RelidEntry::Occupied(&mut self.entries[index].1)
+        } else {
+            RelidEntry::Vacant { map: self, relid }
+        }
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.iter().map(|(_, value)| value)
+    }
+
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &u32> {
+        self.entries.iter().map(|(relid, _)| relid)
+    }
+
+    pub(crate) fn drain(&mut self) -> impl Iterator<Item = (u32, V)> + '_ {
+        self.entries.drain(..)
+    }
+}
+
+pub(crate) enum RelidEntry<'a, V> {
+    Occupied(&'a mut V),
+    Vacant {
+        map: &'a mut RelidMap<V>,
+        relid: u32,
+    },
+}
+
+impl<'a, V> RelidEntry<'a, V> {
+    pub(crate) fn or_insert(self, value: V) -> &'a mut V {
+        match self {
+            Self::Occupied(existing) => existing,
+            Self::Vacant { map, relid } => {
+                map.entries.push((relid, value));
+                &mut map
+                    .entries
+                    .last_mut()
+                    .expect("just pushed relid map entry")
+                    .1
+            }
+        }
+    }
+
+    pub(crate) fn or_insert_with(self, value: impl FnOnce() -> V) -> &'a mut V {
+        match self {
+            Self::Occupied(existing) => existing,
+            Self::Vacant { map, relid } => {
+                map.entries.push((relid, value()));
+                &mut map
+                    .entries
+                    .last_mut()
+                    .expect("just pushed relid map entry")
+                    .1
+            }
+        }
+    }
+}
+
+impl<'a, V: Default> RelidEntry<'a, V> {
+    pub(crate) fn or_default(self) -> &'a mut V {
+        self.or_insert(V::default())
+    }
+}
+
+pub(crate) struct RelidMapIter<'a, V> {
+    inner: std::slice::Iter<'a, (u32, V)>,
+}
+
+impl<'a, V> Iterator for RelidMapIter<'a, V> {
+    type Item = (&'a u32, &'a V);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.inner.next().map(|(relid, value)| (relid, value))
+    }
+}
+
+impl<'a, V> IntoIterator for &'a RelidMap<V> {
+    type Item = (&'a u32, &'a V);
+    type IntoIter = RelidMapIter<'a, V>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        RelidMapIter {
+            inner: self.entries.iter(),
+        }
+    }
+}
+
+impl<V> IntoIterator for RelidMap<V> {
+    type Item = (u32, V);
+    type IntoIter = smallvec::IntoIter<[(u32, V); 4]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct TransactionOverlay {
-    pub(crate) relation_checkpoints: HashMap<u32, RelationCheckpoint>,
-    pub(crate) page_checkpoints: HashMap<u32, BTreeMap<u32, PageCheckpoint>>,
-    pub(crate) new_pages: HashMap<u32, BTreeSet<u32>>,
-    pub(crate) inserted_tids: HashMap<u32, BTreeSet<Tid>>,
-    pub(crate) inserted_xids: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) inserted_cids: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) invalidated_tids: HashMap<u32, BTreeSet<Tid>>,
-    pub(crate) invalidated_xids: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) invalidated_cids: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) row_xmaxs: HashMap<u32, BTreeMap<Tid, u32>>,
-    pub(crate) hot_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
-    pub(crate) update_redirect_inserts: HashMap<u32, BTreeMap<Tid, Tid>>,
-    pub(crate) primary_key_inserts: HashMap<u32, BTreeMap<IndexKey, Tid>>,
-    pub(crate) primary_key_deletes: HashMap<u32, BTreeSet<IndexKey>>,
-    pub(crate) cleared_relations: HashMap<u32, RelationStorage>,
+    pub(crate) relation_checkpoints: RelidMap<RelationCheckpoint>,
+    pub(crate) page_checkpoints: RelidMap<PageCheckpointList>,
+    pub(crate) new_pages: RelidMap<BlockList>,
+    pub(crate) inserted_tids: RelidMap<TidList>,
+    pub(crate) inserted_cids: RelidMap<TidCidList>,
+    pub(crate) invalidated_tids: RelidMap<TidList>,
+    pub(crate) invalidated_metadata: RelidMap<TidMetadataList>,
+    pub(crate) hot_redirect_inserts: RelidMap<RedirectList>,
+    pub(crate) update_redirect_inserts: RelidMap<RedirectList>,
+    pub(crate) primary_key_inserts: RelidMap<HashMap<IndexKey, Tid>>,
+    pub(crate) primary_key_deletes: RelidMap<HashSet<IndexKey>>,
+    pub(crate) cleared_relations: RelidMap<RelationStorage>,
+}
+
+fn push_tid_unique(tids: &mut TidList, tid: Tid) {
+    if !tids.contains(&tid) {
+        tids.push(tid);
+    }
+}
+
+fn push_block_unique(blocks: &mut BlockList, block: u32) {
+    if !blocks.contains(&block) {
+        blocks.push(block);
+    }
+}
+
+fn upsert_page_checkpoint(
+    entries: &mut PageCheckpointList,
+    block: u32,
+    checkpoint: PageCheckpoint,
+) {
+    if entries.iter().any(|(entry_block, _)| *entry_block == block) {
+        return;
+    }
+    entries.push((block, checkpoint));
+}
+
+fn upsert_tid_cid(entries: &mut TidCidList, tid: Tid, cid: u32) {
+    if let Some((_, existing)) = entries.iter_mut().find(|(entry_tid, _)| *entry_tid == tid) {
+        *existing = cid;
+        return;
+    }
+    entries.push((tid, cid));
+}
+
+fn upsert_tid_metadata(entries: &mut TidMetadataList, tid: Tid, metadata: DeleteMetadata) {
+    if let Some((_, existing)) = entries.iter_mut().find(|(entry_tid, _)| *entry_tid == tid) {
+        *existing = metadata;
+        return;
+    }
+    entries.push((tid, metadata));
+}
+
+fn upsert_redirect(entries: &mut RedirectList, old_tid: Tid, new_tid: Tid) {
+    if let Some((_, existing)) = entries
+        .iter_mut()
+        .find(|(entry_tid, _)| *entry_tid == old_tid)
+    {
+        *existing = new_tid;
+        return;
+    }
+    entries.push((old_tid, new_tid));
 }
 
 impl TransactionOverlay {
@@ -25,12 +235,9 @@ impl TransactionOverlay {
             && self.page_checkpoints.is_empty()
             && self.new_pages.is_empty()
             && self.inserted_tids.is_empty()
-            && self.inserted_xids.is_empty()
             && self.inserted_cids.is_empty()
             && self.invalidated_tids.is_empty()
-            && self.invalidated_xids.is_empty()
-            && self.invalidated_cids.is_empty()
-            && self.row_xmaxs.is_empty()
+            && self.invalidated_metadata.is_empty()
             && self.hot_redirect_inserts.is_empty()
             && self.update_redirect_inserts.is_empty()
             && self.primary_key_inserts.is_empty()
@@ -52,72 +259,54 @@ impl TransactionOverlay {
         {
             return;
         }
-        self.page_checkpoints
-            .entry(relid)
-            .or_default()
-            .entry(page.block)
-            .or_insert_with(|| page.checkpoint());
+        upsert_page_checkpoint(
+            self.page_checkpoints.entry(relid).or_default(),
+            page.block,
+            page.checkpoint(),
+        );
     }
 
     pub(crate) fn record_new_page(&mut self, relid: u32, block: u32) {
-        self.new_pages.entry(relid).or_default().insert(block);
+        push_block_unique(self.new_pages.entry(relid).or_default(), block);
     }
 
     pub(crate) fn insert_tid(&mut self, relid: u32, tid: Tid) {
-        self.inserted_tids.entry(relid).or_default().insert(tid);
-    }
-
-    pub(crate) fn set_insert_xid(&mut self, relid: u32, tid: Tid, xid: u32) {
-        self.inserted_xids
-            .entry(relid)
-            .or_default()
-            .insert(tid, xid);
+        push_tid_unique(self.inserted_tids.entry(relid).or_default(), tid);
     }
 
     pub(crate) fn set_insert_cid(&mut self, relid: u32, tid: Tid, cid: u32) {
-        self.inserted_cids
-            .entry(relid)
-            .or_default()
-            .insert(tid, cid);
+        upsert_tid_cid(self.inserted_cids.entry(relid).or_default(), tid, cid);
     }
 
     pub(crate) fn invalidate(&mut self, relid: u32, tid: Tid) {
-        self.invalidated_tids.entry(relid).or_default().insert(tid);
+        push_tid_unique(self.invalidated_tids.entry(relid).or_default(), tid);
     }
 
-    pub(crate) fn set_invalidate_xid(&mut self, relid: u32, tid: Tid, xid: u32) {
-        self.invalidated_xids
-            .entry(relid)
-            .or_default()
-            .insert(tid, xid);
-    }
-
-    pub(crate) fn set_invalidate_cid(&mut self, relid: u32, tid: Tid, cid: u32) {
-        self.invalidated_cids
-            .entry(relid)
-            .or_default()
-            .insert(tid, cid);
-    }
-
-    pub(crate) fn set_row_xmax(&mut self, relid: u32, tid: Tid, xmax: u32) {
-        self.row_xmaxs.entry(relid).or_default().insert(tid, xmax);
+    pub(crate) fn set_invalidate_metadata(&mut self, relid: u32, tid: Tid, xid: u32, cid: u32) {
+        upsert_tid_metadata(
+            self.invalidated_metadata.entry(relid).or_default(),
+            tid,
+            DeleteMetadata { xid, cid },
+        );
     }
 
     pub(crate) fn insert_hot_redirect(&mut self, relid: u32, old_tid: Tid, new_tid: Tid) {
         if old_tid != new_tid {
-            self.hot_redirect_inserts
-                .entry(relid)
-                .or_default()
-                .insert(old_tid, new_tid);
+            upsert_redirect(
+                self.hot_redirect_inserts.entry(relid).or_default(),
+                old_tid,
+                new_tid,
+            );
         }
     }
 
     pub(crate) fn insert_update_redirect(&mut self, relid: u32, old_tid: Tid, new_tid: Tid) {
         if old_tid != new_tid {
-            self.update_redirect_inserts
-                .entry(relid)
-                .or_default()
-                .insert(old_tid, new_tid);
+            upsert_redirect(
+                self.update_redirect_inserts.entry(relid).or_default(),
+                old_tid,
+                new_tid,
+            );
         }
     }
 
@@ -170,8 +359,11 @@ impl TransactionOverlay {
         Some(
             self.inserted_cids
                 .get(&relid)
-                .and_then(|cids| cids.get(&tid))
-                .copied()
+                .and_then(|cids| {
+                    cids.iter()
+                        .find(|(entry_tid, _)| *entry_tid == tid)
+                        .map(|(_, cid)| *cid)
+                })
                 .unwrap_or_default(),
         )
     }
@@ -185,10 +377,14 @@ impl TransactionOverlay {
             return None;
         }
         Some(
-            self.invalidated_cids
+            self.invalidated_metadata
                 .get(&relid)
-                .and_then(|cids| cids.get(&tid))
-                .copied()
+                .and_then(|entries| {
+                    entries
+                        .iter()
+                        .find(|(entry_tid, _)| *entry_tid == tid)
+                        .map(|(_, metadata)| metadata.cid)
+                })
                 .unwrap_or_default(),
         )
     }
@@ -221,14 +417,6 @@ impl TransactionOverlay {
                 .is_some_and(|tids| !tids.is_empty())
     }
 
-    pub(crate) fn visibility_delta_relids(&self) -> BTreeSet<u32> {
-        self.inserted_tids
-            .keys()
-            .chain(self.invalidated_tids.keys())
-            .copied()
-            .collect()
-    }
-
     pub(crate) fn append_from(&mut self, other: &mut Self) {
         for (relid, checkpoint) in other.relation_checkpoints.drain() {
             self.relation_checkpoints.entry(relid).or_insert(checkpoint);
@@ -241,45 +429,51 @@ impl TransactionOverlay {
                     .get(&relid)
                     .is_some_and(|blocks| blocks.contains(&block))
                 {
-                    target.entry(block).or_insert(checkpoint);
+                    upsert_page_checkpoint(target, block, checkpoint);
                 }
             }
         }
         for (relid, blocks) in other.new_pages.drain() {
-            self.new_pages.entry(relid).or_default().extend(blocks);
+            let target = self.new_pages.entry(relid).or_default();
+            for block in blocks {
+                push_block_unique(target, block);
+            }
         }
         for (relid, tids) in other.inserted_tids.drain() {
-            self.inserted_tids.entry(relid).or_default().extend(tids);
-        }
-        for (relid, xids) in other.inserted_xids.drain() {
-            self.inserted_xids.entry(relid).or_default().extend(xids);
-        }
-        for (relid, cids) in other.inserted_cids.drain() {
-            self.inserted_cids.entry(relid).or_default().extend(cids);
+            let target = self.inserted_tids.entry(relid).or_default();
+            for tid in tids {
+                push_tid_unique(target, tid);
+            }
         }
         for (relid, tids) in other.invalidated_tids.drain() {
-            self.invalidated_tids.entry(relid).or_default().extend(tids);
+            let target = self.invalidated_tids.entry(relid).or_default();
+            for tid in tids {
+                push_tid_unique(target, tid);
+            }
         }
-        for (relid, xids) in other.invalidated_xids.drain() {
-            self.invalidated_xids.entry(relid).or_default().extend(xids);
+        for (relid, cids) in other.inserted_cids.drain() {
+            let target = self.inserted_cids.entry(relid).or_default();
+            for (tid, cid) in cids {
+                upsert_tid_cid(target, tid, cid);
+            }
         }
-        for (relid, cids) in other.invalidated_cids.drain() {
-            self.invalidated_cids.entry(relid).or_default().extend(cids);
-        }
-        for (relid, xmaxs) in other.row_xmaxs.drain() {
-            self.row_xmaxs.entry(relid).or_default().extend(xmaxs);
+        for (relid, entries) in other.invalidated_metadata.drain() {
+            let target = self.invalidated_metadata.entry(relid).or_default();
+            for (tid, metadata) in entries {
+                upsert_tid_metadata(target, tid, metadata);
+            }
         }
         for (relid, redirects) in other.hot_redirect_inserts.drain() {
-            self.hot_redirect_inserts
-                .entry(relid)
-                .or_default()
-                .extend(redirects);
+            let target = self.hot_redirect_inserts.entry(relid).or_default();
+            for (old_tid, new_tid) in redirects {
+                upsert_redirect(target, old_tid, new_tid);
+            }
         }
         for (relid, redirects) in other.update_redirect_inserts.drain() {
-            self.update_redirect_inserts
-                .entry(relid)
-                .or_default()
-                .extend(redirects);
+            let target = self.update_redirect_inserts.entry(relid).or_default();
+            for (old_tid, new_tid) in redirects {
+                upsert_redirect(target, old_tid, new_tid);
+            }
         }
         for (relid, keys) in other.primary_key_deletes.drain() {
             self.primary_key_deletes
@@ -367,7 +561,10 @@ impl SessionStorage {
 
     pub(crate) fn commit_empty_implicit_transaction(&mut self) -> bool {
         if self.explicit_transaction {
-            return false;
+            return true;
+        }
+        if self.transaction_stack.is_empty() {
+            return true;
         }
         if self
             .transaction_stack
@@ -381,11 +578,13 @@ impl SessionStorage {
     }
 
     pub(crate) fn abort_empty_implicit_transaction(&mut self) -> bool {
-        if self.explicit_transaction
-            || self
-                .transaction_stack
-                .iter()
-                .any(|overlay| !overlay.is_empty())
+        if self.explicit_transaction {
+            return true;
+        }
+        if self
+            .transaction_stack
+            .iter()
+            .any(|overlay| !overlay.is_empty())
         {
             return false;
         }
@@ -496,14 +695,20 @@ impl SessionStorage {
     }
 
     pub(crate) fn transaction_visible_insert_count(&self, relid: u32) -> usize {
-        let mut tids = BTreeSet::new();
+        let mut tids = SmallVec::<[Tid; 4]>::new();
         for overlay in &self.transaction_stack {
             if let Some(inserted) = overlay.inserted_tids.get(&relid) {
-                tids.extend(inserted.iter().copied());
+                for tid in inserted {
+                    if !tids.contains(tid) {
+                        tids.push(*tid);
+                    }
+                }
             }
             if let Some(invalidated) = overlay.invalidated_tids.get(&relid) {
                 for tid in invalidated {
-                    tids.remove(tid);
+                    if let Some(index) = tids.iter().position(|entry| entry == tid) {
+                        tids.swap_remove(index);
+                    }
                 }
             }
         }
@@ -511,13 +716,18 @@ impl SessionStorage {
     }
 
     pub(crate) fn transaction_invalidated_live_count(&self, relid: u32) -> usize {
-        let mut tids = BTreeSet::new();
+        let mut tids = SmallVec::<[Tid; 4]>::new();
         for overlay in &self.transaction_stack {
             if let Some(invalidated) = overlay.invalidated_tids.get(&relid) {
-                tids.extend(invalidated.iter().copied());
+                for tid in invalidated {
+                    if !tids.contains(tid) {
+                        tids.push(*tid);
+                    }
+                }
             }
         }
-        tids.into_iter()
+        tids.iter()
+            .copied()
             .filter(|tid| !self.owns_inserted_tid(relid, *tid))
             .count()
     }
@@ -553,8 +763,11 @@ pub(crate) fn overlay_inserted_cid(
             overlay
                 .inserted_cids
                 .get(&relid)
-                .and_then(|cids| cids.get(&tid))
-                .copied()
+                .and_then(|cids| {
+                    cids.iter()
+                        .find(|(entry_tid, _)| *entry_tid == tid)
+                        .map(|(_, cid)| *cid)
+                })
                 .unwrap_or_default(),
         )
     })
@@ -628,8 +841,12 @@ pub(crate) fn overlay_tid_redirect(
         overlay
             .hot_redirect_inserts
             .get(&relid)
-            .and_then(|redirects| redirects.get(&tid))
-            .copied()
+            .and_then(|redirects| {
+                redirects
+                    .iter()
+                    .find(|(entry_tid, _)| *entry_tid == tid)
+                    .map(|(_, next_tid)| *next_tid)
+            })
     })
 }
 
@@ -642,8 +859,12 @@ pub(crate) fn overlay_update_redirect(
         overlay
             .update_redirect_inserts
             .get(&relid)
-            .and_then(|redirects| redirects.get(&tid))
-            .copied()
+            .and_then(|redirects| {
+                redirects
+                    .iter()
+                    .find(|(entry_tid, _)| *entry_tid == tid)
+                    .map(|(_, next_tid)| *next_tid)
+            })
     })
 }
 
@@ -657,6 +878,7 @@ static DEFAULT_SESSION_STORAGE: OnceLock<SessionStorageHandle> = OnceLock::new()
 
 thread_local! {
     static CURRENT_SESSION_STORAGE: RefCell<Option<SessionStorageHandle>> = const { RefCell::new(None) };
+    static BORROWED_SESSION_STORAGE: Cell<Option<NonNull<SessionStorage>>> = const { Cell::new(None) };
     pub(crate) static LAST_STORAGE_ERROR: RefCell<Option<CatalogError>> = const { RefCell::new(None) };
 }
 
@@ -688,4 +910,58 @@ pub(crate) fn current_session_storage() -> SessionStorageHandle {
     CURRENT_SESSION_STORAGE
         .with(|slot| slot.borrow().clone())
         .unwrap_or_else(default_session_storage)
+}
+
+#[derive(Debug)]
+pub struct LockedSessionStorageGuard<'a> {
+    _borrowed: BorrowedSessionStorageGuard,
+    _lock: MutexGuard<'a, SessionStorage>,
+}
+
+pub fn enter_locked_session_storage(
+    handle: &SessionStorageHandle,
+) -> LockedSessionStorageGuard<'_> {
+    let mut lock = handle.lock();
+    let borrowed = enter_borrowed_session_storage(&mut lock);
+    LockedSessionStorageGuard {
+        _borrowed: borrowed,
+        _lock: lock,
+    }
+}
+
+#[derive(Debug)]
+struct BorrowedSessionStorageGuard {
+    previous: Option<NonNull<SessionStorage>>,
+}
+
+fn enter_borrowed_session_storage(session: &mut SessionStorage) -> BorrowedSessionStorageGuard {
+    let previous = BORROWED_SESSION_STORAGE.with(|slot| {
+        let previous = slot.get();
+        slot.set(Some(NonNull::from(session)));
+        previous
+    });
+    BorrowedSessionStorageGuard { previous }
+}
+
+impl Drop for BorrowedSessionStorageGuard {
+    fn drop(&mut self) {
+        BORROWED_SESSION_STORAGE.with(|slot| {
+            slot.set(self.previous.take());
+        });
+    }
+}
+
+pub(crate) fn with_current_session_storage<R>(f: impl FnOnce(&mut SessionStorage) -> R) -> R {
+    if let Some(mut borrowed) = BORROWED_SESSION_STORAGE.with(Cell::get) {
+        // SAFETY: enter_locked_session_storage installs this pointer only while
+        // holding the owning session mutex and removes it before that lock is
+        // released. PgCore execution re-enters storage2 callbacks on the same
+        // thread, so each callback observes the active exclusive session borrow.
+        let session = unsafe { borrowed.as_mut() };
+        return f(session);
+    }
+
+    let session = current_session_storage();
+    let mut session = session.lock();
+    f(&mut session)
 }

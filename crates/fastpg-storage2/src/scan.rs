@@ -1,4 +1,7 @@
 use crate::*;
+use smallvec::SmallVec;
+
+pub(crate) type HighWaterOffsets = SmallVec<[u16; 4]>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ScanCursor {
@@ -89,7 +92,7 @@ impl ScanCursor {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ScanState {
     pub(crate) relid: u32,
-    pub(crate) high_water_offsets: Vec<u16>,
+    pub(crate) high_water_offsets: HighWaterOffsets,
     pub(crate) forward_cursor: ScanCursor,
     pub(crate) backward_cursor: ScanCursor,
     pub(crate) has_visibility_deltas: bool,

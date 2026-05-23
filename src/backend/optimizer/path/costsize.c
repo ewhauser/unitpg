@@ -207,8 +207,6 @@ static int32 get_expr_width(PlannerInfo *root, const Node *expr);
 static double relation_byte_size(double tuples, int width);
 static double page_size(double tuples, int width);
 static double get_parallel_divisor(Path *path);
-
-
 /*
  * clamp_row_est
  *		Force a row-count estimate to a sane value.
