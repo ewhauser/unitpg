@@ -118,6 +118,11 @@
 #include "access/xact.h"
 #include "access/xloginsert.h"
 #include "catalog/catalog.h"
+#ifdef USE_FASTPG
+#include "catalog/pg_auth_members.h"
+#include "catalog/pg_authid.h"
+#include "catalog/pg_database.h"
+#endif
 #include "catalog/pg_constraint.h"
 #include "miscadmin.h"
 #include "storage/procnumber.h"
@@ -132,6 +137,10 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+#ifdef USE_FASTPG
+#include "utils/acl.h"
+#include "utils/lsyscache.h"
+#endif
 
 
 /*
@@ -1212,6 +1221,15 @@ AtEOXact_Inval(bool isCommit)
 {
 	inplaceInvalInfo = NULL;
 
+#ifdef USE_FASTPG
+	/*
+	 * The FastPG relname lookup cache is backend-local and intentionally small.
+	 * Be conservative across transaction boundaries so rolled-back DDL and
+	 * ON COMMIT actions cannot leave stale name-to-OID answers behind.
+	 */
+	fastpg_relname_relid_cache_reset();
+#endif
+
 	/* Quick exit if no transactional messages */
 	if (transInvalInfo == NULL)
 		return;
@@ -1333,6 +1351,15 @@ AtEOSubXact_Inval(bool isCommit)
 		Assert(inplaceInvalInfo == NULL);
 	else
 		inplaceInvalInfo = NULL;
+
+#ifdef USE_FASTPG
+	/*
+	 * Subtransaction abort can discard invalidations for catalog tuples that
+	 * were visible to this backend earlier in the savepoint.  Clear the
+	 * FastPG relname shortcut before any quick-exit path.
+	 */
+	fastpg_relname_relid_cache_reset();
+#endif
 
 	/* Quick exit if no transactional messages. */
 	myInfo = transInvalInfo;
@@ -1484,6 +1511,14 @@ CacheInvalidateHeapTupleCommon(Relation relation,
 	 * First let the catcache do its thing
 	 */
 	tupleRelId = RelationGetRelid(relation);
+#ifdef USE_FASTPG
+	if (tupleRelId == RelationRelationId)
+		fastpg_relname_relid_cache_reset();
+	if (tupleRelId == DatabaseRelationId ||
+		tupleRelId == AuthMemRelationId ||
+		tupleRelId == AuthIdRelationId)
+		FastPgResetRoleMembershipCache();
+#endif
 	if (RelationInvalidatesSnapshotsOnly(tupleRelId))
 	{
 		databaseId = IsSharedRelation(tupleRelId) ? InvalidOid : MyDatabaseId;

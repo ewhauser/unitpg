@@ -157,9 +157,16 @@ static const int NSmgr = lengthof(smgrsw);
  * Each backend has a hashtable that stores all extant SMgrRelation objects.
  * In addition, "unpinned" SMgrRelation objects are chained together in a list.
  */
-static HTAB *SMgrRelationHash = NULL;
+#ifdef USE_FASTPG
+#define FASTPG_SMGR_BACKEND_LOCAL _Thread_local
+#else
+#define FASTPG_SMGR_BACKEND_LOCAL
+#endif
 
-static dlist_head unpinned_relns;
+static FASTPG_SMGR_BACKEND_LOCAL HTAB *SMgrRelationHash = NULL;
+
+static FASTPG_SMGR_BACKEND_LOCAL dlist_head unpinned_relns;
+static FASTPG_SMGR_BACKEND_LOCAL bool smgr_initialized = false;
 
 /* local function prototypes */
 static void smgrshutdown(int code, Datum arg);
@@ -189,6 +196,9 @@ smgrinit(void)
 {
 	int			i;
 
+	if (smgr_initialized)
+		return;
+
 	HOLD_INTERRUPTS();
 
 	for (i = 0; i < NSmgr; i++)
@@ -201,7 +211,16 @@ smgrinit(void)
 
 	/* register the shutdown proc */
 	on_proc_exit(smgrshutdown, 0);
+	smgr_initialized = true;
 }
+
+#ifdef USE_FASTPG
+void
+FastPgEnsureThreadSmgr(void)
+{
+	smgrinit();
+}
+#endif
 
 /*
  * on_proc_exit hook for smgr cleanup during backend shutdown

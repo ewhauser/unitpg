@@ -2680,18 +2680,6 @@ fn simple_statement_is_copy_from_stdin(statement: &str) -> bool {
 }
 
 fn simple_query_may_copy_from_stdin(query: &str) -> bool {
-    let bytes = query.as_bytes();
-    let mut index = 0;
-
-    while index < bytes.len() {
-        match bytes[index] {
-            byte if byte.is_ascii_whitespace() || byte == b';' => index += 1,
-            b'c' | b'C' => break,
-            b'-' | b'/' => break,
-            _ => return false,
-        }
-    }
-
     contains_ascii_case_insensitive(query.as_bytes(), b"copy")
         && contains_ascii_case_insensitive(query.as_bytes(), b"from stdin")
 }
@@ -3310,6 +3298,16 @@ mod tests {
         assert_eq!(statements.len(), 2);
         assert!(statements[0].contains("SELECT 1;"));
         assert!(statements[1].contains("SELECT 2;"));
+    }
+
+    #[test]
+    fn simple_query_copy_from_stdin_detector_allows_leading_statements() {
+        let query = "SELECT 0; COPY test3 FROM STDIN; SELECT 1;";
+
+        assert!(simple_query_may_copy_from_stdin(query));
+        assert!(should_split_simple_query(&split_simple_query_statements(
+            query
+        )));
     }
 
     fn command_complete_tag(response: Response) -> String {

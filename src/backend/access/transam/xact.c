@@ -2947,11 +2947,37 @@ PrepareTransaction(void)
 	/* Shut down the deferred-trigger manager */
 	AfterTriggerEndXact(true);
 
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		if ((MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE) ||
+			FastPgTempNamespaceCreatedInCurrentTransaction())
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
+	}
+#endif
+
 	/*
 	 * Let ON COMMIT management do its thing (must happen after closing
 	 * cursors, to avoid dangling-reference problems)
 	 */
 	PreCommit_on_commit_actions();
+
+	if ((MyXactFlags & XACT_FLAGS_ACCESSEDTEMPNAMESPACE))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		if (FastPgTempNamespaceCreatedInCurrentTransaction())
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("cannot PREPARE a transaction that has operated on temporary objects")));
+	}
+#endif
 
 	/*
 	 * Synchronize files that are created and not WAL-logged during this

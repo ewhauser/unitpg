@@ -99,7 +99,8 @@ pub(crate) fn tuple_storage_len(input: &RowInput<'_>) -> Result<usize, CatalogEr
     let natts = input.values.len();
     let null_bitmap_len = natts.div_ceil(8);
     let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
-    let payload_offset = attr_dir_offset + natts.saturating_mul(ATTR_ENTRY_LEN);
+    let payload_offset = attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN));
+    let payload_offset = payload_offset.next_multiple_of(DATUM_ALIGNMENT);
     let _natts: u16 = natts.try_into().map_err(|_| {
         invalid_ffi_argument("row input has too many attributes for storage2 tuple")
     })?;
@@ -152,7 +153,8 @@ pub(crate) fn write_tuple_to_slice_known_len(
     let natts = input.values.len();
     let null_bitmap_len = natts.div_ceil(8);
     let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
-    let payload_offset = attr_dir_offset + natts.saturating_mul(ATTR_ENTRY_LEN);
+    let payload_offset = attr_dir_offset.saturating_add(natts.saturating_mul(ATTR_ENTRY_LEN));
+    let payload_offset = payload_offset.next_multiple_of(DATUM_ALIGNMENT);
     let mut payload_len: usize = 0;
 
     bytes[0..4].copy_from_slice(TUPLE_MAGIC);
@@ -236,7 +238,10 @@ pub(crate) fn decode_tuple(tid: Tid, tuple: &[u8]) -> Option<DecodedTuple<'_>> {
     }
     if payload_offset < attr_dir_offset
         || payload_offset.checked_add(0)? > tuple.len()
-        || payload_offset != attr_dir_offset.checked_add(natts.checked_mul(ATTR_ENTRY_LEN)?)?
+        || payload_offset
+            != attr_dir_offset
+                .checked_add(natts.checked_mul(ATTR_ENTRY_LEN)?)?
+                .next_multiple_of(DATUM_ALIGNMENT)
     {
         return None;
     }
@@ -285,7 +290,9 @@ pub(crate) fn tuple_byval_attr_equals(
 
     let null_bitmap_len = natts.div_ceil(8);
     let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
-    let payload_offset = attr_dir_offset.checked_add(natts.checked_mul(ATTR_ENTRY_LEN)?)?;
+    let payload_offset = attr_dir_offset
+        .checked_add(natts.checked_mul(ATTR_ENTRY_LEN)?)?
+        .next_multiple_of(DATUM_ALIGNMENT);
     if payload_offset > tuple.len() {
         return None;
     }
@@ -414,7 +421,9 @@ pub(crate) fn copy_tuple_to_outputs(
     }
     let null_bitmap_len = tuple_natts.div_ceil(8);
     let attr_dir_offset = TUPLE_HEADER_LEN + null_bitmap_len;
-    let payload_offset = attr_dir_offset.saturating_add(tuple_natts.saturating_mul(ATTR_ENTRY_LEN));
+    let payload_offset = attr_dir_offset
+        .saturating_add(tuple_natts.saturating_mul(ATTR_ENTRY_LEN))
+        .next_multiple_of(DATUM_ALIGNMENT);
     if payload_offset > tuple.len() {
         return false;
     }

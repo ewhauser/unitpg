@@ -56,6 +56,9 @@ typedef struct FileTag
 } FileTag;
 
 extern void InitSync(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadSync(void);
+#endif
 extern void SyncPreCheckpoint(void);
 extern void SyncPostCheckpoint(void);
 extern void ProcessSyncRequests(void);

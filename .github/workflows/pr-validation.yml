@@ -96,7 +96,7 @@ jobs:
           rustfmt --version
 
       - name: Run upstream SQL regression inventory
-        run: make -C benches regression REGRESSION_FAIL_ON_DIFFERENCES=1
+        run: make -C benches regression REGRESSION_FAIL_ON_DIFFERENCES=1 REGRESSION_GLOBAL_TIMEOUT=900 FASTPG_CASE_TIMEOUT=180
 
       - name: Upload regression inventory results
         if: always()

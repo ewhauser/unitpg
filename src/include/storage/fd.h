@@ -193,6 +193,9 @@ extern int	MakePGDirectory(const char *directoryName);
 /* Miscellaneous support routines */
 extern void InitFileAccess(void);
 extern void InitTemporaryFileAccess(void);
+#ifdef USE_FASTPG
+extern void FastPgEnsureThreadFileAccess(void);
+#endif
 extern void set_max_safe_fds(void);
 extern void closeAllVfds(void);
 extern void SetTempTablespaces(Oid *tableSpaces, int numSpaces);

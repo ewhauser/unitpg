@@ -1,12 +1,16 @@
-use std::env;
-use std::ffi::OsString;
-use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::sync::OnceLock;
-use std::time::{SystemTime, UNIX_EPOCH};
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+use std::{
+    env,
+    ffi::OsString,
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::OnceLock,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use tokio::net::TcpListener;
 use tokio::task::JoinHandle;
