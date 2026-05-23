@@ -311,9 +311,6 @@ pub(crate) fn copy_tuple_to_outputs(
     }
     let base = tuple.as_ptr();
     let tuple_natts = unsafe { std::ptr::read_unaligned(base.add(4) as *const u16) } as usize;
-    if tuple_natts > natts {
-        return false;
-    }
     if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
         return false;
     }
@@ -336,7 +333,8 @@ pub(crate) fn copy_tuple_to_outputs(
         payload_offset
     );
 
-    for index in 0..tuple_natts {
+    let output_natts = tuple_natts.min(natts);
+    for index in 0..output_natts {
         let null_byte = unsafe { *base.add(TUPLE_HEADER_LEN + index / 8) };
         let null = null_byte & (1 << (index % 8)) != 0;
         let entry = attr_dir_offset + index * ATTR_ENTRY_LEN;
@@ -379,7 +377,7 @@ pub(crate) fn copy_tuple_to_outputs(
             _ => return false,
         }
     }
-    for index in tuple_natts..natts {
+    for index in output_natts..natts {
         unsafe {
             values_out.add(index).write(0);
             is_null_out.add(index).write(1);

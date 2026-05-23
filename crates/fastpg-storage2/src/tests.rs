@@ -131,6 +131,46 @@ fn scan_i32_values_at_cid(relid: u32, curcid: u32) -> Vec<i32> {
     values
 }
 
+fn scan_i32_values_batch(relid: u32, forward: bool, batch_size: usize) -> Vec<i32> {
+    let scan = fastpg_storage2_scan_begin(relid);
+    assert_ne!(scan, 0);
+    let mut values = Vec::new();
+    let mut raw_values = vec![0usize; batch_size * 2];
+    let mut nulls = vec![1u8; batch_size * 2];
+    let mut tids = vec![0u64; batch_size];
+    let mut stored_natts = vec![0usize; batch_size];
+
+    loop {
+        let count = unsafe {
+            fastpg_storage2_scan_next_batch_with_stored_natts(
+                scan,
+                u8::from(forward),
+                raw_values.as_mut_ptr(),
+                nulls.as_mut_ptr(),
+                2,
+                batch_size,
+                tids.as_mut_ptr(),
+                stored_natts.as_mut_ptr(),
+            )
+        };
+        if count == 0 {
+            break;
+        }
+        assert!(count <= batch_size);
+        for index in 0..count {
+            let attr_offset = index * 2;
+            assert_ne!(tids[index], 0);
+            assert_eq!(stored_natts[index], 1);
+            assert_eq!(nulls[attr_offset], 0);
+            assert_eq!(nulls[attr_offset + 1], 1);
+            values.push(raw_values[attr_offset] as i32);
+        }
+    }
+
+    fastpg_storage2_scan_end(scan);
+    values
+}
+
 fn hot_redirect_target(relid: u32, tid: u64) -> Option<u64> {
     let tid = Tid::unpack(tid)?;
     with_storage(|state, _session| {
@@ -184,6 +224,45 @@ fn fetch_reports_stored_attribute_count_for_missing_attrs() {
     assert_eq!(stored_natts, 1);
     assert_eq!(values[0] as i32, 7);
     assert_eq!(nulls, [0, 1]);
+}
+
+#[test]
+fn fetch_allows_prefix_projection_and_reports_stored_attribute_count() {
+    let _guard = test_guard();
+    let relid = 467;
+    let values = [7usize, 8usize];
+    let nulls = [0u8, 0u8];
+    let byval = [1u8, 1u8];
+    let lens = [0usize, 0usize];
+    let mut tid = 0u64;
+    assert!(unsafe {
+        fastpg_storage2_relation_insert_unchecked(
+            relid,
+            values.as_ptr(),
+            nulls.as_ptr(),
+            byval.as_ptr(),
+            lens.as_ptr(),
+            values.len(),
+            &mut tid,
+        )
+    });
+
+    let mut projected_values = [0usize; 1];
+    let mut projected_nulls = [1u8; 1];
+    let mut stored_natts = 0usize;
+    assert!(unsafe {
+        fastpg_storage2_fetch_tid_any_with_stored_natts(
+            relid,
+            tid,
+            projected_values.as_mut_ptr(),
+            projected_nulls.as_mut_ptr(),
+            projected_values.len(),
+            &mut stored_natts,
+        )
+    });
+    assert_eq!(stored_natts, 2);
+    assert_eq!(projected_values[0] as i32, 7);
+    assert_eq!(projected_nulls[0], 0);
 }
 
 #[test]
@@ -826,6 +905,79 @@ fn scan_tracks_tids_not_materialized_rows() {
             &mut tid,
         )
     });
+    fastpg_storage2_scan_end(scan);
+}
+
+#[test]
+fn batch_scan_matches_forward_and_backward_single_row_scan() {
+    let _guard = test_guard();
+    let relid = 470;
+    fastpg_storage2_xact_begin();
+    for value in 0..5 {
+        insert_i32(relid, value);
+    }
+    fastpg_storage2_xact_commit();
+
+    assert_eq!(scan_i32_values_batch(relid, true, 2), vec![0, 1, 2, 3, 4]);
+    assert_eq!(scan_i32_values_batch(relid, false, 2), vec![4, 3, 2, 1, 0]);
+}
+
+#[test]
+fn batch_scan_open_before_non_hot_update_can_follow_update_redirect() {
+    let _guard = test_guard();
+    let relid = 471;
+    fastpg_storage2_xact_begin();
+    let old_tid = insert_i32(relid, 3);
+    assert!(fastpg_storage2_relation_record_insert_metadata(
+        relid, old_tid, 1, 0
+    ));
+
+    let scan = fastpg_storage2_scan_begin_with_snapshot(relid, 2);
+    assert_ne!(scan, 0);
+
+    let new_tid = update_i32(relid, old_tid, 4);
+    assert!(fastpg_storage2_relation_record_invalidate_metadata(
+        relid, old_tid, 1, 1
+    ));
+    assert!(fastpg_storage2_relation_record_insert_metadata(
+        relid, new_tid, 1, 1
+    ));
+
+    let mut raw_values = [0usize; 2];
+    let mut nulls = [1u8; 2];
+    let mut tids = [0u64; 1];
+    let mut stored_natts = [0usize; 1];
+    let count = unsafe {
+        fastpg_storage2_scan_next_batch_with_stored_natts(
+            scan,
+            1,
+            raw_values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            raw_values.len(),
+            tids.len(),
+            tids.as_mut_ptr(),
+            stored_natts.as_mut_ptr(),
+        )
+    };
+    assert_eq!(count, 1);
+    assert_eq!(tids[0], new_tid);
+    assert_eq!(raw_values[0] as i32, 4);
+    assert_eq!(nulls, [0, 1]);
+    assert_eq!(stored_natts[0], 1);
+
+    let count = unsafe {
+        fastpg_storage2_scan_next_batch_with_stored_natts(
+            scan,
+            1,
+            raw_values.as_mut_ptr(),
+            nulls.as_mut_ptr(),
+            raw_values.len(),
+            tids.len(),
+            tids.as_mut_ptr(),
+            stored_natts.as_mut_ptr(),
+        )
+    };
+    assert_eq!(count, 0);
     fastpg_storage2_scan_end(scan);
 }
 

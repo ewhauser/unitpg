@@ -888,97 +888,94 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
     }
 
     with_storage_read(|state, session| {
-        let Some(scan) = session.scan_slot(scan_handle) else {
-            return 0;
-        };
-        let is_forward = forward != 0;
-        let relid = scan.relid;
-        let mut written = 0;
-
-        while written < max_rows {
-            let cursor = if is_forward {
-                session
-                    .scan_slot(scan_handle)
-                    .map(|scan| scan.forward_cursor)
-            } else {
-                session
-                    .scan_slot(scan_handle)
-                    .map(|scan| scan.backward_cursor)
-            };
-            let Some(cursor) = cursor else {
-                break;
-            };
+        let (written, forward_cursor, backward_cursor) = {
             let Some(scan) = session.scan_slot(scan_handle) else {
-                break;
+                return 0;
             };
-            let tuple = if scan.has_visibility_deltas {
-                state.next_visible_tuple_slice_in_overlays(
-                    &session.transaction_stack,
-                    relid,
-                    cursor,
-                    &scan.high_water_offsets,
-                    is_forward,
-                    scan.snapshot_curcid,
-                )
-            } else {
-                state.next_committed_tuple_slice(
-                    relid,
-                    cursor,
-                    &scan.high_water_offsets,
-                    is_forward,
-                )
-            };
-            let Some((tid, tuple)) = tuple else {
-                if let Some(scan) = session.scan_slot_mut(scan_handle) {
-                    if is_forward {
-                        scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
-                    } else {
-                        scan.forward_cursor = ScanCursor::after_cursor(scan.backward_cursor);
-                    }
-                }
-                break;
-            };
+            let is_forward = forward != 0;
+            let relid = scan.relid;
+            let mut forward_cursor = scan.forward_cursor;
+            let mut backward_cursor = scan.backward_cursor;
+            let mut written = 0;
 
-            let row_values_out = if natts == 0 {
-                std::ptr::null_mut()
-            } else {
-                // SAFETY: caller provided `natts * max_rows` entries and
-                // `written < max_rows`, so this row's segment is in bounds.
-                unsafe { values_out.add(written * natts) }
-            };
-            let row_is_null_out = if natts == 0 {
-                std::ptr::null_mut()
-            } else {
-                // SAFETY: caller provided `natts * max_rows` entries and
-                // `written < max_rows`, so this row's segment is in bounds.
-                unsafe { is_null_out.add(written * natts) }
-            };
-            // SAFETY: caller provided `max_rows` TID/stored-natts entries and
-            // `written < max_rows`.
-            let row_tid_out = unsafe { tids_out.add(written) };
-            let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
-            if !copy_tuple_to_outputs(
-                tid,
-                tuple,
-                row_values_out,
-                row_is_null_out,
-                natts,
-                row_tid_out,
-                row_stored_natts_out,
-            ) {
-                break;
-            }
-
-            if let Some(scan) = session.scan_slot_mut(scan_handle) {
-                if is_forward {
-                    scan.forward_cursor = ScanCursor::after(tid);
-                    scan.backward_cursor = ScanCursor::before(tid);
+            while written < max_rows {
+                let cursor = if is_forward {
+                    forward_cursor
                 } else {
-                    scan.backward_cursor = ScanCursor::before(tid);
-                    scan.forward_cursor = ScanCursor::after(tid);
+                    backward_cursor
+                };
+                let tuple = if scan.has_visibility_deltas {
+                    state.next_visible_tuple_slice_in_overlays(
+                        &session.transaction_stack,
+                        relid,
+                        cursor,
+                        &scan.high_water_offsets,
+                        is_forward,
+                        scan.snapshot_curcid,
+                    )
+                } else {
+                    state.next_committed_tuple_slice(
+                        relid,
+                        cursor,
+                        &scan.high_water_offsets,
+                        is_forward,
+                    )
+                };
+                let Some((tid, tuple)) = tuple else {
+                    if is_forward {
+                        backward_cursor = ScanCursor::before_cursor(forward_cursor);
+                    } else {
+                        forward_cursor = ScanCursor::after_cursor(backward_cursor);
+                    }
+                    break;
+                };
+
+                let row_values_out = if natts == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: caller provided `natts * max_rows` entries and
+                    // `written < max_rows`, so this row's segment is in bounds.
+                    unsafe { values_out.add(written * natts) }
+                };
+                let row_is_null_out = if natts == 0 {
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: caller provided `natts * max_rows` entries and
+                    // `written < max_rows`, so this row's segment is in bounds.
+                    unsafe { is_null_out.add(written * natts) }
+                };
+                // SAFETY: caller provided `max_rows` TID/stored-natts entries and
+                // `written < max_rows`.
+                let row_tid_out = unsafe { tids_out.add(written) };
+                let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
+                if !copy_tuple_to_outputs(
+                    tid,
+                    tuple,
+                    row_values_out,
+                    row_is_null_out,
+                    natts,
+                    row_tid_out,
+                    row_stored_natts_out,
+                ) {
+                    break;
                 }
+
+                if is_forward {
+                    forward_cursor = ScanCursor::after(tid);
+                    backward_cursor = ScanCursor::before(tid);
+                } else {
+                    backward_cursor = ScanCursor::before(tid);
+                    forward_cursor = ScanCursor::after(tid);
+                }
+                written += 1;
             }
-            written += 1;
+
+            (written, forward_cursor, backward_cursor)
+        };
+
+        if let Some(scan) = session.scan_slot_mut(scan_handle) {
+            scan.forward_cursor = forward_cursor;
+            scan.backward_cursor = backward_cursor;
         }
 
         written

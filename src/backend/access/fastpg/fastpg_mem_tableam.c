@@ -5058,10 +5058,45 @@ fastpg_mem_update_index_attr_member(Relation rel, AttrNumber attnum)
 		bms_is_member(attidx, rel->rd_idattr);
 }
 
+static AttrNumber
+fastpg_mem_update_index_max_attr_in_bitmap(Bitmapset *attrs)
+{
+	AttrNumber	max_attnum = 0;
+	int			attidx = -1;
+
+	while ((attidx = bms_next_member(attrs, attidx)) >= 0)
+	{
+		AttrNumber	attnum =
+			attidx + FirstLowInvalidHeapAttributeNumber;
+
+		if (attnum > max_attnum)
+			max_attnum = attnum;
+	}
+
+	return max_attnum;
+}
+
+static AttrNumber
+fastpg_mem_update_index_max_user_attr(Relation rel)
+{
+	AttrNumber	max_attnum;
+
+	max_attnum =
+		fastpg_mem_update_index_max_attr_in_bitmap(rel->rd_hotblockingattr);
+	max_attnum = Max(max_attnum,
+					 fastpg_mem_update_index_max_attr_in_bitmap(rel->rd_summarizedattr));
+	max_attnum = Max(max_attnum,
+					 fastpg_mem_update_index_max_attr_in_bitmap(rel->rd_keyattr));
+	max_attnum = Max(max_attnum,
+					 fastpg_mem_update_index_max_attr_in_bitmap(rel->rd_idattr));
+	return max_attnum;
+}
+
 static bool
 fastpg_mem_storage2_update_preserves_index_attrs(Relation rel,
 												 uint64_t row_id,
-												 TupleTableSlot *new_slot)
+												 TupleTableSlot *new_slot,
+												 AttrNumber max_index_attnum)
 {
 	TupleDesc	tupdesc = RelationGetDescr(rel);
 	uintptr_t	stack_values[FASTPG_MEM_STACK_NATTS];
@@ -5070,26 +5105,26 @@ fastpg_mem_storage2_update_preserves_index_attrs(Relation rel,
 	uint8_t    *isnull = stack_isnull;
 	size_t		stored_natts = 0;
 	bool		preserves = true;
-	bool		heap_buffers = tupdesc->natts > FASTPG_MEM_STACK_NATTS;
+	bool		heap_buffers = max_index_attnum > FASTPG_MEM_STACK_NATTS;
 
 	if (heap_buffers)
 	{
-		values = palloc0_array(uintptr_t, tupdesc->natts);
-		isnull = palloc0_array(uint8_t, tupdesc->natts);
+		values = palloc0_array(uintptr_t, max_index_attnum);
+		isnull = palloc0_array(uint8_t, max_index_attnum);
 	}
 
 	if (!fastpg_storage2_fetch_tid_any_with_stored_natts(RelationGetRelid(rel),
 														 row_id,
 														 values,
 														 isnull,
-														 tupdesc->natts,
+														 max_index_attnum,
 														 &stored_natts))
 	{
 		preserves = false;
 		goto done;
 	}
 
-	for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
+	for (AttrNumber attnum = 1; attnum <= max_index_attnum; attnum++)
 	{
 		Form_pg_attribute attr;
 		Datum		old_value;
@@ -5141,6 +5176,7 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 	TupleTableSlot *old_slot;
 	ItemPointerData tid;
 	bool		preserves = true;
+	AttrNumber	max_index_attnum;
 
 	if (!fastpg_catalog_mode_uses_postgres())
 		return false;
@@ -5153,6 +5189,9 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 		fastpg_mem_index_bitmap_has_non_user_attrs(rel->rd_keyattr, tupdesc) ||
 		fastpg_mem_index_bitmap_has_non_user_attrs(rel->rd_idattr, tupdesc))
 		return false;
+	max_index_attnum = fastpg_mem_update_index_max_user_attr(rel);
+	if (max_index_attnum <= 0 || max_index_attnum > tupdesc->natts)
+		return false;
 
 	if (storage2)
 	{
@@ -5162,7 +5201,8 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 			return false;
 		return fastpg_mem_storage2_update_preserves_index_attrs(rel,
 																row_id,
-																new_slot);
+																new_slot,
+																max_index_attnum);
 	}
 	else if (!fastpg_mem_row_id_to_tid(rel, row_id, &tid))
 		return false;
@@ -5175,7 +5215,7 @@ fastpg_mem_update_preserves_index_attrs(Relation rel,
 		return false;
 	}
 
-	for (AttrNumber attnum = 1; attnum <= tupdesc->natts; attnum++)
+	for (AttrNumber attnum = 1; attnum <= max_index_attnum; attnum++)
 	{
 		Form_pg_attribute attr;
 		Datum		old_value;
