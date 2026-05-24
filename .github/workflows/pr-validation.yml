@@ -118,7 +118,7 @@ jobs:
     timeout-minutes: 120
     permissions:
       contents: read
-      pull-requests: write
+      pull-requests: write # Update the FastPG performance report comment on the PR.
 
     env:
       PERF_OUTPUT_DIR: ${{ github.workspace }}/fastpg-performance
@@ -156,6 +156,11 @@ jobs:
             python3
 
       - name: Run FastPG performance comparison
+        env:
+          BASE_LABEL: ${{ github.base_ref }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_LABEL: PR head
         run: |
           set -uo pipefail
           mkdir -p "$PERF_OUTPUT_DIR"
@@ -168,10 +173,10 @@ jobs:
             --base-repo base \
             --head-repo head \
             --output-dir "$PERF_OUTPUT_DIR" \
-            --base-label "${{ github.base_ref }}" \
-            --head-label "PR head" \
-            --base-sha "${{ github.event.pull_request.base.sha }}" \
-            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --base-label "$BASE_LABEL" \
+            --head-label "$HEAD_LABEL" \
+            --base-sha "$BASE_SHA" \
+            --head-sha "$HEAD_SHA" \
             --threshold-percent 5.0 \
             --scale 1 \
             --transactions 20 \
