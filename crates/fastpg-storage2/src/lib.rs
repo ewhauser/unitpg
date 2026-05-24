@@ -894,6 +894,8 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
             high_water_offsets,
             forward_cursor: ScanCursor::forward_start(),
             backward_cursor: ScanCursor::backward_start(),
+            forward_exhausted: false,
+            backward_exhausted: false,
             has_visibility_deltas: session.transaction_has_visibility_deltas(relid),
             snapshot_curcid,
         };
@@ -913,6 +915,8 @@ pub extern "C" fn fastpg_storage2_scan_reset(scan_handle: u64) {
         if let Some(scan) = session.scan_slot_mut(scan_handle) {
             scan.forward_cursor = ScanCursor::forward_start();
             scan.backward_cursor = ScanCursor::backward_start();
+            scan.forward_exhausted = false;
+            scan.backward_exhausted = false;
             if let Some(has_visibility_deltas) = has_visibility_deltas {
                 scan.has_visibility_deltas = has_visibility_deltas;
             }
@@ -932,6 +936,8 @@ pub extern "C" fn fastpg_storage2_scan_set_position(scan_handle: u64, packed_tid
         };
         scan.forward_cursor = ScanCursor::after(tid);
         scan.backward_cursor = ScanCursor::before(tid);
+        scan.forward_exhausted = false;
+        scan.backward_exhausted = false;
         true
     })
 }
@@ -1022,15 +1028,21 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
     });
     if !has_visibility_deltas {
         return with_storage_read(|state, session| {
-            let (written, forward_cursor, backward_cursor) = {
+            let (written, forward_cursor, backward_cursor, exhausted) = {
                 let Some(scan) = session.scan_slot(scan_handle) else {
                     return 0;
                 };
                 let is_forward = forward != 0;
+                if (is_forward && scan.forward_exhausted)
+                    || (!is_forward && scan.backward_exhausted)
+                {
+                    return 0;
+                }
                 let relid = scan.relid;
                 let mut forward_cursor = scan.forward_cursor;
                 let mut backward_cursor = scan.backward_cursor;
                 let mut written = 0;
+                let mut exhausted = false;
 
                 while written < max_rows {
                     let cursor = if is_forward {
@@ -1049,6 +1061,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                         } else {
                             forward_cursor = ScanCursor::after_cursor(backward_cursor);
                         }
+                        exhausted = true;
                         break;
                     };
 
@@ -1092,12 +1105,28 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                     written += 1;
                 }
 
-                (written, forward_cursor, backward_cursor)
+                (written, forward_cursor, backward_cursor, exhausted)
             };
 
             if let Some(scan) = session.scan_slot_mut(scan_handle) {
                 scan.forward_cursor = forward_cursor;
                 scan.backward_cursor = backward_cursor;
+                if written > 0 {
+                    if forward != 0 {
+                        scan.backward_exhausted = false;
+                    } else {
+                        scan.forward_exhausted = false;
+                    }
+                }
+                if exhausted {
+                    if forward != 0 {
+                        scan.forward_exhausted = true;
+                        scan.backward_exhausted = false;
+                    } else {
+                        scan.backward_exhausted = true;
+                        scan.forward_exhausted = false;
+                    }
+                }
             }
 
             written
@@ -1105,15 +1134,19 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
     }
 
     with_storage(|state, session| {
-        let (written, forward_cursor, backward_cursor) = {
+        let (written, forward_cursor, backward_cursor, exhausted) = {
             let Some(scan) = session.scan_slot(scan_handle) else {
                 return 0;
             };
             let is_forward = forward != 0;
+            if (is_forward && scan.forward_exhausted) || (!is_forward && scan.backward_exhausted) {
+                return 0;
+            }
             let relid = scan.relid;
             let mut forward_cursor = scan.forward_cursor;
             let mut backward_cursor = scan.backward_cursor;
             let mut written = 0;
+            let mut exhausted = false;
 
             while written < max_rows {
                 let cursor = if is_forward {
@@ -1144,6 +1177,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                     } else {
                         forward_cursor = ScanCursor::after_cursor(backward_cursor);
                     }
+                    exhausted = true;
                     break;
                 };
 
@@ -1187,12 +1221,28 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                 written += 1;
             }
 
-            (written, forward_cursor, backward_cursor)
+            (written, forward_cursor, backward_cursor, exhausted)
         };
 
         if let Some(scan) = session.scan_slot_mut(scan_handle) {
             scan.forward_cursor = forward_cursor;
             scan.backward_cursor = backward_cursor;
+            if written > 0 {
+                if forward != 0 {
+                    scan.backward_exhausted = false;
+                } else {
+                    scan.forward_exhausted = false;
+                }
+            }
+            if exhausted {
+                if forward != 0 {
+                    scan.forward_exhausted = true;
+                    scan.backward_exhausted = false;
+                } else {
+                    scan.backward_exhausted = true;
+                    scan.forward_exhausted = false;
+                }
+            }
         }
 
         written
@@ -1219,6 +1269,9 @@ fn scan_next_impl(
                 return false;
             };
             let is_forward = forward != 0;
+            if (is_forward && scan.forward_exhausted) || (!is_forward && scan.backward_exhausted) {
+                return false;
+            }
             let cursor = if is_forward {
                 scan.forward_cursor
             } else {
@@ -1234,8 +1287,12 @@ fn scan_next_impl(
                 if let Some(scan) = session.scan_slot_mut(scan_handle) {
                     if is_forward {
                         scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
+                        scan.forward_exhausted = true;
+                        scan.backward_exhausted = false;
                     } else {
                         scan.forward_cursor = ScanCursor::after_cursor(scan.backward_cursor);
+                        scan.backward_exhausted = true;
+                        scan.forward_exhausted = false;
                     }
                 }
                 return false;
@@ -1244,9 +1301,11 @@ fn scan_next_impl(
                 if is_forward {
                     scan.forward_cursor = ScanCursor::after(tid);
                     scan.backward_cursor = ScanCursor::before(tid);
+                    scan.backward_exhausted = false;
                 } else {
                     scan.backward_cursor = ScanCursor::before(tid);
                     scan.forward_cursor = ScanCursor::after(tid);
+                    scan.forward_exhausted = false;
                 }
             }
             copy_tuple_to_outputs(
@@ -1266,6 +1325,9 @@ fn scan_next_impl(
             return false;
         };
         let is_forward = forward != 0;
+        if (is_forward && scan.forward_exhausted) || (!is_forward && scan.backward_exhausted) {
+            return false;
+        }
         let cursor = if is_forward {
             scan.forward_cursor
         } else {
@@ -1288,8 +1350,12 @@ fn scan_next_impl(
             if let Some(scan) = session.scan_slot_mut(scan_handle) {
                 if is_forward {
                     scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
+                    scan.forward_exhausted = true;
+                    scan.backward_exhausted = false;
                 } else {
                     scan.forward_cursor = ScanCursor::after_cursor(scan.backward_cursor);
+                    scan.backward_exhausted = true;
+                    scan.forward_exhausted = false;
                 }
             }
             return false;
@@ -1298,9 +1364,11 @@ fn scan_next_impl(
             if is_forward {
                 scan.forward_cursor = ScanCursor::after(tid);
                 scan.backward_cursor = ScanCursor::before(tid);
+                scan.backward_exhausted = false;
             } else {
                 scan.backward_cursor = ScanCursor::before(tid);
                 scan.forward_cursor = ScanCursor::after(tid);
+                scan.forward_exhausted = false;
             }
         }
         copy_tuple_to_outputs(
