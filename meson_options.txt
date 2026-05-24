@@ -62,7 +62,7 @@ option('fastpg_postgres_smgr', type: 'combo',
 option('fastpg_use_mem_index_am', type: 'boolean', value: false,
   description: 'Use fastpg in-memory index AM for eligible postgres-catalog indexes')
 
-option('fastpg_skip_recovery_startup', type: 'boolean', value: false,
+option('fastpg_skip_recovery_startup', type: 'boolean', value: true,
   description: 'Skip WAL recovery during fastpg startup for disposable Rust-server catalog runs')
 
 option('PG_TEST_EXTRA', type: 'string', value: '',
