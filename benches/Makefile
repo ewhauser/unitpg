@@ -15,6 +15,7 @@ RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage2
 CATALOG_MODE ?= postgres
 CATALOG_PGDATA_MODE ?= seed-skeleton
+FASTPG_POSTGRES_SMGR ?= mem
 FASTPG_USE_MEM_INDEX_AM ?= 0
 UPSTREAM_REGRESSION_CASES ?=
 UPSTREAM_REGRESSION_LIMIT ?=
@@ -52,6 +53,7 @@ PGBENCH_COMMON_ARGS = \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
+	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG)
 
@@ -66,6 +68,7 @@ PGBENCH_PROFILE_ARGS = \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
+	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--rust-build-profile "release" \
 	--profile-fastpg-rust-server \
 	--profile-tool "$(PROFILE_TOOL)" \
@@ -148,6 +151,7 @@ regression:
 	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
+	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \
 	--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG) \
