@@ -687,8 +687,15 @@ static ChecksumStateType LocalDataChecksumState = 0;
 int			data_checksums = 0;
 
 /* For WALInsertLockAcquire/Release functions */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL int MyLockNo = 0;
+static PG_THREAD_LOCAL bool holdingAllLocks = false;
+static PG_THREAD_LOCAL int lockToTry = -1;
+#else
 static int	MyLockNo = 0;
 static bool holdingAllLocks = false;
+static int	lockToTry = -1;
+#endif
 
 #ifdef WAL_DEBUG
 static MemoryContext walDebugCxt = NULL;
@@ -1435,8 +1442,6 @@ WALInsertLockAcquire(void)
 	 * (semi-)randomly.  This allows the locks to be used evenly if you have a
 	 * lot of very short connections.
 	 */
-	static int	lockToTry = -1;
-
 	if (lockToTry == -1)
 		lockToTry = MyProcNumber % NUM_XLOGINSERT_LOCKS;
 	MyLockNo = lockToTry;

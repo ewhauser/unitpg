@@ -11,6 +11,7 @@ JOBS ?= 1
 RUNS ?= 3
 PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
+SEMA_KIND ?= auto
 RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage2
 CATALOG_MODE ?= postgres
@@ -36,6 +37,7 @@ PROFILE_HYPERFINE_WARMUP ?= 0
 PROFILE_SERVER_MEMORY ?= 1
 CRITERION_ARGS ?=
 CLIPPY_ARGS ?= --workspace --all-targets
+UNIT_TEST_WORKLOAD_SCRIPT ?= workloads/unit-test-workload.sql
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 PROFILE_HYPERFINE_FLAG := $(if $(filter 1 true yes,$(PROFILE_HYPERFINE)),--profile-hyperfine,)
 PROFILE_SERVER_MEMORY_FLAG := $(if $(filter 1 true yes,$(PROFILE_SERVER_MEMORY)),--profile-server-memory,)
@@ -57,6 +59,7 @@ PGBENCH_COMMON_ARGS = \
 	--runs "$(RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--sema-kind "$(SEMA_KIND)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
@@ -74,6 +77,7 @@ PGBENCH_PROFILE_ARGS = \
 	--runs "$(PROFILE_RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--sema-kind "$(SEMA_KIND)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
@@ -92,7 +96,7 @@ PGBENCH_PROFILE_ARGS = \
 	$(PROFILE_SERVER_MEMORY_FLAG) \
 	$(PROFILE_OPEN_FLAG)
 
-.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb profile profile-open profile-side-by-side profile-open-latest
+.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb pgbench-unit-test-workload profile profile-unit-test-workload profile-open profile-side-by-side profile-open-latest
 .PHONY: regression
 .PHONY: bench bench-smoke lint validate
 
@@ -116,10 +120,29 @@ pgbench-tpcb:
 		--init-steps "default" \
 		$(PGBENCH_COMMON_ARGS)
 
+pgbench-unit-test-workload: TRANSACTIONS = 200
+pgbench-unit-test-workload: CLIENTS = 10
+pgbench-unit-test-workload: JOBS = 10
+pgbench-unit-test-workload:
+	$(PYTHON) pgbench_compare.py \
+		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \
+		--skip-pgbench-init \
+		$(PGBENCH_COMMON_ARGS)
+
 profile:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "$(BUILTIN)" \
 		--init-steps "$(INIT_STEPS)" \
+		$(PGBENCH_PROFILE_ARGS)
+
+profile-unit-test-workload: PROFILE_TRANSACTIONS = 500
+profile-unit-test-workload: PROFILE_RUNS = 1
+profile-unit-test-workload: CLIENTS = 10
+profile-unit-test-workload: JOBS = 10
+profile-unit-test-workload:
+	$(PYTHON) pgbench_compare.py \
+		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \
+		--skip-pgbench-init \
 		$(PGBENCH_PROFILE_ARGS)
 
 profile-open:
@@ -136,6 +159,7 @@ profile-side-by-side:
 		--runs "1" \
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--sema-kind "$(SEMA_KIND)" \
 		--storage-engine "$(STORAGE_ENGINE)" \
 		--catalog-mode "$(CATALOG_MODE)" \
 		--rust-build-profile "release" \
@@ -165,6 +189,7 @@ regression:
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
+	--sema-kind "$(SEMA_KIND)" \
 	$(PGVECTOR_ARG) \
 	$(PGVECTOR_VERSION_ARG) \
 	--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \

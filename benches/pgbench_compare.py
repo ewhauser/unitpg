@@ -211,6 +211,8 @@ class PgBenchCompare:
             "created_at": timestamp,
             "config": {
                 "builtin": args.builtin,
+                "script": args.script,
+                "skip_pgbench_init": args.skip_pgbench_init,
                 "init_steps": args.init_steps,
                 "scale": args.scale,
                 "transactions": args.transactions,
@@ -226,6 +228,7 @@ class PgBenchCompare:
                 "pgvector": args.pgvector,
                 "pgvector_version": args.pgvector_version,
                 "meson_buildtype": args.meson_buildtype,
+                "sema_kind": args.sema_kind,
                 "rust_build_profile": args.rust_build_profile,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
                 "profile_normal_postgres": args.profile_normal_postgres,
@@ -238,8 +241,13 @@ class PgBenchCompare:
                 "profile_hyperfine_warmup": args.profile_hyperfine_warmup,
                 "profile_server_memory": args.profile_server_memory,
             },
-            "workload": workload_metadata(args.builtin, args.init_steps),
-            "warnings": workload_warnings(args.init_steps),
+            "workload": workload_metadata(
+                args.builtin,
+                args.init_steps,
+                args.script,
+                args.skip_pgbench_init,
+            ),
+            "warnings": workload_warnings(args.init_steps, args.script),
             "variants": {},
         }
 
@@ -297,6 +305,7 @@ class PgBenchCompare:
             f"-Dfastpg_use_mem_index_am="
             f"{'true' if variant.fastpg and self.args.fastpg_use_mem_index_am else 'false'}"
         )
+        sema_kind_arg = f"-Dsema_kind={self.args.sema_kind}"
         setup_args = [
             "meson",
             "setup",
@@ -307,6 +316,20 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
             mem_index_arg,
+            sema_kind_arg,
+        ]
+        setup_wipe_args = [
+            "meson",
+            "setup",
+            "--wipe",
+            str(build_dir),
+            str(self.source_root),
+            f"--buildtype={self.args.meson_buildtype}",
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            f"-Dfastpg={'true' if variant.fastpg else 'false'}",
+            mem_index_arg,
+            sema_kind_arg,
         ]
         reconfigure_args = [
             "meson",
@@ -318,10 +341,15 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
             mem_index_arg,
+            sema_kind_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
-            self.checked_command(variant.name, "setup", reconfigure_args, output_dir, "meson-reconfigure")
+            reconfigure = self.command(reconfigure_args, output_dir, "meson-reconfigure")
+            if reconfigure.returncode != 0:
+                if "Unknown option" not in reconfigure.stdout + reconfigure.stderr:
+                    raise BenchmarkFailure(variant.name, "setup", reconfigure, output_dir)
+                self.checked_command(variant.name, "setup", setup_wipe_args, output_dir, "meson-wipe")
         else:
             self.checked_command(variant.name, "setup", setup_args, output_dir, "meson-setup")
 
@@ -497,6 +525,7 @@ class PgBenchCompare:
             f"{'true' if self.args.fastpg_use_mem_index_am else 'false'}"
         )
         smgr_arg = f"-Dfastpg_postgres_smgr={self.args.fastpg_postgres_smgr}"
+        sema_kind_arg = f"-Dsema_kind={self.args.sema_kind}"
         setup_args = [
             "meson",
             "setup",
@@ -510,6 +539,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
         setup_wipe_args = [
             "meson",
@@ -525,6 +555,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
         reconfigure_args = [
             "meson",
@@ -539,6 +570,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
         configure_args = [
             "meson",
@@ -552,6 +584,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
@@ -935,15 +968,18 @@ class PgBenchCompare:
             started = True
             run_record["commands"]["start"] = start.as_json()
 
-            init = self.checked_command(
-                variant.name,
-                "pgbench-init",
-                self.pgbench_init_command(paths["bindir"], str(socket_dir), port),
-                run_dir,
-                "pgbench-init",
-                env=env,
-            )
-            run_record["commands"]["pgbench_init"] = init.as_json()
+            if self.args.skip_pgbench_init:
+                run_record["pgbench_init_skipped"] = True
+            else:
+                init = self.checked_command(
+                    variant.name,
+                    "pgbench-init",
+                    self.pgbench_init_command(paths["bindir"], str(socket_dir), port),
+                    run_dir,
+                    "pgbench-init",
+                    env=env,
+                )
+                run_record["commands"]["pgbench_init"] = init.as_json()
 
             if self.should_profile_normal_postgres(variant) and self.args.profile_phase == "run":
                 postmaster_pid = read_postmaster_pid(data_dir)
@@ -1072,15 +1108,18 @@ class PgBenchCompare:
                 profiler = server["profiler"]
                 run_record["commands"]["profile_start"] = profiler["result"].as_json()
 
-            init = self.checked_command(
-                variant.name,
-                "pgbench-init",
-                self.pgbench_init_command(paths["client_bindir"], host, port),
-                run_dir,
-                "pgbench-init",
-                env=env,
-            )
-            run_record["commands"]["pgbench_init"] = init.as_json()
+            if self.args.skip_pgbench_init:
+                run_record["pgbench_init_skipped"] = True
+            else:
+                init = self.checked_command(
+                    variant.name,
+                    "pgbench-init",
+                    self.pgbench_init_command(paths["client_bindir"], host, port),
+                    run_dir,
+                    "pgbench-init",
+                    env=env,
+                )
+                run_record["commands"]["pgbench_init"] = init.as_json()
 
             if self.should_profile_rust_server(variant) and self.args.profile_phase == "run":
                 profiler = self.start_rust_profiler(variant.name, server, run_dir)
@@ -1575,7 +1614,7 @@ class PgBenchCompare:
             "--title",
             title,
             "--notes",
-            f"builtin={self.args.builtin} scale={self.args.scale} transactions={self.args.transactions}",
+            workload_note(self.args),
         ]
         if self.args.profile_open:
             command.append("--open")
@@ -1651,7 +1690,7 @@ class PgBenchCompare:
         return command
 
     def pgbench_run_command(self, bindir: Path, host: str, port: int) -> list[str]:
-        return [
+        command = [
             str(bindir / "pgbench"),
             "-h",
             host,
@@ -1659,8 +1698,12 @@ class PgBenchCompare:
             str(port),
             "-U",
             "postgres",
-            "-b",
-            self.args.builtin,
+        ]
+        if self.args.script is None:
+            command.extend(["-b", self.args.builtin])
+        else:
+            command.extend(["-f", self.args.script])
+        command.extend([
             "-s",
             str(self.args.scale),
             "-t",
@@ -1674,7 +1717,8 @@ class PgBenchCompare:
             "-n",
             "-r",
             "postgres",
-        ]
+        ])
+        return command
 
     def checked_command(
         self,
@@ -1783,6 +1827,12 @@ class PgBenchCompare:
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--builtin", default="simple-update")
+    parser.add_argument("--script", help="run a custom pgbench transaction script with -f")
+    parser.add_argument(
+        "--skip-pgbench-init",
+        action="store_true",
+        help="skip pgbench -i setup when the workload script creates its own schema",
+    )
     parser.add_argument("--init-steps", default="dt")
     parser.add_argument("--scale", type=int, default=1)
     parser.add_argument("--transactions", type=int, default=20)
@@ -1795,6 +1845,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["plain", "debug", "debugoptimized", "release", "minsize"],
         default="release",
         help="Meson buildtype for normal Postgres, pgbench client binaries, and linked pgcore",
+    )
+    parser.add_argument(
+        "--sema-kind",
+        choices=["auto", "sysv", "unnamed_posix", "named_posix"],
+        default=os.environ.get("PGBENCH_SEMA_KIND", "auto"),
+        help="Meson semaphore implementation for benchmark Postgres builds",
     )
     parser.add_argument(
         "--rust-build-profile",
@@ -1911,6 +1967,25 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     if args.profile_hyperfine_warmup < 0:
         parser.error("--profile-hyperfine-warmup must be non-negative")
     return args
+
+
+def resolve_pgbench_script_path(script: str | None, source_root: Path) -> str | None:
+    if script is None:
+        return None
+    raw = Path(script).expanduser()
+    if raw.is_absolute():
+        if raw.is_file():
+            return str(raw)
+        raise FileNotFoundError(script)
+
+    candidates = [
+        source_root / raw,
+        source_root / "benches" / raw,
+    ]
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    raise FileNotFoundError(script)
 
 
 def normalize_init_steps(init_steps: str | None) -> str | None:
@@ -2697,7 +2772,17 @@ def has_primary_key_init_step(init_steps: str | None) -> bool:
     return "p" in effective_init_steps(init_steps)
 
 
-def workload_metadata(builtin: str, init_steps: str | None) -> dict[str, Any]:
+def workload_metadata(
+    builtin: str, init_steps: str | None, script: str | None, skip_pgbench_init: bool
+) -> dict[str, Any]:
+    if script is not None:
+        script_path = Path(script)
+        return {
+            "label": f"pgbench custom script {script_path.stem} comparison",
+            "script": str(script_path),
+            "skips_pgbench_init": skip_pgbench_init,
+        }
+
     indexed = has_primary_key_init_step(init_steps)
     workload_name = "TPC-B-like" if builtin == "tpcb-like" else builtin
     if indexed:
@@ -2717,7 +2802,9 @@ def workload_metadata(builtin: str, init_steps: str | None) -> dict[str, Any]:
     }
 
 
-def workload_warnings(init_steps: str | None) -> list[str]:
+def workload_warnings(init_steps: str | None, script: str | None) -> list[str]:
+    if script is not None:
+        return []
     if has_primary_key_init_step(init_steps):
         return []
     effective = effective_init_steps(init_steps)
@@ -2725,6 +2812,12 @@ def workload_warnings(init_steps: str | None) -> list[str]:
         f"init_steps={effective} does not create pgbench primary-key indexes (`p` step missing). "
         "Treat this as an unindexed smoke path, not UPDATE performance evidence.",
     ]
+
+
+def workload_note(args: argparse.Namespace) -> str:
+    if args.script is not None:
+        return f"script={args.script} scale={args.scale} transactions={args.transactions}"
+    return f"builtin={args.builtin} scale={args.scale} transactions={args.transactions}"
 
 
 def render_markdown(results: dict[str, Any], result_root: Path) -> str:
@@ -3311,7 +3404,17 @@ def classify_failure(result: CommandResult) -> str | None:
 
 
 def main(argv: list[str]) -> int:
-    runner = PgBenchCompare(parse_args(argv))
+    args = parse_args(argv)
+    try:
+        args.script = resolve_pgbench_script_path(
+            args.script,
+            Path(__file__).resolve().parents[1],
+        )
+    except FileNotFoundError as error:
+        print(f"pgbench script not found: {error}", file=sys.stderr)
+        return 2
+
+    runner = PgBenchCompare(args)
     try:
         return runner.run()
     except BenchmarkFailure as failure:

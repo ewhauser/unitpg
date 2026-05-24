@@ -86,6 +86,11 @@ option('extra_version', type: 'string', value: '',
 option('darwin_sysroot', type: 'string', value: '',
   description: 'Select a non-default sysroot path')
 
+option('sema_kind', type: 'combo',
+  choices: ['auto', 'sysv', 'unnamed_posix', 'named_posix'],
+  value: 'auto',
+  description: 'Semaphore implementation to use, or auto for platform default')
+
 option('rpath', type: 'boolean', value: true,
   description: 'Embed shared library search path in executables')
 

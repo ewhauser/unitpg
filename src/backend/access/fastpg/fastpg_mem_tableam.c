@@ -3899,6 +3899,10 @@ fastpg_mem_index_build(Relation heapRelation, Relation indexRelation,
 	bool		storage2 =
 		fastpg_mem_use_storage2_for_relid((uint32_t) RelationGetRelid(heapRelation));
 
+	if (fastpg_catalog_mode_uses_postgres() &&
+		FastPgMemRelationPhysicalPages(heapRelation) == 0)
+		return result;
+
 	if (storage2 && !fastpg_catalog_mode_uses_postgres())
 		(void) fastpg_storage2_rebuild_primary_key_index((uint32_t) RelationGetRelid(indexRelation));
 

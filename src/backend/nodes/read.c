@@ -29,10 +29,17 @@
 
 
 /* Static state for pg_strtok */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL const char *pg_strtok_ptr = NULL;
+#else
 static const char *pg_strtok_ptr = NULL;
+#endif
 
 /* State flag that determines how readfuncs.c should treat location fields */
 #ifdef DEBUG_NODE_TESTS_ENABLED
+#ifdef USE_FASTPG
+PG_THREAD_LOCAL
+#endif
 bool		restore_location_fields = false;
 #endif
 

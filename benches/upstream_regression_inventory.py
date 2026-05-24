@@ -1090,6 +1090,8 @@ def count_schedule_cases(schedule: Path) -> int:
 def helper_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         builtin="simple-update",
+        script=None,
+        skip_pgbench_init=False,
         init_steps="dtg",
         scale=1,
         transactions=1,
@@ -1097,6 +1099,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         jobs=1,
         runs=1,
         protocol="simple",
+        sema_kind=args.sema_kind,
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
         storage_engine=args.storage_engine,
@@ -1454,6 +1457,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--rust-build-profile",
         choices=["debug", "release"],
         default="release",
+    )
+    parser.add_argument(
+        "--sema-kind",
+        choices=["auto", "sysv", "unnamed_posix", "named_posix"],
+        default=os.environ.get("PGBENCH_SEMA_KIND", "auto"),
+        help="Meson semaphore implementation for regression Postgres builds",
     )
     parser.add_argument(
         "--storage-engine",

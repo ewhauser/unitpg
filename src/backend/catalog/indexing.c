@@ -339,18 +339,19 @@ CatalogCloseIndexes(CatalogIndexState indstate)
  * This is effectively a cut-down version of ExecInsertIndexTuples.
  */
 static void
-CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
-				   TU_UpdateIndexes updateIndexes)
+CatalogIndexInsertWithSlot(CatalogIndexState indstate, HeapTuple heapTuple,
+						   TU_UpdateIndexes updateIndexes,
+						   TupleTableSlot *slot)
 {
 	int			i;
 	int			numIndexes;
 	RelationPtr relationDescs;
 	Relation	heapRelation;
-	TupleTableSlot *slot;
 	IndexInfo **indexInfoArray;
 	Datum		values[INDEX_MAX_KEYS];
 	bool		isnull[INDEX_MAX_KEYS];
 	bool		onlySummarized = (updateIndexes == TU_Summarizing);
+	bool		own_slot = false;
 
 	if (indstate == NULL)
 		return;
@@ -379,8 +380,14 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
 	heapRelation = indstate->ri_RelationDesc;
 
 	/* Need a slot to hold the tuple being examined */
-	slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRelation),
-									&TTSOpsHeapTuple);
+	if (slot == NULL)
+	{
+		slot = MakeSingleTupleTableSlot(RelationGetDescr(heapRelation),
+										&TTSOpsHeapTuple);
+		own_slot = true;
+	}
+	else
+		ExecClearTuple(slot);
 	ExecStoreHeapTuple(heapTuple, slot, false);
 
 	/*
@@ -448,7 +455,17 @@ CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
 					 indexInfo);
 	}
 
-	ExecDropSingleTupleTableSlot(slot);
+	if (own_slot)
+		ExecDropSingleTupleTableSlot(slot);
+	else
+		ExecClearTuple(slot);
+}
+
+static void
+CatalogIndexInsert(CatalogIndexState indstate, HeapTuple heapTuple,
+				   TU_UpdateIndexes updateIndexes)
+{
+	CatalogIndexInsertWithSlot(indstate, heapTuple, updateIndexes, NULL);
 }
 
 /*
@@ -588,17 +605,24 @@ CatalogTuplesMultiInsertWithInfo(Relation heapRel, TupleTableSlot **slot,
 	 * There is no equivalent to heap_multi_insert for the catalog indexes, so
 	 * we must loop over and insert individually.
 	 */
-	for (int i = 0; i < ntuples; i++)
 	{
-		bool		should_free;
-		HeapTuple	tuple;
+		TupleTableSlot *index_slot =
+			MakeSingleTupleTableSlot(RelationGetDescr(heapRel),
+									 &TTSOpsHeapTuple);
 
-		tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
-		tuple->t_tableOid = slot[i]->tts_tableOid;
-		CatalogIndexInsert(indstate, tuple, TU_All);
+		for (int i = 0; i < ntuples; i++)
+		{
+			bool		should_free;
+			HeapTuple	tuple;
 
-		if (should_free)
-			heap_freetuple(tuple);
+			tuple = ExecFetchSlotHeapTuple(slot[i], true, &should_free);
+			tuple->t_tableOid = slot[i]->tts_tableOid;
+			CatalogIndexInsertWithSlot(indstate, tuple, TU_All, index_slot);
+
+			if (should_free)
+				heap_freetuple(tuple);
+		}
+		ExecDropSingleTupleTableSlot(index_slot);
 	}
 }
 

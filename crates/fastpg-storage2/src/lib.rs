@@ -147,6 +147,20 @@ pub(crate) use tuple::*;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_begin() {
+    if with_session_storage(|session| {
+        if session.explicit_transaction {
+            session.ensure_transaction();
+            return true;
+        }
+        if session.commit_empty_implicit_transaction() {
+            session.ensure_transaction();
+            session.explicit_transaction = true;
+            return true;
+        }
+        false
+    }) {
+        return;
+    }
     with_storage(|state, session| state.begin_explicit_transaction(session));
 }
 
