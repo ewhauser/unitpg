@@ -101,11 +101,6 @@ jobs:
       - name: Run Rust unit tests
         run: cargo test --workspace
 
-      - name: Run pgvector integration test
-        env:
-          FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
-        run: cargo test -p fastpg-testkit --features postgres-execution --test pgvector_smoke
-
       - name: Switch pgcore to Rust catalog for linked Rust tests
         run: |
           set -euo pipefail

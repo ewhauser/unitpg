@@ -192,10 +192,11 @@ fn postgres_client_bindir(build_dir: &Path) -> Result<PathBuf, String> {
         ));
     }
 
-    let mut candidates = vec![build_dir.join("tmp_install/usr/local/pgsql/bin")];
+    let mut candidates = Vec::new();
     if let Some(parent) = build_dir.parent() {
         candidates.push(parent.join("normal/tmp_install/usr/local/pgsql/bin"));
     }
+    candidates.push(build_dir.join("tmp_install/usr/local/pgsql/bin"));
 
     candidates
         .into_iter()
