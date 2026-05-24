@@ -7,8 +7,7 @@ on:
       - master
       - rusty
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
   group: pr-validation-${{ github.event.pull_request.number }}
@@ -19,6 +18,8 @@ jobs:
     name: Rust lint
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    permissions:
+      contents: read
 
     env:
       PGCORE_BUILD_DIR: benches/.build/ci-clippy-pgcore
@@ -26,7 +27,9 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |
@@ -73,7 +76,9 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         run: |
@@ -100,7 +105,7 @@ jobs:
 
       - name: Upload regression inventory results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: upstream-regression-inventory
           path: benches/results/upstream-regression/**
@@ -111,6 +116,8 @@ jobs:
     name: Validate ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -128,7 +135,9 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -200,27 +209,33 @@ jobs:
         run: cargo test -p fastpg-testkit --features postgres-execution,rust-catalog
 
       - name: Package Rust server distribution
+        env:
+          DIST_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           ci/package-rust-server-dist.sh \
             target/release/fastpg-server \
             "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
-            "${{ matrix.target }}" \
+            "$DIST_TARGET" \
             "$RUNNER_TEMP/server-dist"
 
       - name: Check package layout
+        env:
+          DIST_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
+          dist="$RUNNER_TEMP/server-dist/postgres-server-$DIST_TARGET"
           test -x "$dist/bin/fastpg-server"
           test -x "$dist/bin/psql"
           test -x "$dist/bin/pgbench"
           test -f "$dist/README.server.txt"
 
       - name: Smoke-test packaged Rust server
+        env:
+          DIST_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
+          dist="$RUNNER_TEMP/server-dist/postgres-server-$DIST_TARGET"
           workdir="$RUNNER_TEMP/server-smoke"
           rm -rf "$workdir"
           mkdir -p "$workdir"
@@ -232,7 +247,7 @@ jobs:
           grep -F "Postgres catalog mode requires FASTPG_PGDATA" "$workdir/fastpg-server.log"
 
       - name: Upload binary archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: pr-server-dist-${{ matrix.target }}
           path: |

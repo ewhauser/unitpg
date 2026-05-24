@@ -8,8 +8,7 @@ on:
       - rusty
   workflow_dispatch:
 
-permissions:
-  contents: write
+permissions: {}
 
 concurrency:
   group: release-server-binaries-${{ github.ref }}
@@ -20,6 +19,8 @@ jobs:
     name: Build ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 90
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -37,7 +38,9 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Install Linux build dependencies
         if: runner.os == 'Linux'
@@ -109,27 +112,33 @@ jobs:
         run: cargo test -p fastpg-testkit --features postgres-execution,rust-catalog
 
       - name: Package Rust server distribution
+        env:
+          DIST_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
           ci/package-rust-server-dist.sh \
             target/release/fastpg-server \
             "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
-            "${{ matrix.target }}" \
+            "$DIST_TARGET" \
             "$RUNNER_TEMP/server-dist"
 
       - name: Check package layout
+        env:
+          DIST_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
+          dist="$RUNNER_TEMP/server-dist/postgres-server-$DIST_TARGET"
           test -x "$dist/bin/fastpg-server"
           test -x "$dist/bin/psql"
           test -x "$dist/bin/pgbench"
           test -f "$dist/README.server.txt"
 
       - name: Smoke-test packaged Rust server
+        env:
+          DIST_TARGET: ${{ matrix.target }}
         run: |
           set -euo pipefail
-          dist="$RUNNER_TEMP/server-dist/postgres-server-${{ matrix.target }}"
+          dist="$RUNNER_TEMP/server-dist/postgres-server-$DIST_TARGET"
           workdir="$RUNNER_TEMP/server-smoke"
           rm -rf "$workdir"
           mkdir -p "$workdir"
@@ -141,7 +150,7 @@ jobs:
           grep -F "Postgres catalog mode requires FASTPG_PGDATA" "$workdir/fastpg-server.log"
 
       - name: Upload binary archive
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: server-dist-${{ matrix.target }}
           path: |
@@ -155,13 +164,23 @@ jobs:
     runs-on: ubuntu-24.04
     needs: build
     timeout-minutes: 15
+    environment: release
+    permissions:
+      attestations: write # Publish build provenance for release archives.
+      contents: write # Create the GitHub release and upload assets.
+      id-token: write # Request an OIDC signing token for attestations.
 
     steps:
       - name: Download binary archives
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           path: dist
           merge-multiple: true
+
+      - name: Attest release artifacts
+        uses: actions/attest@59d89421af93a897026c735860bf21b6eb4f7b26 # v4
+        with:
+          subject-path: dist/*
 
       - name: Publish release
         env:
@@ -184,10 +203,11 @@ jobs:
           } > "$notes"
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            gh release upload "$tag" dist/* --clobber
-          else
-            gh release create "$tag" dist/* \
-              --target "$GITHUB_SHA" \
-              --title "$title" \
-              --notes-file "$notes"
+            echo "release already exists: $tag" >&2
+            exit 1
           fi
+
+          gh release create "$tag" dist/* \
+            --target "$GITHUB_SHA" \
+            --title "$title" \
+            --notes-file "$notes"
