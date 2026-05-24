@@ -276,6 +276,7 @@ fn prepare_pgcore_libdir(
         copy_pgcore_library(&source, &libdir)?;
     }
 
+    remove_pgcore_pgvector_libraries(&libdir)?;
     if let Some(extension_libdir) = extension_libdir {
         for source in installed_pgvector_libraries(extension_libdir)? {
             copy_pgcore_library(&source, &libdir)?;
@@ -283,6 +284,19 @@ fn prepare_pgcore_libdir(
     }
 
     Ok(libdir)
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn remove_pgcore_pgvector_libraries(libdir: &Path) -> Result<(), String> {
+    for path in installed_pgvector_libraries(libdir)? {
+        fs::remove_file(&path).map_err(|error| {
+            format!(
+                "could not remove stale pgvector library {}: {error}",
+                path.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]

@@ -45,7 +45,9 @@ REGRESSION_FAIL_ON_DIFFERENCES_ARG := $(if $(filter 1 true yes,$(REGRESSION_FAIL
 FASTPG_USE_MEM_INDEX_AM_ARG := $(if $(filter 1 true yes,$(FASTPG_USE_MEM_INDEX_AM)),--fastpg-use-mem-index-am,)
 PGVECTOR_ARG := $(if $(filter 0 false no,$(PGVECTOR)),--no-pgvector,)
 PGVECTOR_VERSION_ARG := --pgvector-version "$(PGVECTOR_VERSION)"
-PGVECTOR_TEST_CMD := $(if $(filter 0 false no,$(PGVECTOR)),@true,FASTPG_POSTGRES_BUILD_DIR="$(CURDIR)/.build/pgbench/fastpg" cargo test -p fastpg-testkit --features postgres-execution --test pgvector_smoke)
+PGVECTOR_TEST_CMD := $(if $(filter 0 false no,$(PGVECTOR)),@true,$(MAKE) pgvector-smoke)
+FASTPG_PGVECTOR_PREFIX := $(CURDIR)/.build/pgbench/fastpg/tmp_install/usr/local/pgsql
+FASTPG_PGVECTOR_SOURCE_DIR := $(CURDIR)/.build/pgbench/pgvector/fastpg-smoke
 
 PGBENCH_COMMON_ARGS = \
 	--scale "$(SCALE)" \
@@ -169,6 +171,11 @@ regression:
 	--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG) \
 	$(REGRESSION_FAIL_ON_DIFFERENCES_ARG)
+
+pgvector-smoke:
+	meson test -C "$(CURDIR)/.build/pgbench/fastpg" --print-errorlogs postgresql:tmp_install
+	../ci/build-pgvector.sh "$(FASTPG_PGVECTOR_PREFIX)" "$(FASTPG_PGVECTOR_SOURCE_DIR)" "$(PGVECTOR_VERSION)"
+	FASTPG_POSTGRES_BUILD_DIR="$(CURDIR)/.build/pgbench/fastpg" cargo test -p fastpg-testkit --features postgres-execution --test pgvector_smoke
 
 bench:
 	cargo bench -p fastpg-storage --bench storage_engine -- $(CRITERION_ARGS)

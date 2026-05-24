@@ -387,7 +387,6 @@ class PgBenchCompare:
             )
 
         pgcore_build_dir = self.ensure_fastpg_pgcore_build(variant.name, output_dir)
-        pgcore_prefix = self.ensure_fastpg_pgcore_install(variant.name, pgcore_build_dir, output_dir)
         features = ["postgres-execution"]
         if self.args.catalog_mode == "rust":
             features.append("rust-catalog")
@@ -435,13 +434,11 @@ class PgBenchCompare:
             "client_bindir": self.pgbench_client_paths["bindir"],
             "client_libdir": self.pgbench_client_paths["libdir"],
             "pgcore_build_dir": pgcore_build_dir,
-            "pgcore_prefix": pgcore_prefix,
-            "pgcore_extension_libdir": pgcore_prefix / "lib",
         }
         paths["pgcore_build_dir"] = Path(build_env["FASTPG_POSTGRES_BUILD_DIR"])
         paths["pgcore_libdir"] = self.prepare_fastpg_pgcore_libdir(
             paths["pgcore_build_dir"],
-            paths["pgcore_extension_libdir"],
+            paths["client_libdir"],
         )
         return paths
 
@@ -599,28 +596,6 @@ class PgBenchCompare:
             "ninja-fastpg-regress-lib",
         )
         return build_dir
-
-    def ensure_fastpg_pgcore_install(self, variant_name: str, build_dir: Path, output_dir: Path) -> Path:
-        prefix = build_dir / "tmp_install" / "usr" / "local" / "pgsql"
-        pg_config = prefix / "bin" / "pg_config"
-        if not pg_config.exists():
-            self.checked_command(
-                variant_name,
-                "setup",
-                ["meson", "test", "-C", str(build_dir), "--print-errorlogs", "postgresql:tmp_install"],
-                output_dir,
-                "meson-test-fastpg-tmp-install",
-            )
-        if not pg_config.exists():
-            raise BenchmarkFailure(
-                variant_name,
-                "setup",
-                CommandResult([str(pg_config)], str(self.source_root), 1, "", "missing installed pg_config", 0.0),
-                output_dir,
-            )
-
-        self.ensure_pgvector_install(variant_name, prefix, output_dir)
-        return prefix
 
     def prepare_fastpg_pgcore_libdir(self, build_dir: Path, extension_libdir: Path | None = None) -> Path:
         suffix = ".dylib" if platform.system() == "Darwin" else ".so"

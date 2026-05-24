@@ -104,9 +104,7 @@ jobs:
         run: make -C benches regression REGRESSION_FAIL_ON_DIFFERENCES=1 REGRESSION_GLOBAL_TIMEOUT=900 FASTPG_CASE_TIMEOUT=180
 
       - name: Run pgvector integration test
-        env:
-          FASTPG_POSTGRES_BUILD_DIR: benches/.build/pgbench/fastpg
-        run: cargo test -p fastpg-testkit --features postgres-execution --test pgvector_smoke
+        run: make -C benches pgvector-smoke
 
       - name: Upload regression inventory results
         if: always()
