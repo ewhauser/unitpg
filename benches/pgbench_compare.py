@@ -221,6 +221,7 @@ class PgBenchCompare:
                 "storage_engine": args.storage_engine,
                 "catalog_mode": args.catalog_mode,
                 "fastpg_catalog_pgdata_mode": args.fastpg_catalog_pgdata_mode,
+                "fastpg_postgres_smgr": args.fastpg_postgres_smgr,
                 "fastpg_use_mem_index_am": args.fastpg_use_mem_index_am,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
@@ -441,6 +442,7 @@ class PgBenchCompare:
             f"-Dfastpg_use_mem_index_am="
             f"{'true' if self.args.fastpg_use_mem_index_am else 'false'}"
         )
+        smgr_arg = f"-Dfastpg_postgres_smgr={self.args.fastpg_postgres_smgr}"
         setup_args = [
             "meson",
             "setup",
@@ -451,6 +453,22 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            smgr_arg,
+            "-Dfastpg_skip_recovery_startup=true",
+            mem_index_arg,
+        ]
+        setup_wipe_args = [
+            "meson",
+            "setup",
+            "--wipe",
+            str(build_dir),
+            str(self.source_root),
+            f"--buildtype={self.args.meson_buildtype}",
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            "-Dfastpg=true",
+            f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
         ]
@@ -464,6 +482,7 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
         ]
@@ -476,19 +495,27 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             "-Dfastpg=true",
             f"-Dfastpg_catalog_mode={self.args.catalog_mode}",
+            smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
-            self.checked_command(variant_name, "setup", configure_args, output_dir, "meson-configure-fastpg")
-            self.checked_command(
-                variant_name,
-                "setup",
-                reconfigure_args,
-                output_dir,
-                "meson-reconfigure-fastpg",
-            )
+            configure = self.command(configure_args, output_dir, "meson-configure-fastpg")
+            if configure.returncode != 0:
+                if "Unknown option" not in configure.stdout + configure.stderr:
+                    raise BenchmarkFailure(variant_name, "setup", configure, output_dir)
+                self.checked_command(variant_name, "setup", setup_wipe_args, output_dir, "meson-wipe-fastpg")
+            else:
+                reconfigure = self.command(
+                    reconfigure_args,
+                    output_dir,
+                    "meson-reconfigure-fastpg",
+                )
+                if reconfigure.returncode != 0:
+                    if "Unknown option" not in reconfigure.stdout + reconfigure.stderr:
+                        raise BenchmarkFailure(variant_name, "setup", reconfigure, output_dir)
+                    self.checked_command(variant_name, "setup", setup_wipe_args, output_dir, "meson-wipe-fastpg")
         else:
             self.checked_command(variant_name, "setup", setup_args, output_dir, "meson-setup-fastpg")
 
@@ -1731,6 +1758,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
             "prepare FASTPG_PGDATA with a fresh initdb, a full copy of one seed initdb, "
             "or a small runtime skeleton backed by the seed relation files"
         ),
+    )
+    parser.add_argument(
+        "--fastpg-postgres-smgr",
+        choices=["md", "mem"],
+        default="mem",
+        help="select the PostgreSQL storage manager compiled into the fastpg pgcore build",
     )
     parser.add_argument(
         "--fastpg-use-mem-index-am",

@@ -54,6 +54,11 @@ option('fastpg_catalog_mode', type: 'combo',
   value: 'postgres',
   description: 'Select the catalog implementation for fastpg builds')
 
+option('fastpg_postgres_smgr', type: 'combo',
+  choices: ['md', 'mem'],
+  value: 'mem',
+  description: 'Select the PostgreSQL storage manager for fastpg builds')
+
 option('fastpg_use_mem_index_am', type: 'boolean', value: false,
   description: 'Use fastpg in-memory index AM for eligible postgres-catalog indexes')
 

@@ -70,7 +70,7 @@
 #include "storage/bufmgr.h"
 #include "storage/ipc.h"
 #include "storage/md.h"
-#ifdef USE_FASTPG
+#ifdef FASTPG_USE_MEM_SMGR
 #include "storage/memsmgr.h"
 #endif
 #include "storage/smgr.h"
@@ -128,31 +128,17 @@ typedef struct f_smgr
 	int			(*smgr_fd) (SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum, uint32 *off);
 } f_smgr;
 
+typedef enum SMgrWhich
+{
+	SMGR_MD = 0,
+#ifdef FASTPG_USE_MEM_SMGR
+	SMGR_MEM,
+#endif
+} SMgrWhich;
+
 static const f_smgr smgrsw[] = {
 	/* magnetic disk */
 	{
-#ifdef USE_FASTPG
-		.smgr_init = meminit,
-		.smgr_shutdown = memshutdown,
-		.smgr_open = memopen,
-		.smgr_close = memclose,
-		.smgr_create = memcreate,
-		.smgr_exists = memexists,
-		.smgr_unlink = memunlink,
-		.smgr_extend = memextend,
-		.smgr_zeroextend = memzeroextend,
-		.smgr_prefetch = memprefetch,
-		.smgr_maxcombine = memmaxcombine,
-		.smgr_readv = memreadv,
-		.smgr_startreadv = memstartreadv,
-		.smgr_writev = memwritev,
-		.smgr_writeback = memwriteback,
-		.smgr_nblocks = memnblocks,
-		.smgr_truncate = memtruncate,
-		.smgr_immedsync = memimmedsync,
-		.smgr_registersync = memregistersync,
-		.smgr_fd = memfd,
-#else
 		.smgr_init = mdinit,
 		.smgr_shutdown = NULL,
 		.smgr_open = mdopen,
@@ -173,8 +159,32 @@ static const f_smgr smgrsw[] = {
 		.smgr_immedsync = mdimmedsync,
 		.smgr_registersync = mdregistersync,
 		.smgr_fd = mdfd,
+	},
+#ifdef FASTPG_USE_MEM_SMGR
+	/* seed-backed memory overlay */
+	{
+		.smgr_init = meminit,
+		.smgr_shutdown = memshutdown,
+		.smgr_open = memopen,
+		.smgr_close = memclose,
+		.smgr_create = memcreate,
+		.smgr_exists = memexists,
+		.smgr_unlink = memunlink,
+		.smgr_extend = memextend,
+		.smgr_zeroextend = memzeroextend,
+		.smgr_prefetch = memprefetch,
+		.smgr_maxcombine = memmaxcombine,
+		.smgr_readv = memreadv,
+		.smgr_startreadv = memstartreadv,
+		.smgr_writev = memwritev,
+		.smgr_writeback = memwriteback,
+		.smgr_nblocks = memnblocks,
+		.smgr_truncate = memtruncate,
+		.smgr_immedsync = memimmedsync,
+		.smgr_registersync = memregistersync,
+		.smgr_fd = memfd,
+	},
 #endif
-	}
 };
 
 static const int NSmgr = lengthof(smgrsw);
@@ -196,6 +206,7 @@ static FASTPG_SMGR_BACKEND_LOCAL bool smgr_initialized = false;
 
 /* local function prototypes */
 static void smgrshutdown(int code, Datum arg);
+static int	smgrchoose(RelFileLocatorBackend rlocator);
 static void smgrdestroy(SMgrRelation reln);
 
 static void smgr_aio_reopen(PgAioHandle *ioh);
@@ -267,6 +278,18 @@ smgrshutdown(int code, Datum arg)
 	RESUME_INTERRUPTS();
 }
 
+static int
+smgrchoose(RelFileLocatorBackend rlocator)
+{
+	(void) rlocator;
+
+#ifdef FASTPG_USE_MEM_SMGR
+	return SMGR_MEM;
+#else
+	return SMGR_MD;
+#endif
+}
+
 /*
  * smgropen() -- Return an SMgrRelation object, creating it if need be.
  *
@@ -318,7 +341,7 @@ smgropen(RelFileLocator rlocator, ProcNumber backend)
 		reln->smgr_targblock = InvalidBlockNumber;
 		for (int i = 0; i <= MAX_FORKNUM; ++i)
 			reln->smgr_cached_nblocks[i] = InvalidBlockNumber;
-		reln->smgr_which = 0;	/* we only have md.c at present */
+		reln->smgr_which = smgrchoose(brlocator);
 
 		/* it is not pinned yet */
 		reln->pincount = 0;
