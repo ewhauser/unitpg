@@ -105,6 +105,7 @@ impl Default for ServerState {
 }
 
 type SessionBackendJob = Box<dyn FnOnce() + Send + 'static>;
+const POSTGRES_SAFE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
 enum SessionBackendMessage {
     Run(SessionBackendJob),
@@ -121,6 +122,7 @@ impl SessionBackendExecutor {
         let (sender, receiver) = mpsc::channel::<SessionBackendMessage>();
         let handle = thread::Builder::new()
             .name(format!("fastpg-session-{session_id}"))
+            .stack_size(POSTGRES_SAFE_THREAD_STACK_SIZE)
             .spawn(move || {
                 while let Ok(message) = receiver.recv() {
                     match message {
