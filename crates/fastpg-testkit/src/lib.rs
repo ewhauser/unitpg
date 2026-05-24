@@ -95,7 +95,8 @@ fn bootstrap_postgres_catalog() -> Result<CatalogBootstrap, String> {
             )
         })?;
     repair_macos_client_library_names(&client_bindir, &client_libdir)?;
-    let pgcore_libdir = prepare_pgcore_libdir(&build_dir, &client_libdir)?;
+    let pgcore_extension_libdir = pgcore_extension_libdir(&build_dir)?;
+    let pgcore_libdir = prepare_pgcore_libdir(&build_dir, pgcore_extension_libdir.as_deref())?;
     let pgdata = create_catalog_pgdata(&client_bindir, &client_libdir)?;
 
     let postgres_exec = client_bindir.join(exe_name("postgres"));
@@ -210,7 +211,31 @@ fn postgres_client_bindir(build_dir: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
-fn prepare_pgcore_libdir(build_dir: &Path, extension_libdir: &Path) -> Result<PathBuf, String> {
+fn pgcore_extension_libdir(build_dir: &Path) -> Result<Option<PathBuf>, String> {
+    if let Some(value) = env::var_os("FASTPG_POSTGRES_EXTENSION_LIBDIR") {
+        let libdir = PathBuf::from(value);
+        if !libdir.is_dir() {
+            return Err(format!(
+                "FASTPG_POSTGRES_EXTENSION_LIBDIR does not exist or is not a directory: {}",
+                libdir.display()
+            ));
+        }
+        return Ok(Some(libdir));
+    }
+
+    let libdir = build_dir.join("tmp_install/usr/local/pgsql/lib");
+    if installed_pgvector_libraries(&libdir)?.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(libdir))
+    }
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn prepare_pgcore_libdir(
+    build_dir: &Path,
+    extension_libdir: Option<&Path>,
+) -> Result<PathBuf, String> {
     let libdir = build_dir.join("fastpg-pgcore-libdir");
     fs::create_dir_all(&libdir).map_err(|error| {
         format!(
@@ -251,8 +276,10 @@ fn prepare_pgcore_libdir(build_dir: &Path, extension_libdir: &Path) -> Result<Pa
         copy_pgcore_library(&source, &libdir)?;
     }
 
-    for source in installed_pgvector_libraries(extension_libdir)? {
-        copy_pgcore_library(&source, &libdir)?;
+    if let Some(extension_libdir) = extension_libdir {
+        for source in installed_pgvector_libraries(extension_libdir)? {
+            copy_pgcore_library(&source, &libdir)?;
+        }
     }
 
     Ok(libdir)
