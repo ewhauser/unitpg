@@ -1090,6 +1090,8 @@ def count_schedule_cases(schedule: Path) -> int:
 def helper_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         builtin="simple-update",
+        script=None,
+        skip_pgbench_init=False,
         init_steps="dtg",
         scale=1,
         transactions=1,
@@ -1097,6 +1099,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         jobs=1,
         runs=1,
         protocol="simple",
+        sema_kind="auto",
         meson_buildtype=args.meson_buildtype,
         rust_build_profile=args.rust_build_profile,
         storage_engine=args.storage_engine,
