@@ -11,6 +11,13 @@ not document upstream PostgreSQL build options.
 | `fastpg_use_mem_index_am` | boolean | `false` | `FASTPG_USE_MEM_INDEX_AM` when `fastpg=true` | Uses the FastPG in-memory index access method for eligible PostgreSQL-catalog indexes. |
 | `fastpg_skip_recovery_startup` | boolean | `false` | `FASTPG_SKIP_RECOVERY_STARTUP` when `fastpg=true` | Skips WAL recovery during startup for disposable Rust-server catalog runs. This is for benchmark/test PGDATA only, not durable PostgreSQL clusters. |
 
-Runtime selectors such as `FASTPG_STORAGE_ENGINE`, `FASTPG_PGDATA`, and
-`FASTPG_PGDATA_SEED` are intentionally not listed here because they are not
-PostgreSQL compiler options.
+## Fork Runtime Environment Variables
+
+These are runtime selectors read by FastPG paths. They are not PostgreSQL
+compiler options.
+
+| Environment variable | Values / default | What it does |
+| --- | --- | --- |
+| `FASTPG_STORAGE_ENGINE` | `storage2` selects `fastpg-storage2`; other values select `fastpg-storage` where this selector is honored. Defaults are caller-dependent; the benchmark harness defaults to `storage2`. | Selects the Rust storage engine used by FastPG execution paths. |
+| `FASTPG_PGDATA` | Absolute path to an existing PGDATA directory. Required by PostgreSQL-catalog runtime paths. | Points the Rust server and pgcore PostgreSQL-catalog bootstrap at the prepared catalog directory. |
+| `FASTPG_PGDATA_SEED` | Path to a seed relation-file root. Unset disables seed-backed memory-smgr reads unless the legacy `PG_FASTFORK_SEED_DIR` alias is set. | Lets the FastPG memory smgr read existing relation files from a seed tree while keeping writes in the in-memory overlay. |
