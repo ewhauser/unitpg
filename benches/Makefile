@@ -11,12 +11,13 @@ JOBS ?= 1
 RUNS ?= 3
 PROTOCOL ?= simple
 MESON_BUILDTYPE ?= release
+SEMA_KIND ?= auto
 RUST_BUILD_PROFILE ?= release
 STORAGE_ENGINE ?= storage2
 CATALOG_MODE ?= postgres
 CATALOG_PGDATA_MODE ?= seed-skeleton
 FASTPG_POSTGRES_SMGR ?= mem
-FASTPG_USE_MEM_INDEX_AM ?= 0
+FASTPG_USE_MEM_INDEX_AM ?= 1
 PGVECTOR ?= 1
 PGVECTOR_VERSION ?= v0.8.2
 UPSTREAM_REGRESSION_CASES ?=
@@ -58,6 +59,7 @@ PGBENCH_COMMON_ARGS = \
 	--runs "$(RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--sema-kind "$(SEMA_KIND)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
@@ -75,6 +77,7 @@ PGBENCH_PROFILE_ARGS = \
 	--runs "$(PROFILE_RUNS)" \
 	--protocol "$(PROTOCOL)" \
 	--meson-buildtype "$(MESON_BUILDTYPE)" \
+	--sema-kind "$(SEMA_KIND)" \
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
@@ -117,7 +120,7 @@ pgbench-tpcb:
 		--init-steps "default" \
 		$(PGBENCH_COMMON_ARGS)
 
-pgbench-unit-test-workload: TRANSACTIONS = 5
+pgbench-unit-test-workload: TRANSACTIONS = 200
 pgbench-unit-test-workload: CLIENTS = 10
 pgbench-unit-test-workload: JOBS = 10
 pgbench-unit-test-workload:
@@ -156,6 +159,7 @@ profile-side-by-side:
 		--runs "1" \
 		--protocol "$(PROTOCOL)" \
 		--meson-buildtype "$(MESON_BUILDTYPE)" \
+		--sema-kind "$(SEMA_KIND)" \
 		--storage-engine "$(STORAGE_ENGINE)" \
 		--catalog-mode "$(CATALOG_MODE)" \
 		--rust-build-profile "release" \

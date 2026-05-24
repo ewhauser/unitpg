@@ -2751,6 +2751,46 @@ AddRelationNewConstraints(Relation rel,
 
 			Assert(cdef->initially_valid != cdef->skip_validation);
 
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres() &&
+				rel->rd_tableam == GetFastPgMemTableAmRoutine())
+			{
+				if (cdef->conname)
+				{
+					if (ConstraintNameIsUsed(CONSTRAINT_RELATION,
+											 RelationGetRelid(rel),
+											 cdef->conname))
+						ereport(ERROR,
+								errcode(ERRCODE_DUPLICATE_OBJECT),
+								errmsg("constraint \"%s\" for relation \"%s\" already exists",
+									   cdef->conname, RelationGetRelationName(rel)));
+					nnname = cdef->conname;
+				}
+				else
+					nnname = ChooseConstraintName(RelationGetRelationName(rel),
+												  strVal(linitial(cdef->keys)),
+												  "not_null",
+												  RelationGetNamespace(rel),
+												  nnnames);
+				nnnames = lappend(nnnames, nnname);
+
+				nncooked = palloc_object(CookedConstraint);
+				nncooked->contype = CONSTR_NOTNULL;
+				nncooked->conoid = InvalidOid;
+				nncooked->name = nnname;
+				nncooked->attnum = colnum;
+				nncooked->expr = NULL;
+				nncooked->is_enforced = true;
+				nncooked->skip_validation = cdef->skip_validation;
+				nncooked->is_local = is_local;
+				nncooked->inhcount = inhcount;
+				nncooked->is_no_inherit = cdef->is_no_inherit;
+
+				cookedConstraints = lappend(cookedConstraints, nncooked);
+				continue;
+			}
+#endif
+
 			/*
 			 * If the column already has a not-null constraint, we don't want
 			 * to add another one; adjust inheritance status as needed.  This
@@ -3023,6 +3063,60 @@ AddRelationNotNullConstraints(Relation rel, List *constraints,
 	List	   *givennames;
 	List	   *nnnames;
 	List	   *nncols = NIL;
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		rel->rd_tableam == GetFastPgMemTableAmRoutine())
+	{
+		TupleDesc	tupdesc = RelationGetDescr(rel);
+
+		foreach_ptr(Constraint, constr, constraints)
+		{
+			AttrNumber	attnum;
+			const char *attname;
+
+			Assert(constr->contype == CONSTR_NOTNULL);
+			Assert(list_length(constr->keys) == 1);
+			attname = strVal(linitial(constr->keys));
+			attnum = InvalidAttrNumber;
+			for (int index = 0; index < tupdesc->natts; index++)
+			{
+				Form_pg_attribute attr = TupleDescAttr(tupdesc, index);
+
+				if (!attr->attisdropped &&
+					namestrcmp(&attr->attname, attname) == 0)
+				{
+					attnum = index + 1;
+					break;
+				}
+			}
+			if (attnum == InvalidAttrNumber)
+				ereport(ERROR,
+						errcode(ERRCODE_UNDEFINED_COLUMN),
+						errmsg("column \"%s\" of relation \"%s\" does not exist",
+							   attname,
+							   RelationGetRelationName(rel)));
+			if (attnum < InvalidAttrNumber)
+				ereport(ERROR,
+						errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("cannot add not-null constraint on system column \"%s\"",
+							   attname));
+			if (!TupleDescAttr(tupdesc, attnum - 1)->attnotnull &&
+				!list_member_int(nncols, attnum))
+				nncols = lappend_int(nncols, attnum);
+		}
+		foreach_ptr(CookedConstraint, cooked, old_notnulls)
+		{
+			Assert(cooked->contype == CONSTR_NOTNULL);
+			if (cooked->attnum > 0 &&
+				cooked->attnum <= tupdesc->natts &&
+				!TupleDescAttr(tupdesc, cooked->attnum - 1)->attnotnull &&
+				!list_member_int(nncols, cooked->attnum))
+				nncols = lappend_int(nncols, cooked->attnum);
+		}
+		return nncols;
+	}
+#endif
 
 	/*
 	 * We track two lists of names: nnnames keeps all the constraint names,

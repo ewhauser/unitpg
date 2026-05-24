@@ -1,6 +1,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 use std::borrow::Cow;
+#[cfg(feature = "postgres-execution")]
 use std::ffi::CStr;
 use std::ops::{Deref, DerefMut};
 use std::sync::OnceLock;
@@ -253,6 +254,15 @@ impl PgCoreTransactionCommand {
             Self::Rollback => "ROLLBACK",
         }
     }
+
+    #[cfg(feature = "postgres-execution")]
+    fn pgcore_code(self) -> i32 {
+        match self {
+            Self::Begin => 0,
+            Self::Commit => 1,
+            Self::Rollback => 2,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -355,21 +365,9 @@ impl PgCoreSession {
     pub fn execute_transaction_command(
         &self,
         command: PgCoreTransactionCommand,
-    ) -> ExecutionResult {
+    ) -> Result<ExecutionResult, PgCoreError> {
         let _guard = self.enter_storage();
-        self.inner.execute_transaction_command(command);
-        ExecutionResult {
-            statements: vec![ExecutionStatement {
-                command_tag: command.command_tag().into(),
-                command_rows: None,
-                is_select: false,
-                fields: Vec::new(),
-                rows: Vec::new(),
-                copy_in: None,
-                copy_out: None,
-            }],
-            notices: Vec::new(),
-        }
+        self.inner.execute_transaction_command(command)
     }
 
     pub fn execute_copy_from_stdin(
@@ -749,6 +747,9 @@ mod inner {
             prepared: *const FastPgPgCorePrepared,
         ) -> *mut FastPgPgCoreExecuteResult;
         fn fastpg_pgcore_execute_simple(sql: *const c_char) -> *mut FastPgPgCoreExecuteResult;
+        fn fastpg_pgcore_execute_transaction_command(
+            command: i32,
+        ) -> *mut FastPgPgCoreExecuteResult;
         fn fastpg_pgcore_execute_params(
             prepared: *const FastPgPgCorePrepared,
             parameter_values: *const *const c_char,
@@ -1325,9 +1326,17 @@ mod inner {
             simple_execution_result_from_ptr(result)
         }
 
-        pub fn execute_transaction_command(&self, command: PgCoreTransactionCommand) {
+        pub fn execute_transaction_command(
+            &self,
+            command: PgCoreTransactionCommand,
+        ) -> Result<ExecutionResult, PgCoreError> {
             let _guard = enter_pgcore_lane("transaction_command");
             self.set_database();
+            if postgres_catalog_enabled() {
+                let result =
+                    unsafe { fastpg_pgcore_execute_transaction_command(command.pgcore_code()) };
+                return execution_result_from_ptr(result);
+            }
             match command {
                 PgCoreTransactionCommand::Begin => {
                     unsafe {
@@ -1351,6 +1360,18 @@ mod inner {
                     fastpg_storage2::fastpg_storage2_xact_abort();
                 }
             }
+            Ok(ExecutionResult {
+                statements: vec![ExecutionStatement {
+                    command_tag: command.command_tag().into(),
+                    command_rows: None,
+                    is_select: false,
+                    fields: Vec::new(),
+                    rows: Vec::new(),
+                    copy_in: None,
+                    copy_out: None,
+                }],
+                notices: Vec::new(),
+            })
         }
 
         pub fn execute_copy_from_stdin(

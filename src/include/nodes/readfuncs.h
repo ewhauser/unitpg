@@ -20,7 +20,11 @@
  * variable in read.c that needs to be accessible to readfuncs.c
  */
 #ifdef DEBUG_NODE_TESTS_ENABLED
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL bool restore_location_fields;
+#else
 extern PGDLLIMPORT bool restore_location_fields;
+#endif
 #endif
 
 /*

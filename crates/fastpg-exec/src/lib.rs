@@ -408,6 +408,16 @@ impl QueryExecutor {
     #[cfg(feature = "postgres-execution")]
     pub fn execute_simple_cstr(&self, sql: &CStr) -> QueryExecution {
         self.ensure_pgcore_session_started();
+        if let Ok(sql_text) = sql.to_str()
+            && let Some(command) = fast_transaction_command(sql_text)
+        {
+            return match self.pgcore_session.execute_transaction_command(command) {
+                Ok(result) => {
+                    pgcore_execution_to_query_execution(result, PgCoreRowConversion::PreserveText)
+                }
+                Err(error) => pgcore_error_execution(error),
+            };
+        }
         match self.pgcore_session.execute_simple_cstr_fast(sql) {
             Ok(PgCoreSimpleExecutionResult::Command { notices, tag, rows }) => {
                 if !notices.is_empty() {
@@ -878,14 +888,13 @@ impl QueryExecutor {
         row_conversion: PgCoreRowConversion,
     ) -> QueryExecution {
         self.ensure_pgcore_session_started();
-        if !postgres_catalog_enabled()
-            && parameters.is_empty()
+        if parameters.is_empty()
             && let Some(command) = fast_transaction_command(sql)
         {
-            return pgcore_execution_to_query_execution(
-                self.pgcore_session.execute_transaction_command(command),
-                row_conversion,
-            );
+            return match self.pgcore_session.execute_transaction_command(command) {
+                Ok(result) => pgcore_execution_to_query_execution(result, row_conversion),
+                Err(error) => pgcore_error_execution(error),
+            };
         }
 
         let execution_result = if parameters.is_empty() {

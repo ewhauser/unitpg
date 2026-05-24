@@ -390,6 +390,9 @@ else
   error('unknown host system: @0@'.format(host_system))
 endif
 
+if get_option('sema_kind') != 'auto'
+  sema_kind = get_option('sema_kind')
+endif
 
 
 ###############################################################

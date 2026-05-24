@@ -21,8 +21,10 @@
 #include <sys/stat.h>
 
 #include "access/xlogutils.h"
+#include "common/hashfn.h"
 #include "common/relpath.h"
 #include "miscadmin.h"
+#include "port/atomics.h"
 #include "portability/mem.h"
 #include "storage/aio.h"
 #include "storage/aio_internal.h"
@@ -51,6 +53,11 @@
  */
 #define MEMSMGR_SHARED_MAX_FORKS	8192
 #define MEMSMGR_SHARED_MAX_PAGES	262144
+#define MEMSMGR_SHARED_PARTITIONS	32
+#define MEMSMGR_SHARED_FORKS_PER_PARTITION \
+	((MEMSMGR_SHARED_MAX_FORKS + MEMSMGR_SHARED_PARTITIONS - 1) / MEMSMGR_SHARED_PARTITIONS)
+#define MEMSMGR_SHARED_PAGES_PER_PARTITION \
+	((MEMSMGR_SHARED_MAX_PAGES + MEMSMGR_SHARED_PARTITIONS - 1) / MEMSMGR_SHARED_PARTITIONS)
 #define MEMSMGR_MAX_COMBINE			32
 
 typedef struct MemSmgrForkKey
@@ -82,19 +89,25 @@ typedef struct MemSmgrPageEntry
 
 typedef struct MemSmgrSharedState
 {
-	LWLock		lock;
+	LWLock		locks[MEMSMGR_SHARED_PARTITIONS];
 	bool		initialized;
-	uint32		next_page;
+	pg_atomic_uint32 next_page;
 	char	   *page_data;
 } MemSmgrSharedState;
 
 static MemSmgrSharedState *MemSmgrState;
-static HTAB *MemSmgrForkHash;
-static HTAB *MemSmgrPageHash;
+static HTAB *MemSmgrForkHashes[MEMSMGR_SHARED_PARTITIONS];
+static HTAB *MemSmgrPageHashes[MEMSMGR_SHARED_PARTITIONS];
 
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL MemoryContext MemSmgrLocalCxt;
+static PG_THREAD_LOCAL HTAB *LocalForkHash;
+static PG_THREAD_LOCAL HTAB *LocalPageHash;
+#else
 static MemoryContext MemSmgrLocalCxt;
 static HTAB *LocalForkHash;
 static HTAB *LocalPageHash;
+#endif
 
 static void MemSmgrShmemRequest(void *arg);
 static void MemSmgrShmemInit(void *arg);
@@ -106,6 +119,9 @@ const ShmemCallbacks MemSmgrShmemCallbacks = {
 
 static bool mem_use_md(SMgrRelation reln);
 static bool mem_key_is_temp(const RelFileLocatorBackend *rlocator);
+static uint32 mem_shared_partition_for(const RelFileLocatorBackend *rlocator);
+static const char *mem_shmem_partition_name(const char *prefix,
+											uint32 partition);
 static HTAB *mem_fork_hash_for(const RelFileLocatorBackend *rlocator);
 static HTAB *mem_page_hash_for(const RelFileLocatorBackend *rlocator);
 static LWLock *mem_lock_for(const RelFileLocatorBackend *rlocator);
@@ -133,6 +149,8 @@ static uint32 mem_alloc_page_index(void);
 static void mem_remove_pages(RelFileLocatorBackend rlocator, ForkNumber forknum,
 							 BlockNumber first_block);
 static bool mem_relation_is_memory_only(RelFileLocatorBackend rlocator);
+static bool mem_backing_exists(RelFileLocatorBackend rlocator,
+							   ForkNumber forknum);
 static void mem_remove_memory_only_fork(RelFileLocatorBackend rlocator,
 										ForkNumber forknum);
 static void mem_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum);
@@ -169,19 +187,24 @@ MemSmgrShmemRequest(void *arg)
 					   .size = sizeof(MemSmgrSharedState),
 					   .ptr = (void **) &MemSmgrState);
 
-	ShmemRequestHash(.name = "MemSmgr Fork Hash",
-					 .nelems = MEMSMGR_SHARED_MAX_FORKS,
-					 .ptr = &MemSmgrForkHash,
-					 .hash_info.keysize = sizeof(MemSmgrForkKey),
-					 .hash_info.entrysize = sizeof(MemSmgrForkEntry),
-					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
+	for (uint32 partition = 0; partition < MEMSMGR_SHARED_PARTITIONS; partition++)
+	{
+		ShmemRequestHash(.name = mem_shmem_partition_name("MemSmgr Fork Hash",
+														  partition),
+						 .nelems = MEMSMGR_SHARED_FORKS_PER_PARTITION,
+						 .ptr = &MemSmgrForkHashes[partition],
+						 .hash_info.keysize = sizeof(MemSmgrForkKey),
+						 .hash_info.entrysize = sizeof(MemSmgrForkEntry),
+						 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
 
-	ShmemRequestHash(.name = "MemSmgr Page Hash",
-					 .nelems = MEMSMGR_SHARED_MAX_PAGES,
-					 .ptr = &MemSmgrPageHash,
-					 .hash_info.keysize = sizeof(MemSmgrPageKey),
-					 .hash_info.entrysize = sizeof(MemSmgrPageEntry),
-					 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
+		ShmemRequestHash(.name = mem_shmem_partition_name("MemSmgr Page Hash",
+														  partition),
+						 .nelems = MEMSMGR_SHARED_PAGES_PER_PARTITION,
+						 .ptr = &MemSmgrPageHashes[partition],
+						 .hash_info.keysize = sizeof(MemSmgrPageKey),
+						 .hash_info.entrysize = sizeof(MemSmgrPageEntry),
+						 .hash_flags = HASH_ELEM | HASH_BLOBS | HASH_FIXED_SIZE);
+	}
 }
 
 static void
@@ -192,8 +215,10 @@ MemSmgrShmemInit(void *arg)
 		Size		map_size;
 		void	   *map;
 
-		LWLockInitialize(&MemSmgrState->lock, LWTRANCHE_BUFFER_MAPPING);
-		MemSmgrState->next_page = 0;
+		for (uint32 partition = 0; partition < MEMSMGR_SHARED_PARTITIONS; partition++)
+			LWLockInitialize(&MemSmgrState->locks[partition],
+							 LWTRANCHE_BUFFER_MAPPING);
+		pg_atomic_init_u32(&MemSmgrState->next_page, 0);
 
 		/*
 		 * Keep page contents out of PostgreSQL's fixed-size shared hash.
@@ -332,7 +357,7 @@ memunlink(RelFileLocatorBackend rlocator, ForkNumber forknum, bool isRedo)
 {
 	LWLock	   *lock;
 
-	if (!IsUnderPostmaster)
+	if (!IsUnderPostmaster && mem_seed_root() == NULL)
 	{
 		mdunlink(rlocator, forknum, isRedo);
 		return;
@@ -644,6 +669,35 @@ mem_key_is_temp(const RelFileLocatorBackend *rlocator)
 	return RelFileLocatorBackendIsTemp(*rlocator);
 }
 
+static uint32
+mem_shared_partition_for(const RelFileLocatorBackend *rlocator)
+{
+	uint32		hash;
+
+	hash = DatumGetUInt32(hash_uint32((uint32) rlocator->locator.relNumber));
+	hash = hash_combine(hash,
+						DatumGetUInt32(hash_uint32((uint32) rlocator->locator.dbOid)));
+	hash = hash_combine(hash,
+						DatumGetUInt32(hash_uint32((uint32) rlocator->locator.spcOid)));
+	hash = hash_combine(hash,
+						DatumGetUInt32(hash_uint32((uint32) rlocator->backend)));
+
+	return hash % MEMSMGR_SHARED_PARTITIONS;
+}
+
+static const char *
+mem_shmem_partition_name(const char *prefix, uint32 partition)
+{
+	MemoryContext oldcxt;
+	char	   *name;
+
+	oldcxt = MemoryContextSwitchTo(TopMemoryContext);
+	name = psprintf("%s %02u", prefix, partition);
+	MemoryContextSwitchTo(oldcxt);
+
+	return name;
+}
+
 static HTAB *
 mem_fork_hash_for(const RelFileLocatorBackend *rlocator)
 {
@@ -652,7 +706,7 @@ mem_fork_hash_for(const RelFileLocatorBackend *rlocator)
 		mem_ensure_local_hashes();
 		return LocalForkHash;
 	}
-	return MemSmgrForkHash;
+	return MemSmgrForkHashes[mem_shared_partition_for(rlocator)];
 }
 
 static HTAB *
@@ -663,7 +717,7 @@ mem_page_hash_for(const RelFileLocatorBackend *rlocator)
 		mem_ensure_local_hashes();
 		return LocalPageHash;
 	}
-	return MemSmgrPageHash;
+	return MemSmgrPageHashes[mem_shared_partition_for(rlocator)];
 }
 
 static LWLock *
@@ -675,7 +729,7 @@ mem_lock_for(const RelFileLocatorBackend *rlocator)
 	if (MemSmgrState == NULL)
 		elog(ERROR, "memory storage manager shared state is not initialized");
 
-	return &MemSmgrState->lock;
+	return &MemSmgrState->locks[mem_shared_partition_for(rlocator)];
 }
 
 static const char *
@@ -982,7 +1036,7 @@ mem_alloc_page_index(void)
 	if (MemSmgrState == NULL || MemSmgrState->page_data == NULL)
 		elog(ERROR, "memory storage manager page arena is not initialized");
 
-	page_index = MemSmgrState->next_page++;
+	page_index = pg_atomic_fetch_add_u32(&MemSmgrState->next_page, 1);
 	if (page_index >= MEMSMGR_SHARED_MAX_PAGES)
 		ereport(ERROR,
 				(errcode(ERRCODE_OUT_OF_MEMORY),
@@ -1034,21 +1088,57 @@ mem_relation_is_memory_only(RelFileLocatorBackend rlocator)
 	return saw_entry;
 }
 
+static bool
+mem_backing_exists(RelFileLocatorBackend rlocator, ForkNumber forknum)
+{
+	struct stat statbuf;
+
+	if (mem_seed_active_for(&rlocator))
+		return mem_seed_exists(rlocator, forknum);
+
+	if (mem_key_is_temp(&rlocator))
+		return false;
+
+	if (mem_seed_root() == NULL)
+	{
+		RelPathStr	path;
+
+		path = relpath(rlocator, forknum);
+		if (stat(path.str, &statbuf) == 0)
+			return true;
+
+		if (errno == ENOENT)
+			return false;
+
+		ereport(ERROR,
+				(errcode_for_file_access(),
+				 errmsg("could not stat memory storage manager backing relation: %m")));
+	}
+
+	return false;
+}
+
 static void
 mem_remove_memory_only_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
 {
 	MemSmgrForkKey key;
 	HTAB	   *fork_hash;
 	MemSmgrForkEntry *entry;
+	BlockNumber nblocks;
 
 	mem_build_fork_key(&key, rlocator, forknum);
 	fork_hash = mem_fork_hash_for(&rlocator);
 	entry = hash_search(fork_hash, &key, HASH_FIND, NULL);
 
+	if (entry == NULL)
+		return;
+
+	nblocks = entry->nblocks;
 	if (entry != NULL && !entry->on_disk)
 		hash_search(fork_hash, &key, HASH_REMOVE, NULL);
 
-	mem_remove_pages(rlocator, forknum, 0);
+	if (nblocks > 0)
+		mem_remove_pages(rlocator, forknum, 0);
 }
 
 static void
@@ -1057,15 +1147,25 @@ mem_remove_fork(RelFileLocatorBackend rlocator, ForkNumber forknum)
 	MemSmgrForkKey key;
 	HTAB	   *fork_hash;
 	MemSmgrForkEntry *entry;
+	BlockNumber nblocks;
 
 	mem_build_fork_key(&key, rlocator, forknum);
 	fork_hash = mem_fork_hash_for(&rlocator);
 	entry = hash_search(fork_hash, &key, HASH_FIND, NULL);
 
 	if (entry != NULL && !entry->on_disk)
+	{
+		nblocks = entry->nblocks;
 		hash_search(fork_hash, &key, HASH_REMOVE, NULL);
+		if (nblocks > 0)
+			mem_remove_pages(rlocator, forknum, 0);
+		return;
+	}
 	else
 	{
+		if (entry == NULL && !mem_backing_exists(rlocator, forknum))
+			return;
+
 		if (entry == NULL)
 		{
 			bool		found;
@@ -1095,8 +1195,16 @@ mem_readv_locked(SMgrRelation reln, ForkNumber forknum, BlockNumber blocknum,
 	if (fork == NULL || !fork->exists || blocknum + nblocks > fork->nblocks)
 		ereport(ERROR,
 				(errcode(ERRCODE_DATA_CORRUPTED),
-				 errmsg("could not read blocks %u..%u in memory relation fork",
-						blocknum, blocknum + nblocks - 1)));
+				 errmsg("could not read blocks %u..%u in memory relation fork %u/%u/%u/%d fork %d (exists=%s, on_disk=%s, nblocks=%u)",
+						blocknum, blocknum + nblocks - 1,
+						reln->smgr_rlocator.locator.spcOid,
+						reln->smgr_rlocator.locator.dbOid,
+						reln->smgr_rlocator.locator.relNumber,
+						reln->smgr_rlocator.backend,
+						forknum,
+						fork != NULL && fork->exists ? "true" : "false",
+						fork != NULL && fork->on_disk ? "true" : "false",
+						fork != NULL ? fork->nblocks : 0)));
 
 	for (BlockNumber i = 0; i < nblocks; i++)
 	{

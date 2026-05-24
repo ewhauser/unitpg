@@ -22,6 +22,7 @@
 
 #ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
+#include "port/atomics.h"
 #endif
 #include "access/commit_ts.h"
 #include "access/multixact.h"
@@ -279,10 +280,11 @@ static TransactionStateData TopTransactionStateData = {
 #endif
 
 #ifdef USE_FASTPG
-static PGPROC FastPgStandaloneProc;
-static LocalTransactionId FastPgStandaloneNextLocalTransactionId = 1;
-static TransactionId FastPgStandaloneNextTransactionId = FirstNormalTransactionId;
-static bool FastPgStandaloneProcInitialized = false;
+static PG_THREAD_LOCAL PGPROC FastPgStandaloneProc;
+static PG_THREAD_LOCAL LocalTransactionId FastPgStandaloneNextLocalTransactionId = 1;
+static PG_THREAD_LOCAL bool FastPgStandaloneProcInitialized = false;
+static pg_atomic_uint32 FastPgStandaloneNextProcNumber;
+static pg_atomic_uint32 FastPgStandaloneNextTransactionIdOffset;
 
 static void FastPgEnsureStandaloneProc(void);
 
@@ -299,10 +301,11 @@ FastPgNextStandaloneLocalTransactionId(void)
 static FullTransactionId
 FastPgNextStandaloneFullTransactionId(void)
 {
-	TransactionId xid = FastPgStandaloneNextTransactionId++;
+	TransactionId xid = FirstNormalTransactionId +
+		pg_atomic_fetch_add_u32(&FastPgStandaloneNextTransactionIdOffset, 1);
 
-	if (!TransactionIdIsNormal(FastPgStandaloneNextTransactionId))
-		FastPgStandaloneNextTransactionId = FirstNormalTransactionId;
+	if (!TransactionIdIsNormal(xid))
+		elog(ERROR, "fastpg standalone transaction ID counter wrapped");
 	return FullTransactionIdFromEpochAndXid(0, xid);
 }
 
@@ -334,13 +337,18 @@ FastPgEnsureStandaloneProc(void)
 
 	if (!FastPgStandaloneProcInitialized)
 	{
+		uint32		procNumber;
+
 		memset(&FastPgStandaloneProc, 0, sizeof(FastPgStandaloneProc));
+		procNumber = pg_atomic_fetch_add_u32(&FastPgStandaloneNextProcNumber, 1);
+		if (procNumber >= (uint32) MAX_BACKENDS)
+			elog(ERROR, "fastpg standalone proc number counter wrapped");
 		FastPgStandaloneProc.pid = MyProcPid != 0 ? MyProcPid : getpid();
 		FastPgStandaloneProc.backendType = B_STANDALONE_BACKEND;
 		FastPgStandaloneProc.databaseId = MyDatabaseId;
 		FastPgStandaloneProc.roleId = BOOTSTRAP_SUPERUSERID;
 		FastPgStandaloneProc.pgxactoff = -1;
-		FastPgStandaloneProc.vxid.procNumber = 0;
+		FastPgStandaloneProc.vxid.procNumber = (ProcNumber) procNumber;
 		FastPgStandaloneProc.vxid.lxid = InvalidLocalTransactionId;
 		FastPgStandaloneProc.xid = InvalidTransactionId;
 		FastPgStandaloneProc.xmin = InvalidTransactionId;

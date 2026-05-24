@@ -228,6 +228,7 @@ class PgBenchCompare:
                 "pgvector": args.pgvector,
                 "pgvector_version": args.pgvector_version,
                 "meson_buildtype": args.meson_buildtype,
+                "sema_kind": args.sema_kind,
                 "rust_build_profile": args.rust_build_profile,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
                 "profile_normal_postgres": args.profile_normal_postgres,
@@ -304,6 +305,7 @@ class PgBenchCompare:
             f"-Dfastpg_use_mem_index_am="
             f"{'true' if variant.fastpg and self.args.fastpg_use_mem_index_am else 'false'}"
         )
+        sema_kind_arg = f"-Dsema_kind={self.args.sema_kind}"
         setup_args = [
             "meson",
             "setup",
@@ -314,6 +316,20 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
             mem_index_arg,
+            sema_kind_arg,
+        ]
+        setup_wipe_args = [
+            "meson",
+            "setup",
+            "--wipe",
+            str(build_dir),
+            str(self.source_root),
+            f"--buildtype={self.args.meson_buildtype}",
+            "--auto-features=disabled",
+            "-Dtap_tests=disabled",
+            f"-Dfastpg={'true' if variant.fastpg else 'false'}",
+            mem_index_arg,
+            sema_kind_arg,
         ]
         reconfigure_args = [
             "meson",
@@ -325,10 +341,15 @@ class PgBenchCompare:
             "-Dtap_tests=disabled",
             f"-Dfastpg={'true' if variant.fastpg else 'false'}",
             mem_index_arg,
+            sema_kind_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
-            self.checked_command(variant.name, "setup", reconfigure_args, output_dir, "meson-reconfigure")
+            reconfigure = self.command(reconfigure_args, output_dir, "meson-reconfigure")
+            if reconfigure.returncode != 0:
+                if "Unknown option" not in reconfigure.stdout + reconfigure.stderr:
+                    raise BenchmarkFailure(variant.name, "setup", reconfigure, output_dir)
+                self.checked_command(variant.name, "setup", setup_wipe_args, output_dir, "meson-wipe")
         else:
             self.checked_command(variant.name, "setup", setup_args, output_dir, "meson-setup")
 
@@ -504,6 +525,7 @@ class PgBenchCompare:
             f"{'true' if self.args.fastpg_use_mem_index_am else 'false'}"
         )
         smgr_arg = f"-Dfastpg_postgres_smgr={self.args.fastpg_postgres_smgr}"
+        sema_kind_arg = f"-Dsema_kind={self.args.sema_kind}"
         setup_args = [
             "meson",
             "setup",
@@ -517,6 +539,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
         setup_wipe_args = [
             "meson",
@@ -532,6 +555,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
         reconfigure_args = [
             "meson",
@@ -546,6 +570,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
         configure_args = [
             "meson",
@@ -559,6 +584,7 @@ class PgBenchCompare:
             smgr_arg,
             "-Dfastpg_skip_recovery_startup=true",
             mem_index_arg,
+            sema_kind_arg,
         ]
 
         if (build_dir / "build.ninja").exists():
@@ -1819,6 +1845,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         choices=["plain", "debug", "debugoptimized", "release", "minsize"],
         default="release",
         help="Meson buildtype for normal Postgres, pgbench client binaries, and linked pgcore",
+    )
+    parser.add_argument(
+        "--sema-kind",
+        choices=["auto", "sysv", "unnamed_posix", "named_posix"],
+        default=os.environ.get("PGBENCH_SEMA_KIND", "auto"),
+        help="Meson semaphore implementation for benchmark Postgres builds",
     )
     parser.add_argument(
         "--rust-build-profile",
