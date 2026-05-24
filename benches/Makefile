@@ -17,6 +17,8 @@ CATALOG_MODE ?= postgres
 CATALOG_PGDATA_MODE ?= seed-skeleton
 FASTPG_POSTGRES_SMGR ?= mem
 FASTPG_USE_MEM_INDEX_AM ?= 0
+PGVECTOR ?= 1
+PGVECTOR_VERSION ?= v0.8.2
 UPSTREAM_REGRESSION_CASES ?=
 UPSTREAM_REGRESSION_LIMIT ?=
 REGRESSION_GLOBAL_TIMEOUT ?= 300
@@ -41,6 +43,9 @@ UPSTREAM_REGRESSION_CASE_ARGS := $(foreach case,$(UPSTREAM_REGRESSION_CASES),--c
 UPSTREAM_REGRESSION_LIMIT_ARG := $(if $(UPSTREAM_REGRESSION_LIMIT),--limit "$(UPSTREAM_REGRESSION_LIMIT)",)
 REGRESSION_FAIL_ON_DIFFERENCES_ARG := $(if $(filter 1 true yes,$(REGRESSION_FAIL_ON_DIFFERENCES)),--fail-on-differences,)
 FASTPG_USE_MEM_INDEX_AM_ARG := $(if $(filter 1 true yes,$(FASTPG_USE_MEM_INDEX_AM)),--fastpg-use-mem-index-am,)
+PGVECTOR_ARG := $(if $(filter 0 false no,$(PGVECTOR)),--no-pgvector,)
+PGVECTOR_VERSION_ARG := --pgvector-version "$(PGVECTOR_VERSION)"
+PGVECTOR_TEST_CMD := $(if $(filter 0 false no,$(PGVECTOR)),@true,FASTPG_POSTGRES_BUILD_DIR="$(CURDIR)/.build/pgbench/fastpg" cargo test -p fastpg-testkit --features postgres-execution --test pgvector_smoke)
 
 PGBENCH_COMMON_ARGS = \
 	--scale "$(SCALE)" \
@@ -55,6 +60,8 @@ PGBENCH_COMMON_ARGS = \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
+	$(PGVECTOR_ARG) \
+	$(PGVECTOR_VERSION_ARG) \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG)
 
 PGBENCH_PROFILE_ARGS = \
@@ -70,6 +77,8 @@ PGBENCH_PROFILE_ARGS = \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--rust-build-profile "release" \
+	$(PGVECTOR_ARG) \
+	$(PGVECTOR_VERSION_ARG) \
 	--profile-fastpg-rust-server \
 	--profile-tool "$(PROFILE_TOOL)" \
 	--profile-phase "$(PROFILE_PHASE)" \
@@ -128,6 +137,8 @@ profile-side-by-side:
 		--storage-engine "$(STORAGE_ENGINE)" \
 		--catalog-mode "$(CATALOG_MODE)" \
 		--rust-build-profile "release" \
+		$(PGVECTOR_ARG) \
+		$(PGVECTOR_VERSION_ARG) \
 		--profile-normal-postgres \
 		--profile-fastpg-rust-server \
 		--profile-tool "$(PROFILE_TOOL)" \
@@ -152,6 +163,8 @@ regression:
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
+	$(PGVECTOR_ARG) \
+	$(PGVECTOR_VERSION_ARG) \
 	--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \
 	--fastpg-case-timeout "$(FASTPG_CASE_TIMEOUT)" \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG) \
@@ -171,4 +184,5 @@ validate:
 	$(PYTHON) -m py_compile pgbench_compare.py open_latest_profile.py upstream_regression_inventory.py
 	cargo test -p fastpg-storage
 	$(MAKE) pgbench-tpcb
+	$(PGVECTOR_TEST_CMD)
 	$(MAKE) regression

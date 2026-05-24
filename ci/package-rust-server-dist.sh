@@ -123,6 +123,35 @@ if [[ -d "$CLIENT_PREFIX/share" ]]; then
 	rm -rf "$PACKAGE_DIR/share/doc" "$PACKAGE_DIR/share/man"
 fi
 
+mirror_pkglib_layouts() {
+	local path
+	local base
+
+	mkdir -p "$PACKAGE_DIR/lib/postgresql"
+
+	while IFS= read -r -d '' path; do
+		if ! is_runtime_shared_object "$path"; then
+			continue
+		fi
+		base="$(basename "$path")"
+		if [[ ! -e "$PACKAGE_DIR/lib/postgresql/$base" ]]; then
+			cp -pP "$path" "$PACKAGE_DIR/lib/postgresql/"
+		fi
+	done < <(find "$PACKAGE_DIR/lib" -maxdepth 1 \( -type f -o -type l \) -print0)
+
+	while IFS= read -r -d '' path; do
+		if ! is_runtime_shared_object "$path"; then
+			continue
+		fi
+		base="$(basename "$path")"
+		if [[ ! -e "$PACKAGE_DIR/lib/$base" ]]; then
+			cp -pP "$path" "$PACKAGE_DIR/lib/"
+		fi
+	done < <(find "$PACKAGE_DIR/lib/postgresql" -maxdepth 1 \( -type f -o -type l \) -print0)
+}
+
+mirror_pkglib_layouts
+
 cat > "$PACKAGE_DIR/README.server.txt" <<EOF
 This archive contains the fastpg Rust single-process server for $TARGET.
 
@@ -132,6 +161,7 @@ Included:
 - bin/pgbench
 - bin/pg_isready, when installed
 - client/runtime libraries needed by the packaged client tools
+- pgvector extension files, when installed
 - share runtime data from the matching PostgreSQL client build
 
 The server is the Tokio Rust server linked against fastpg's PostgreSQL parser,
@@ -167,6 +197,9 @@ rewrite_darwin_install_names() {
 			case "$path" in
 				"$PACKAGE_DIR/bin/"*)
 					replacement="@loader_path/../lib/$base"
+					;;
+				"$PACKAGE_DIR/lib/postgresql/"*)
+					replacement="@loader_path/../$base"
 					;;
 				"$PACKAGE_DIR/lib/"*)
 					replacement="@loader_path/$base"
@@ -215,6 +248,9 @@ rewrite_linux_rpaths() {
 		case "$path" in
 			"$PACKAGE_DIR/bin/"*)
 				rpath="$bin_rpath"
+				;;
+			"$PACKAGE_DIR/lib/postgresql/"*)
+				rpath='$ORIGIN:$ORIGIN/..'
 				;;
 			"$PACKAGE_DIR/lib/"*)
 				rpath='$ORIGIN:$ORIGIN/..'

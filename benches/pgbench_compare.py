@@ -223,6 +223,8 @@ class PgBenchCompare:
                 "fastpg_catalog_pgdata_mode": args.fastpg_catalog_pgdata_mode,
                 "fastpg_postgres_smgr": args.fastpg_postgres_smgr,
                 "fastpg_use_mem_index_am": args.fastpg_use_mem_index_am,
+                "pgvector": args.pgvector,
+                "pgvector_version": args.pgvector_version,
                 "meson_buildtype": args.meson_buildtype,
                 "rust_build_profile": args.rust_build_profile,
                 "profile_fastpg_rust_server": args.profile_fastpg_rust_server,
@@ -371,6 +373,7 @@ class PgBenchCompare:
                 )
 
         self.repair_macos_libpq_names(variant.name, bindir, libdir, output_dir)
+        self.ensure_pgvector_install(variant.name, prefix, output_dir)
         return {"build_dir": build_dir, "prefix": prefix, "bindir": bindir, "libdir": libdir}
 
     def ensure_rust_server_install(self, variant: Variant, output_dir: Path) -> dict[str, Path]:
@@ -433,8 +436,59 @@ class PgBenchCompare:
             "pgcore_build_dir": pgcore_build_dir,
         }
         paths["pgcore_build_dir"] = Path(build_env["FASTPG_POSTGRES_BUILD_DIR"])
-        paths["pgcore_libdir"] = self.prepare_fastpg_pgcore_libdir(paths["pgcore_build_dir"])
+        paths["pgcore_libdir"] = self.prepare_fastpg_pgcore_libdir(
+            paths["pgcore_build_dir"],
+            paths["client_libdir"],
+        )
         return paths
+
+    def ensure_pgvector_install(self, variant_name: str, prefix: Path, output_dir: Path) -> None:
+        if not self.args.pgvector:
+            return
+
+        control_file = prefix / "share" / "extension" / "vector.control"
+        libdir = prefix / "lib"
+        if control_file.exists() and installed_pgvector_libraries(libdir):
+            return
+
+        script = self.source_root / "ci" / "build-pgvector.sh"
+        source_dir = self.build_root / "pgvector" / variant_name
+        self.checked_command(
+            variant_name,
+            "setup",
+            [str(script), str(prefix), str(source_dir), self.args.pgvector_version],
+            output_dir,
+            "build-pgvector",
+        )
+
+        if not control_file.exists():
+            raise BenchmarkFailure(
+                variant_name,
+                "setup",
+                CommandResult(
+                    [str(control_file)],
+                    str(self.source_root),
+                    1,
+                    "",
+                    "missing installed pgvector control file",
+                    0.0,
+                ),
+                output_dir,
+            )
+        if not installed_pgvector_libraries(libdir):
+            raise BenchmarkFailure(
+                variant_name,
+                "setup",
+                CommandResult(
+                    [str(libdir)],
+                    str(self.source_root),
+                    1,
+                    "",
+                    "missing installed pgvector shared library",
+                    0.0,
+                ),
+                output_dir,
+            )
 
     def ensure_fastpg_pgcore_build(self, variant_name: str, output_dir: Path) -> Path:
         build_dir = self.build_root / "fastpg"
@@ -543,7 +597,7 @@ class PgBenchCompare:
         )
         return build_dir
 
-    def prepare_fastpg_pgcore_libdir(self, build_dir: Path) -> Path:
+    def prepare_fastpg_pgcore_libdir(self, build_dir: Path, extension_libdir: Path | None = None) -> Path:
         suffix = ".dylib" if platform.system() == "Darwin" else ".so"
         libdir = build_dir / "fastpg-pgcore-libdir"
         libdir.mkdir(parents=True, exist_ok=True)
@@ -569,6 +623,16 @@ class PgBenchCompare:
                 dest.symlink_to(source)
             except OSError:
                 shutil.copy2(source, dest)
+
+        if extension_libdir is not None:
+            for source in installed_pgvector_libraries(extension_libdir):
+                dest = libdir / source.name
+                if dest.exists() or dest.is_symlink():
+                    dest.unlink()
+                try:
+                    dest.symlink_to(source)
+                except OSError:
+                    shutil.copy2(source, dest)
 
         return libdir
 
@@ -1771,6 +1835,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="compile fastpg with the in-memory index AM for eligible postgres-catalog indexes",
     )
     parser.add_argument(
+        "--no-pgvector",
+        dest="pgvector",
+        action="store_false",
+        help="skip the default pgvector build/install step for PostgreSQL installs",
+    )
+    parser.add_argument(
+        "--pgvector-version",
+        default=os.environ.get("PGVECTOR_VERSION", "v0.8.2"),
+        help="pgvector git tag or ref to build by default",
+    )
+    parser.set_defaults(pgvector=True)
+    parser.add_argument(
         "--profile-fastpg-rust-server",
         action="store_true",
         help="profile the fastpg Rust server during the pgbench run",
@@ -1860,6 +1936,20 @@ def rust_server_pgbench_env(bindir: Path, libdir: Path) -> dict[str, str]:
     env["PGSSLMODE"] = "disable"
     env["PGGSSENCMODE"] = "disable"
     return env
+
+
+def installed_pgvector_libraries(libdir: Path) -> list[Path]:
+    if not libdir.exists():
+        return []
+
+    libraries = []
+    for path in libdir.rglob("vector*"):
+        if not path.is_file():
+            continue
+        name = path.name
+        if name.endswith(".so") or ".so." in name or name.endswith(".dylib"):
+            libraries.append(path)
+    return sorted(libraries)
 
 
 def short_temp_dir(prefix: str) -> Path:

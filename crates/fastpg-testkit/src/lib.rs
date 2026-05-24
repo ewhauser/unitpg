@@ -95,7 +95,7 @@ fn bootstrap_postgres_catalog() -> Result<CatalogBootstrap, String> {
                 client_bindir.display()
             )
         })?;
-    let pgcore_libdir = prepare_pgcore_libdir(&build_dir)?;
+    let pgcore_libdir = prepare_pgcore_libdir(&build_dir, &client_libdir)?;
     let pgdata = create_catalog_pgdata(&client_bindir, &client_libdir)?;
 
     let postgres_exec = client_bindir.join(exe_name("postgres"));
@@ -209,7 +209,7 @@ fn postgres_client_bindir(build_dir: &Path) -> Result<PathBuf, String> {
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
-fn prepare_pgcore_libdir(build_dir: &Path) -> Result<PathBuf, String> {
+fn prepare_pgcore_libdir(build_dir: &Path, extension_libdir: &Path) -> Result<PathBuf, String> {
     let libdir = build_dir.join("fastpg-pgcore-libdir");
     fs::create_dir_all(&libdir).map_err(|error| {
         format!(
@@ -247,25 +247,76 @@ fn prepare_pgcore_libdir(build_dir: &Path) -> Result<PathBuf, String> {
         if !source.is_file() {
             continue;
         }
-        let dest = libdir.join(source.file_name().expect("candidate has file name"));
-        if dest.exists() {
-            fs::remove_file(&dest).map_err(|error| {
-                format!(
-                    "could not replace pgcore library {}: {error}",
-                    dest.display()
-                )
-            })?;
-        }
-        fs::copy(&source, &dest).map_err(|error| {
+        copy_pgcore_library(&source, &libdir)?;
+    }
+
+    for source in installed_pgvector_libraries(extension_libdir)? {
+        copy_pgcore_library(&source, &libdir)?;
+    }
+
+    Ok(libdir)
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn copy_pgcore_library(source: &Path, libdir: &Path) -> Result<(), String> {
+    let dest = libdir.join(source.file_name().expect("candidate has file name"));
+    if dest.exists() {
+        fs::remove_file(&dest).map_err(|error| {
             format!(
-                "could not copy pgcore library {} to {}: {error}",
-                source.display(),
+                "could not replace pgcore library {}: {error}",
                 dest.display()
             )
         })?;
     }
+    fs::copy(source, &dest).map_err(|error| {
+        format!(
+            "could not copy pgcore library {} to {}: {error}",
+            source.display(),
+            dest.display()
+        )
+    })?;
+    Ok(())
+}
 
-    Ok(libdir)
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn installed_pgvector_libraries(libdir: &Path) -> Result<Vec<PathBuf>, String> {
+    let mut libraries = Vec::new();
+    collect_installed_pgvector_libraries(libdir, &mut libraries)?;
+    libraries.sort();
+    Ok(libraries)
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn collect_installed_pgvector_libraries(
+    dir: &Path,
+    libraries: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    for entry in
+        fs::read_dir(dir).map_err(|error| format!("could not read {}: {error}", dir.display()))?
+    {
+        let path = entry
+            .map_err(|error| format!("could not read entry in {}: {error}", dir.display()))?
+            .path();
+        if path.is_dir() {
+            collect_installed_pgvector_libraries(&path, libraries)?;
+        } else if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(is_pgvector_library)
+        {
+            libraries.push(path);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn is_pgvector_library(name: &str) -> bool {
+    name.starts_with("vector")
+        && (name.ends_with(".so") || name.contains(".so.") || name.ends_with(".dylib"))
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]

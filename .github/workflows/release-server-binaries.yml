@@ -35,6 +35,7 @@ jobs:
     env:
       PGCORE_BUILD_DIR: benches/.build/ci-pgcore-${{ matrix.target }}
       RELEASE_JOBS: 4
+      PGVECTOR_VERSION: v0.8.2
 
     steps:
       - name: Check out source
@@ -85,6 +86,13 @@ jobs:
           meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
           meson test -C "$PGCORE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
 
+      - name: Build pgvector extension
+        run: |
+          ci/build-pgvector.sh \
+            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RUNNER_TEMP/pgvector" \
+            "$PGVECTOR_VERSION"
+
       - name: Build Rust server
         env:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
@@ -92,6 +100,11 @@ jobs:
 
       - name: Run Rust unit tests
         run: cargo test --workspace
+
+      - name: Run pgvector integration test
+        env:
+          FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
+        run: cargo test -p fastpg-testkit --features postgres-execution --test pgvector_smoke
 
       - name: Switch pgcore to Rust catalog for linked Rust tests
         run: |
@@ -132,6 +145,9 @@ jobs:
           test -x "$dist/bin/psql"
           test -x "$dist/bin/pgbench"
           test -f "$dist/README.server.txt"
+          test -n "$(find "$dist/lib" -maxdepth 3 -name 'vector*' -print -quit)"
+          test -f "$dist/share/extension/vector.control"
+          test -n "$(find "$dist/share/extension" -maxdepth 1 -name 'vector--*.sql' -print -quit)"
 
       - name: Smoke-test packaged Rust server
         env:
@@ -195,6 +211,8 @@ jobs:
 
           {
             echo "fastpg Rust single-process server binary distributions for ${GITHUB_SHA}."
+            echo
+            echo "Archives include pgvector extension files built against the packaged PostgreSQL install."
             echo
             echo "Assets:"
             for archive in dist/*.tar.gz; do
