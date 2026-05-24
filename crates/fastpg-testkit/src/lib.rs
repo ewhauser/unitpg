@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
 use std::{
     env,
-    ffi::OsString,
+    ffi::{OsStr, OsString},
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -95,6 +95,7 @@ fn bootstrap_postgres_catalog() -> Result<CatalogBootstrap, String> {
                 client_bindir.display()
             )
         })?;
+    repair_macos_client_library_names(&client_bindir, &client_libdir)?;
     let pgcore_libdir = prepare_pgcore_libdir(&build_dir, &client_libdir)?;
     let pgdata = create_catalog_pgdata(&client_bindir, &client_libdir)?;
 
@@ -320,6 +321,96 @@ fn is_pgvector_library(name: &str) -> bool {
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn repair_macos_client_library_names(
+    client_bindir: &Path,
+    client_libdir: &Path,
+) -> Result<(), String> {
+    if cfg!(not(target_os = "macos")) {
+        return Ok(());
+    }
+
+    let old_name = "/usr/local/pgsql/lib/libpq.5.dylib";
+    let new_name = client_libdir.join("libpq.5.dylib");
+    let mut targets = vec![
+        client_bindir.join("initdb"),
+        client_bindir.join("postgres"),
+        client_bindir.join("pg_ctl"),
+        client_libdir.join("libpq.5.dylib"),
+    ];
+    if let Ok(entries) = fs::read_dir(client_libdir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".dylib"))
+            {
+                targets.push(path);
+            }
+        }
+    }
+
+    for target in targets {
+        if !target.is_file() {
+            continue;
+        }
+        let output = Command::new("otool")
+            .arg("-L")
+            .arg(&target)
+            .output()
+            .map_err(|error| format!("failed to inspect {}: {error}", target.display()))?;
+        if !output.status.success() {
+            return Err(format!(
+                "otool -L failed for {} with status {}: {}",
+                target.display(),
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let linked_libraries = String::from_utf8_lossy(&output.stdout);
+        if target.file_name().and_then(|name| name.to_str()) == Some("libpq.5.dylib")
+            && linked_libraries.contains(old_name)
+        {
+            run_install_name_tool(&target, &[OsStr::new("-id"), new_name.as_os_str()])?;
+        } else if linked_libraries.contains(old_name) {
+            run_install_name_tool(
+                &target,
+                &[
+                    OsStr::new("-change"),
+                    OsStr::new(old_name),
+                    new_name.as_os_str(),
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+fn run_install_name_tool(target: &Path, args: &[&OsStr]) -> Result<(), String> {
+    let output = Command::new("install_name_tool")
+        .args(args)
+        .arg(target)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to update install names for {}: {error}",
+                target.display()
+            )
+        })?;
+    if !output.status.success() {
+        return Err(format!(
+            "install_name_tool failed for {} with status {}: {}",
+            target.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
 fn create_catalog_pgdata(client_bindir: &Path, client_libdir: &Path) -> Result<PathBuf, String> {
     let pgdata = unique_temp_dir("fastpg-testkit-pgdata")?;
     let initdb = client_bindir.join(exe_name("initdb"));
@@ -331,11 +422,7 @@ fn create_catalog_pgdata(client_bindir: &Path, client_libdir: &Path) -> Result<P
         .arg("postgres")
         .arg("-A")
         .arg("trust")
-        .arg("--no-locale")
-        .arg("-c")
-        .arg("shared_memory_type=mmap")
-        .arg("-c")
-        .arg("dynamic_shared_memory_type=mmap");
+        .arg("--no-locale");
 
     command.env(
         "PATH",
