@@ -93,7 +93,7 @@ PGBENCH_PROFILE_ARGS = \
 	$(PROFILE_SERVER_MEMORY_FLAG) \
 	$(PROFILE_OPEN_FLAG)
 
-.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb pgbench-unit-test-workload profile profile-open profile-side-by-side profile-open-latest
+.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb pgbench-unit-test-workload profile profile-unit-test-workload profile-open profile-side-by-side profile-open-latest
 .PHONY: regression
 .PHONY: bench bench-smoke lint validate
 
@@ -118,8 +118,8 @@ pgbench-tpcb:
 		$(PGBENCH_COMMON_ARGS)
 
 pgbench-unit-test-workload: TRANSACTIONS = 5
-pgbench-unit-test-workload: CLIENTS = 1
-pgbench-unit-test-workload: JOBS = 1
+pgbench-unit-test-workload: CLIENTS = 10
+pgbench-unit-test-workload: JOBS = 10
 pgbench-unit-test-workload:
 	$(PYTHON) pgbench_compare.py \
 		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \
@@ -130,6 +130,16 @@ profile:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "$(BUILTIN)" \
 		--init-steps "$(INIT_STEPS)" \
+		$(PGBENCH_PROFILE_ARGS)
+
+profile-unit-test-workload: PROFILE_TRANSACTIONS = 500
+profile-unit-test-workload: PROFILE_RUNS = 1
+profile-unit-test-workload: CLIENTS = 10
+profile-unit-test-workload: JOBS = 10
+profile-unit-test-workload:
+	$(PYTHON) pgbench_compare.py \
+		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \
+		--skip-pgbench-init \
 		$(PGBENCH_PROFILE_ARGS)
 
 profile-open:

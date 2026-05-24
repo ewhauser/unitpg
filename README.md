@@ -266,6 +266,17 @@ make -C benches pgbench-unit-test-workload
 
 That target skips `pgbench -i`; the transaction script creates and alters its
 own tables, inserts seed data, runs aggregate join queries, then rolls back.
+It runs 10 concurrent clients by default to exercise concurrent transaction
+setup and rollback.
+
+Run the existing FastPG profile path against the same workload:
+
+```sh
+make -C benches profile-unit-test-workload
+```
+
+That target uses the normal pgbench profiling harness with the custom
+unit-test-workload script and the same 10-client default.
 
 To run the storage engine Criterion benchmarks:
 
