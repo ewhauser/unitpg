@@ -744,6 +744,19 @@ impl StorageState {
             .tuple_slice(tid, overlays_own_inserted_tid(overlays, relid, tid))
     }
 
+    fn physical_visible_tuple_slice_for_session<'a>(
+        &'a self,
+        session: &SessionStorage,
+        relid: u32,
+        tid: Tid,
+        has_visibility_deltas: bool,
+    ) -> Option<&'a [u8]> {
+        if !has_visibility_deltas {
+            return self.relations.get(&relid)?.tuple_slice(tid, false);
+        }
+        self.physical_visible_tuple_slice_in_overlays(&session.transaction_stack, relid, tid)
+    }
+
     pub(crate) fn visible_tuple_slice_in_overlays_at_cid<'a>(
         &'a self,
         overlays: &[TransactionOverlay],
@@ -1047,6 +1060,21 @@ impl StorageState {
         relid: u32,
         key: &IndexKey,
     ) -> Option<Tid> {
+        if !session.transaction_has_visibility_deltas(relid) {
+            let tid = self
+                .relations
+                .get(&relid)?
+                .primary_key_index
+                .get(key)
+                .copied()?;
+            let tid = self.resolve_tid_redirect_in_overlays_compress(&[], relid, tid);
+            return self
+                .relations
+                .get(&relid)?
+                .tuple_slice(tid, false)
+                .map(|_| tid);
+        }
+
         for overlay in session.transaction_stack.iter().rev() {
             if let Some(tid) = overlay
                 .primary_key_inserts
@@ -1096,6 +1124,21 @@ impl StorageState {
         relid: u32,
         key: &IndexKey,
     ) -> Option<Tid> {
+        if !session.transaction_has_visibility_deltas(relid) {
+            let tid = self
+                .relations
+                .get(&relid)?
+                .primary_key_index
+                .get(key)
+                .copied()?;
+            let tid = self.resolve_tid_redirect_in_overlays(&[], relid, tid);
+            return self
+                .relations
+                .get(&relid)?
+                .tuple_slice(tid, false)
+                .map(|_| tid);
+        }
+
         for overlay in session.transaction_stack.iter().rev() {
             if let Some(tid) = overlay
                 .primary_key_inserts
@@ -1449,20 +1492,30 @@ pub(crate) fn relation_update_impl(
     };
     let hot_unchecked = record_hot_redirect && matches!(unique_check, UniqueCheck::Skip);
     let result = with_storage(|state, session| -> Result<Option<Tid>, CatalogError> {
+        let has_visibility_deltas = session.transaction_has_visibility_deltas(relid);
         let old_tid = state.resolve_update_redirect_in_overlays_compress(
-            &session.transaction_stack,
+            if has_visibility_deltas {
+                &session.transaction_stack
+            } else {
+                &[]
+            },
             relid,
             old_tid,
         );
         let old_tid = state.resolve_tid_redirect_in_overlays_compress(
-            &session.transaction_stack,
+            if has_visibility_deltas {
+                &session.transaction_stack
+            } else {
+                &[]
+            },
             relid,
             old_tid,
         );
-        let Some(old_tuple_slice) = state.physical_visible_tuple_slice_in_overlays(
-            &session.transaction_stack,
+        let Some(old_tuple_slice) = state.physical_visible_tuple_slice_for_session(
+            session,
             relid,
             old_tid,
+            has_visibility_deltas,
         ) else {
             return Ok(None);
         };
@@ -1584,20 +1637,30 @@ pub(crate) fn relation_update_hot_if_single_byval_preserved_impl(
     }
     let result = with_storage(
         |state, session| -> Result<Option<(Tid, bool)>, CatalogError> {
+            let has_visibility_deltas = session.transaction_has_visibility_deltas(relid);
             let old_tid = state.resolve_update_redirect_in_overlays_compress(
-                &session.transaction_stack,
+                if has_visibility_deltas {
+                    &session.transaction_stack
+                } else {
+                    &[]
+                },
                 relid,
                 old_tid,
             );
             let old_tid = state.resolve_tid_redirect_in_overlays_compress(
-                &session.transaction_stack,
+                if has_visibility_deltas {
+                    &session.transaction_stack
+                } else {
+                    &[]
+                },
                 relid,
                 old_tid,
             );
-            let Some(old_tuple_slice) = state.physical_visible_tuple_slice_in_overlays(
-                &session.transaction_stack,
+            let Some(old_tuple_slice) = state.physical_visible_tuple_slice_for_session(
+                session,
                 relid,
                 old_tid,
+                has_visibility_deltas,
             ) else {
                 return Ok(None);
             };

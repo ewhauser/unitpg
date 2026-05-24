@@ -119,6 +119,8 @@ typedef struct FastPgMemScanDesc
 	int			batch_index;
 	bool		batch_forward;
 	bool		batch_enabled;
+	bool		batch_exhausted_forward;
+	bool		batch_exhausted_backward;
 	bool		cache_single_index_key;
 	AttrNumber	single_index_attnum;
 	BlockNumber sample_block;
@@ -2898,6 +2900,13 @@ fastpg_mem_scan_discard_batch(FastPgMemScanDesc *scan)
 }
 
 static void
+fastpg_mem_scan_reset_batch_exhaustion(FastPgMemScanDesc *scan)
+{
+	scan->batch_exhausted_forward = false;
+	scan->batch_exhausted_backward = false;
+}
+
+static void
 fastpg_mem_scan_free_batch(FastPgMemScanDesc *scan)
 {
 	if (scan->batch_values != NULL)
@@ -3082,6 +3091,7 @@ fastpg_mem_scan_rescan(TableScanDesc sscan,
 	scan->bitmap_index = 0;
 	scan->bitmap_recheck = false;
 	fastpg_mem_scan_discard_batch(scan);
+	fastpg_mem_scan_reset_batch_exhaustion(scan);
 }
 
 static bool
@@ -3107,13 +3117,14 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 
 	ExecClearTuple(slot);
 
-	if (scan->batch_count > scan->batch_index &&
-		scan->batch_forward != forward)
+	if (scan->batch_count > 0 && scan->batch_forward != forward)
 	{
-		if (scan->storage2 && scan->batch_index > 0)
+		if (scan->batch_count > scan->batch_index &&
+			scan->storage2 && scan->batch_index > 0)
 			(void) fastpg_storage2_scan_set_position(scan->scan_handle,
 													 scan->batch_row_ids[scan->batch_index - 1]);
 		fastpg_mem_scan_discard_batch(scan);
+		fastpg_mem_scan_reset_batch_exhaustion(scan);
 	}
 
 	use_batch = scan->batch_enabled && !(scan->storage2 && !forward);
@@ -3219,9 +3230,13 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 	{
 		int			batch_index;
 
-			if (scan->batch_index >= scan->batch_count)
-			{
-				scan->batch_forward = forward;
+		if (scan->batch_index >= scan->batch_count)
+		{
+			if ((forward && scan->batch_exhausted_forward) ||
+				(!forward && scan->batch_exhausted_backward))
+				return false;
+
+			scan->batch_forward = forward;
 			scan->batch_count = scan->storage2 ?
 				(int) fastpg_storage2_scan_next_batch_with_stored_natts(scan->scan_handle,
 																		forward ? 1 : 0,
@@ -3250,10 +3265,27 @@ fastpg_mem_scan_getnextslot(TableScanDesc sscan,
 																	FASTPG_MEM_SCAN_BATCH_ROWS,
 																		scan->batch_row_ids,
 																		scan->batch_stored_natts));
-				scan->batch_index = 0;
-				if (scan->batch_count <= 0)
-					return false;
+			scan->batch_index = 0;
+			if (scan->batch_count < FASTPG_MEM_SCAN_BATCH_ROWS)
+			{
+				if (forward)
+				{
+					scan->batch_exhausted_forward = true;
+					scan->batch_exhausted_backward = false;
+				}
+				else
+				{
+					scan->batch_exhausted_backward = true;
+					scan->batch_exhausted_forward = false;
+				}
 			}
+			else if (forward)
+				scan->batch_exhausted_backward = false;
+			else
+				scan->batch_exhausted_forward = false;
+			if (scan->batch_count <= 0)
+				return false;
+		}
 
 		batch_index = scan->batch_index++;
 		values = natts > 0 ?
@@ -7640,6 +7672,28 @@ fastpg_mem_relation_estimate_size(Relation rel,
 	}
 
 	storage2 = fastpg_mem_use_storage2_for_relid(relid);
+#ifdef FASTPG_USE_MEM_INDEX_AM
+	if (storage2 && fastpg_catalog_mode_uses_postgres())
+	{
+		size_t		physical_pages;
+		BlockNumber runtime_pages;
+
+		row_count = fastpg_storage2_relation_row_count(RelationGetRelid(rel));
+		layout_pages = fastpg_mem_heap_pages_for_layout(rel, row_count);
+		physical_pages = fastpg_storage2_relation_block_count(relid);
+		runtime_pages = physical_pages > (size_t) MaxBlockNumber ?
+			MaxBlockNumber : (BlockNumber) physical_pages;
+		runtime_pages = Max(runtime_pages, layout_pages);
+		if (row_count > 0)
+			runtime_pages = Max(runtime_pages, 8);
+
+		*pages = runtime_pages;
+		*tuples = (double) row_count;
+		*allvisfrac = runtime_pages == 0 ? 0.0 :
+			(double) FastPgMemRelationAllVisiblePages(rel) / (double) runtime_pages;
+		return;
+	}
+#endif
 	if (fastpg_catalog_mode_uses_postgres() &&
 		rel->rd_rel->reltuples >= 0 &&
 		rel->rd_rel->relpages > 0)

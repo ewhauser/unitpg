@@ -95,6 +95,8 @@ pub(crate) struct ScanState {
     pub(crate) high_water_offsets: HighWaterOffsets,
     pub(crate) forward_cursor: ScanCursor,
     pub(crate) backward_cursor: ScanCursor,
+    pub(crate) forward_exhausted: bool,
+    pub(crate) backward_exhausted: bool,
     pub(crate) has_visibility_deltas: bool,
     pub(crate) snapshot_curcid: Option<u32>,
 }
