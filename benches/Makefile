@@ -36,6 +36,7 @@ PROFILE_HYPERFINE_WARMUP ?= 0
 PROFILE_SERVER_MEMORY ?= 1
 CRITERION_ARGS ?=
 CLIPPY_ARGS ?= --workspace --all-targets
+UNIT_TEST_WORKLOAD_SCRIPT ?= workloads/unit-test-workload.sql
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 PROFILE_HYPERFINE_FLAG := $(if $(filter 1 true yes,$(PROFILE_HYPERFINE)),--profile-hyperfine,)
 PROFILE_SERVER_MEMORY_FLAG := $(if $(filter 1 true yes,$(PROFILE_SERVER_MEMORY)),--profile-server-memory,)
@@ -92,7 +93,7 @@ PGBENCH_PROFILE_ARGS = \
 	$(PROFILE_SERVER_MEMORY_FLAG) \
 	$(PROFILE_OPEN_FLAG)
 
-.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb profile profile-open profile-side-by-side profile-open-latest
+.PHONY: pgbench pgbench-simple-indexed pgbench-tpcb pgbench-unit-test-workload profile profile-open profile-side-by-side profile-open-latest
 .PHONY: regression
 .PHONY: bench bench-smoke lint validate
 
@@ -114,6 +115,15 @@ pgbench-tpcb:
 	$(PYTHON) pgbench_compare.py \
 		--builtin "tpcb-like" \
 		--init-steps "default" \
+		$(PGBENCH_COMMON_ARGS)
+
+pgbench-unit-test-workload: TRANSACTIONS = 5
+pgbench-unit-test-workload: CLIENTS = 1
+pgbench-unit-test-workload: JOBS = 1
+pgbench-unit-test-workload:
+	$(PYTHON) pgbench_compare.py \
+		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \
+		--skip-pgbench-init \
 		$(PGBENCH_COMMON_ARGS)
 
 profile:

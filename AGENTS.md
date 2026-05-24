@@ -55,10 +55,21 @@ the full PostgreSQL parser/analyzer/rewriter/planner/executor facade:
 make -C benches pgbench-tpcb
 ```
 
-The `pgbench`, `pgbench-simple-indexed`, and `pgbench-tpcb` targets build the
-Rust server with full PostgreSQL execution in release mode and link it against a
-`-Dfastpg=true` Postgres backend build so the guarded virtual catalog hooks are
-available. The default fastpg build includes the internal IPC guard.
+To run the custom unit-test-workload script:
+
+```sh
+make -C benches pgbench-unit-test-workload
+```
+
+That target uses `benches/workloads/unit-test-workload.sql`, skips `pgbench
+-i`, creates and alters ordinary tables inside the measured transaction,
+inserts seed data, runs aggregate join queries, then rolls back.
+
+The `pgbench`, `pgbench-simple-indexed`, `pgbench-tpcb`, and
+`pgbench-unit-test-workload` targets build the Rust server with full PostgreSQL
+execution in release mode and link it against a `-Dfastpg=true` Postgres
+backend build so the guarded virtual catalog hooks are available. The default
+fastpg build includes the internal IPC guard.
 
 To temporarily run a quicker debug build:
 
