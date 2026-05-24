@@ -87,7 +87,6 @@ fn bootstrap_postgres_catalog() -> Result<CatalogBootstrap, String> {
     let client_bindir = postgres_client_bindir(&build_dir)?;
     let client_libdir = client_bindir
         .parent()
-        .and_then(Path::parent)
         .map(|prefix| prefix.join("lib"))
         .ok_or_else(|| {
             format!(
