@@ -1104,6 +1104,8 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
         fastpg_catalog_pgdata_mode="seed-copy",
         fastpg_postgres_smgr=args.fastpg_postgres_smgr,
         fastpg_use_mem_index_am=args.fastpg_use_mem_index_am,
+        pgvector=args.pgvector,
+        pgvector_version=args.pgvector_version,
         profile_fastpg_rust_server=False,
         profile_normal_postgres=False,
         profile_tool="flamegraph",
@@ -1474,6 +1476,18 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="compile fastpg with the in-memory index AM for eligible postgres-catalog indexes",
     )
+    parser.add_argument(
+        "--no-pgvector",
+        dest="pgvector",
+        action="store_false",
+        help="skip the default pgvector build/install step for PostgreSQL installs",
+    )
+    parser.add_argument(
+        "--pgvector-version",
+        default=os.environ.get("PGVECTOR_VERSION", "v0.8.2"),
+        help="pgvector git tag or ref to build by default",
+    )
+    parser.set_defaults(pgvector=True)
     parser.add_argument(
         "--global-timeout",
         type=float,

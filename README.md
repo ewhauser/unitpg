@@ -207,7 +207,8 @@ make -C benches regression
 Most full-execution tests build a local fastpg-enabled PostgreSQL core and pass
 that build directory to Cargo through `FASTPG_POSTGRES_BUILD_DIR`. The harnesses
 under `benches/` do that setup for you. The default fastpg build includes the
-internal IPC guard.
+internal IPC guard and builds pgvector into the generated PostgreSQL install.
+Set `PGVECTOR=0` for harness runs that must skip the extension download/build.
 
 ## Run The Server
 
@@ -280,9 +281,10 @@ as evidence for a given commit and machine, not as project promises.
 
 ## Release Artifacts
 
-The GitHub release workflow builds the Rust server in release mode, packages it
-with matching Postgres client tools such as `psql` and `pgbench`, smoke-tests
-the packaged server, and uploads archives for Linux and macOS targets.
+The GitHub release workflow builds the Rust server in release mode, compiles
+pgvector against the matching PostgreSQL install, packages the server with
+Postgres client tools such as `psql` and `pgbench`, smoke-tests the packaged
+server, and uploads archives for Linux and macOS targets.
 
 These artifacts are still test-server artifacts. They are not Postgres
 production distributions.
