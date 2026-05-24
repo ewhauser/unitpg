@@ -16,9 +16,6 @@
  */
 #include "postgres.h"
 
-#ifdef USE_FASTPG
-#include "access/fastpg_catalog.h"
-#endif
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
@@ -1164,9 +1161,6 @@ ProcessUtilitySlow(ParseState *pstate,
 							CreateStmt *cstmt = (CreateStmt *) stmt;
 							Datum		toast_options;
 							const char *const validnsps[] = HEAP_RELOPT_NAMESPACES;
-#ifdef USE_FASTPG
-							bool		fastpg_skip_toast_probe;
-#endif
 
 							/* Remember transformed RangeVar for LIKE */
 							table_rv = cstmt->relation;
@@ -1185,15 +1179,6 @@ ProcessUtilitySlow(ParseState *pstate,
 							 * one needs a secondary relation too.
 							 */
 							CommandCounterIncrement();
-
-#ifdef USE_FASTPG
-							fastpg_skip_toast_probe =
-								fastpg_catalog_mode_uses_postgres() &&
-								cstmt->relation->relpersistence != RELPERSISTENCE_TEMP &&
-								address.objectId >= (Oid) FirstNormalObjectId;
-							if (fastpg_skip_toast_probe)
-								continue;
-#endif
 
 							/*
 							 * parse and validate reloptions for the toast

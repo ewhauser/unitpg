@@ -17,7 +17,6 @@
 #include "access/attmap.h"
 #ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
-#include "access/fastpg_tableam.h"
 #endif
 #include "access/genam.h"
 #include "access/gist.h"
@@ -1159,12 +1158,8 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 
 	/*
 	 * Make column generation expressions visible for use by partitioning.
-	 * If no generated/default expressions were stored, this extra bump only
-	 * churns relcache state; ProcessUtility will still make the completed
-	 * CREATE TABLE visible to following subcommands.
 	 */
-	if (rawDefaults || partitioned || stmt->partbound)
-		CommandCounterIncrement();
+	CommandCounterIncrement();
 
 	/* Process and store partition bound, if any. */
 	if (stmt->partbound)
@@ -7345,9 +7340,6 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	AlterTableCmd *childcmd;
 	ObjectAddress address;
 	TupleDesc	tupdesc;
-#ifdef USE_FASTPG
-	bool		fastpg_skip_existing_row_fill = false;
-#endif
 
 	/* since this function recurses, it could be driven to stack overflow */
 	check_stack_depth();
@@ -7475,13 +7467,6 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 		elog(ERROR, "cache lookup failed for relation %u", myrelid);
 	relform = (Form_pg_class) GETSTRUCT(reltup);
 	relkind = relform->relkind;
-#ifdef USE_FASTPG
-	fastpg_skip_existing_row_fill =
-		fastpg_catalog_mode_uses_postgres() &&
-		RELKIND_HAS_STORAGE(relkind) &&
-		rel->rd_tableam == GetFastPgMemTableAmRoutine() &&
-		FastPgMemRelationPhysicalPages(rel) == 0;
-#endif
 
 	/* Determine the new attribute's number */
 	newattnum = relform->relnatts + 1;
@@ -7573,11 +7558,7 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	 * We can skip this entirely for relations without storage, since Phase 3
 	 * is certainly not going to touch them.
 	 */
-	if (RELKIND_HAS_STORAGE(relkind)
-#ifdef USE_FASTPG
-		&& !fastpg_skip_existing_row_fill
-#endif
-		)
+	if (RELKIND_HAS_STORAGE(relkind))
 	{
 		bool		has_domain_constraints;
 		bool		has_missing = false;
@@ -10063,40 +10044,6 @@ ATAddCheckNNConstraint(List **wqueue, AlteredTableInfo *tab, Relation rel,
 	if (recursing)
 		ATSimplePermissions(AT_AddConstraint, rel,
 							ATT_TABLE | ATT_PARTITIONED_TABLE | ATT_FOREIGN_TABLE);
-
-#ifdef USE_FASTPG
-	if (fastpg_catalog_mode_uses_postgres() &&
-		constr->contype == CONSTR_NOTNULL &&
-		rel->rd_tableam == GetFastPgMemTableAmRoutine() &&
-		!recursing &&
-		!is_readd &&
-		!rel->rd_rel->relhassubclass &&
-		FastPgMemRelationPhysicalPages(rel) == 0)
-	{
-		AttrNumber	attnum;
-		char	   *attname;
-
-		Assert(list_length(constr->keys) == 1);
-		attname = strVal(linitial(constr->keys));
-		attnum = get_attnum(RelationGetRelid(rel), attname);
-		if (attnum == InvalidAttrNumber)
-			ereport(ERROR,
-					errcode(ERRCODE_UNDEFINED_COLUMN),
-					errmsg("column \"%s\" of relation \"%s\" does not exist",
-						   attname, RelationGetRelationName(rel)));
-		if (constr->conname &&
-			ConstraintNameIsUsed(CONSTRAINT_RELATION,
-								 RelationGetRelid(rel),
-								 constr->conname))
-			ereport(ERROR,
-					errcode(ERRCODE_DUPLICATE_OBJECT),
-					errmsg("constraint \"%s\" for relation \"%s\" already exists",
-						   constr->conname, RelationGetRelationName(rel)));
-
-		set_attnotnull(wqueue, rel, attnum, true, false);
-		return InvalidObjectAddress;
-	}
-#endif
 
 	/*
 	 * Call AddRelationNewConstraints to do the work, making sure it works on

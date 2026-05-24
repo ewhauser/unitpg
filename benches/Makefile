@@ -189,6 +189,7 @@ regression:
 	--storage-engine "$(STORAGE_ENGINE)" \
 	--catalog-mode "$(CATALOG_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
+	--sema-kind "$(SEMA_KIND)" \
 	$(PGVECTOR_ARG) \
 	$(PGVECTOR_VERSION_ARG) \
 	--global-timeout "$(REGRESSION_GLOBAL_TIMEOUT)" \

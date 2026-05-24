@@ -4039,7 +4039,12 @@ fastpg_pgcore_execute_transaction_command(int command)
 
 	fastpg_pgcore_enter();
 	oldcontext = CurrentMemoryContext;
+	result->context = AllocSetContextCreate(TopMemoryContext,
+											"fastpg pgcore transaction command result",
+											ALLOCSET_DEFAULT_SIZES);
+	result->owns_context = true;
 
+	fastpg_pgcore_begin_notice_capture(result, source_text);
 	PG_TRY();
 	{
 		TransactionStmt stmt;
@@ -4100,6 +4105,7 @@ fastpg_pgcore_execute_transaction_command(int command)
 		fastpg_pgcore_abort_postgres_catalog_command(&postgres_command_started);
 	}
 	PG_END_TRY();
+	fastpg_pgcore_end_notice_capture();
 
 	MemoryContextSwitchTo(oldcontext);
 	return result;

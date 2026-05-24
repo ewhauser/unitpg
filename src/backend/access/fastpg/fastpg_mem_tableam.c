@@ -7611,8 +7611,10 @@ fastpg_mem_relation_needs_toast_table(Relation rel)
 		}
 	}
 
-	if (!has_toastable_attrs || maxlength_unknown)
+	if (!has_toastable_attrs)
 		return false;
+	if (maxlength_unknown)
+		return true;
 	tuple_length = MAXALIGN(SizeofHeapTupleHeader +
 							BITMAPLEN(tupdesc->natts)) +
 		MAXALIGN(data_length);

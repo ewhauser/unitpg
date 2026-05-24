@@ -125,6 +125,10 @@ static void SetDatabaseHasLoginEventTriggers(void);
 static bool
 EventTriggersDisabledByProcessMode(void)
 {
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+		return false;
+#endif
 	return !IsUnderPostmaster;
 }
 

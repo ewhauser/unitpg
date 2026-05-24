@@ -413,7 +413,22 @@ impl QueryExecutor {
         {
             return match self.pgcore_session.execute_transaction_command(command) {
                 Ok(result) => {
-                    pgcore_execution_to_query_execution(result, PgCoreRowConversion::PreserveText)
+                    let PgCoreExecutionResult {
+                        notices,
+                        statements,
+                    } = result;
+                    if !notices.is_empty() {
+                        self.replace_notices(
+                            notices
+                                .into_iter()
+                                .map(pgcore_notice_to_query_notice)
+                                .collect(),
+                        );
+                    }
+                    pgcore_statements_to_query_execution(
+                        statements,
+                        PgCoreRowConversion::PreserveText,
+                    )
                 }
                 Err(error) => pgcore_error_execution(error),
             };
@@ -892,7 +907,21 @@ impl QueryExecutor {
             && let Some(command) = fast_transaction_command(sql)
         {
             return match self.pgcore_session.execute_transaction_command(command) {
-                Ok(result) => pgcore_execution_to_query_execution(result, row_conversion),
+                Ok(result) => {
+                    let PgCoreExecutionResult {
+                        notices,
+                        statements,
+                    } = result;
+                    if !notices.is_empty() {
+                        self.replace_notices(
+                            notices
+                                .into_iter()
+                                .map(pgcore_notice_to_query_notice)
+                                .collect(),
+                        );
+                    }
+                    pgcore_statements_to_query_execution(statements, row_conversion)
+                }
                 Err(error) => pgcore_error_execution(error),
             };
         }
@@ -1063,14 +1092,6 @@ fn query_description_from_pgcore(statement: &PreparedStatement) -> QueryDescript
             })
             .collect(),
     )
-}
-
-#[cfg(feature = "postgres-execution")]
-fn pgcore_execution_to_query_execution(
-    result: PgCoreExecutionResult,
-    row_conversion: PgCoreRowConversion,
-) -> QueryExecution {
-    pgcore_statements_to_query_execution(result.statements, row_conversion)
 }
 
 #[cfg(feature = "postgres-execution")]
