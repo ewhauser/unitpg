@@ -112,6 +112,150 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
+  performance:
+    name: FastPG performance gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      pull-requests: write
+
+    env:
+      PERF_OUTPUT_DIR: ${{ github.workspace }}/fastpg-performance
+
+    steps:
+      - name: Check out base source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ github.event.pull_request.base.repo.full_name }}
+          ref: ${{ github.event.pull_request.base.sha }}
+          path: base
+          persist-credentials: false
+
+      - name: Check out PR source
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: head
+          persist-credentials: false
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            bison \
+            build-essential \
+            flex \
+            libipc-run-perl \
+            meson \
+            ninja-build \
+            patchelf \
+            perl \
+            pkg-config \
+            python3
+
+      - name: Run FastPG performance comparison
+        run: |
+          set -uo pipefail
+          mkdir -p "$PERF_OUTPUT_DIR"
+          script="head/ci/fastpg_perf_gate.py"
+          if [ -f "base/ci/fastpg_perf_gate.py" ]; then
+            script="base/ci/fastpg_perf_gate.py"
+          fi
+          set +e
+          python3 "$script" \
+            --base-repo base \
+            --head-repo head \
+            --output-dir "$PERF_OUTPUT_DIR" \
+            --base-label "${{ github.base_ref }}" \
+            --head-label "PR head" \
+            --base-sha "${{ github.event.pull_request.base.sha }}" \
+            --head-sha "${{ github.event.pull_request.head.sha }}" \
+            --threshold-percent 5.0 \
+            --scale 1 \
+            --transactions 20 \
+            --runs 3
+          status=$?
+          echo "$status" > "$PERF_OUTPUT_DIR/exit-code"
+          exit 0
+
+      - name: Add performance report to job summary
+        if: always()
+        run: |
+          if [ -f "$PERF_OUTPUT_DIR/report.md" ]; then
+            cat "$PERF_OUTPUT_DIR/report.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload performance report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fastpg-performance-report
+          path: ${{ env.PERF_OUTPUT_DIR }}/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      - name: Comment on PR
+        if: always()
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPORT_PATH: ${{ env.PERF_OUTPUT_DIR }}/report.md
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+          from pathlib import Path
+
+          marker = "<!-- fastpg-performance-report -->"
+          report_path = Path(os.environ["REPORT_PATH"])
+          if report_path.exists():
+              body = report_path.read_text()
+          else:
+              body = f"{marker}\n## FastPG Performance Gate: FAIL\n\nNo performance report was produced."
+          if marker not in body:
+              body = f"{marker}\n{body}"
+
+          api_url = os.environ.get("GITHUB_API_URL", "https://api.github.com")
+          repo = os.environ["GITHUB_REPOSITORY"]
+          pr_number = os.environ["PR_NUMBER"]
+          token = os.environ["GH_TOKEN"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+          }
+
+          def request(method, path, payload=None):
+              data = None
+              if payload is not None:
+                  data = json.dumps(payload).encode()
+                  headers["Content-Type"] = "application/json"
+              req = urllib.request.Request(f"{api_url}{path}", data=data, headers=headers, method=method)
+              with urllib.request.urlopen(req) as response:
+                  text = response.read().decode()
+              return json.loads(text) if text else None
+
+          comments = request("GET", f"/repos/{repo}/issues/{pr_number}/comments?per_page=100")
+          existing = next((comment for comment in comments if marker in comment.get("body", "")), None)
+          if existing:
+              request("PATCH", f"/repos/{repo}/issues/comments/{existing['id']}", {"body": body})
+          else:
+              request("POST", f"/repos/{repo}/issues/{pr_number}/comments", {"body": body})
+          PY
+
+      - name: Enforce performance gate
+        if: always()
+        run: |
+          if [ ! -f "$PERF_OUTPUT_DIR/exit-code" ]; then
+            exit 1
+          fi
+          exit "$(cat "$PERF_OUTPUT_DIR/exit-code")"
+
   validate:
     name: Validate ${{ matrix.target }}
     runs-on: ${{ matrix.runner }}
