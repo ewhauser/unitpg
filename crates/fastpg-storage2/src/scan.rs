@@ -98,5 +98,35 @@ pub(crate) struct ScanState {
     pub(crate) forward_exhausted: bool,
     pub(crate) backward_exhausted: bool,
     pub(crate) has_visibility_deltas: bool,
+    pub(crate) overlay_only: bool,
     pub(crate) snapshot_curcid: Option<u32>,
+}
+
+pub(crate) fn tid_beyond_high_water(tid: Tid, high_water_offsets: &[u16]) -> bool {
+    high_water_offsets
+        .get(tid.block as usize)
+        .is_none_or(|max_offset| tid.offset > *max_offset)
+}
+
+pub(crate) fn scan_backward_end_tid(cursor: ScanCursor, high_water_offsets: &[u16]) -> Option<Tid> {
+    if cursor.block == u32::MAX {
+        let (block, offset) = high_water_offsets
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|(_, offset)| **offset > 0)?;
+        return Some(Tid {
+            block: block.try_into().ok()?,
+            offset: *offset,
+        });
+    }
+
+    if cursor.offset == 0 || usize::try_from(cursor.block).ok()? >= high_water_offsets.len() {
+        return None;
+    }
+
+    Some(Tid {
+        block: cursor.block,
+        offset: cursor.offset,
+    })
 }

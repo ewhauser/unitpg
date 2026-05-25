@@ -370,6 +370,20 @@ handle_sig_alarm(SIGNAL_ARGS)
 	 */
 	HOLD_INTERRUPTS();
 
+#ifdef USE_FASTPG
+	/*
+	 * FastPG embeds PostgreSQL backend code in a threaded Rust server.  POSIX
+	 * timers deliver SIGALRM to an arbitrary unblocked thread in the process,
+	 * which can be a non-PostgreSQL listener/runtime thread with no local
+	 * latch.  Such a thread cannot safely service PostgreSQL timeout state.
+	 */
+	if (MyLatch == NULL)
+	{
+		RESUME_INTERRUPTS();
+		return;
+	}
+#endif
+
 	/*
 	 * SIGALRM is always cause for waking anything waiting on the process
 	 * latch.

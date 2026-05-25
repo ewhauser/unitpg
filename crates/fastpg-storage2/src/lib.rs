@@ -250,6 +250,30 @@ pub extern "C" fn fastpg_storage2_relation_row_count(relid: u32) -> usize {
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_has_visibility_deltas(relid: u32) -> bool {
+    with_session_storage(|session| session.transaction_has_visibility_deltas(relid))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_row_count_if_visibility_deltas(
+    relid: u32,
+    row_count_out: *mut usize,
+) -> bool {
+    if !with_session_storage(|session| session.transaction_has_visibility_deltas(relid)) {
+        return false;
+    }
+    if !row_count_out.is_null() {
+        unsafe {
+            *row_count_out = visible_row_count_cached(relid);
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_page_count(relid: u32) -> usize {
     with_storage_read(|state, _session| {
         state
@@ -327,6 +351,55 @@ pub extern "C" fn fastpg_storage2_relation_contains_tid(relid: u32, packed_tid: 
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_current_session_owns_inserted_tid(
+    relid: u32,
+    packed_tid: u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_session_storage(|session| session.owns_inserted_tid(relid, tid))
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_current_session_visible_tid(
+    relid: u32,
+    packed_tid: u64,
+    use_curcid: u8,
+    curcid: u32,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_session_storage(|session| {
+        let overlays = &session.transaction_stack;
+        let resolved = resolve_overlay_update_redirect(overlays, relid, tid);
+        let curcid = (use_curcid != 0).then_some(curcid);
+        if overlay_visible_tuple_slice(overlays, relid, resolved, curcid).is_none() {
+            return false;
+        }
+        if !resolved_tid_out.is_null() {
+            unsafe {
+                *resolved_tid_out = resolved.pack();
+            }
+        }
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_index_tid_all_dead(relid: u32, packed_tid: u64) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return true;
+    };
+    with_storage_read(|state, session| state.index_tid_all_dead(session, relid, tid))
+}
+
+#[unsafe(no_mangle)]
 /// # Safety
 ///
 /// C callers must pass a valid output pointer when non-null.
@@ -340,6 +413,29 @@ pub unsafe extern "C" fn fastpg_storage2_relation_resolve_tid(
     };
     let resolved = with_storage(|state, session| {
         state.resolve_tid_redirect_in_overlays_compress(&session.transaction_stack, relid, tid)
+    });
+    if !resolved_tid_out.is_null() {
+        unsafe {
+            *resolved_tid_out = resolved.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_resolve_tid_read(
+    relid: u32,
+    packed_tid: u64,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let resolved = with_storage_read(|state, session| {
+        state.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
     });
     if !resolved_tid_out.is_null() {
         unsafe {
@@ -849,6 +945,25 @@ pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -
         return false;
     };
     with_storage(|state, session| {
+        let has_visibility_deltas = session.transaction_has_visibility_deltas(relid);
+        let tid = state.resolve_update_redirect_in_overlays_compress(
+            if has_visibility_deltas {
+                &session.transaction_stack
+            } else {
+                &[]
+            },
+            relid,
+            tid,
+        );
+        let tid = state.resolve_tid_redirect_in_overlays_compress(
+            if has_visibility_deltas {
+                &session.transaction_stack
+            } else {
+                &[]
+            },
+            relid,
+            tid,
+        );
         let own_insert = session.owns_inserted_tid(relid, tid);
         let Some(tuple) = state.find_visible_tuple(session, relid, tid) else {
             return false;
@@ -886,8 +1001,15 @@ pub extern "C" fn fastpg_storage2_scan_begin_with_snapshot(relid: u32, curcid: u
 
 fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
     clear_last_storage_error();
+    if let Some(handle) = scan_begin_committed_empty_impl(relid, snapshot_curcid) {
+        return handle;
+    }
     with_storage_read(|state, session| {
-        let high_water_offsets = state
+        let overlay_only = !state
+            .relations
+            .get(&relid)
+            .is_some_and(|relation| !relation.live_tids.is_empty());
+        let mut high_water_offsets = state
             .relations
             .get(&relid)
             .map(|relation| {
@@ -902,6 +1024,9 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
                     .collect::<HighWaterOffsets>()
             })
             .unwrap_or_default();
+        for overlay in &session.transaction_stack {
+            overlay.extend_high_water_offsets(relid, &mut high_water_offsets);
+        }
         let handle = session.allocate_scan_handle();
         let scan = ScanState {
             relid,
@@ -911,12 +1036,48 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
             forward_exhausted: false,
             backward_exhausted: false,
             has_visibility_deltas: session.transaction_has_visibility_deltas(relid),
+            overlay_only,
             snapshot_curcid,
         };
         if !session.insert_scan(handle, scan) {
             return 0;
         }
         handle
+    })
+}
+
+fn scan_begin_committed_empty_impl(relid: u32, snapshot_curcid: Option<u32>) -> Option<u64> {
+    if committed_row_count_cached(relid) != 0 {
+        return None;
+    }
+
+    with_session_storage(|session| {
+        let has_visibility_deltas = session.transaction_has_visibility_deltas(relid);
+        if !has_visibility_deltas {
+            return None;
+        }
+
+        let mut high_water_offsets = HighWaterOffsets::default();
+        for overlay in &session.transaction_stack {
+            overlay.extend_high_water_offsets(relid, &mut high_water_offsets);
+        }
+
+        let handle = session.allocate_scan_handle();
+        let scan = ScanState {
+            relid,
+            high_water_offsets,
+            forward_cursor: ScanCursor::forward_start(),
+            backward_cursor: ScanCursor::backward_start(),
+            forward_exhausted: false,
+            backward_exhausted: false,
+            has_visibility_deltas,
+            overlay_only: true,
+            snapshot_curcid,
+        };
+        if !session.insert_scan(handle, scan) {
+            return None;
+        }
+        Some(handle)
     })
 }
 
@@ -1010,6 +1171,392 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_with_stored_natts(
     )
 }
 
+fn overlay_visible_tuple_slice<'a>(
+    overlays: &'a [TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+    curcid: Option<u32>,
+) -> Option<&'a [u8]> {
+    if let [overlay] = overlays {
+        return single_overlay_visible_pending_tuple_slice(overlay, relid, tid, curcid);
+    }
+
+    if let Some(curcid) = curcid {
+        if overlays_invalidate_tid_before(overlays, relid, tid, curcid) {
+            return None;
+        }
+        let owns_pending = overlays_own_inserted_tid(overlays, relid, tid);
+        let include_pending = overlays_own_inserted_tid_before(overlays, relid, tid, curcid);
+        if owns_pending && !include_pending {
+            return None;
+        }
+    } else if overlays_invalidate_tid(overlays, relid, tid) {
+        return None;
+    }
+    if overlays_clear_tid(overlays, relid, tid) {
+        return None;
+    }
+    overlay_pending_tuple_slice(overlays, relid, tid)
+}
+
+fn next_overlay_candidate_tid(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    cursor: ScanCursor,
+    high_water_offsets: &[u16],
+    forward: bool,
+) -> Option<Tid> {
+    if overlays.len() == 1 {
+        if let Some(candidate) = next_single_overlay_candidate_tid(
+            &overlays[0],
+            relid,
+            cursor,
+            high_water_offsets,
+            forward,
+        ) {
+            return Some(candidate);
+        }
+    }
+
+    if forward {
+        if cursor.offset == 0 || usize::try_from(cursor.block).ok()? >= high_water_offsets.len() {
+            return None;
+        }
+        let start_tid = Tid {
+            block: cursor.block,
+            offset: cursor.offset,
+        };
+        let mut candidate = None;
+        for overlay in overlays {
+            let Some(tids) = overlay.inserted_tids.get(&relid) else {
+                continue;
+            };
+            for tid in tids.iter().copied() {
+                if tid < start_tid || tid_beyond_high_water(tid, high_water_offsets) {
+                    continue;
+                }
+                candidate = Some(candidate.map_or(tid, |current: Tid| current.min(tid)));
+            }
+        }
+        return candidate;
+    }
+
+    let end_tid = scan_backward_end_tid(cursor, high_water_offsets)?;
+    let mut candidate = None;
+    for overlay in overlays {
+        let Some(tids) = overlay.inserted_tids.get(&relid) else {
+            continue;
+        };
+        for tid in tids.iter().copied() {
+            if tid > end_tid || tid_beyond_high_water(tid, high_water_offsets) {
+                continue;
+            }
+            candidate = Some(candidate.map_or(tid, |current: Tid| current.max(tid)));
+        }
+    }
+    candidate
+}
+
+fn next_single_overlay_candidate_tid(
+    overlay: &TransactionOverlay,
+    relid: u32,
+    cursor: ScanCursor,
+    high_water_offsets: &[u16],
+    forward: bool,
+) -> Option<Tid> {
+    let tids = overlay.inserted_tids.get(&relid)?;
+
+    if forward {
+        if cursor.offset == 0 || usize::try_from(cursor.block).ok()? >= high_water_offsets.len() {
+            return None;
+        }
+        let start_tid = Tid {
+            block: cursor.block,
+            offset: cursor.offset,
+        };
+        let start_index = tids.binary_search(&start_tid).unwrap_or_else(|index| index);
+        return tids
+            .iter()
+            .copied()
+            .skip(start_index)
+            .find(|tid| !tid_beyond_high_water(*tid, high_water_offsets));
+    }
+
+    let end_tid = scan_backward_end_tid(cursor, high_water_offsets)?;
+    let end_index = match tids.binary_search(&end_tid) {
+        Ok(index) => index.checked_add(1)?,
+        Err(index) => index,
+    };
+    tids.iter()
+        .copied()
+        .take(end_index)
+        .rev()
+        .find(|tid| !tid_beyond_high_water(*tid, high_water_offsets))
+}
+
+fn resolve_overlay_tid_redirect(overlays: &[TransactionOverlay], relid: u32, mut tid: Tid) -> Tid {
+    for _ in 0..1_000_000 {
+        let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) else {
+            break;
+        };
+        tid = next_tid;
+    }
+    tid
+}
+
+fn resolve_overlay_update_redirect(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    mut tid: Tid,
+) -> Tid {
+    for _ in 0..1_000_000 {
+        let Some(next_tid) = overlay_update_redirect(overlays, relid, tid) else {
+            break;
+        };
+        tid = next_tid;
+    }
+    tid
+}
+
+fn visible_overlay_update_redirect_tid_beyond_high_water(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+    high_water_offsets: &[u16],
+    curcid: Option<u32>,
+) -> Option<Tid> {
+    let next_tid = overlay_update_redirect(overlays, relid, tid)?;
+    if !tid_beyond_high_water(next_tid, high_water_offsets) {
+        return None;
+    }
+
+    let redirect_tid = resolve_overlay_update_redirect(overlays, relid, tid);
+    if !tid_beyond_high_water(redirect_tid, high_water_offsets) {
+        return None;
+    }
+    overlay_visible_tuple_slice(overlays, relid, redirect_tid, curcid)?;
+    Some(redirect_tid)
+}
+
+fn next_overlay_tuple_slice<'a>(
+    overlays: &'a [TransactionOverlay],
+    relid: u32,
+    mut cursor: ScanCursor,
+    high_water_offsets: &[u16],
+    forward: bool,
+    curcid: Option<u32>,
+) -> Option<(Tid, &'a [u8])> {
+    loop {
+        let tid = next_overlay_candidate_tid(overlays, relid, cursor, high_water_offsets, forward)?;
+        if let Some(tuple) = overlay_visible_tuple_slice(overlays, relid, tid, curcid) {
+            return Some((tid, tuple));
+        }
+        if let Some(redirect_tid) = visible_overlay_update_redirect_tid_beyond_high_water(
+            overlays,
+            relid,
+            tid,
+            high_water_offsets,
+            curcid,
+        ) {
+            let tuple = overlay_visible_tuple_slice(overlays, relid, redirect_tid, curcid)?;
+            return Some((redirect_tid, tuple));
+        }
+        cursor = if forward {
+            ScanCursor::after(tid)
+        } else {
+            ScanCursor::before(tid)
+        };
+    }
+}
+
+fn scan_next_overlay_only_impl(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    tid_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> bool {
+    with_session_storage(|session| {
+        let Some(scan) = session.scan_slot(scan_handle).cloned() else {
+            return false;
+        };
+        let is_forward = forward != 0;
+        if (is_forward && scan.forward_exhausted) || (!is_forward && scan.backward_exhausted) {
+            return false;
+        }
+        let cursor = if is_forward {
+            scan.forward_cursor
+        } else {
+            scan.backward_cursor
+        };
+        let Some((tid, copied)) = next_overlay_tuple_slice(
+            &session.transaction_stack,
+            scan.relid,
+            cursor,
+            &scan.high_water_offsets,
+            is_forward,
+            scan.snapshot_curcid,
+        )
+        .map(|(tid, tuple)| {
+            (
+                tid,
+                copy_tuple_to_outputs(
+                    tid,
+                    tuple,
+                    values_out,
+                    is_null_out,
+                    natts,
+                    tid_out,
+                    stored_natts_out,
+                ),
+            )
+        }) else {
+            if let Some(scan) = session.scan_slot_mut(scan_handle) {
+                if is_forward {
+                    scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
+                    scan.forward_exhausted = true;
+                    scan.backward_exhausted = false;
+                } else {
+                    scan.forward_cursor = ScanCursor::after_cursor(scan.backward_cursor);
+                    scan.backward_exhausted = true;
+                    scan.forward_exhausted = false;
+                }
+            }
+            return false;
+        };
+        if !copied {
+            return false;
+        }
+        if let Some(scan) = session.scan_slot_mut(scan_handle) {
+            if is_forward {
+                scan.forward_cursor = ScanCursor::after(tid);
+                scan.backward_cursor = ScanCursor::before(tid);
+                scan.backward_exhausted = false;
+            } else {
+                scan.backward_cursor = ScanCursor::before(tid);
+                scan.forward_cursor = ScanCursor::after(tid);
+                scan.forward_exhausted = false;
+            }
+        }
+        true
+    })
+}
+
+fn scan_next_overlay_only_batch_impl(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    max_rows: usize,
+    tids_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> usize {
+    with_session_storage(|session| {
+        let Some(scan) = session.scan_slot(scan_handle).cloned() else {
+            return 0;
+        };
+        let is_forward = forward != 0;
+        if (is_forward && scan.forward_exhausted) || (!is_forward && scan.backward_exhausted) {
+            return 0;
+        }
+
+        let relid = scan.relid;
+        let mut forward_cursor = scan.forward_cursor;
+        let mut backward_cursor = scan.backward_cursor;
+        let mut written = 0;
+        let mut exhausted = false;
+
+        while written < max_rows {
+            let cursor = if is_forward {
+                forward_cursor
+            } else {
+                backward_cursor
+            };
+            let Some((tid, tuple)) = next_overlay_tuple_slice(
+                &session.transaction_stack,
+                relid,
+                cursor,
+                &scan.high_water_offsets,
+                is_forward,
+                scan.snapshot_curcid,
+            ) else {
+                if is_forward {
+                    backward_cursor = ScanCursor::before_cursor(forward_cursor);
+                } else {
+                    forward_cursor = ScanCursor::after_cursor(backward_cursor);
+                }
+                exhausted = true;
+                break;
+            };
+
+            let row_values_out = if natts == 0 {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: caller provided `natts * max_rows` entries and
+                // `written < max_rows`, so this row's segment is in bounds.
+                unsafe { values_out.add(written * natts) }
+            };
+            let row_is_null_out = if natts == 0 {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: caller provided `natts * max_rows` entries and
+                // `written < max_rows`, so this row's segment is in bounds.
+                unsafe { is_null_out.add(written * natts) }
+            };
+            // SAFETY: caller provided `max_rows` TID/stored-natts entries and
+            // `written < max_rows`.
+            let row_tid_out = unsafe { tids_out.add(written) };
+            let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
+            if !copy_tuple_to_outputs(
+                tid,
+                tuple,
+                row_values_out,
+                row_is_null_out,
+                natts,
+                row_tid_out,
+                row_stored_natts_out,
+            ) {
+                break;
+            }
+
+            if is_forward {
+                forward_cursor = ScanCursor::after(tid);
+                backward_cursor = ScanCursor::before(tid);
+            } else {
+                backward_cursor = ScanCursor::before(tid);
+                forward_cursor = ScanCursor::after(tid);
+            }
+            written += 1;
+        }
+
+        if let Some(scan) = session.scan_slot_mut(scan_handle) {
+            scan.forward_cursor = forward_cursor;
+            scan.backward_cursor = backward_cursor;
+            if written > 0 {
+                if forward != 0 {
+                    scan.backward_exhausted = false;
+                } else {
+                    scan.forward_exhausted = false;
+                }
+            }
+            if exhausted {
+                if forward != 0 {
+                    scan.forward_exhausted = true;
+                    scan.backward_exhausted = false;
+                } else {
+                    scan.backward_exhausted = true;
+                    scan.forward_exhausted = false;
+                }
+            }
+        }
+
+        written
+    })
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///
@@ -1035,10 +1582,12 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
         return 0;
     }
 
-    let has_visibility_deltas = with_session_storage(|session| {
+    let (has_visibility_deltas, overlay_only) = with_session_storage(|session| {
         session
             .scan_slot(scan_handle)
-            .is_some_and(|scan| scan.has_visibility_deltas)
+            .map_or((false, false), |scan| {
+                (scan.has_visibility_deltas, scan.overlay_only)
+            })
     });
     if !has_visibility_deltas {
         return with_storage_read(|state, session| {
@@ -1145,6 +1694,18 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
 
             written
         });
+    }
+    if overlay_only {
+        return scan_next_overlay_only_batch_impl(
+            scan_handle,
+            forward,
+            values_out,
+            is_null_out,
+            natts,
+            max_rows,
+            tids_out,
+            stored_natts_out,
+        );
     }
 
     with_storage(|state, session| {
@@ -1272,10 +1833,12 @@ fn scan_next_impl(
     tid_out: *mut u64,
     stored_natts_out: *mut usize,
 ) -> bool {
-    let has_visibility_deltas = with_session_storage(|session| {
+    let (has_visibility_deltas, overlay_only) = with_session_storage(|session| {
         session
             .scan_slot(scan_handle)
-            .is_some_and(|scan| scan.has_visibility_deltas)
+            .map_or((false, false), |scan| {
+                (scan.has_visibility_deltas, scan.overlay_only)
+            })
     });
     if !has_visibility_deltas {
         return with_storage_read(|state, session| {
@@ -1333,6 +1896,17 @@ fn scan_next_impl(
             )
         });
     }
+    if overlay_only {
+        return scan_next_overlay_only_impl(
+            scan_handle,
+            forward,
+            values_out,
+            is_null_out,
+            natts,
+            tid_out,
+            stored_natts_out,
+        );
+    }
 
     with_storage(|state, session| {
         let Some(scan) = session.scan_slot(scan_handle) else {
@@ -1349,16 +1923,20 @@ fn scan_next_impl(
         };
         let relid = scan.relid;
         let tuple = if scan.has_visibility_deltas {
-            state.next_visible_tuple_slice_in_overlays(
-                &session.transaction_stack,
-                relid,
-                cursor,
-                &scan.high_water_offsets,
-                is_forward,
-                scan.snapshot_curcid,
-            )
+            state
+                .next_visible_tuple_slice_in_overlays(
+                    &session.transaction_stack,
+                    relid,
+                    cursor,
+                    &scan.high_water_offsets,
+                    is_forward,
+                    scan.snapshot_curcid,
+                )
+                .map(|(tid, tuple)| (tid, tuple.to_vec()))
         } else {
-            state.next_committed_tuple_slice(relid, cursor, &scan.high_water_offsets, is_forward)
+            state
+                .next_committed_tuple_slice(relid, cursor, &scan.high_water_offsets, is_forward)
+                .map(|(tid, tuple)| (tid, tuple.to_vec()))
         };
         let Some((tid, tuple)) = tuple else {
             if let Some(scan) = session.scan_slot_mut(scan_handle) {
@@ -1387,7 +1965,7 @@ fn scan_next_impl(
         }
         copy_tuple_to_outputs(
             tid,
-            tuple,
+            &tuple,
             values_out,
             is_null_out,
             natts,
@@ -1442,6 +2020,52 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_tid_snapshot_with_stored_natts(
         natts,
         stored_natts_out,
     )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries and optional
+/// valid output pointers for `stored_natts_out` and `resolved_tid_out`.
+pub unsafe extern "C" fn fastpg_storage2_fetch_current_session_tid_with_stored_natts(
+    relid: u32,
+    packed_tid: u64,
+    use_curcid: u8,
+    curcid: u32,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    stored_natts_out: *mut usize,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_session_storage(|session| {
+        let overlays = &session.transaction_stack;
+        let resolved = resolve_overlay_update_redirect(overlays, relid, tid);
+        let curcid = (use_curcid != 0).then_some(curcid);
+        let Some(tuple) = overlay_visible_tuple_slice(overlays, relid, resolved, curcid) else {
+            return false;
+        };
+        if !copy_tuple_to_outputs(
+            resolved,
+            tuple,
+            values_out,
+            is_null_out,
+            natts,
+            std::ptr::null_mut(),
+            stored_natts_out,
+        ) {
+            return false;
+        }
+        if !resolved_tid_out.is_null() {
+            unsafe {
+                *resolved_tid_out = resolved.pack();
+            }
+        }
+        true
+    })
 }
 
 fn fetch_tid_snapshot_impl(
@@ -1639,12 +2263,32 @@ fn fetch_tid_any_impl(
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    with_storage_read(|state, _session| {
-        let Some(tuple) = state
-            .relations
-            .get(&relid)
-            .and_then(|relation| relation.tuple_slice_any(tid))
-        else {
+    if let Some(copied) = with_session_storage(|session| {
+        let tid = resolve_overlay_tid_redirect(&session.transaction_stack, relid, tid);
+        overlay_pending_tuple_slice(&session.transaction_stack, relid, tid).map(|tuple| {
+            copy_tuple_to_outputs(
+                tid,
+                tuple,
+                values_out,
+                is_null_out,
+                natts,
+                std::ptr::null_mut(),
+                stored_natts_out,
+            )
+        })
+    }) {
+        return copied;
+    }
+    with_storage_read(|state, session| {
+        let tid = state.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
+        let tuple =
+            overlay_pending_tuple_slice(&session.transaction_stack, relid, tid).or_else(|| {
+                state
+                    .relations
+                    .get(&relid)
+                    .and_then(|relation| relation.tuple_slice_any(tid))
+            });
+        let Some(tuple) = tuple else {
             return false;
         };
         copy_tuple_to_outputs(
@@ -1658,6 +2302,80 @@ fn fetch_tid_any_impl(
         )
     })
 }
+
+enum OverlayLookup {
+    Found(Tid),
+    Hidden,
+    Missing,
+}
+
+enum ConflictLookup {
+    Found(Tid),
+    NoConflict,
+    Missing,
+}
+
+fn primary_key_overlay_lookup_current_session(relid: u32, key: &IndexKey) -> OverlayLookup {
+    with_session_storage(|session| {
+        for overlay in session.transaction_stack.iter().rev() {
+            if let Some(tid) = overlay
+                .primary_key_inserts
+                .get(&relid)
+                .and_then(|entries| entries.get(key))
+                .copied()
+            {
+                let tid = resolve_overlay_update_redirect(&session.transaction_stack, relid, tid);
+                if overlay_pending_tuple_slice(&session.transaction_stack, relid, tid).is_some()
+                    && !overlays_invalidate_tid(&session.transaction_stack, relid, tid)
+                {
+                    return OverlayLookup::Found(tid);
+                }
+                return OverlayLookup::Hidden;
+            }
+            if overlay
+                .primary_key_deletes
+                .get(&relid)
+                .is_some_and(|keys| keys.contains(key))
+            {
+                return OverlayLookup::Hidden;
+            }
+        }
+        OverlayLookup::Missing
+    })
+}
+
+fn resolve_replacing_tid_current_session(relid: u32, replacing_tid: Option<Tid>) -> Option<Tid> {
+    with_session_storage(|session| {
+        replacing_tid
+            .map(|tid| resolve_overlay_update_redirect(&session.transaction_stack, relid, tid))
+    })
+}
+
+fn primary_key_conflict_current_session_or_empty(
+    relid: u32,
+    key: &IndexKey,
+    replacing_tid: Option<Tid>,
+) -> ConflictLookup {
+    let replacing_tid = resolve_replacing_tid_current_session(relid, replacing_tid);
+
+    match primary_key_overlay_lookup_current_session(relid, key) {
+        OverlayLookup::Found(tid) => {
+            if Some(tid) == replacing_tid {
+                ConflictLookup::NoConflict
+            } else {
+                ConflictLookup::Found(tid)
+            }
+        }
+        OverlayLookup::Hidden | OverlayLookup::Missing => {
+            if committed_row_count_cached(relid) == 0 {
+                ConflictLookup::NoConflict
+            } else {
+                ConflictLookup::Missing
+            }
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 /// # Safety
 ///
@@ -1679,9 +2397,13 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup(
     let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
         return false;
     };
-    let tid = with_storage(|state, session| {
-        state.primary_key_lookup(session, index_spec.relation_oid.0, &key)
-    });
+    let tid = match primary_key_overlay_lookup_current_session(index_spec.relation_oid.0, &key) {
+        OverlayLookup::Found(tid) => Some(tid),
+        OverlayLookup::Hidden => None,
+        OverlayLookup::Missing => with_storage(|state, session| {
+            state.primary_key_lookup(session, index_spec.relation_oid.0, &key)
+        }),
+    };
     let Some(tid) = tid else {
         return false;
     };
@@ -1730,17 +2452,21 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
     let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
         return false;
     };
-    let tid = with_storage(|state, session| {
-        state
-            .primary_key_lookup(session, heap_relid, &key)
-            .or_else(|| {
-                let mut scan_spec = index_spec.clone();
-                scan_spec.is_primary = false;
-                state.find_visible_by_index_key_excluding(
-                    session, heap_relid, &scan_spec, &key, None,
-                )
-            })
-    });
+    let tid = match primary_key_overlay_lookup_current_session(heap_relid, &key) {
+        OverlayLookup::Found(tid) => Some(tid),
+        OverlayLookup::Hidden => None,
+        OverlayLookup::Missing => with_storage(|state, session| {
+            state
+                .primary_key_lookup(session, heap_relid, &key)
+                .or_else(|| {
+                    let mut scan_spec = index_spec.clone();
+                    scan_spec.is_primary = false;
+                    state.find_visible_by_index_key_excluding(
+                        session, heap_relid, &scan_spec, &key, None,
+                    )
+                })
+        }),
+    };
     let Some(tid) = tid else {
         return false;
     };
@@ -1769,7 +2495,13 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_single_byval_w
     }
 
     let key = IndexKey::single(IndexKeyPart::ByValue(value));
-    let tid = with_storage(|state, session| state.primary_key_lookup(session, heap_relid, &key));
+    let tid = match primary_key_overlay_lookup_current_session(heap_relid, &key) {
+        OverlayLookup::Found(tid) => Some(tid),
+        OverlayLookup::Hidden => None,
+        OverlayLookup::Missing => {
+            with_storage(|state, session| state.primary_key_lookup(session, heap_relid, &key))
+        }
+    };
     let Some(tid) = tid else {
         return false;
     };
@@ -1895,6 +2627,20 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict(
     } else {
         Tid::unpack(replacing_tid)
     };
+    if index_spec.is_primary {
+        match primary_key_conflict_current_session_or_empty(relid.0, &key, replacing_tid) {
+            ConflictLookup::Found(tid) => {
+                if !tid_out.is_null() {
+                    unsafe {
+                        *tid_out = tid.pack();
+                    }
+                }
+                return true;
+            }
+            ConflictLookup::NoConflict => return false,
+            ConflictLookup::Missing => {}
+        }
+    }
     let conflict = with_storage_read(|state, session| {
         state.find_visible_by_index_key_excluding_read(
             session,
@@ -1929,6 +2675,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
     values: *const usize,
     is_null: *const u8,
     nkeys: usize,
+    is_primary: u8,
     nulls_not_distinct: u8,
     replacing_tid: u64,
     tid_out: *mut u64,
@@ -1945,7 +2692,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
             typbyval,
             typlen,
             nkeys,
-            is_primary: false,
+            is_primary: is_primary != 0,
             nulls_not_distinct: nulls_not_distinct != 0,
         })
     }) else {
@@ -1959,6 +2706,20 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
     } else {
         Tid::unpack(replacing_tid)
     };
+    if index_spec.is_primary {
+        match primary_key_conflict_current_session_or_empty(heap_relid, &key, replacing_tid) {
+            ConflictLookup::Found(tid) => {
+                if !tid_out.is_null() {
+                    unsafe {
+                        *tid_out = tid.pack();
+                    }
+                }
+                return true;
+            }
+            ConflictLookup::NoConflict => return false,
+            ConflictLookup::Missing => {}
+        }
+    }
     let conflict = with_storage_read(|state, session| {
         state.find_visible_by_index_key_excluding_read(
             session,

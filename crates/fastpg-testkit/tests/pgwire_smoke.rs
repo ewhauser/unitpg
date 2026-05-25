@@ -3,10 +3,14 @@
 use std::error::Error;
 
 use fastpg_testkit::TestServer;
+use tokio::sync::Mutex;
 use tokio_postgres::{NoTls, SimpleQueryMessage};
+
+static PGWIRE_TEST_MUTEX: Mutex<()> = Mutex::const_new(());
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tokio_postgres_simple_query_smoke() -> Result<(), Box<dyn Error>> {
+    let _guard = PGWIRE_TEST_MUTEX.lock().await;
     let server = TestServer::start().await?;
     let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
     let connection_task = tokio::spawn(connection);
@@ -38,6 +42,7 @@ async fn tokio_postgres_simple_query_smoke() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn tokio_postgres_extended_query_smoke() -> Result<(), Box<dyn Error>> {
+    let _guard = PGWIRE_TEST_MUTEX.lock().await;
     let server = TestServer::start().await?;
     let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
     let connection_task = tokio::spawn(connection);
@@ -62,6 +67,7 @@ async fn tokio_postgres_extended_query_smoke() -> Result<(), Box<dyn Error>> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_are_isolated_per_client() -> Result<(), Box<dyn Error>> {
+    let _guard = PGWIRE_TEST_MUTEX.lock().await;
     let server = TestServer::start().await?;
     let (client_a, connection_a) =
         tokio_postgres::connect(&server.connection_string(), NoTls).await?;
@@ -101,6 +107,81 @@ async fn transactions_are_isolated_per_client() -> Result<(), Box<dyn Error>> {
     drop((client_a, client_b));
     connection_task_a.abort();
     connection_task_b.abort();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn foreign_keys_see_rows_inserted_earlier_in_transaction() -> Result<(), Box<dyn Error>> {
+    let _guard = PGWIRE_TEST_MUTEX.lock().await;
+    let server = TestServer::start().await?;
+    let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let suffix = std::process::id();
+    let trigger_parent = format!("fastpg_fk_trigger_parent_{suffix}");
+    let trigger_child = format!("fastpg_fk_trigger_child_{suffix}");
+    let validate_parent = format!("fastpg_fk_validate_parent_{suffix}");
+    let validate_child = format!("fastpg_fk_validate_child_{suffix}");
+    let validate_constraint = format!("fastpg_fk_validate_{suffix}");
+
+    client
+        .simple_query(&format!(
+            "DROP TABLE IF EXISTS {trigger_child}, {trigger_parent}, {validate_child}, {validate_parent}"
+        ))
+        .await?;
+
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {trigger_parent}(id int PRIMARY KEY)"
+        ))
+        .await?;
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {trigger_child}(id int REFERENCES {trigger_parent}(id))"
+        ))
+        .await?;
+
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query(&format!("INSERT INTO {trigger_parent} VALUES (1)"))
+        .await?;
+    client
+        .simple_query(&format!("INSERT INTO {trigger_child} VALUES (1)"))
+        .await?;
+    client.simple_query("COMMIT").await?;
+    assert_eq!(count_rows(&client, &trigger_child).await?, 1);
+
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {validate_parent}(id int PRIMARY KEY)"
+        ))
+        .await?;
+    client
+        .simple_query(&format!("CREATE TABLE {validate_child}(id int)"))
+        .await?;
+
+    client.simple_query("BEGIN").await?;
+    client
+        .simple_query(&format!("INSERT INTO {validate_parent} VALUES (1)"))
+        .await?;
+    client
+        .simple_query(&format!("INSERT INTO {validate_child} VALUES (1)"))
+        .await?;
+    client
+        .simple_query(&format!(
+            "ALTER TABLE {validate_child} ADD CONSTRAINT {validate_constraint} FOREIGN KEY (id) REFERENCES {validate_parent}(id)"
+        ))
+        .await?;
+    client.simple_query("COMMIT").await?;
+    assert_eq!(count_rows(&client, &validate_child).await?, 1);
+
+    client
+        .simple_query(&format!(
+            "DROP TABLE IF EXISTS {trigger_child}, {trigger_parent}, {validate_child}, {validate_parent}"
+        ))
+        .await?;
+    drop(client);
+    connection_task.abort();
 
     Ok(())
 }

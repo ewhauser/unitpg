@@ -84,19 +84,42 @@ struct cachedesc
 StaticAssertDecl(lengthof(cacheinfo) == SysCacheSize,
 				 "SysCacheSize does not match syscache.c's array");
 
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL CatCache *SysCache[SysCacheSize];
+static PG_THREAD_LOCAL bool CacheInitialized = false;
+#else
 static CatCache *SysCache[SysCacheSize];
-
 static bool CacheInitialized = false;
+#endif
 
 /* Sorted array of OIDs of tables that have caches on them */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL Oid SysCacheRelationOid[SysCacheSize];
+static PG_THREAD_LOCAL int SysCacheRelationOidSize;
+#else
 static Oid	SysCacheRelationOid[SysCacheSize];
 static int	SysCacheRelationOidSize;
+#endif
 
 /* Sorted array of OIDs of tables and indexes used by caches */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL Oid SysCacheSupportingRelOid[SysCacheSize * 2];
+static PG_THREAD_LOCAL int SysCacheSupportingRelOidSize;
+#else
 static Oid	SysCacheSupportingRelOid[SysCacheSize * 2];
 static int	SysCacheSupportingRelOidSize;
+#endif
 
 static int	oid_compare(const void *a, const void *b);
+
+#ifdef USE_FASTPG
+static inline void
+FastPgEnsureCatalogCacheInitialized(void)
+{
+	if (!CacheInitialized)
+		InitCatalogCache();
+}
+#endif
 
 
 /*
@@ -112,6 +135,10 @@ InitCatalogCache(void)
 {
 	SysCacheIdentifier cacheId;
 
+#ifdef USE_FASTPG
+	if (CacheInitialized)
+		return;
+#endif
 	Assert(!CacheInitialized);
 
 	SysCacheRelationOidSize = SysCacheSupportingRelOidSize = 0;
@@ -182,6 +209,9 @@ InitCatalogCachePhase2(void)
 {
 	SysCacheIdentifier cacheId;
 
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	Assert(CacheInitialized);
 
 	for (cacheId = 0; cacheId < SysCacheSize; cacheId++)
@@ -212,6 +242,9 @@ SearchSysCache(SysCacheIdentifier cacheId,
 			   Datum key3,
 			   Datum key4)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 
 	return SearchCatCache(SysCache[cacheId], key1, key2, key3, key4);
@@ -221,6 +254,9 @@ HeapTuple
 SearchSysCache1(SysCacheIdentifier cacheId,
 				Datum key1)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 1);
 
@@ -231,6 +267,9 @@ HeapTuple
 SearchSysCache2(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 2);
 
@@ -241,6 +280,9 @@ HeapTuple
 SearchSysCache3(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2, Datum key3)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 3);
 
@@ -251,6 +293,9 @@ HeapTuple
 SearchSysCache4(SysCacheIdentifier cacheId,
 				Datum key1, Datum key2, Datum key3, Datum key4)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	Assert(cacheId >= 0 && cacheId < SysCacheSize && SysCache[cacheId]);
 	Assert(SysCache[cacheId]->cc_nkeys == 4);
 
@@ -283,6 +328,9 @@ HeapTuple
 SearchSysCacheLocked1(SysCacheIdentifier cacheId,
 					  Datum key1)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	CatCache   *cache = SysCache[cacheId];
 	ItemPointerData tid;
 	LOCKTAG		tag;
@@ -452,6 +500,9 @@ GetSysCacheOid(SysCacheIdentifier cacheId,
 	bool		isNull;
 	Oid			result;
 
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	tuple = SearchSysCache(cacheId, key1, key2, key3, key4);
 	if (!HeapTupleIsValid(tuple))
 		return InvalidOid;
@@ -597,6 +648,9 @@ SysCacheGetAttr(SysCacheIdentifier cacheId, HeapTuple tup,
 				AttrNumber attributeNumber,
 				bool *isNull)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	/*
 	 * We just need to get the TupleDesc out of the cache entry, and then we
 	 * can apply heap_getattr().  Normally the cache control data is already
@@ -659,6 +713,9 @@ GetSysCacheHashValue(SysCacheIdentifier cacheId,
 					 Datum key3,
 					 Datum key4)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	if (cacheId < 0 || cacheId >= SysCacheSize || !SysCache[cacheId])
 		elog(ERROR, "invalid cache ID: %d", cacheId);
 
@@ -672,6 +729,9 @@ struct catclist *
 SearchSysCacheList(SysCacheIdentifier cacheId, int nkeys,
 				   Datum key1, Datum key2, Datum key3)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	if (cacheId < 0 || cacheId >= SysCacheSize || !SysCache[cacheId])
 		elog(ERROR, "invalid cache ID: %d", cacheId);
 
@@ -690,6 +750,9 @@ SearchSysCacheList(SysCacheIdentifier cacheId, int nkeys,
 void
 SysCacheInvalidate(SysCacheIdentifier cacheId, uint32 hashValue)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	if (cacheId < 0 || cacheId >= SysCacheSize)
 		elog(ERROR, "invalid cache ID: %d", cacheId);
 
@@ -714,6 +777,9 @@ SysCacheInvalidate(SysCacheIdentifier cacheId, uint32 hashValue)
 bool
 RelationInvalidatesSnapshotsOnly(Oid relid)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	switch (relid)
 	{
 		case DbRoleSettingRelationId:
@@ -737,6 +803,9 @@ RelationInvalidatesSnapshotsOnly(Oid relid)
 bool
 RelationHasSysCache(Oid relid)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	int			low = 0,
 				high = SysCacheRelationOidSize - 1;
 
@@ -762,6 +831,9 @@ RelationHasSysCache(Oid relid)
 bool
 RelationSupportsSysCache(Oid relid)
 {
+#ifdef USE_FASTPG
+	FastPgEnsureCatalogCacheInitialized();
+#endif
 	int			low = 0,
 				high = SysCacheSupportingRelOidSize - 1;
 

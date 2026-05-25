@@ -501,8 +501,13 @@ typedef struct ViewOptions
  * Note:
  *		Assumes relation descriptor is valid.
  */
+#ifdef USE_FASTPG
+#define RelationHasReferenceCountZero(relation) \
+		((bool)(__atomic_load_n(&(relation)->rd_refcnt, __ATOMIC_ACQUIRE) == 0))
+#else
 #define RelationHasReferenceCountZero(relation) \
 		((bool)((relation)->rd_refcnt == 0))
+#endif
 
 /*
  * RelationGetForm

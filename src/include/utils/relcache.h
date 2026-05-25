@@ -141,6 +141,7 @@ extern void RelationCacheInvalidate(bool debug_discard);
 
 #ifdef USE_FASTPG
 extern void FastPgReconcileRelcacheAfterCatalogRollback(void);
+extern uint64 FastPgRelcacheGeneration(void);
 #endif
 
 #ifdef USE_ASSERT_CHECKING

@@ -120,7 +120,11 @@ typedef struct CatCInProgress
 	struct CatCInProgress *next;
 } CatCInProgress;
 
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL CatCInProgress *catcache_in_progress_stack = NULL;
+#else
 static CatCInProgress *catcache_in_progress_stack = NULL;
+#endif
 
  /* #define CACHEDEBUG */	/* turns DEBUG elogs on */
 
@@ -143,7 +147,11 @@ static CatCInProgress *catcache_in_progress_stack = NULL;
 #endif
 
 /* Cache management header --- pointer is NULL until created */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL CatCacheHeader *CacheHdr = NULL;
+#else
 static CatCacheHeader *CacheHdr = NULL;
+#endif
 
 static inline HeapTuple SearchCatCacheInternal(CatCache *cache,
 											   int nkeys,
@@ -2051,11 +2059,6 @@ CatCacheInvalidate(CatCache *cache, uint32 hashValue)
 	Index		hashIndex;
 	dlist_mutable_iter iter;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
 	CACHE_elog(DEBUG2, "CatCacheInvalidate: called");
 
 	/*
@@ -2118,16 +2121,6 @@ CatCacheInvalidate(CatCache *cache, uint32 hashValue)
 				e->dead = true;
 		}
 	}
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
 }
 
 /* ----------------------------------------------------------------
@@ -2262,9 +2255,8 @@ ResetCatalogCachesExt(bool debug_discard)
 	slist_iter	iter;
 
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
+	if (CacheHdr == NULL)
+		return;
 #endif
 	CACHE_elog(DEBUG2, "ResetCatalogCaches called");
 
@@ -2276,16 +2268,6 @@ ResetCatalogCachesExt(bool debug_discard)
 	}
 
 	CACHE_elog(DEBUG2, "end of ResetCatalogCaches call");
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
 }
 
 /*
@@ -2307,9 +2289,8 @@ CatalogCacheFlushCatalog(Oid catId)
 	slist_iter	iter;
 
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
+	if (CacheHdr == NULL)
+		return;
 #endif
 	CACHE_elog(DEBUG2, "CatalogCacheFlushCatalog called for %u", catId);
 
@@ -2329,16 +2310,6 @@ CatalogCacheFlushCatalog(Oid catId)
 	}
 
 	CACHE_elog(DEBUG2, "end of CatalogCacheFlushCatalog call");
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
 }
 
 /*
@@ -2873,22 +2844,7 @@ SearchCatCache(CatCache *cache,
 {
 	HeapTuple	result = NULL;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-		result = SearchCatCacheInternal(cache, cache->cc_nkeys, v1, v2, v3, v4);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
+	result = SearchCatCacheInternal(cache, cache->cc_nkeys, v1, v2, v3, v4);
 	return result;
 }
 
@@ -2905,22 +2861,7 @@ SearchCatCache1(CatCache *cache,
 {
 	HeapTuple	result = NULL;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-		result = SearchCatCacheInternal(cache, 1, v1, 0, 0, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
+	result = SearchCatCacheInternal(cache, 1, v1, 0, 0, 0);
 	return result;
 }
 
@@ -2931,22 +2872,7 @@ SearchCatCache2(CatCache *cache,
 {
 	HeapTuple	result = NULL;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-		result = SearchCatCacheInternal(cache, 2, v1, v2, 0, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
+	result = SearchCatCacheInternal(cache, 2, v1, v2, 0, 0);
 	return result;
 }
 
@@ -2957,22 +2883,7 @@ SearchCatCache3(CatCache *cache,
 {
 	HeapTuple	result = NULL;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-		result = SearchCatCacheInternal(cache, 3, v1, v2, v3, 0);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
+	result = SearchCatCacheInternal(cache, 3, v1, v2, v3, 0);
 	return result;
 }
 
@@ -2983,22 +2894,7 @@ SearchCatCache4(CatCache *cache,
 {
 	HeapTuple	result = NULL;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-		result = SearchCatCacheInternal(cache, 4, v1, v2, v3, v4);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
+	result = SearchCatCacheInternal(cache, 4, v1, v2, v3, v4);
 	return result;
 }
 
@@ -3290,22 +3186,7 @@ SearchCatCacheMiss(CatCache *cache,
 void
 ReleaseCatCache(HeapTuple tuple)
 {
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
 	ReleaseCatCacheWithOwner(tuple, CurrentResourceOwner);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
 }
 
 static void
@@ -3765,22 +3646,7 @@ SearchCatCacheList(CatCache *cache,
 {
 	CatCList  *result = NULL;
 
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-		result = SearchCatCacheListInternal(cache, nkeys, v1, v2, v3);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
+	result = SearchCatCacheListInternal(cache, nkeys, v1, v2, v3);
 	return result;
 }
 
@@ -3792,22 +3658,7 @@ SearchCatCacheList(CatCache *cache,
 void
 ReleaseCatCacheList(CatCList *list)
 {
-#ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
 	ReleaseCatCacheListWithOwner(list, CurrentResourceOwner);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
-#endif
 }
 
 static void
