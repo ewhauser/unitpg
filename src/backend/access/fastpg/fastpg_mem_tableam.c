@@ -223,7 +223,6 @@ typedef struct FastPgMemIndexMatch
 	uint64_t	row_id;
 	Datum		values[FASTPG_MAX_INDEX_KEYS];
 	bool		isnull[FASTPG_MAX_INDEX_KEYS];
-	bool		owned[FASTPG_MAX_INDEX_KEYS];
 } FastPgMemIndexMatch;
 
 typedef struct FastPgMemIndexSortContext
@@ -784,6 +783,7 @@ typedef struct FastPgMemIndexScan
 	uint64_t	scan_handle;
 	bool		scan_storage2;
 	TupleTableSlot *scan_slot;
+	MemoryContext match_context;
 	FastPgMemIndexMatch *matched_rows;
 	int			matched_count;
 	int			matched_capacity;
@@ -4770,6 +4770,10 @@ fastpg_mem_index_begin_scan(Relation indexRelation, int nkeys, int norderbys)
 	opaque = palloc0_object(FastPgMemIndexScan);
 	opaque->nkeys = (size_t) expected_keys;
 	opaque->array_key_index = -1;
+	opaque->match_context =
+		AllocSetContextCreate(CurrentMemoryContext,
+							  "fastpg mem index matches",
+							  ALLOCSET_DEFAULT_SIZES);
 	scan->opaque = opaque;
 	return scan;
 }
@@ -4800,23 +4804,10 @@ fastpg_mem_index_clear_scan_keys(FastPgMemIndexScan *opaque)
 static void
 fastpg_mem_index_clear_matches(FastPgMemIndexScan *opaque)
 {
-	if (opaque->matched_rows != NULL)
-	{
-		for (int match_index = 0; match_index < opaque->matched_count; match_index++)
-		{
-			FastPgMemIndexMatch *match = &opaque->matched_rows[match_index];
-
-			for (int key_index = 0; key_index < FASTPG_MAX_INDEX_KEYS; key_index++)
-			{
-				if (match->owned[key_index])
-				{
-					pfree(DatumGetPointer(match->values[key_index]));
-					match->owned[key_index] = false;
-				}
-			}
-		}
+	if (opaque->match_context != NULL)
+		MemoryContextReset(opaque->match_context);
+	else if (opaque->matched_rows != NULL)
 		pfree(opaque->matched_rows);
-	}
 	opaque->matched_rows = NULL;
 	opaque->matched_count = 0;
 	opaque->matched_capacity = 0;
@@ -4841,6 +4832,11 @@ fastpg_mem_index_release_scan(FastPgMemIndexScan *opaque)
 		opaque->scan_slot = NULL;
 	}
 	fastpg_mem_index_clear_matches(opaque);
+	if (opaque->match_context != NULL)
+	{
+		MemoryContextDelete(opaque->match_context);
+		opaque->match_context = NULL;
+	}
 }
 
 static bool
@@ -5282,16 +5278,19 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 	int			key_count = IndexRelationGetNumberOfKeyAttributes(indexRelation);
 	FastPgMemIndexMatch *match;
 
-	if (opaque->matched_count >= opaque->matched_capacity)
-	{
-		int			new_capacity = opaque->matched_capacity == 0 ?
-			64 : opaque->matched_capacity * 2;
+		if (opaque->matched_count >= opaque->matched_capacity)
+		{
+			int			new_capacity = opaque->matched_capacity == 0 ?
+				64 : opaque->matched_capacity * 2;
+			MemoryContext oldcontext;
 
-		opaque->matched_rows = opaque->matched_rows == NULL ?
-			palloc_array(FastPgMemIndexMatch, new_capacity) :
-			repalloc_array(opaque->matched_rows, FastPgMemIndexMatch, new_capacity);
-		opaque->matched_capacity = new_capacity;
-	}
+			oldcontext = MemoryContextSwitchTo(opaque->match_context);
+			opaque->matched_rows = opaque->matched_rows == NULL ?
+				palloc_array(FastPgMemIndexMatch, new_capacity) :
+				repalloc_array(opaque->matched_rows, FastPgMemIndexMatch, new_capacity);
+			MemoryContextSwitchTo(oldcontext);
+			opaque->matched_capacity = new_capacity;
+		}
 
 	match = &opaque->matched_rows[opaque->matched_count++];
 	memset(match, 0, sizeof(*match));
@@ -5311,6 +5310,9 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 		match->isnull[index] = isnull;
 		if (!isnull && !attr->attbyval)
 		{
+			MemoryContext oldcontext;
+
+			oldcontext = MemoryContextSwitchTo(opaque->match_context);
 			if (attr->attlen == -1)
 			{
 				Pointer		raw = DatumGetPointer(value);
@@ -5322,7 +5324,7 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 			}
 			else
 				match->values[index] = datumCopy(value, false, attr->attlen);
-			match->owned[index] = true;
+			MemoryContextSwitchTo(oldcontext);
 		}
 		else
 			match->values[index] = value;
