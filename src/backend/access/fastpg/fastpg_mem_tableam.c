@@ -5072,10 +5072,13 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 	}
 }
 
+static void fastpg_mem_index_remember_match(IndexScanDesc scan,
+											FastPgMemIndexScan *opaque,
+											uint64_t row_id);
+
 static bool
-fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
-									  FastPgMemIndexScan *opaque,
-									  uint64_t *row_id_out)
+fastpg_mem_index_full_scan_remember_next(IndexScanDesc scan,
+										 FastPgMemIndexScan *opaque)
 {
 	Relation	heapRelation = scan->heapRelation;
 	int			natts = RelationGetDescr(heapRelation)->natts;
@@ -5124,17 +5127,17 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 	values = heap_buffers ? palloc0_array(uintptr_t, natts) : stack_values;
 	isnull = heap_buffers ? palloc0_array(uint8_t, natts) : stack_isnull;
 
-		while ((found = opaque->scan_storage2 ?
-				fastpg_storage2_scan_next_with_stored_natts(opaque->scan_handle,
-															1,
-															values,
-															isnull,
-															natts,
-															&row_id,
-															&stored_natts) :
-				(use_mvcc_snapshot ?
-				 fastpg_rust_scan_next_with_metadata(opaque->scan_handle,
-													 1,
+	while ((found = opaque->scan_storage2 ?
+			fastpg_storage2_scan_next_with_stored_natts(opaque->scan_handle,
+														1,
+														values,
+														isnull,
+														natts,
+														&row_id,
+														&stored_natts) :
+			(use_mvcc_snapshot ?
+			 fastpg_rust_scan_next_with_metadata(opaque->scan_handle,
+												 1,
 												 values,
 												 isnull,
 												 natts,
@@ -5150,17 +5153,17 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 													 &row_id,
 													 &stored_natts))))
 	{
-			ExecClearTuple(opaque->scan_slot);
-			if (opaque->scan_storage2)
-			{
-				fastpg_mem_fill_virtual_tuple_attrs(heapRelation,
-													opaque->scan_slot,
-													values,
-													isnull,
-													stored_natts);
-				if (!fastpg_mem_storage2_tid_to_tid(row_id, &opaque->scan_slot->tts_tid))
-					elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
-						 (unsigned long long) row_id);
+		ExecClearTuple(opaque->scan_slot);
+		if (opaque->scan_storage2)
+		{
+			fastpg_mem_fill_virtual_tuple_attrs(heapRelation,
+												opaque->scan_slot,
+												values,
+												isnull,
+												stored_natts);
+			if (!fastpg_mem_storage2_tid_to_tid(row_id, &opaque->scan_slot->tts_tid))
+				elog(ERROR, "fastpg_mem storage2 TID %llu cannot be represented as a CTID",
+					 (unsigned long long) row_id);
 			opaque->scan_slot->tts_tableOid = RelationGetRelid(heapRelation);
 			ExecStoreVirtualTuple(opaque->scan_slot);
 		}
@@ -5186,7 +5189,7 @@ fastpg_mem_index_full_scan_match_next(IndexScanDesc scan,
 											   opaque->scan_nkeys,
 											   opaque->scan_keys))
 		{
-			*row_id_out = row_id;
+			fastpg_mem_index_remember_match(scan, opaque, row_id);
 			break;
 		}
 	}
@@ -5278,19 +5281,19 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 	int			key_count = IndexRelationGetNumberOfKeyAttributes(indexRelation);
 	FastPgMemIndexMatch *match;
 
-		if (opaque->matched_count >= opaque->matched_capacity)
-		{
-			int			new_capacity = opaque->matched_capacity == 0 ?
-				64 : opaque->matched_capacity * 2;
-			MemoryContext oldcontext;
+	if (opaque->matched_count >= opaque->matched_capacity)
+	{
+		int			new_capacity = opaque->matched_capacity == 0 ?
+			64 : opaque->matched_capacity * 2;
+		MemoryContext oldcontext;
 
-			oldcontext = MemoryContextSwitchTo(opaque->match_context);
-			opaque->matched_rows = opaque->matched_rows == NULL ?
-				palloc_array(FastPgMemIndexMatch, new_capacity) :
-				repalloc_array(opaque->matched_rows, FastPgMemIndexMatch, new_capacity);
-			MemoryContextSwitchTo(oldcontext);
-			opaque->matched_capacity = new_capacity;
-		}
+		oldcontext = MemoryContextSwitchTo(opaque->match_context);
+		opaque->matched_rows = opaque->matched_rows == NULL ?
+			palloc_array(FastPgMemIndexMatch, new_capacity) :
+			repalloc_array(opaque->matched_rows, FastPgMemIndexMatch, new_capacity);
+		MemoryContextSwitchTo(oldcontext);
+		opaque->matched_capacity = new_capacity;
+	}
 
 	match = &opaque->matched_rows[opaque->matched_count++];
 	memset(match, 0, sizeof(*match));
@@ -5314,14 +5317,7 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 
 			oldcontext = MemoryContextSwitchTo(opaque->match_context);
 			if (attr->attlen == -1)
-			{
-				Pointer		raw = DatumGetPointer(value);
-				Size		len = VARSIZE_ANY(raw);
-				Pointer		copy = palloc(len);
-
-				memcpy(copy, raw, len);
-				match->values[index] = PointerGetDatum(copy);
-			}
+				match->values[index] = PointerGetDatum(PG_DETOAST_DATUM_COPY(value));
 			else
 				match->values[index] = datumCopy(value, false, attr->attlen);
 			MemoryContextSwitchTo(oldcontext);
@@ -5334,13 +5330,11 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 static void
 fastpg_mem_index_collect_matches(IndexScanDesc scan, FastPgMemIndexScan *opaque)
 {
-	uint64_t	row_id;
-
 	if (opaque->matched_ready)
 		return;
 
-	while (fastpg_mem_index_full_scan_match_next(scan, opaque, &row_id))
-		fastpg_mem_index_remember_match(scan, opaque, row_id);
+	while (fastpg_mem_index_full_scan_remember_next(scan, opaque))
+		;
 
 	fastpg_mem_index_sort_matches(scan, opaque);
 
