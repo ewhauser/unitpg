@@ -223,6 +223,7 @@ typedef struct FastPgMemIndexMatch
 	uint64_t	row_id;
 	Datum		values[FASTPG_MAX_INDEX_KEYS];
 	bool		isnull[FASTPG_MAX_INDEX_KEYS];
+	bool		owned[FASTPG_MAX_INDEX_KEYS];
 } FastPgMemIndexMatch;
 
 typedef struct FastPgMemIndexSortContext
@@ -4797,6 +4798,33 @@ fastpg_mem_index_clear_scan_keys(FastPgMemIndexScan *opaque)
 }
 
 static void
+fastpg_mem_index_clear_matches(FastPgMemIndexScan *opaque)
+{
+	if (opaque->matched_rows != NULL)
+	{
+		for (int match_index = 0; match_index < opaque->matched_count; match_index++)
+		{
+			FastPgMemIndexMatch *match = &opaque->matched_rows[match_index];
+
+			for (int key_index = 0; key_index < FASTPG_MAX_INDEX_KEYS; key_index++)
+			{
+				if (match->owned[key_index])
+				{
+					pfree(DatumGetPointer(match->values[key_index]));
+					match->owned[key_index] = false;
+				}
+			}
+		}
+		pfree(opaque->matched_rows);
+	}
+	opaque->matched_rows = NULL;
+	opaque->matched_count = 0;
+	opaque->matched_capacity = 0;
+	opaque->matched_index = 0;
+	opaque->matched_ready = false;
+}
+
+static void
 fastpg_mem_index_release_scan(FastPgMemIndexScan *opaque)
 {
 	if (opaque->scan_handle != 0)
@@ -4812,13 +4840,7 @@ fastpg_mem_index_release_scan(FastPgMemIndexScan *opaque)
 		ExecDropSingleTupleTableSlot(opaque->scan_slot);
 		opaque->scan_slot = NULL;
 	}
-	if (opaque->matched_rows != NULL)
-		pfree(opaque->matched_rows);
-	opaque->matched_rows = NULL;
-	opaque->matched_count = 0;
-	opaque->matched_capacity = 0;
-	opaque->matched_index = 0;
-	opaque->matched_ready = false;
+	fastpg_mem_index_clear_matches(opaque);
 }
 
 static bool
@@ -4934,15 +4956,7 @@ fastpg_mem_index_rescan(IndexScanDesc scan,
 	opaque->counted_scan = false;
 	fastpg_mem_index_clear_array_keys(opaque);
 	fastpg_mem_index_clear_scan_keys(opaque);
-	if (opaque->matched_rows != NULL)
-	{
-		pfree(opaque->matched_rows);
-		opaque->matched_rows = NULL;
-	}
-	opaque->matched_count = 0;
-	opaque->matched_capacity = 0;
-	opaque->matched_index = 0;
-	opaque->matched_ready = false;
+	fastpg_mem_index_clear_matches(opaque);
 	memset(opaque->values, 0, sizeof(opaque->values));
 	memset(opaque->isnull, 1, sizeof(opaque->isnull));
 	memset(opaque->key_seen, 0, sizeof(opaque->key_seen));
@@ -5286,11 +5300,32 @@ fastpg_mem_index_remember_match(IndexScanDesc scan,
 	for (int index = 0; index < key_count; index++)
 	{
 		AttrNumber	heap_attnum = indexRelation->rd_index->indkey.values[index];
+		Form_pg_attribute attr;
+		bool		isnull;
+		Datum		value;
 
 		if (heap_attnum <= 0 || heap_attnum > heapDesc->natts)
 			fastpg_mem_index_unsupported("indexes with unsupported key metadata");
-		match->values[index] =
-			slot_getattr(opaque->scan_slot, heap_attnum, &match->isnull[index]);
+		attr = TupleDescAttr(heapDesc, heap_attnum - 1);
+		value = slot_getattr(opaque->scan_slot, heap_attnum, &isnull);
+		match->isnull[index] = isnull;
+		if (!isnull && !attr->attbyval)
+		{
+			if (attr->attlen == -1)
+			{
+				Pointer		raw = DatumGetPointer(value);
+				Size		len = VARSIZE_ANY(raw);
+				Pointer		copy = palloc(len);
+
+				memcpy(copy, raw, len);
+				match->values[index] = PointerGetDatum(copy);
+			}
+			else
+				match->values[index] = datumCopy(value, false, attr->attlen);
+			match->owned[index] = true;
+		}
+		else
+			match->values[index] = value;
 	}
 }
 
@@ -5361,6 +5396,8 @@ fastpg_mem_index_get_tuple_full_scan(IndexScanDesc scan,
 			return false;
 		}
 		row_id = opaque->matched_rows[--opaque->matched_index].row_id;
+		if (opaque->matched_index == 0)
+			opaque->done = true;
 		return fastpg_mem_index_return_row_id(scan, opaque, row_id);
 	}
 
