@@ -24,6 +24,7 @@ pub(crate) struct RelationStorage {
 }
 
 impl RelationStorage {
+    #[allow(dead_code)]
     pub(crate) fn checkpoint(&self) -> RelationCheckpoint {
         RelationCheckpoint {
             pages_len: self.pages.len(),
@@ -248,6 +249,7 @@ impl RelationStorage {
         Some(tid)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn append_pending_input_tuple(
         &mut self,
         block: u32,

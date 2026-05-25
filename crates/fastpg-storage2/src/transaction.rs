@@ -111,6 +111,7 @@ impl<'a, V> RelidEntry<'a, V> {
         }
     }
 
+    #[allow(dead_code)]
     pub(crate) fn or_insert_with(self, value: impl FnOnce() -> V) -> &'a mut V {
         match self {
             Self::Occupied(existing) => existing,
@@ -256,12 +257,14 @@ impl TransactionOverlay {
             && self.cleared_relations.is_empty()
     }
 
+    #[allow(dead_code)]
     pub(crate) fn checkpoint_relation(&mut self, relid: u32, relation: &RelationStorage) {
         self.relation_checkpoints
             .entry(relid)
             .or_insert_with(|| relation.checkpoint());
     }
 
+    #[allow(dead_code)]
     pub(crate) fn checkpoint_page(&mut self, relid: u32, page: &Page) {
         if self
             .new_pages
@@ -277,6 +280,7 @@ impl TransactionOverlay {
         );
     }
 
+    #[allow(dead_code)]
     pub(crate) fn record_new_page(&mut self, relid: u32, block: u32) {
         push_block_unique(self.new_pages.entry(relid).or_default(), block);
     }

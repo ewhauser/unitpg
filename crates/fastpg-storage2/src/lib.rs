@@ -1005,10 +1005,10 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
         return handle;
     }
     with_storage_read(|state, session| {
-        let overlay_only = !state
+        let overlay_only = state
             .relations
             .get(&relid)
-            .is_some_and(|relation| !relation.live_tids.is_empty());
+            .is_none_or(|relation| relation.live_tids.is_empty());
         let mut high_water_offsets = state
             .relations
             .get(&relid)
@@ -1171,12 +1171,12 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_with_stored_natts(
     )
 }
 
-fn overlay_visible_tuple_slice<'a>(
-    overlays: &'a [TransactionOverlay],
+fn overlay_visible_tuple_slice(
+    overlays: &[TransactionOverlay],
     relid: u32,
     tid: Tid,
     curcid: Option<u32>,
-) -> Option<&'a [u8]> {
+) -> Option<&[u8]> {
     if let [overlay] = overlays {
         return single_overlay_visible_pending_tuple_slice(overlay, relid, tid, curcid);
     }
@@ -1206,16 +1206,16 @@ fn next_overlay_candidate_tid(
     high_water_offsets: &[u16],
     forward: bool,
 ) -> Option<Tid> {
-    if overlays.len() == 1 {
-        if let Some(candidate) = next_single_overlay_candidate_tid(
+    if overlays.len() == 1
+        && let Some(candidate) = next_single_overlay_candidate_tid(
             &overlays[0],
             relid,
             cursor,
             high_water_offsets,
             forward,
-        ) {
-            return Some(candidate);
-        }
+        )
+    {
+        return Some(candidate);
     }
 
     if forward {
@@ -1444,6 +1444,7 @@ fn scan_next_overlay_only_impl(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_next_overlay_only_batch_impl(
     scan_handle: u64,
     forward: u8,

@@ -214,6 +214,7 @@ impl Page {
         true
     }
 
+    #[allow(dead_code)]
     pub(crate) fn checkpoint(&self) -> PageCheckpoint {
         PageCheckpoint {
             used: self.used,

@@ -522,10 +522,9 @@ impl StorageState {
                 .inserted_tids
                 .get(&relid)
                 .is_some_and(|tids| tids.contains(&tid))
+            && !overlay.set_pending_row_xmax(relid, tid, xmax)
         {
-            if !overlay.set_pending_row_xmax(relid, tid, xmax) {
-                self.set_row_xmax(relid, tid, xmax);
-            }
+            self.set_row_xmax(relid, tid, xmax);
         }
     }
 
@@ -1799,12 +1798,12 @@ pub(crate) fn relation_insert_impl(
         }
 
         let tid = append_pending_input_tuple_current_session(relid, &input)?;
-        if let Some(metadata) = metadata {
-            if !record_current_session_insert_metadata(relid, tid, metadata) {
-                with_storage(|state, _session| {
-                    state.set_insert_metadata(relid, tid, metadata.xid, metadata.cid);
-                });
-            }
+        if let Some(metadata) = metadata
+            && !record_current_session_insert_metadata(relid, tid, metadata)
+        {
+            with_storage(|state, _session| {
+                state.set_insert_metadata(relid, tid, metadata.xid, metadata.cid);
+            });
         }
 
         if record_primary_key {
