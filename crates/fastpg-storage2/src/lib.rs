@@ -1294,16 +1294,6 @@ fn next_single_overlay_candidate_tid(
         .find(|tid| !tid_beyond_high_water(*tid, high_water_offsets))
 }
 
-fn resolve_overlay_tid_redirect(overlays: &[TransactionOverlay], relid: u32, mut tid: Tid) -> Tid {
-    for _ in 0..1_000_000 {
-        let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) else {
-            break;
-        };
-        tid = next_tid;
-    }
-    tid
-}
-
 fn resolve_overlay_update_redirect(
     overlays: &[TransactionOverlay],
     relid: u32,
@@ -2265,7 +2255,6 @@ fn fetch_tid_any_impl(
         return false;
     };
     if let Some(copied) = with_session_storage(|session| {
-        let tid = resolve_overlay_tid_redirect(&session.transaction_stack, relid, tid);
         overlay_pending_tuple_slice(&session.transaction_stack, relid, tid).map(|tuple| {
             copy_tuple_to_outputs(
                 tid,
@@ -2281,7 +2270,6 @@ fn fetch_tid_any_impl(
         return copied;
     }
     with_storage_read(|state, session| {
-        let tid = state.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
         let tuple =
             overlay_pending_tuple_slice(&session.transaction_stack, relid, tid).or_else(|| {
                 state
@@ -2414,6 +2402,58 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup(
         }
     }
     true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata arrays, key input arrays, and a
+/// valid packed storage2 TID for the heap row.
+pub unsafe extern "C" fn fastpg_storage2_primary_key_index_insert_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    packed_tid: u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let Some((values, is_null)) = key_arrays(values, is_null, nkeys) else {
+        return false;
+    };
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: true,
+            nulls_not_distinct: false,
+        })
+    }) else {
+        return false;
+    };
+    let Some(key) = index_key_for_key_datums(&index_spec, values, is_null) else {
+        return false;
+    };
+
+    with_session_storage(|session| {
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        overlay.insert_primary_key(heap_relid, key, tid);
+        true
+    })
 }
 
 #[unsafe(no_mangle)]

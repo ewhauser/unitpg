@@ -736,6 +736,11 @@ impl TransactionOverlay {
                 *new_tid = remap_tid(*new_tid, remaps);
             }
         }
+        if let Some(entries) = self.primary_key_inserts.get_mut(&relid) {
+            for tid in entries.values_mut() {
+                *tid = remap_tid(*tid, remaps);
+            }
+        }
     }
 
     pub(crate) fn accounted_bytes(&self) -> usize {
