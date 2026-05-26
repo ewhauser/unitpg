@@ -20,6 +20,8 @@
 #include "postgres.h"
 
 #ifdef USE_FASTPG
+#include <pthread.h>
+
 #include "access/fastpg_catalog.h"
 #endif
 #include "access/htup_details.h"
@@ -31,11 +33,28 @@
 #include "common/hashfn.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
-#ifdef USE_FASTPG
-#include "utils/relcache.h"
-#endif
 #include "utils/resowner.h"
 #include "utils/syscache.h"
+
+#ifdef USE_FASTPG
+static pthread_mutex_t fastpg_tupdesc_lock = PTHREAD_MUTEX_INITIALIZER;
+static _Thread_local int fastpg_tupdesc_lock_depth = 0;
+
+static void
+FastPgTupleDescLock(void)
+{
+	if (fastpg_tupdesc_lock_depth++ == 0)
+		pthread_mutex_lock(&fastpg_tupdesc_lock);
+}
+
+static void
+FastPgTupleDescUnlock(void)
+{
+	Assert(fastpg_tupdesc_lock_depth > 0);
+	if (--fastpg_tupdesc_lock_depth == 0)
+		pthread_mutex_unlock(&fastpg_tupdesc_lock);
+}
+#endif
 
 /* ResourceOwner callbacks to hold tupledesc references  */
 static void ResOwnerReleaseTupleDesc(Datum res);
@@ -626,7 +645,7 @@ IncrTupleDescRefCount(TupleDesc tupdesc)
 
 	ResourceOwnerEnlarge(CurrentResourceOwner);
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
+	FastPgTupleDescLock();
 	PG_TRY();
 	{
 #endif
@@ -636,11 +655,11 @@ IncrTupleDescRefCount(TupleDesc tupdesc)
 	}
 	PG_CATCH();
 	{
-		FastPgCatalogCacheUnlock();
+		FastPgTupleDescUnlock();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
+	FastPgTupleDescUnlock();
 #endif
 }
 
@@ -658,7 +677,7 @@ DecrTupleDescRefCount(TupleDesc tupdesc)
 	Assert(tupdesc->tdrefcount > 0);
 
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
+	FastPgTupleDescLock();
 	PG_TRY();
 	{
 #endif
@@ -669,11 +688,11 @@ DecrTupleDescRefCount(TupleDesc tupdesc)
 	}
 	PG_CATCH();
 	{
-		FastPgCatalogCacheUnlock();
+		FastPgTupleDescUnlock();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
+	FastPgTupleDescUnlock();
 #endif
 }
 
@@ -1339,7 +1358,7 @@ ResOwnerReleaseTupleDesc(Datum res)
 	/* Like DecrTupleDescRefCount, but don't call ResourceOwnerForget() */
 	Assert(tupdesc->tdrefcount > 0);
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
+	FastPgTupleDescLock();
 	PG_TRY();
 	{
 #endif
@@ -1349,11 +1368,11 @@ ResOwnerReleaseTupleDesc(Datum res)
 	}
 	PG_CATCH();
 	{
-		FastPgCatalogCacheUnlock();
+		FastPgTupleDescUnlock();
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
+	FastPgTupleDescUnlock();
 #endif
 }
 

@@ -17,7 +17,7 @@ STORAGE_ENGINE ?= storage2
 CATALOG_MODE ?= postgres
 CATALOG_PGDATA_MODE ?= seed-skeleton
 FASTPG_POSTGRES_SMGR ?= mem
-FASTPG_USE_MEM_INDEX_AM ?= 0
+FASTPG_USE_MEM_INDEX_AM ?= 1
 PGVECTOR ?= 1
 PGVECTOR_VERSION ?= v0.8.2
 UPSTREAM_REGRESSION_CASES ?=
@@ -38,6 +38,8 @@ PROFILE_SERVER_MEMORY ?= 1
 CRITERION_ARGS ?=
 CLIPPY_ARGS ?= --workspace --all-targets
 UNIT_TEST_WORKLOAD_SCRIPT ?= workloads/unit-test-workload.sql
+UNIT_TEST_WORKLOAD_SETUP_SCRIPT ?= workloads/unit-test-workload-setup.sql
+SETUP_SCRIPT ?=
 PROFILE_OPEN_FLAG := $(if $(filter 1 true yes,$(PROFILE_OPEN)),--profile-open,)
 PROFILE_HYPERFINE_FLAG := $(if $(filter 1 true yes,$(PROFILE_HYPERFINE)),--profile-hyperfine,)
 PROFILE_SERVER_MEMORY_FLAG := $(if $(filter 1 true yes,$(PROFILE_SERVER_MEMORY)),--profile-server-memory,)
@@ -47,6 +49,7 @@ REGRESSION_FAIL_ON_DIFFERENCES_ARG := $(if $(filter 1 true yes,$(REGRESSION_FAIL
 FASTPG_USE_MEM_INDEX_AM_ARG := $(if $(filter 1 true yes,$(FASTPG_USE_MEM_INDEX_AM)),--fastpg-use-mem-index-am,)
 PGVECTOR_ARG := $(if $(filter 0 false no,$(PGVECTOR)),--no-pgvector,)
 PGVECTOR_VERSION_ARG := --pgvector-version "$(PGVECTOR_VERSION)"
+SETUP_SCRIPT_ARG = $(if $(SETUP_SCRIPT),--setup-script "$(SETUP_SCRIPT)",)
 PGVECTOR_TEST_CMD := $(if $(filter 0 false no,$(PGVECTOR)),@true,$(MAKE) pgvector-smoke)
 FASTPG_PGVECTOR_PREFIX := $(CURDIR)/.build/pgbench/fastpg/tmp_install/usr/local/pgsql
 FASTPG_PGVECTOR_SOURCE_DIR := $(CURDIR)/.build/pgbench/pgvector/fastpg-smoke
@@ -65,6 +68,7 @@ PGBENCH_COMMON_ARGS = \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--rust-build-profile "$(RUST_BUILD_PROFILE)" \
+	$(SETUP_SCRIPT_ARG) \
 	$(PGVECTOR_ARG) \
 	$(PGVECTOR_VERSION_ARG) \
 	$(FASTPG_USE_MEM_INDEX_AM_ARG)
@@ -83,6 +87,7 @@ PGBENCH_PROFILE_ARGS = \
 	--fastpg-catalog-pgdata-mode "$(CATALOG_PGDATA_MODE)" \
 	--fastpg-postgres-smgr "$(FASTPG_POSTGRES_SMGR)" \
 	--rust-build-profile "release" \
+	$(SETUP_SCRIPT_ARG) \
 	$(PGVECTOR_ARG) \
 	$(PGVECTOR_VERSION_ARG) \
 	--profile-fastpg-rust-server \
@@ -123,6 +128,7 @@ pgbench-tpcb:
 pgbench-unit-test-workload: TRANSACTIONS = 200
 pgbench-unit-test-workload: CLIENTS = 10
 pgbench-unit-test-workload: JOBS = 10
+pgbench-unit-test-workload: SETUP_SCRIPT = $(UNIT_TEST_WORKLOAD_SETUP_SCRIPT)
 pgbench-unit-test-workload:
 	$(PYTHON) pgbench_compare.py \
 		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \
@@ -139,6 +145,7 @@ profile-unit-test-workload: PROFILE_TRANSACTIONS = 500
 profile-unit-test-workload: PROFILE_RUNS = 1
 profile-unit-test-workload: CLIENTS = 10
 profile-unit-test-workload: JOBS = 10
+profile-unit-test-workload: SETUP_SCRIPT = $(UNIT_TEST_WORKLOAD_SETUP_SCRIPT)
 profile-unit-test-workload:
 	$(PYTHON) pgbench_compare.py \
 		--script "$(UNIT_TEST_WORKLOAD_SCRIPT)" \

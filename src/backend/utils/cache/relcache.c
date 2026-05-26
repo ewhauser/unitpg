@@ -148,6 +148,14 @@ static HTAB *RelationIdCache;
 #ifdef USE_FASTPG
 static pthread_mutex_t fastpg_catalog_cache_lock = PTHREAD_MUTEX_INITIALIZER;
 static _Thread_local int fastpg_catalog_cache_lock_depth = 0;
+#define FASTPG_LOCAL_RELCACHE_SLOTS 256
+
+typedef struct FastPgLocalRelCacheEntry
+{
+	Oid			relid;
+	uint64		generation;
+	Relation	rel;
+} FastPgLocalRelCacheEntry;
 
 typedef struct FastPgLocalRelRef
 {
@@ -157,6 +165,64 @@ typedef struct FastPgLocalRelRef
 } FastPgLocalRelRef;
 
 static _Thread_local FastPgLocalRelRef *fastpg_local_relrefs = NULL;
+static _Thread_local FastPgLocalRelCacheEntry
+			fastpg_local_relcache[FASTPG_LOCAL_RELCACHE_SLOTS];
+static uint64 fastpg_relcache_generation = 1;
+
+uint64
+FastPgRelcacheGeneration(void)
+{
+	return __atomic_load_n(&fastpg_relcache_generation, __ATOMIC_ACQUIRE);
+}
+
+static inline void
+FastPgRelcacheBumpGeneration(void)
+{
+	(void) __atomic_add_fetch(&fastpg_relcache_generation, 1,
+							  __ATOMIC_ACQ_REL);
+}
+
+static inline FastPgLocalRelCacheEntry *
+FastPgLocalRelCacheSlot(Oid relid)
+{
+	return &fastpg_local_relcache[relid % FASTPG_LOCAL_RELCACHE_SLOTS];
+}
+
+static Relation
+FastPgLocalRelCacheLookup(Oid relid)
+{
+	uint64		generation = FastPgRelcacheGeneration();
+	FastPgLocalRelCacheEntry *entry = FastPgLocalRelCacheSlot(relid);
+	Relation	rel = entry->rel;
+
+	if (entry->relid != relid ||
+		entry->generation != generation ||
+		!RelationIsValid(rel) ||
+		rel->rd_id != relid ||
+		!rel->rd_isvalid ||
+		rel->rd_droppedSubid != InvalidSubTransactionId)
+		return NULL;
+
+	RelationIncrementReferenceCount(rel);
+	return rel;
+}
+
+static void
+FastPgLocalRelCacheRemember(Oid relid, Relation rel)
+{
+	FastPgLocalRelCacheEntry *entry;
+
+	if (!RelationIsValid(rel) ||
+		rel->rd_id != relid ||
+		!rel->rd_isvalid ||
+		rel->rd_droppedSubid != InvalidSubTransactionId)
+		return;
+
+	entry = FastPgLocalRelCacheSlot(relid);
+	entry->relid = relid;
+	entry->rel = rel;
+	entry->generation = FastPgRelcacheGeneration();
+}
 
 void
 FastPgCatalogCacheLock(void)
@@ -243,7 +309,8 @@ FastPgCurrentBackendOwnsAllRelationRefs(Relation rel)
 {
 	int			local_refs = FastPgCurrentBackendRelationRefCount(rel);
 
-	return local_refs > 0 && rel->rd_refcnt == local_refs;
+	return local_refs > 0 &&
+		__atomic_load_n(&rel->rd_refcnt, __ATOMIC_ACQUIRE) == local_refs;
 }
 
 static void
@@ -251,6 +318,8 @@ FastPgMarkSharedRelationInvalid(Relation relation)
 {
 	relation->rd_isvalid = false;
 }
+#else
+#define FastPgRelcacheBumpGeneration() ((void) 0)
 #endif
 
 /*
@@ -345,13 +414,14 @@ do { \
 										   &((RELATION)->rd_id), \
 										   HASH_ENTER, &found); \
 	if (found) \
-	{ \
-		/* see comments in RelationBuildDesc and RelationBuildLocalRelation */ \
-		Relation _old_rel = hentry->reldesc; \
-		Assert(replace_allowed); \
-		hentry->reldesc = (RELATION); \
-		if (RelationHasReferenceCountZero(_old_rel)) \
-			RelationDestroyRelation(_old_rel, false); \
+		{ \
+			/* see comments in RelationBuildDesc and RelationBuildLocalRelation */ \
+			Relation _old_rel = hentry->reldesc; \
+			Assert(replace_allowed); \
+			FastPgRelcacheBumpGeneration(); \
+			hentry->reldesc = (RELATION); \
+			if (RelationHasReferenceCountZero(_old_rel)) \
+				RelationDestroyRelation(_old_rel, false); \
 		else if (!IsBootstrapProcessingMode()) \
 			elog(WARNING, "leaking still-referenced relcache entry for \"%s\"", \
 				 RelationGetRelationName(_old_rel)); \
@@ -2571,7 +2641,6 @@ UseFastPgMemIndexAm(Relation relation)
 		IsUnderPostmaster ||
 		relation->rd_index == NULL ||
 		relation->rd_indextuple == NULL ||
-		!relation->rd_index->indisunique ||
 		relation->rd_index->indisexclusion ||
 		relation->rd_rel->relam != BTREE_AM_OID ||
 		!UseFastPgMemTableAmOid(relation->rd_index->indrelid))
@@ -2958,6 +3027,10 @@ RelationIdGetRelation(Oid relationId)
 	Relation	result = NULL;
 
 #ifdef USE_FASTPG
+	result = FastPgLocalRelCacheLookup(relationId);
+	if (RelationIsValid(result))
+		return result;
+
 	FastPgCatalogCacheLock();
 	PG_TRY();
 	{
@@ -2972,6 +3045,7 @@ RelationIdGetRelation(Oid relationId)
 	}
 	PG_END_TRY();
 	FastPgCatalogCacheUnlock();
+	FastPgLocalRelCacheRemember(relationId, result);
 #endif
 	return result;
 }
@@ -3028,26 +3102,16 @@ void
 RelationIncrementReferenceCount(Relation rel)
 {
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
 	ResourceOwnerEnlarge(CurrentResourceOwner);
-	rel->rd_refcnt += 1;
-#ifdef USE_FASTPG
+	__atomic_add_fetch(&rel->rd_refcnt, 1, __ATOMIC_ACQ_REL);
 	FastPgRememberLocalRelationRef(rel);
-#endif
 	if (!IsBootstrapProcessingMode())
 		ResourceOwnerRememberRelationRef(CurrentResourceOwner, rel);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
+#else
+	ResourceOwnerEnlarge(CurrentResourceOwner);
+	rel->rd_refcnt += 1;
+	if (!IsBootstrapProcessingMode())
+		ResourceOwnerRememberRelationRef(CurrentResourceOwner, rel);
 #endif
 }
 
@@ -3059,26 +3123,16 @@ void
 RelationDecrementReferenceCount(Relation rel)
 {
 #ifdef USE_FASTPG
-	FastPgCatalogCacheLock();
-	PG_TRY();
-	{
-#endif
-	Assert(rel->rd_refcnt > 0);
-	rel->rd_refcnt -= 1;
-#ifdef USE_FASTPG
+	Assert(__atomic_load_n(&rel->rd_refcnt, __ATOMIC_ACQUIRE) > 0);
+	__atomic_sub_fetch(&rel->rd_refcnt, 1, __ATOMIC_ACQ_REL);
 	FastPgForgetLocalRelationRef(rel);
-#endif
 	if (!IsBootstrapProcessingMode())
 		ResourceOwnerForgetRelationRef(CurrentResourceOwner, rel);
-#ifdef USE_FASTPG
-	}
-	PG_CATCH();
-	{
-		FastPgCatalogCacheUnlock();
-		PG_RE_THROW();
-	}
-	PG_END_TRY();
-	FastPgCatalogCacheUnlock();
+#else
+	Assert(rel->rd_refcnt > 0);
+	rel->rd_refcnt -= 1;
+	if (!IsBootstrapProcessingMode())
+		ResourceOwnerForgetRelationRef(CurrentResourceOwner, rel);
 #endif
 }
 
@@ -3412,6 +3466,9 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
 static void
 RelationInvalidateRelation(Relation relation)
 {
+#ifdef USE_FASTPG
+	FastPgRelcacheBumpGeneration();
+#endif
 	/*
 	 * Make sure smgr and lower levels close the relation's files, if they
 	 * weren't closed already.  If the relation is not getting deleted, the

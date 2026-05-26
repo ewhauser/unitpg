@@ -345,9 +345,47 @@ pub(crate) fn byref_len_from_bytes(typlen: i16, bytes: &[u8]) -> Option<usize> {
     }
 }
 
+pub(crate) fn byref_key_bytes(
+    typlen: i16,
+    value: usize,
+    fallback_len: Option<usize>,
+) -> Option<Vec<u8>> {
+    if typlen == -1 {
+        let (offset, len) = varlena_payload_range(value)?;
+        return Some(
+            unsafe { slice::from_raw_parts((value as *const u8).add(offset), len) }.to_vec(),
+        );
+    }
+    let len = byref_len(typlen, value, fallback_len)?;
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    if value == 0 {
+        return None;
+    }
+    Some(unsafe { slice::from_raw_parts(value as *const u8, len) }.to_vec())
+}
+
+pub(crate) fn byref_key_bytes_from_bytes(typlen: i16, bytes: &[u8]) -> Option<Vec<u8>> {
+    if typlen == -1 {
+        let (offset, len) = varlena_payload_range_from_bytes(bytes)?;
+        return Some(bytes.get(offset..offset + len)?.to_vec());
+    }
+    let len = byref_len_from_bytes(typlen, bytes)?;
+    Some(bytes.get(..len)?.to_vec())
+}
+
 pub(crate) fn varlena_payload_len(value: usize) -> Option<usize> {
     if value == 0 {
         return None;
+    }
+    let tag = unsafe { std::ptr::read(value as *const u8) };
+    if tag & 0x01 != 0 {
+        if tag == 0x01 {
+            return None;
+        }
+        let len = (tag >> 1) as usize;
+        return (len >= 1).then_some(len);
     }
     let raw = unsafe { std::ptr::read_unaligned(value as *const u32) };
     let len = if cfg!(target_endian = "little") {
@@ -356,6 +394,46 @@ pub(crate) fn varlena_payload_len(value: usize) -> Option<usize> {
         raw as usize
     };
     (len >= 4).then_some(len)
+}
+
+fn varlena_payload_range(value: usize) -> Option<(usize, usize)> {
+    if value == 0 {
+        return None;
+    }
+    let tag = unsafe { std::ptr::read(value as *const u8) };
+    if tag & 0x01 != 0 {
+        if tag == 0x01 {
+            return None;
+        }
+        let len = (tag >> 1) as usize;
+        return (len >= 1).then_some((1, len - 1));
+    }
+    let raw = unsafe { std::ptr::read_unaligned(value as *const u32) };
+    let len = if cfg!(target_endian = "little") {
+        (raw >> 2) as usize
+    } else {
+        raw as usize
+    };
+    (len >= 4).then_some((4, len - 4))
+}
+
+fn varlena_payload_range_from_bytes(bytes: &[u8]) -> Option<(usize, usize)> {
+    let tag = *bytes.first()?;
+    if tag & 0x01 != 0 {
+        if tag == 0x01 {
+            return None;
+        }
+        let len = (tag >> 1) as usize;
+        return (len >= 1 && len <= bytes.len()).then_some((1, len - 1));
+    }
+    let header = bytes.get(..4)?;
+    let raw = u32::from_ne_bytes(header.try_into().ok()?);
+    let len = if cfg!(target_endian = "little") {
+        (raw >> 2) as usize
+    } else {
+        raw as usize
+    };
+    (len >= 4 && len <= bytes.len()).then_some((4, len - 4))
 }
 
 pub(crate) fn c_string_payload_len(value: usize) -> Option<usize> {

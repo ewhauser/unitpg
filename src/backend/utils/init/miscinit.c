@@ -69,8 +69,10 @@ static List *lock_files = NIL;
 
 #ifdef USE_FASTPG
 static _Thread_local Latch LocalLatchData;
+#define FASTPG_SESSION_LOCAL PG_THREAD_LOCAL
 #else
 static Latch LocalLatchData;
+#define FASTPG_SESSION_LOCAL
 #endif
 
 /* ----------------------------------------------------------------
@@ -451,19 +453,19 @@ ChangeToDataDir(void)
  * convenient way to do it.
  * ----------------------------------------------------------------
  */
-static Oid	AuthenticatedUserId = InvalidOid;
-static Oid	SessionUserId = InvalidOid;
-static Oid	OuterUserId = InvalidOid;
-static Oid	CurrentUserId = InvalidOid;
-static const char *SystemUser = NULL;
+static FASTPG_SESSION_LOCAL Oid AuthenticatedUserId = InvalidOid;
+static FASTPG_SESSION_LOCAL Oid SessionUserId = InvalidOid;
+static FASTPG_SESSION_LOCAL Oid OuterUserId = InvalidOid;
+static FASTPG_SESSION_LOCAL Oid CurrentUserId = InvalidOid;
+static FASTPG_SESSION_LOCAL const char *SystemUser = NULL;
 
 /* We also have to remember the superuser state of the session user */
-static bool SessionUserIsSuperuser = false;
+static FASTPG_SESSION_LOCAL bool SessionUserIsSuperuser = false;
 
-static int	SecurityRestrictionContext = 0;
+static FASTPG_SESSION_LOCAL int SecurityRestrictionContext = 0;
 
 /* We also remember if a SET ROLE is currently active */
-static bool SetRoleIsActive = false;
+static FASTPG_SESSION_LOCAL bool SetRoleIsActive = false;
 
 /*
  * GetUserId - get the current effective user ID.

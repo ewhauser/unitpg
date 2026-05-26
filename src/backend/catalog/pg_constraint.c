@@ -31,10 +31,91 @@
 #include "common/int.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
+#include "utils/catcache.h"
 #include "utils/fmgroids.h"
 #include "utils/lsyscache.h"
+#include "utils/memutils.h"
 #include "utils/rel.h"
+#include "utils/relcache.h"
 #include "utils/syscache.h"
+
+#ifdef USE_FASTPG
+#define FASTPG_PK_ATTNOS_CACHE_SLOTS 256
+
+typedef struct FastPgPrimaryKeyAttnosCacheEntry
+{
+	Oid			relid;
+	bool		deferrable_ok;
+	bool		valid;
+	uint64		generation;
+	Oid			constraint_oid;
+	Bitmapset  *attnos;
+} FastPgPrimaryKeyAttnosCacheEntry;
+
+static PG_THREAD_LOCAL FastPgPrimaryKeyAttnosCacheEntry
+			fastpg_pk_attnos_cache[FASTPG_PK_ATTNOS_CACHE_SLOTS];
+
+static inline FastPgPrimaryKeyAttnosCacheEntry *
+FastPgPrimaryKeyAttnosCacheSlot(Oid relid, bool deferrableOk)
+{
+	uint32		slot = relid;
+
+	if (deferrableOk)
+		slot ^= 0x9e3779b9U;
+	return &fastpg_pk_attnos_cache[slot % FASTPG_PK_ATTNOS_CACHE_SLOTS];
+}
+
+static bool
+FastPgPrimaryKeyAttnosCacheLookup(Oid relid, bool deferrableOk,
+								  uint64 generation,
+								  Oid *constraintOid,
+								  Bitmapset **pkattnos)
+{
+	FastPgPrimaryKeyAttnosCacheEntry *entry =
+		FastPgPrimaryKeyAttnosCacheSlot(relid, deferrableOk);
+
+	if (!entry->valid ||
+		entry->relid != relid ||
+		entry->deferrable_ok != deferrableOk ||
+		entry->generation != generation)
+		return false;
+
+	*constraintOid = entry->constraint_oid;
+	*pkattnos = entry->attnos ? bms_copy(entry->attnos) : NULL;
+	return true;
+}
+
+static void
+FastPgPrimaryKeyAttnosCacheRemember(Oid relid, bool deferrableOk,
+									uint64 generation,
+									Oid constraintOid,
+									Bitmapset *pkattnos)
+{
+	FastPgPrimaryKeyAttnosCacheEntry *entry =
+		FastPgPrimaryKeyAttnosCacheSlot(relid, deferrableOk);
+	MemoryContext oldcontext;
+	Bitmapset  *cached_attnos = NULL;
+
+	if (generation != FastPgRelcacheGeneration())
+		return;
+
+	if (!CacheMemoryContext)
+		CreateCacheMemoryContext();
+
+	oldcontext = MemoryContextSwitchTo(CacheMemoryContext);
+	cached_attnos = pkattnos ? bms_copy(pkattnos) : NULL;
+	MemoryContextSwitchTo(oldcontext);
+
+	if (entry->attnos)
+		bms_free(entry->attnos);
+	entry->relid = relid;
+	entry->deferrable_ok = deferrableOk;
+	entry->valid = true;
+	entry->generation = generation;
+	entry->constraint_oid = constraintOid;
+	entry->attnos = cached_attnos;
+}
+#endif
 
 
 /*
@@ -1456,9 +1537,19 @@ get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
 	HeapTuple	tuple;
 	SysScanDesc scan;
 	ScanKeyData skey[1];
+#ifdef USE_FASTPG
+	uint64		fastpg_cache_generation = FastPgRelcacheGeneration();
+#endif
 
 	/* Set *constraintOid, to avoid complaints about uninitialized vars */
 	*constraintOid = InvalidOid;
+
+#ifdef USE_FASTPG
+	if (FastPgPrimaryKeyAttnosCacheLookup(relid, deferrableOk,
+										 fastpg_cache_generation,
+										 constraintOid, &pkattnos))
+		return pkattnos;
+#endif
 
 	/* Scan pg_constraint for constraints of the target rel */
 	pg_constraint = table_open(ConstraintRelationId, AccessShareLock);
@@ -1523,6 +1614,12 @@ get_primary_key_attnos(Oid relid, bool deferrableOk, Oid *constraintOid)
 	systable_endscan(scan);
 
 	table_close(pg_constraint, AccessShareLock);
+
+#ifdef USE_FASTPG
+	FastPgPrimaryKeyAttnosCacheRemember(relid, deferrableOk,
+										fastpg_cache_generation,
+										*constraintOid, pkattnos);
+#endif
 
 	return pkattnos;
 }

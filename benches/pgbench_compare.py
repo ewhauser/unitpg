@@ -212,6 +212,7 @@ class PgBenchCompare:
             "config": {
                 "builtin": args.builtin,
                 "script": args.script,
+                "setup_script": args.setup_script,
                 "skip_pgbench_init": args.skip_pgbench_init,
                 "init_steps": args.init_steps,
                 "scale": args.scale,
@@ -245,6 +246,7 @@ class PgBenchCompare:
                 args.builtin,
                 args.init_steps,
                 args.script,
+                args.setup_script,
                 args.skip_pgbench_init,
             ),
             "warnings": workload_warnings(args.init_steps, args.script),
@@ -981,6 +983,17 @@ class PgBenchCompare:
                 )
                 run_record["commands"]["pgbench_init"] = init.as_json()
 
+            if self.args.setup_script is not None:
+                setup = self.checked_command(
+                    variant.name,
+                    "workload-setup",
+                    self.psql_script_command(paths["bindir"], str(socket_dir), port),
+                    run_dir,
+                    "workload-setup",
+                    env=env,
+                )
+                run_record["commands"]["workload_setup"] = setup.as_json()
+
             if self.should_profile_normal_postgres(variant) and self.args.profile_phase == "run":
                 postmaster_pid = read_postmaster_pid(data_dir)
                 bench, profiler, server_memory = self.run_profiled_postgres_pgbench(
@@ -1120,6 +1133,17 @@ class PgBenchCompare:
                     env=env,
                 )
                 run_record["commands"]["pgbench_init"] = init.as_json()
+
+            if self.args.setup_script is not None:
+                setup = self.checked_command(
+                    variant.name,
+                    "workload-setup",
+                    self.psql_script_command(paths["client_bindir"], host, port),
+                    run_dir,
+                    "workload-setup",
+                    env=env,
+                )
+                run_record["commands"]["workload_setup"] = setup.as_json()
 
             if self.should_profile_rust_server(variant) and self.args.profile_phase == "run":
                 profiler = self.start_rust_profiler(variant.name, server, run_dir)
@@ -1720,6 +1744,24 @@ class PgBenchCompare:
         ])
         return command
 
+    def psql_script_command(self, bindir: Path, host: str, port: int) -> list[str]:
+        if self.args.setup_script is None:
+            raise ValueError("setup_script is required")
+        return [
+            str(bindir / "psql"),
+            "-h",
+            host,
+            "-p",
+            str(port),
+            "-U",
+            "postgres",
+            "-v",
+            "ON_ERROR_STOP=1",
+            "-f",
+            self.args.setup_script,
+            "postgres",
+        ]
+
     def checked_command(
         self,
         variant: str,
@@ -1828,10 +1870,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--builtin", default="simple-update")
     parser.add_argument("--script", help="run a custom pgbench transaction script with -f")
+    parser.add_argument("--setup-script", help="run a SQL setup script once before the pgbench transaction run")
     parser.add_argument(
         "--skip-pgbench-init",
         action="store_true",
-        help="skip pgbench -i setup when the workload script creates its own schema",
+        help="skip pgbench -i setup when the workload setup/script creates its own schema",
     )
     parser.add_argument("--init-steps", default="dt")
     parser.add_argument("--scale", type=int, default=1)
@@ -2773,15 +2816,22 @@ def has_primary_key_init_step(init_steps: str | None) -> bool:
 
 
 def workload_metadata(
-    builtin: str, init_steps: str | None, script: str | None, skip_pgbench_init: bool
+    builtin: str,
+    init_steps: str | None,
+    script: str | None,
+    setup_script: str | None,
+    skip_pgbench_init: bool,
 ) -> dict[str, Any]:
     if script is not None:
         script_path = Path(script)
-        return {
+        metadata = {
             "label": f"pgbench custom script {script_path.stem} comparison",
             "script": str(script_path),
             "skips_pgbench_init": skip_pgbench_init,
         }
+        if setup_script is not None:
+            metadata["setup_script"] = str(Path(setup_script))
+        return metadata
 
     indexed = has_primary_key_init_step(init_steps)
     workload_name = "TPC-B-like" if builtin == "tpcb-like" else builtin
@@ -2816,7 +2866,8 @@ def workload_warnings(init_steps: str | None, script: str | None) -> list[str]:
 
 def workload_note(args: argparse.Namespace) -> str:
     if args.script is not None:
-        return f"script={args.script} scale={args.scale} transactions={args.transactions}"
+        setup = f" setup={args.setup_script}" if args.setup_script is not None else ""
+        return f"script={args.script}{setup} scale={args.scale} transactions={args.transactions}"
     return f"builtin={args.builtin} scale={args.scale} transactions={args.transactions}"
 
 
@@ -3410,8 +3461,12 @@ def main(argv: list[str]) -> int:
             args.script,
             Path(__file__).resolve().parents[1],
         )
+        args.setup_script = resolve_pgbench_script_path(
+            args.setup_script,
+            Path(__file__).resolve().parents[1],
+        )
     except FileNotFoundError as error:
-        print(f"pgbench script not found: {error}", file=sys.stderr)
+        print(f"pgbench SQL script not found: {error}", file=sys.stderr)
         return 2
 
     runner = PgBenchCompare(args)

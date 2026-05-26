@@ -160,6 +160,16 @@ fastpg_pgcore_complete_storage2_xact_finish(bool force_abort)
 		fastpg_storage2_xact_commit();
 	fastpg_mem_release_row_locks();
 }
+
+static int
+fastpg_pgcore_cursor_options(void)
+{
+	/*
+	 * The single-process FastPG table/index AMs do not support parallel
+	 * scans yet, so avoid planning pgcore statements as parallel-safe.
+	 */
+	return 0;
+}
 #else
 #define FASTPG_PGCORE_CATALOG_ERROR_CLEANUP() ((void) 0)
 #endif
@@ -3102,8 +3112,7 @@ fastpg_pgcore_prepare(const char *query)
 		else
 		{
 #ifdef USE_FASTPG
-			cursor_options = fastpg_catalog_mode_uses_postgres() ?
-				CURSOR_OPT_PARALLEL_OK : 0;
+			cursor_options = fastpg_pgcore_cursor_options();
 #else
 			cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif
@@ -3623,8 +3632,7 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 			int			cursor_options;
 
 #ifdef USE_FASTPG
-			cursor_options = fastpg_catalog_mode_uses_postgres() ?
-				CURSOR_OPT_PARALLEL_OK : 0;
+			cursor_options = fastpg_pgcore_cursor_options();
 #else
 			cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif
@@ -4186,8 +4194,7 @@ fastpg_pgcore_execute_simple(const char *query)
 		}
 
 #ifdef USE_FASTPG
-		cursor_options = postgres_catalog ?
-			CURSOR_OPT_PARALLEL_OK : 0;
+		cursor_options = fastpg_pgcore_cursor_options();
 #else
 		cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif

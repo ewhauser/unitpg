@@ -316,16 +316,8 @@ fn index_key_part_for_input(
         return Some(IndexKeyPart::ByValue(*input.values.get(index)?));
     }
     let value = *input.values.get(index)?;
-    let len = byref_len(column.typlen, value, Some(*input.value_lens.get(index)?))?;
-    let bytes = if len == 0 {
-        Vec::new()
-    } else {
-        if value == 0 {
-            return None;
-        }
-        unsafe { slice::from_raw_parts(value as *const u8, len) }.to_vec()
-    };
-    Some(IndexKeyPart::Bytes(bytes))
+    byref_key_bytes(column.typlen, value, Some(*input.value_lens.get(index)?))
+        .map(IndexKeyPart::Bytes)
 }
 
 fn index_key_part_for_decoded(
@@ -340,8 +332,7 @@ fn index_key_part_for_decoded(
             if column.typbyval {
                 return None;
             }
-            let len = byref_len_from_bytes(column.typlen, bytes)?;
-            Some(IndexKeyPart::Bytes(bytes.get(..len)?.to_vec()))
+            byref_key_bytes_from_bytes(column.typlen, bytes).map(IndexKeyPart::Bytes)
         }
     }
 }
@@ -359,11 +350,5 @@ fn index_key_part_for_key_datum(
     if column.typbyval {
         return Some(IndexKeyPart::ByValue(values[key_index]));
     }
-    let len = byref_len(column.typlen, values[key_index], None)?;
-    let bytes = if len == 0 {
-        Vec::new()
-    } else {
-        unsafe { slice::from_raw_parts(values[key_index] as *const u8, len) }.to_vec()
-    };
-    Some(IndexKeyPart::Bytes(bytes))
+    byref_key_bytes(column.typlen, values[key_index], None).map(IndexKeyPart::Bytes)
 }

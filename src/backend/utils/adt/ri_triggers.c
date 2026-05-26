@@ -24,6 +24,9 @@
 #include "postgres.h"
 
 #include "access/amapi.h"
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/skey.h"
@@ -337,6 +340,19 @@ static bool ri_FastPathProbeOne(Relation pk_rel, Relation idx_rel,
 								IndexScanDesc scandesc, TupleTableSlot *slot,
 								Snapshot snapshot, const RI_ConstraintInfo *riinfo,
 								ScanKeyData *skey, int nkeys);
+#ifdef USE_FASTPG
+static bool ri_FastPathProbeFastPg(Relation pk_rel, Relation idx_rel,
+								   TupleTableSlot *slot, Snapshot snapshot,
+								   ScanKeyData *skey, int nkeys,
+								   bool *handled);
+static int	ri_FastPathFlushArrayFastPg(RI_FastPathEntry *fpentry,
+										TupleTableSlot *pk_slot,
+										const RI_ConstraintInfo *riinfo,
+										Relation pk_rel, Relation idx_rel,
+										Snapshot snapshot,
+										Datum *search_vals,
+										bool *handled);
+#endif
 static bool ri_LockPKTuple(Relation pk_rel, TupleTableSlot *slot, Snapshot snap,
 						   bool *concurrently_updated);
 static bool ri_fastpath_is_applicable(const RI_ConstraintInfo *riinfo);
@@ -2807,8 +2823,10 @@ ri_FastPathCheck(RI_ConstraintInfo *riinfo,
 	/*
 	 * Advance the command counter so the snapshot sees the effects of prior
 	 * triggers in this statement.  Mirrors what the SPI path does in
-	 * ri_PerformCheck().
+	 * ri_PerformCheck().  Force the current CID to be marked used first;
+	 * otherwise CommandCounterIncrement() can be a no-op in this fast path.
 	 */
+	(void) GetCurrentCommandId(true);
 	CommandCounterIncrement();
 	snapshot = RegisterSnapshot(GetTransactionSnapshot());
 
@@ -2920,6 +2938,8 @@ ri_FastPathBatchFlush(RI_FastPathEntry *fpentry, Relation fk_rel,
 	 * -- the only difference is that the SPI path sets and restores the
 	 * context per row whereas we do it once around the whole batch.
 	 */
+	/* Force the current CID to be marked used so CCI cannot be a no-op. */
+	(void) GetCurrentCommandId(true);
 	CommandCounterIncrement();
 	snapshot = RegisterSnapshot(GetTransactionSnapshot());
 
@@ -3086,6 +3106,20 @@ ri_FastPathFlushArray(RI_FastPathEntry *fpentry, TupleTableSlot *fk_slot,
 			search_vals[i] = pk_vals[0];
 	}
 
+#ifdef USE_FASTPG
+	{
+		bool		fastpg_handled = false;
+		int			fastpg_violation;
+
+		fastpg_violation = ri_FastPathFlushArrayFastPg(fpentry, pk_slot,
+													   riinfo, pk_rel, idx_rel,
+													   snapshot, search_vals,
+													   &fastpg_handled);
+		if (fastpg_handled)
+			return fastpg_violation;
+	}
+#endif
+
 	/*
 	 * Array element type must match the operator's right-hand input type,
 	 * which is what the index comparison expects on the search side.
@@ -3181,6 +3215,103 @@ ri_FastPathFlushArray(RI_FastPathEntry *fpentry, TupleTableSlot *fk_slot,
 	return -1;
 }
 
+#ifdef USE_FASTPG
+static bool
+ri_FastPathProbeFastPg(Relation pk_rel, Relation idx_rel,
+					   TupleTableSlot *slot, Snapshot snapshot,
+					   ScanKeyData *skey, int nkeys,
+					   bool *handled)
+{
+	Datum		values[INDEX_MAX_KEYS];
+	bool		isnull[INDEX_MAX_KEYS];
+	bool		concurrently_updated;
+
+	*handled = false;
+	for (int i = 0; i < nkeys; i++)
+	{
+		if (skey[i].sk_flags & SK_ISNULL)
+			return false;
+		values[i] = skey[i].sk_argument;
+		isnull[i] = false;
+	}
+
+	if (!FastPgMemLookupPrimaryKeyTuple(pk_rel, idx_rel, values, isnull,
+										nkeys, snapshot, slot, handled))
+		return false;
+	if (!*handled)
+		return false;
+
+	if (!ri_LockPKTuple(pk_rel, slot, snapshot, &concurrently_updated))
+		return false;
+	if (concurrently_updated)
+		return recheck_matched_pk_tuple(idx_rel, skey, nkeys, slot);
+	return true;
+}
+
+static int
+ri_FastPathFlushArrayFastPg(RI_FastPathEntry *fpentry,
+							TupleTableSlot *pk_slot,
+							const RI_ConstraintInfo *riinfo,
+							Relation pk_rel, Relation idx_rel,
+							Snapshot snapshot,
+							Datum *search_vals,
+							bool *handled)
+{
+	FastPathMeta *fpmeta = riinfo->fpmeta;
+	bool		matched[RI_FASTPATH_BATCH_SIZE];
+	int			nvals = fpentry->batch_count;
+
+	*handled = false;
+	memset(matched, 0, nvals * sizeof(bool));
+
+	for (int i = 0; i < nvals; i++)
+	{
+		Datum		values[1];
+		bool		isnull[1];
+		bool		lookup_handled = false;
+		bool		concurrently_updated;
+		ScanKeyData recheck_skey[1];
+
+		values[0] = search_vals[i];
+		isnull[0] = false;
+		if (!FastPgMemLookupPrimaryKeyTuple(pk_rel, idx_rel,
+											values, isnull, 1,
+											snapshot, pk_slot,
+											&lookup_handled))
+		{
+			if (!lookup_handled)
+				return -1;
+			*handled = true;
+			continue;
+		}
+		*handled = true;
+
+		if (!ri_LockPKTuple(pk_rel, pk_slot, snapshot, &concurrently_updated))
+			continue;
+
+		if (concurrently_updated)
+		{
+			ScanKeyEntryInitialize(&recheck_skey[0], 0, 1,
+								   fpmeta->strats[0],
+								   fpmeta->subtypes[0],
+								   idx_rel->rd_indcollation[0],
+								   fpmeta->regops[0],
+								   search_vals[i]);
+			if (!recheck_matched_pk_tuple(idx_rel, recheck_skey, 1, pk_slot))
+				continue;
+		}
+		matched[i] = true;
+	}
+
+	if (!*handled)
+		return -1;
+	for (int i = 0; i < nvals; i++)
+		if (!matched[i])
+			return i;
+	return -1;
+}
+#endif
+
 /*
  * ri_FastPathProbeOne
  *		Probe the PK index for one set of scan keys, lock the matching
@@ -3196,6 +3327,15 @@ ri_FastPathProbeOne(Relation pk_rel, Relation idx_rel,
 					ScanKeyData *skey, int nkeys)
 {
 	bool		found = false;
+#ifdef USE_FASTPG
+	bool		fastpg_handled = false;
+
+	if (ri_FastPathProbeFastPg(pk_rel, idx_rel, slot, snapshot,
+							   skey, nkeys, &fastpg_handled))
+		return true;
+	if (fastpg_handled)
+		return false;
+#endif
 
 	index_rescan(scandesc, skey, nkeys, NULL, 0);
 

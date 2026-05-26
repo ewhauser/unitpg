@@ -1091,6 +1091,7 @@ def helper_args(args: argparse.Namespace) -> argparse.Namespace:
     return argparse.Namespace(
         builtin="simple-update",
         script=None,
+        setup_script=None,
         skip_pgbench_init=False,
         init_steps="dtg",
         scale=1,

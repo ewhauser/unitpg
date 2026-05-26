@@ -9,6 +9,9 @@ pub(crate) struct RelationStorage {
     pub(crate) row_delete_xids: HashMap<Tid, u32>,
     pub(crate) row_delete_cids: HashMap<Tid, u32>,
     pub(crate) live_tids: BTreeSet<Tid>,
+    pub(crate) pending_reserved_tids: BTreeSet<Tid>,
+    pub(crate) pending_reserved_blocks: BTreeSet<u32>,
+    pub(crate) appendable_blocks: BTreeSet<u32>,
     pub(crate) next_block: u32,
     pub(crate) append_hint: Option<u32>,
     pub(crate) live_tuple_count: usize,
@@ -21,6 +24,7 @@ pub(crate) struct RelationStorage {
 }
 
 impl RelationStorage {
+    #[allow(dead_code)]
     pub(crate) fn checkpoint(&self) -> RelationCheckpoint {
         RelationCheckpoint {
             pages_len: self.pages.len(),
@@ -41,12 +45,23 @@ impl RelationStorage {
             .next_block
             .max(checkpoint.next_block)
             .max(u32::try_from(self.pages.len()).unwrap_or(u32::MAX));
-        self.append_hint = checkpoint.append_hint.filter(|block| {
-            self.page(*block)
-                .is_some_and(|page| self.page_can_accept_tuple(page, 1))
-        });
         self.max_tuples_per_block = checkpoint.max_tuples_per_block;
+        self.recompute_appendable_blocks();
         self.recompute_tuple_stats();
+    }
+
+    pub(crate) fn restore_rollback_metadata_preserving_tid_space(
+        &mut self,
+        checkpoint: RelationCheckpoint,
+    ) {
+        self.next_block = self
+            .next_block
+            .max(checkpoint.next_block)
+            .max(u32::try_from(self.pages.len()).unwrap_or(u32::MAX));
+        if self.max_tuples_per_block != checkpoint.max_tuples_per_block {
+            self.max_tuples_per_block = checkpoint.max_tuples_per_block;
+            self.recompute_appendable_blocks();
+        }
     }
 
     pub(crate) fn reserve_block(&mut self) -> Option<u32> {
@@ -60,19 +75,16 @@ impl RelationStorage {
         if self.pages.len() <= block {
             self.pages.resize_with(block + 1, || None);
         }
-        if self.page_can_accept_tuple(&page, 1) {
-            self.append_hint = Some(page.block);
-        }
+        let page_block = page.block;
         self.pages[block] = Some(page);
+        self.refresh_appendable_block(page_block);
     }
 
     pub(crate) fn mark_page_dead(&mut self, block: u32) {
         if let Some(page) = self.page_mut(block) {
             page.mark_all_dead();
         }
-        if self.append_hint == Some(block) {
-            self.append_hint = None;
-        }
+        self.refresh_appendable_block(block);
     }
 
     pub(crate) fn page(&self, block: u32) -> Option<&Page> {
@@ -95,6 +107,10 @@ impl RelationStorage {
     fn line_pointer(&self, tid: Tid) -> Option<&LinePointer> {
         let index = usize::from(tid.offset.checked_sub(1)?);
         self.page(tid.block)?.line_pointers.get(index)
+    }
+
+    pub(crate) fn line_pointer_state(&self, tid: Tid) -> Option<LinePointerState> {
+        Some(self.line_pointer(tid)?.state)
     }
 
     fn line_pointer_mut(&mut self, tid: Tid) -> Option<&mut LinePointer> {
@@ -198,14 +214,10 @@ impl RelationStorage {
             return Some(block);
         }
 
-        if let Some((block, _)) = self
-            .pages
-            .iter()
-            .enumerate()
-            .rev()
-            .filter_map(|(block, page)| Some((u32::try_from(block).ok()?, page.as_ref()?)))
-            .find(|(_, page)| self.page_can_accept_tuple(page, tuple_len))
-        {
+        if let Some(block) = self.appendable_blocks.iter().rev().copied().find(|block| {
+            self.page(*block)
+                .is_some_and(|page| self.page_can_accept_tuple(page, tuple_len))
+        }) {
             self.append_hint = Some(block);
             return Some(block);
         }
@@ -228,10 +240,16 @@ impl RelationStorage {
         };
         self.pending_tuple_count = self.pending_tuple_count.saturating_add(1);
         self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(tuple.len());
-        self.append_hint = if can_fit_more { Some(block) } else { None };
+        if can_fit_more {
+            self.appendable_blocks.insert(block);
+        } else {
+            self.appendable_blocks.remove(&block);
+        }
+        self.append_hint = self.appendable_blocks.iter().next_back().copied();
         Some(tid)
     }
 
+    #[allow(dead_code)]
     pub(crate) fn append_pending_input_tuple(
         &mut self,
         block: u32,
@@ -255,7 +273,12 @@ impl RelationStorage {
         };
         self.pending_tuple_count = self.pending_tuple_count.saturating_add(1);
         self.pending_tuple_bytes = self.pending_tuple_bytes.saturating_add(tuple_len);
-        self.append_hint = if can_fit_more { Some(block) } else { None };
+        if can_fit_more {
+            self.appendable_blocks.insert(block);
+        } else {
+            self.appendable_blocks.remove(&block);
+        }
+        self.append_hint = self.appendable_blocks.iter().next_back().copied();
         Ok(Some(tid))
     }
 
@@ -290,10 +313,7 @@ impl RelationStorage {
     pub(crate) fn set_max_tuples_per_block(&mut self, max_tuples: u16) {
         let max_tuples = max_tuples.clamp(1, MAX_CTID_OFFSET as u16);
         self.max_tuples_per_block = Some(max_tuples);
-        self.append_hint = self.append_hint.filter(|block| {
-            self.page(*block)
-                .is_some_and(|page| self.page_can_accept_tuple(page, 1))
-        });
+        self.recompute_appendable_blocks();
     }
 
     fn page_can_accept_tuple(&self, page: &Page, tuple_len: usize) -> bool {
@@ -301,6 +321,33 @@ impl RelationStorage {
             && self
                 .max_tuples_per_block
                 .is_none_or(|max| page.line_pointers.len() < usize::from(max))
+    }
+
+    fn refresh_appendable_block(&mut self, block: u32) {
+        if self
+            .page(block)
+            .is_some_and(|page| self.page_can_accept_tuple(page, 1))
+        {
+            self.appendable_blocks.insert(block);
+        } else {
+            self.appendable_blocks.remove(&block);
+        }
+        self.append_hint = self.appendable_blocks.iter().next_back().copied();
+    }
+
+    fn recompute_appendable_blocks(&mut self) {
+        self.appendable_blocks.clear();
+        for (block, page) in self.pages.iter().enumerate() {
+            let Some(page) = page.as_ref() else {
+                continue;
+            };
+            if self.page_can_accept_tuple(page, 1)
+                && let Ok(block) = u32::try_from(block)
+            {
+                self.appendable_blocks.insert(block);
+            }
+        }
+        self.append_hint = self.appendable_blocks.iter().next_back().copied();
     }
 
     fn recompute_tuple_stats(&mut self) {

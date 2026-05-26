@@ -21,6 +21,9 @@
 
 #include <math.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_tableam.h"
+#endif
 #include "access/syncscan.h"
 #include "access/tableam.h"
 #include "access/xact.h"
@@ -244,6 +247,11 @@ table_index_fetch_tuple_check(Relation rel,
 							  Snapshot snapshot,
 							  bool *all_dead)
 {
+#ifdef USE_FASTPG
+	if (rel->rd_tableam == GetFastPgMemTableAmRoutine())
+		return FastPgMemIndexFetchTupleCheck(rel, tid, snapshot, all_dead);
+#endif
+
 	IndexFetchTableData *scan;
 	TupleTableSlot *slot;
 	bool		call_again = false;

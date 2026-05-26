@@ -25,6 +25,18 @@ extern void FastPgMemResetCommandTouchedRows(void);
 extern bool FastPgMemResolveIndexFetchTid(Relation heapRelation,
 										  const ItemPointerData *tupleid,
 										  ItemPointer resolvedTid);
+extern bool FastPgMemIndexFetchTupleCheck(Relation rel,
+										  ItemPointer tid,
+										  Snapshot snapshot,
+										  bool *all_dead);
+extern bool FastPgMemLookupPrimaryKeyTuple(Relation heapRelation,
+										   Relation indexRelation,
+										   const Datum *values,
+										   const bool *isnull,
+										   int nkeys,
+										   Snapshot snapshot,
+										   TupleTableSlot *slot,
+										   bool *handled);
 extern bool FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 											  Relation indexRelation,
 											  const Datum *values,

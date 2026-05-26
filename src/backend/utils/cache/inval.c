@@ -294,7 +294,11 @@ int			debug_discard_caches = 0;
 #define MAX_RELCACHE_CALLBACKS 10
 #define MAX_RELSYNC_CALLBACKS 10
 
+#ifdef USE_FASTPG
+static _Thread_local struct SYSCACHECALLBACK
+#else
 static struct SYSCACHECALLBACK
+#endif
 {
 	int16		id;				/* cache number */
 	int16		link;			/* next callback index+1 for same cache */
@@ -302,25 +306,49 @@ static struct SYSCACHECALLBACK
 	Datum		arg;
 }			syscache_callback_list[MAX_SYSCACHE_CALLBACKS];
 
+#ifdef USE_FASTPG
+static _Thread_local int16 syscache_callback_links[SysCacheSize];
+#else
 static int16 syscache_callback_links[SysCacheSize];
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local int syscache_callback_count = 0;
+#else
 static int	syscache_callback_count = 0;
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local struct RELCACHECALLBACK
+#else
 static struct RELCACHECALLBACK
+#endif
 {
 	RelcacheCallbackFunction function;
 	Datum		arg;
 }			relcache_callback_list[MAX_RELCACHE_CALLBACKS];
 
+#ifdef USE_FASTPG
+static _Thread_local int relcache_callback_count = 0;
+#else
 static int	relcache_callback_count = 0;
+#endif
 
+#ifdef USE_FASTPG
+static _Thread_local struct RELSYNCCALLBACK
+#else
 static struct RELSYNCCALLBACK
+#endif
 {
 	RelSyncCallbackFunction function;
 	Datum		arg;
 }			relsync_callback_list[MAX_RELSYNC_CALLBACKS];
 
+#ifdef USE_FASTPG
+static _Thread_local int relsync_callback_count = 0;
+#else
 static int	relsync_callback_count = 0;
+#endif
 
 
 /* ----------------------------------------------------------------
