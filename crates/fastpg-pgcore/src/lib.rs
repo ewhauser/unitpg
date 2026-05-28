@@ -418,9 +418,9 @@ pub struct PreparedStatement {
     storage2_session: fastpg_storage2::SessionStorageHandle,
 }
 
-// pgcore-backed execution is intentionally allowed to overlap across client
-// tasks so the Rust server's concurrency tests exercise the real concurrent
-// path instead of a single global lane.
+// Prepared statements may move across client tasks. The pgcore lane serializes
+// Postgres-catalog calls because upstream backend state is still process-global;
+// rust-catalog calls can still overlap and exercise the concurrent path.
 unsafe impl Send for PreparedStatement {}
 unsafe impl Sync for PreparedStatement {}
 
@@ -502,6 +502,7 @@ mod inner {
     use std::ptr;
     use std::ptr::NonNull;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard};
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyColumn, PgCoreCopyIn, PgCoreCopyOut,
@@ -515,6 +516,7 @@ mod inner {
     static PGCORE_MAX_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static PGCORE_LANE_LOCK: Mutex<()> = Mutex::new(());
     const STACK_SQL_BUFFER_LEN: usize = 1024;
 
     thread_local! {
@@ -531,14 +533,25 @@ mod inner {
         }
     }
 
-    struct PgCoreLaneGuard;
+    struct PgCoreLaneGuard {
+        _lock: Option<MutexGuard<'static, ()>>,
+    }
 
     fn enter_pgcore_lane(_operation: &'static str) -> PgCoreLaneGuard {
+        // The embedded upstream backend still has process-global state in
+        // Postgres-catalog mode, including session reset and login hooks.
+        let lock = postgres_catalog_enabled().then(lock_pgcore_lane);
         let active = PGCORE_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
         PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         update_max_active(active);
         refresh_pgcore_caches_if_catalog_changed();
-        PgCoreLaneGuard
+        PgCoreLaneGuard { _lock: lock }
+    }
+
+    fn lock_pgcore_lane() -> MutexGuard<'static, ()> {
+        PGCORE_LANE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     impl Drop for PgCoreLaneGuard {

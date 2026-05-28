@@ -31,10 +31,17 @@ async fn rust_server_handles_concurrent_client_transactions() -> TestResult {
         metrics.operations >= (CLIENTS * QUERIES_PER_CLIENT) as u64,
         "expected pgcore metrics to observe the concurrent workload, got {metrics:?}"
     );
-    assert!(
-        metrics.max_active > 1,
-        "expected overlapping pgcore execution under concurrent clients, got {metrics:?}"
-    );
+    if cfg!(feature = "rust-catalog") {
+        assert!(
+            metrics.max_active > 1,
+            "expected overlapping pgcore execution under concurrent clients, got {metrics:?}"
+        );
+    } else {
+        assert_eq!(
+            metrics.max_active, 1,
+            "expected postgres-catalog pgcore execution to remain serialized under concurrent clients, got {metrics:?}"
+        );
+    }
 
     Ok(())
 }

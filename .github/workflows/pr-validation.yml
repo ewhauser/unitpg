@@ -283,6 +283,7 @@ jobs:
 
     env:
       PGCORE_BUILD_DIR: benches/.build/ci-pgcore-${{ matrix.target }}
+      PACKAGE_CLIENT_BUILD_DIR: benches/.build/ci-package-client-${{ matrix.target }}
       RELEASE_JOBS: 4
       PGVECTOR_VERSION: v0.8.2
 
@@ -335,13 +336,6 @@ jobs:
           meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
           meson test -C "$PGCORE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
 
-      - name: Build pgvector extension
-        run: |
-          ci/build-pgvector.sh \
-            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
-            "$RUNNER_TEMP/pgvector" \
-            "$PGVECTOR_VERSION"
-
       - name: Build Rust server
         env:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
@@ -368,6 +362,22 @@ jobs:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
         run: cargo test -p fastpg-testkit --features postgres-execution,rust-catalog
 
+      - name: Build package PostgreSQL client install
+        run: |
+          set -euo pipefail
+          rm -rf "$PACKAGE_CLIENT_BUILD_DIR"
+          meson setup "$PACKAGE_CLIENT_BUILD_DIR" . \
+            --buildtype=release \
+            --auto-features=disabled \
+            -Dtap_tests=disabled \
+            -Dfastpg=false
+          meson compile -C "$PACKAGE_CLIENT_BUILD_DIR" -j "$RELEASE_JOBS"
+          meson test -C "$PACKAGE_CLIENT_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
+          ci/build-pgvector.sh \
+            "$PACKAGE_CLIENT_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RUNNER_TEMP/pgvector-package" \
+            "$PGVECTOR_VERSION"
+
       - name: Package Rust server distribution
         env:
           DIST_TARGET: ${{ matrix.target }}
@@ -375,7 +385,7 @@ jobs:
           set -euo pipefail
           ci/package-rust-server-dist.sh \
             target/release/fastpg-server \
-            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$PACKAGE_CLIENT_BUILD_DIR/tmp_install/usr/local/pgsql" \
             "$DIST_TARGET" \
             "$RUNNER_TEMP/server-dist"
 
@@ -386,8 +396,15 @@ jobs:
           set -euo pipefail
           dist="$RUNNER_TEMP/server-dist/postgres-server-$DIST_TARGET"
           test -x "$dist/bin/fastpg-server"
+          test -x "$dist/bin/postgres"
+          test -x "$dist/bin/initdb"
+          test -x "$dist/bin/pg_ctl"
+          test -x "$dist/bin/pg_isready"
           test -x "$dist/bin/psql"
           test -x "$dist/bin/pgbench"
+          cmp -s "$dist/bin/fastpg-server" "$dist/bin/postgres"
+          "$dist/bin/fastpg-server" --version | grep -F "fastpg-server"
+          "$dist/bin/postgres" --version | grep -F "postgres (PostgreSQL)"
           test -f "$dist/README.server.txt"
           test -n "$(find "$dist/lib" -maxdepth 3 -name 'vector*' -print -quit)"
           test -f "$dist/share/extension/vector.control"
@@ -402,12 +419,74 @@ jobs:
           workdir="$RUNNER_TEMP/server-smoke"
           rm -rf "$workdir"
           mkdir -p "$workdir"
-          unset FASTPG_PGDATA
-          if "$dist/bin/fastpg-server" "127.0.0.1:0" >"$workdir/fastpg-server.log" 2>&1; then
-            cat "$workdir/fastpg-server.log" >&2
+          pgdata="$workdir/pgdata"
+          port="$(python3 - <<'PY'
+          import socket
+          s = socket.socket()
+          s.bind(("127.0.0.1", 0))
+          print(s.getsockname()[1])
+          s.close()
+          PY
+          )"
+          dump_smoke_logs() {
+            for log in initdb fastpg-server psql pg_ctl-stop; do
+              if [[ -f "$workdir/$log.log" ]]; then
+                echo "===== $log.log =====" >&2
+                cat "$workdir/$log.log" >&2
+              fi
+            done
+            if [[ -f "$pgdata/postmaster.pid" ]]; then
+              echo "===== postmaster.pid =====" >&2
+              sed -n '1,12p' "$pgdata/postmaster.pid" >&2
+            fi
+          }
+          if ! "$dist/bin/initdb" -N -A trust -U postgres -D "$pgdata" --no-locale >"$workdir/initdb.log" 2>&1; then
+            dump_smoke_logs
             exit 1
           fi
-          grep -F "Postgres catalog mode requires FASTPG_PGDATA" "$workdir/fastpg-server.log"
+          cat >"$pgdata/postgresql.conf" <<EOF
+          listen_addresses='127.0.0.1'
+          port=$port
+          fsync=off
+          synchronous_commit=off
+          full_page_writes=off
+          EOF
+          PGMAXPROTOCOLVERSION=3.0 \
+          PGSSLMODE=disable \
+          PGGSSENCMODE=disable \
+            "$dist/bin/postgres" -D "$pgdata" >"$workdir/fastpg-server.log" 2>&1 &
+          server_pid="$!"
+          cleanup() {
+            "$dist/bin/pg_ctl" -D "$pgdata" -m fast -w stop >/dev/null 2>&1 || kill "$server_pid" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+          ready=0
+          for _ in {1..100}; do
+            if PGMAXPROTOCOLVERSION=3.0 PGSSLMODE=disable PGGSSENCMODE=disable \
+              "$dist/bin/pg_isready" -h 127.0.0.1 -p "$port" -d postgres >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+            if ! kill -0 "$server_pid" 2>/dev/null; then
+              dump_smoke_logs
+              exit 1
+            fi
+            sleep 0.1
+          done
+          if [[ "$ready" != 1 ]]; then
+            dump_smoke_logs
+            exit 1
+          fi
+          if [[ "$(PGMAXPROTOCOLVERSION=3.0 PGSSLMODE=disable PGGSSENCMODE=disable \
+            "$dist/bin/psql" -XAt -h 127.0.0.1 -p "$port" -U postgres -d postgres -c "select 1" >"$workdir/psql.log" 2>&1 && cat "$workdir/psql.log")" != 1 ]]; then
+            dump_smoke_logs
+            exit 1
+          fi
+          if ! "$dist/bin/pg_ctl" -D "$pgdata" -m fast -w stop >"$workdir/pg_ctl-stop.log" 2>&1; then
+            dump_smoke_logs
+            exit 1
+          fi
+          trap - EXIT
 
       - name: Upload binary archive
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4

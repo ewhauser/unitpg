@@ -39,11 +39,15 @@ SERVER_BINARY="$(cd "$(dirname "$SERVER_BINARY")" && pwd)/$(basename "$SERVER_BI
 CLIENT_PREFIX="$(cd "$CLIENT_PREFIX" && pwd)"
 OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"
 PACKAGE_DIR="$OUTPUT_DIR/$PACKAGE_NAME"
+BOOTSTRAP_ROOT="$PACKAGE_DIR/libexec/fastpg-bootstrap"
+BOOTSTRAP_DIR="$BOOTSTRAP_ROOT/bin"
 ARCHIVE="$OUTPUT_DIR/$PACKAGE_NAME.tar.gz"
 CHECKSUM="$ARCHIVE.sha256"
 
 rm -rf "$PACKAGE_DIR" "$ARCHIVE" "$CHECKSUM"
-mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" "$PACKAGE_DIR/share"
+mkdir -p "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" "$PACKAGE_DIR/share" "$BOOTSTRAP_DIR"
+ln -s ../../share "$BOOTSTRAP_ROOT/share"
+ln -s ../../lib "$BOOTSTRAP_ROOT/lib"
 
 copy_required_client_binary() {
 	local binary="$1"
@@ -57,13 +61,68 @@ copy_required_client_binary() {
 	cp -pP "$source" "$PACKAGE_DIR/bin/"
 }
 
-copy_optional_client_binary() {
-	local binary="$1"
-	local source="$CLIENT_PREFIX/bin/$binary"
+copy_matching_client_binaries() {
+	local path
+	local binary
 
-	if [[ -e "$source" ]]; then
-		cp -pP "$source" "$PACKAGE_DIR/bin/"
-	fi
+	while IFS= read -r -d '' path; do
+		binary="$(basename "$path")"
+		case "$binary" in
+			fastpg-server|initdb|postgres|postmaster)
+				continue
+				;;
+		esac
+		cp -pP "$path" "$PACKAGE_DIR/bin/"
+	done < <(find "$CLIENT_PREFIX/bin" -maxdepth 1 \( -type f -o -type l \) -print0)
+}
+
+copy_bootstrap_initdb() {
+	local binary
+
+	for binary in initdb postgres; do
+		if [[ ! -e "$CLIENT_PREFIX/bin/$binary" ]]; then
+			printf 'missing required client binary: %s\n' "$CLIENT_PREFIX/bin/$binary" >&2
+			exit 1
+		fi
+		cp -pP "$CLIENT_PREFIX/bin/$binary" "$BOOTSTRAP_DIR/"
+	done
+
+	cat > "$PACKAGE_DIR/bin/initdb" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+
+case "$0" in
+	*/*)
+		bindir=${0%/*}
+		;;
+	*)
+		bindir=.
+		;;
+esac
+prefix=$(CDPATH= cd "$bindir/.." && pwd -P)
+
+exec "$prefix/libexec/fastpg-bootstrap/bin/initdb" "$@"
+EOF
+	chmod 755 "$PACKAGE_DIR/bin/initdb"
+
+	cat > "$BOOTSTRAP_DIR/pg_ctl" <<'EOF'
+#!/usr/bin/env sh
+set -eu
+
+case "$0" in
+	*/*)
+		bindir=${0%/*}
+		;;
+	*)
+		bindir=.
+		;;
+esac
+bootstrap_root=$(CDPATH= cd "$bindir/.." && pwd -P)
+prefix=$(CDPATH= cd "$bootstrap_root/../.." && pwd -P)
+
+exec "$prefix/bin/pg_ctl" "$@"
+EOF
+	chmod 755 "$BOOTSTRAP_DIR/pg_ctl"
 }
 
 is_runtime_shared_object() {
@@ -109,10 +168,14 @@ copy_runtime_shared_tree() {
 	done < <(find "$source_root" \( -type f -o -type l \) -print0)
 }
 
-cp -pP "$SERVER_BINARY" "$PACKAGE_DIR/bin/fastpg-server"
+copy_matching_client_binaries
+copy_bootstrap_initdb
+copy_required_client_binary pg_ctl
+copy_required_client_binary pg_isready
 copy_required_client_binary psql
 copy_required_client_binary pgbench
-copy_optional_client_binary pg_isready
+cp -pP "$SERVER_BINARY" "$PACKAGE_DIR/bin/fastpg-server"
+cp -pP "$SERVER_BINARY" "$PACKAGE_DIR/bin/postgres"
 
 if [[ -d "$CLIENT_PREFIX/lib" ]]; then
 	copy_runtime_shared_tree "$CLIENT_PREFIX/lib" "$PACKAGE_DIR/lib"
@@ -157,16 +220,20 @@ This archive contains the fastpg Rust single-process server for $TARGET.
 
 Included:
 - bin/fastpg-server
-- bin/psql
-- bin/pgbench
-- bin/pg_isready, when installed
+- bin/postgres, the same FastPG Rust server with a PostgreSQL-compatible
+  startup CLI subset
+- matching PostgreSQL client/tool binaries, including initdb, pg_ctl,
+  pg_isready, psql, and pgbench
+- a private PostgreSQL bootstrap helper used only by packaged initdb
 - client/runtime libraries needed by the packaged client tools
 - pgvector extension files, when installed
 - share runtime data from the matching PostgreSQL client build
 
 The server is the Tokio Rust server linked against fastpg's PostgreSQL parser,
-analyzer, planner, and executor facade. It does not use initdb, pg_ctl, a
-PostgreSQL postmaster process, WAL, shared buffers, or a data directory.
+analyzer, planner, and executor facade. The packaged postgres binary is not the
+upstream PostgreSQL server; it is FastPG. initdb and pg_ctl are included so
+PostgreSQL-shaped test launchers can create a catalog PGDATA and stop the
+FastPG process through the postmaster.pid compatibility file.
 EOF
 
 rewrite_darwin_install_names() {
@@ -198,6 +265,9 @@ rewrite_darwin_install_names() {
 				"$PACKAGE_DIR/bin/"*)
 					replacement="@loader_path/../lib/$base"
 					;;
+				"$BOOTSTRAP_DIR/"*)
+					replacement="@loader_path/../../../lib/$base"
+					;;
 				"$PACKAGE_DIR/lib/postgresql/"*)
 					replacement="@loader_path/../$base"
 					;;
@@ -212,7 +282,7 @@ rewrite_darwin_install_names() {
 			install_name_tool -change "$dep" "$replacement" "$path" 2>/dev/null || true
 		done < <(otool -L "$path" 2>/dev/null | awk 'NR > 1 {print $1}')
 	done < <(
-		find "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" \
+		find "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" "$PACKAGE_DIR/libexec" \
 			\( -type f -o -type l \) \
 			\( -perm -111 -o -name '*.dylib' -o -name '*.so' -o -name '*.so.*' \) \
 			-print0
@@ -225,6 +295,7 @@ rewrite_linux_rpaths() {
 	local dir
 	local relative_dir
 	local bin_rpath
+	local bootstrap_rpath
 
 	if [[ "$TARGET" != linux-* ]]; then
 		return
@@ -235,9 +306,11 @@ rewrite_linux_rpaths() {
 	fi
 
 	bin_rpath='$ORIGIN/../lib'
+	bootstrap_rpath='$ORIGIN/../../../lib'
 	while IFS= read -r -d '' dir; do
 		relative_dir="${dir#$PACKAGE_DIR/lib}"
 		bin_rpath="$bin_rpath:\$ORIGIN/../lib$relative_dir"
+		bootstrap_rpath="$bootstrap_rpath:\$ORIGIN/../../../lib$relative_dir"
 	done < <(find "$PACKAGE_DIR/lib" -mindepth 1 -type d -print0)
 
 	while IFS= read -r -d '' path; do
@@ -248,6 +321,9 @@ rewrite_linux_rpaths() {
 		case "$path" in
 			"$PACKAGE_DIR/bin/"*)
 				rpath="$bin_rpath"
+				;;
+			"$BOOTSTRAP_DIR/"*)
+				rpath="$bootstrap_rpath"
 				;;
 			"$PACKAGE_DIR/lib/postgresql/"*)
 				rpath='$ORIGIN:$ORIGIN/..'
@@ -262,7 +338,7 @@ rewrite_linux_rpaths() {
 
 		patchelf --set-rpath "$rpath" "$path" 2>/dev/null || true
 	done < <(
-		find "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" \
+		find "$PACKAGE_DIR/bin" "$PACKAGE_DIR/lib" "$PACKAGE_DIR/libexec" \
 			-type f \
 			\( -perm -111 -o -name '*.so' -o -name '*.so.*' \) \
 			-print0

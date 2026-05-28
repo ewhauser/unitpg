@@ -449,6 +449,7 @@ dependencies = [
 name = "fastpg-server"
 version = "0.1.0"
 dependencies = [
+ "fastpg-compat",
  "fastpg-wire",
  "pgwire",
  "tokio",
