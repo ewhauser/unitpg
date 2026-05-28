@@ -39,6 +39,9 @@
 static Oid	last_roleid = InvalidOid;	/* InvalidOid == cache not valid */
 static bool last_roleid_is_super = false;
 static bool roleid_callback_registered = false;
+#ifdef USE_FASTPG
+static uint64 last_roleid_fastpg_inval_generation = 0;
+#endif
 
 static void RoleidCallback(Datum arg, SysCacheIdentifier cacheid,
 						   uint32 hashvalue);
@@ -80,7 +83,11 @@ superuser_arg(Oid roleid)
 #endif
 
 	/* Quick out for cache hit */
-	if (OidIsValid(last_roleid) && last_roleid == roleid)
+	if (OidIsValid(last_roleid) && last_roleid == roleid
+#ifdef USE_FASTPG
+		&& last_roleid_fastpg_inval_generation == FastPgInvalidationGeneration()
+#endif
+		)
 		return last_roleid_is_super;
 
 	/* Special escape path in case you deleted all your users. */
@@ -112,6 +119,9 @@ superuser_arg(Oid roleid)
 	/* Cache the result for next time */
 	last_roleid = roleid;
 	last_roleid_is_super = result;
+#ifdef USE_FASTPG
+	last_roleid_fastpg_inval_generation = FastPgInvalidationGeneration();
+#endif
 
 	return result;
 }

@@ -165,10 +165,11 @@ static int
 fastpg_pgcore_cursor_options(void)
 {
 	/*
-	 * The single-process FastPG table/index AMs do not support parallel
-	 * scans yet, so avoid planning pgcore statements as parallel-safe.
+	 * The single-process FastPG executor emulates planned parallelism locally
+	 * through Gather/Gather Merge.  Let pgcore plan parallel-safe statements so
+	 * execution observes the same plan shape that EXPLAIN reports.
 	 */
-	return 0;
+	return CURSOR_OPT_PARALLEL_OK;
 }
 #else
 #define FASTPG_PGCORE_CATALOG_ERROR_CLEANUP() ((void) 0)

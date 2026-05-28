@@ -3,6 +3,12 @@ use smallvec::SmallVec;
 
 const MAX_HOT_REDIRECT_HOPS: usize = 1_000_000;
 
+pub(crate) struct VisibleTupleSlice<'a> {
+    pub(crate) cursor_tid: Tid,
+    pub(crate) output_tid: Tid,
+    pub(crate) tuple: &'a [u8],
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StorageState {
     pub(crate) relations: HashMap<u32, RelationStorage>,
@@ -108,7 +114,7 @@ impl StorageState {
                     || relation.live_tuple_count == 0
                         && relation.pending_tuple_count == 0
                         && relation.dead_tuple_count == 0
-                        && relation.pages.iter().all(Option::is_none)
+                        && relation.physical_blocks.is_empty()
                 {
                     for (index, _) in page.line_pointers.iter().enumerate() {
                         if let Ok(offset) = u16::try_from(index + 1) {
@@ -191,7 +197,9 @@ impl StorageState {
 
         for (relid, redirects) in overlay.hot_redirect_inserts {
             if let Some(relation) = self.relations.get_mut(&relid) {
-                relation.hot_redirects.extend(redirects);
+                for (old_tid, new_tid) in redirects {
+                    relation.insert_hot_redirect(old_tid, new_tid);
+                }
             }
         }
 
@@ -214,6 +222,20 @@ impl StorageState {
                 for (key, tid) in entries {
                     if relation.tuple_slice(tid, false).is_some() {
                         relation.primary_key_index.insert(key, tid);
+                    }
+                }
+            }
+        }
+
+        for (relid, index_maps) in overlay.index_inserts {
+            if let Some(relation) = self.relations.get_mut(&relid) {
+                for (index_relid, entries) in index_maps {
+                    for (key, tids) in entries {
+                        for tid in tids {
+                            if relation.tuple_slice(tid, false).is_some() {
+                                relation.insert_index_entry(index_relid, key.clone(), tid);
+                            }
+                        }
                     }
                 }
             }
@@ -389,11 +411,15 @@ impl StorageState {
         tuple: &[u8],
     ) -> Result<Tid, CatalogError> {
         session.ensure_transaction();
+        let max_tuples_per_block = self
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.max_tuples_per_block);
         if let Some(tid) = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured")
-            .append_pending_tuple_to_existing_page(relid, tuple)
+            .append_pending_tuple_to_existing_page(relid, tuple, max_tuples_per_block)
         {
             session
                 .transaction_stack
@@ -433,17 +459,32 @@ impl StorageState {
         tuple_len: usize,
     ) -> Result<Tid, CatalogError> {
         session.ensure_transaction();
+        let max_tuples_per_block = self
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.max_tuples_per_block);
         if let Some(tid) = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured")
-            .append_pending_input_tuple_to_existing_page(relid, input, tuple_len)?
+            .append_pending_input_tuple_to_existing_page(
+                relid,
+                input,
+                tuple_len,
+                max_tuples_per_block,
+            )?
         {
             session
                 .transaction_stack
                 .last_mut()
                 .expect("transaction was just ensured")
                 .insert_tid(relid, tid);
+            return Ok(tid);
+        }
+
+        if let Some(tid) =
+            self.append_pending_input_tuple_to_relation_page(session, relid, input, tuple_len)?
+        {
             return Ok(tid);
         }
 
@@ -457,6 +498,39 @@ impl StorageState {
             .ok_or_else(|| storage_limit_error("storage2 could not allocate tuple page"))?;
         overlay.insert_tid(relid, tid);
         Ok(tid)
+    }
+
+    fn append_pending_input_tuple_to_relation_page(
+        &mut self,
+        session: &mut SessionStorage,
+        relid: u32,
+        input: &RowInput<'_>,
+        tuple_len: usize,
+    ) -> Result<Option<Tid>, CatalogError> {
+        if !unique_index_specs_for_relation_oid(Oid(relid)).is_empty() {
+            return Ok(None);
+        }
+
+        let epoch = self.epoch;
+        let generation = self.generation;
+        let relation = self.relation_mut(relid);
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+
+        overlay.checkpoint_relation(relid, relation);
+        let Some(block) = relation.append_target_block(tuple_len, epoch, generation) else {
+            return Ok(None);
+        };
+        if let Some(page) = relation.page(block) {
+            overlay.checkpoint_page(relid, page);
+        }
+        let Some(tid) = relation.append_pending_input_tuple(block, input, tuple_len)? else {
+            return Ok(None);
+        };
+        overlay.insert_tid(relid, tid);
+        Ok(Some(tid))
     }
 
     fn set_insert_metadata(&mut self, relid: u32, tid: Tid, xid: u32, cid: u32) {
@@ -730,11 +804,11 @@ impl StorageState {
             if let Some(first_tid) = first_committed_tid
                 && first_tid != tid
             {
-                relation.hot_redirects.insert(first_tid, tid);
+                relation.insert_hot_redirect(first_tid, tid);
             }
             for visited_tid in rest_committed_tids {
                 if visited_tid != tid {
-                    relation.hot_redirects.insert(visited_tid, tid);
+                    relation.insert_hot_redirect(visited_tid, tid);
                 }
             }
         }
@@ -988,40 +1062,14 @@ impl StorageState {
     }
 
     pub(crate) fn next_visible_tuple_slice_in_overlays<'a>(
-        &'a mut self,
+        &'a self,
         overlays: &'a [TransactionOverlay],
-        relid: u32,
-        cursor: ScanCursor,
-        high_water_offsets: &[u16],
-        forward: bool,
-        curcid: Option<u32>,
-    ) -> Option<(Tid, &'a [u8])> {
-        let tid = self.next_visible_tid_in_overlays(
-            overlays,
-            relid,
-            cursor,
-            high_water_offsets,
-            forward,
-            curcid,
-        )?;
-        let tuple = match curcid {
-            Some(curcid) => {
-                self.physical_visible_tuple_slice_in_overlays_at_cid(overlays, relid, tid, curcid)?
-            }
-            None => self.physical_visible_tuple_slice_in_overlays(overlays, relid, tid)?,
-        };
-        Some((tid, tuple))
-    }
-
-    fn next_visible_tid_in_overlays(
-        &mut self,
-        overlays: &[TransactionOverlay],
         relid: u32,
         mut cursor: ScanCursor,
         high_water_offsets: &[u16],
         forward: bool,
         curcid: Option<u32>,
-    ) -> Option<Tid> {
+    ) -> Option<VisibleTupleSlice<'a>> {
         loop {
             let tid = self.next_candidate_tid_in_overlays(
                 overlays,
@@ -1030,15 +1078,53 @@ impl StorageState {
                 high_water_offsets,
                 forward,
             )?;
-            let visible = match curcid {
+
+            let relation = self.relations.get(&relid);
+            if overlay_tid_redirect_target(overlays, relid, tid)
+                || relation.is_some_and(|relation| relation.is_hot_redirect_target(tid))
+            {
+                cursor = if forward {
+                    ScanCursor::after(tid)
+                } else {
+                    ScanCursor::before(tid)
+                };
+                continue;
+            }
+
+            if let Some(tuple) = match curcid {
                 Some(curcid) => self
                     .physical_visible_tuple_slice_in_overlays_at_cid(overlays, relid, tid, curcid),
                 None => self.physical_visible_tuple_slice_in_overlays(overlays, relid, tid),
+            } {
+                return Some(VisibleTupleSlice {
+                    cursor_tid: tid,
+                    output_tid: tid,
+                    tuple,
+                });
             }
-            .is_some();
-            if visible {
-                return Some(tid);
+
+            let follows_hot_redirect = overlay_tid_redirect(overlays, relid, tid).is_some()
+                || relation.is_some_and(|relation| relation.is_hot_redirect_root(tid));
+            if follows_hot_redirect {
+                let hot_tid = self.resolve_tid_redirect_in_overlays(overlays, relid, tid);
+                if hot_tid != tid
+                    && let Some(tuple) = match curcid {
+                        Some(curcid) => self.physical_visible_tuple_slice_in_overlays_at_cid(
+                            overlays, relid, hot_tid, curcid,
+                        ),
+                        None => {
+                            self.physical_visible_tuple_slice_in_overlays(overlays, relid, hot_tid)
+                        }
+                    }
+                {
+                    return Some(VisibleTupleSlice {
+                        cursor_tid: tid,
+                        output_tid: hot_tid,
+                        tuple,
+                    });
+                }
             }
+
             if let Some(redirect_tid) = self.visible_update_redirect_tid_beyond_high_water(
                 overlays,
                 relid,
@@ -1046,7 +1132,24 @@ impl StorageState {
                 high_water_offsets,
                 curcid,
             ) {
-                return Some(redirect_tid);
+                let tuple = match curcid {
+                    Some(curcid) => self.physical_visible_tuple_slice_in_overlays_at_cid(
+                        overlays,
+                        relid,
+                        redirect_tid,
+                        curcid,
+                    )?,
+                    None => self.physical_visible_tuple_slice_in_overlays(
+                        overlays,
+                        relid,
+                        redirect_tid,
+                    )?,
+                };
+                return Some(VisibleTupleSlice {
+                    cursor_tid: tid,
+                    output_tid: redirect_tid,
+                    tuple,
+                });
             }
 
             cursor = if forward {
@@ -1092,11 +1195,22 @@ impl StorageState {
             offset: cursor.offset,
         };
         let mut candidate = self.relations.get(&relid).and_then(|relation| {
-            relation
+            let live_candidate = relation
                 .live_tids
                 .range(start_tid..)
                 .find(|tid| !tid_beyond_high_water(**tid, high_water_offsets))
-                .copied()
+                .copied();
+            let hot_root_candidate = relation
+                .hot_redirect_roots
+                .range(start_tid..)
+                .find(|tid| !tid_beyond_high_water(**tid, high_water_offsets))
+                .copied();
+            match (live_candidate, hot_root_candidate) {
+                (Some(live), Some(hot_root)) => Some(live.min(hot_root)),
+                (Some(live), None) => Some(live),
+                (None, Some(hot_root)) => Some(hot_root),
+                (None, None) => None,
+            }
         });
 
         for overlay in overlays {
@@ -1123,12 +1237,24 @@ impl StorageState {
     ) -> Option<Tid> {
         let end_tid = scan_backward_end_tid(cursor, high_water_offsets)?;
         let mut candidate = self.relations.get(&relid).and_then(|relation| {
-            relation
+            let live_candidate = relation
                 .live_tids
                 .range(..=end_tid)
                 .rev()
                 .find(|tid| !tid_beyond_high_water(**tid, high_water_offsets))
-                .copied()
+                .copied();
+            let hot_root_candidate = relation
+                .hot_redirect_roots
+                .range(..=end_tid)
+                .rev()
+                .find(|tid| !tid_beyond_high_water(**tid, high_water_offsets))
+                .copied();
+            match (live_candidate, hot_root_candidate) {
+                (Some(live), Some(hot_root)) => Some(live.max(hot_root)),
+                (Some(live), None) => Some(live),
+                (None, Some(hot_root)) => Some(hot_root),
+                (None, None) => None,
+            }
         });
 
         for overlay in overlays {
@@ -1147,7 +1273,7 @@ impl StorageState {
     }
 
     fn visible_update_redirect_tid_beyond_high_water(
-        &mut self,
+        &self,
         overlays: &[TransactionOverlay],
         relid: u32,
         tid: Tid,
@@ -1164,7 +1290,7 @@ impl StorageState {
             return None;
         }
 
-        let redirect_tid = self.resolve_update_redirect_in_overlays_compress(overlays, relid, tid);
+        let redirect_tid = self.resolve_update_redirect_in_overlays(overlays, relid, tid);
         if !tid_beyond_high_water(redirect_tid, high_water_offsets) {
             return None;
         }
@@ -1187,8 +1313,9 @@ impl StorageState {
         cursor: ScanCursor,
         high_water_offsets: &[u16],
         forward: bool,
-    ) -> Option<(Tid, &'a [u8])> {
+    ) -> Option<VisibleTupleSlice<'a>> {
         let relation = self.relations.get(&relid)?;
+
         if forward {
             if cursor.offset == 0 || usize::try_from(cursor.block).ok()? >= high_water_offsets.len()
             {
@@ -1207,7 +1334,13 @@ impl StorageState {
             if tid_beyond_high_water(tid, high_water_offsets) {
                 return None;
             }
-            return relation.tuple_slice(tid, false).map(|tuple| (tid, tuple));
+            return relation
+                .tuple_slice(tid, false)
+                .map(|tuple| VisibleTupleSlice {
+                    cursor_tid: tid,
+                    output_tid: tid,
+                    tuple,
+                });
         }
 
         let end_tid = if cursor.block == u32::MAX {
@@ -1229,7 +1362,19 @@ impl StorageState {
         if tid_beyond_high_water(tid, high_water_offsets) {
             return None;
         }
-        relation.tuple_slice(tid, false).map(|tuple| (tid, tuple))
+        relation
+            .tuple_slice(tid, false)
+            .map(|tuple| VisibleTupleSlice {
+                cursor_tid: tid,
+                output_tid: tid,
+                tuple,
+            })
+    }
+
+    pub(crate) fn committed_hot_root_for_target(&self, relid: u32, tid: Tid) -> Option<Tid> {
+        self.relations
+            .get(&relid)?
+            .hot_redirect_root_for_target(tid)
     }
 
     pub(crate) fn primary_key_lookup(
@@ -1526,6 +1671,13 @@ pub(crate) fn storage() -> &'static RwLock<StorageState> {
     STORAGE.get_or_init(|| RwLock::new(StorageState::default()))
 }
 
+#[cfg(test)]
+pub(crate) fn reset_storage_for_tests() {
+    *storage().write() = StorageState::default();
+    row_counts().lock().clear();
+    ROW_COUNT_COUNTER_CACHE.with(|cache| cache.borrow_mut().clear());
+}
+
 fn row_counts() -> &'static Mutex<HashMap<u32, Arc<AtomicUsize>>> {
     STORAGE2_ROW_COUNTS.get_or_init(|| Mutex::new(HashMap::default()))
 }
@@ -1636,14 +1788,24 @@ fn append_pending_input_tuple_current_session(
     input: &RowInput<'_>,
 ) -> Result<Tid, CatalogError> {
     let tuple_len = tuple_storage_len(input)?;
+    let max_tuples_per_block = with_storage_read(|state, _session| {
+        state
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.max_tuples_per_block)
+    });
     if let Some(tid) = with_session_storage(|session| -> Result<Option<Tid>, CatalogError> {
         session.ensure_transaction();
         let overlay = session
             .transaction_stack
             .last_mut()
             .expect("transaction was just ensured");
-        let Some(tid) =
-            overlay.append_pending_input_tuple_to_existing_page(relid, input, tuple_len)?
+        let Some(tid) = overlay.append_pending_input_tuple_to_existing_page(
+            relid,
+            input,
+            tuple_len,
+            max_tuples_per_block,
+        )?
         else {
             return Ok(None);
         };
@@ -1704,6 +1866,12 @@ fn update_current_session_pending_hot(
 ) -> Result<Option<Tid>, CatalogError> {
     let old_tid = resolve_update_redirect_current_session(relid, old_tid);
     let tuple_len = tuple_storage_len(input)?;
+    let max_tuples_per_block = with_storage_read(|state, _session| {
+        state
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.max_tuples_per_block)
+    });
     with_session_storage(|session| -> Result<Option<Tid>, CatalogError> {
         if !session.owns_inserted_tid(relid, old_tid)
             || overlays_invalidate_tid(&session.transaction_stack, relid, old_tid)
@@ -1715,8 +1883,12 @@ fn update_current_session_pending_hot(
         let Some(overlay) = session.transaction_stack.last_mut() else {
             return Ok(None);
         };
-        let Some(new_tid) =
-            overlay.append_pending_input_tuple_to_existing_page(relid, input, tuple_len)?
+        let Some(new_tid) = overlay.append_pending_input_tuple_to_existing_page(
+            relid,
+            input,
+            tuple_len,
+            max_tuples_per_block,
+        )?
         else {
             return Ok(None);
         };

@@ -22,6 +22,7 @@
 #include "access/visibilitymap.h"
 #ifdef USE_FASTPG
 #include "access/fastpg_catalog.h"
+#include "access/fastpg_tableam.h"
 #endif
 #include "access/xact.h"
 #include "access/xlog.h"
@@ -225,6 +226,9 @@ RelationDropStorage(Relation rel)
 	PendingRelDelete *pending;
 
 #ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		rel->rd_tableam == GetFastPgMemTableAmRoutine())
+		FastPgMemRelationDropStorage(rel);
 	if (!IsUnderPostmaster &&
 		!fastpg_catalog_mode_uses_postgres() &&
 		rel->rd_locator.relNumber >= (RelFileNumber) FirstNormalObjectId)

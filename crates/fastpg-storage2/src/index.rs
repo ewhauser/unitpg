@@ -44,6 +44,7 @@ fn index_key_part_bytes(part: &IndexKeyPart) -> usize {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct IndexColumnSpec {
     pub(crate) column_index: usize,
+    pub(crate) type_oid: Oid,
     pub(crate) typbyval: bool,
     pub(crate) typlen: i16,
 }
@@ -90,6 +91,7 @@ pub(crate) fn unique_index_spec_for_record(record: &IndexRecord) -> Option<Uniqu
         let pg_type = lookup_type(column.type_oid)?;
         columns.push(IndexColumnSpec {
             column_index,
+            type_oid: column.type_oid,
             typbyval: pg_type.typbyval,
             typlen: pg_type.typlen,
         });
@@ -201,6 +203,7 @@ pub(crate) struct UniqueIndexFfiSpecArgs {
     pub(crate) index_relid: u32,
     pub(crate) heap_relid: u32,
     pub(crate) attnums: *const i16,
+    pub(crate) type_oids: *const u32,
     pub(crate) typbyval: *const u8,
     pub(crate) typlen: *const i16,
     pub(crate) nkeys: usize,
@@ -215,6 +218,7 @@ pub(crate) unsafe fn unique_index_spec_from_ffi(
         index_relid,
         heap_relid,
         attnums,
+        type_oids,
         typbyval,
         typlen,
         nkeys,
@@ -222,10 +226,16 @@ pub(crate) unsafe fn unique_index_spec_from_ffi(
         nulls_not_distinct,
     } = args;
 
-    if nkeys == 0 || attnums.is_null() || typbyval.is_null() || typlen.is_null() {
+    if nkeys == 0
+        || attnums.is_null()
+        || type_oids.is_null()
+        || typbyval.is_null()
+        || typlen.is_null()
+    {
         return None;
     }
     let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let type_oids = unsafe { slice::from_raw_parts(type_oids, nkeys) };
     let typbyval = unsafe { slice::from_raw_parts(typbyval, nkeys) };
     let typlen = unsafe { slice::from_raw_parts(typlen, nkeys) };
     let mut columns = Vec::with_capacity(nkeys);
@@ -236,6 +246,7 @@ pub(crate) unsafe fn unique_index_spec_from_ffi(
         }
         columns.push(IndexColumnSpec {
             column_index: usize::try_from(attnum - 1).ok()?,
+            type_oid: Oid(type_oids[index]),
             typbyval: typbyval[index] != 0,
             typlen: typlen[index],
         });
@@ -317,7 +328,7 @@ fn index_key_part_for_input(
     }
     let value = *input.values.get(index)?;
     byref_key_bytes(column.typlen, value, Some(*input.value_lens.get(index)?))
-        .map(IndexKeyPart::Bytes)
+        .map(|bytes| IndexKeyPart::Bytes(canonical_key_bytes(column, bytes)))
 }
 
 fn index_key_part_for_decoded(
@@ -332,7 +343,8 @@ fn index_key_part_for_decoded(
             if column.typbyval {
                 return None;
             }
-            byref_key_bytes_from_bytes(column.typlen, bytes).map(IndexKeyPart::Bytes)
+            byref_key_bytes_from_bytes(column.typlen, bytes)
+                .map(|bytes| IndexKeyPart::Bytes(canonical_key_bytes(column, bytes)))
         }
     }
 }
@@ -350,5 +362,15 @@ fn index_key_part_for_key_datum(
     if column.typbyval {
         return Some(IndexKeyPart::ByValue(values[key_index]));
     }
-    byref_key_bytes(column.typlen, values[key_index], None).map(IndexKeyPart::Bytes)
+    byref_key_bytes(column.typlen, values[key_index], None)
+        .map(|bytes| IndexKeyPart::Bytes(canonical_key_bytes(column, bytes)))
+}
+
+fn canonical_key_bytes(column: &IndexColumnSpec, mut bytes: Vec<u8>) -> Vec<u8> {
+    if column.type_oid == BPCHAR_OID {
+        while bytes.last() == Some(&b' ') {
+            bytes.pop();
+        }
+    }
+    bytes
 }

@@ -880,6 +880,11 @@ retry:
 		bool		existing_isnull[INDEX_MAX_KEYS];
 		char	   *error_new;
 		char	   *error_existing;
+#ifdef USE_FASTPG
+		bool		fastpg_force_exclusion_recheck =
+			indexInfo->ii_ExclusionOps != NULL &&
+			heap->rd_tableam == GetFastPgMemTableAmRoutine();
+#endif
 
 		/*
 		 * Ignore the entry for the tuple we're trying to check.
@@ -891,9 +896,14 @@ retry:
 			ItemPointerEquals(tupleid, &existing_slot->tts_tid))
 #endif
 		{
+#ifdef USE_FASTPG
+			if (found_self)
+				continue;
+#else
 			if (found_self)		/* should not happen */
 				elog(ERROR, "found self tuple multiple times in index \"%s\"",
 					 RelationGetRelationName(index));
+#endif
 			found_self = true;
 			continue;
 		}
@@ -906,7 +916,11 @@ retry:
 					   existing_values, existing_isnull);
 
 		/* If lossy indexscan, must recheck the condition */
-		if (index_scan->xs_recheck)
+		if (index_scan->xs_recheck
+#ifdef USE_FASTPG
+			|| fastpg_force_exclusion_recheck
+#endif
+			)
 		{
 			if (!index_recheck_constraint(index,
 										  constr_procs,

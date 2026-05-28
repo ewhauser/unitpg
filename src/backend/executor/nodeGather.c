@@ -53,7 +53,6 @@ static bool
 fastpg_gather_emulates_parallel_workers(EState *estate, int num_workers)
 {
 	return num_workers > 0 &&
-		estate->es_use_parallel_mode &&
 		!IsUnderPostmaster &&
 		fastpg_catalog_mode_uses_postgres();
 }

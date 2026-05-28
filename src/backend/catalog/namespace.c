@@ -192,6 +192,7 @@ static Oid	namespaceUser = InvalidOid;
 /* The above four values are valid only if baseSearchPathValid */
 #ifdef USE_FASTPG
 static _Thread_local bool baseSearchPathValid = true;
+static _Thread_local uint64 fastpgNamespaceInvalidationGeneration = 0;
 #else
 static bool baseSearchPathValid = true;
 #endif
@@ -295,6 +296,7 @@ FastPgEnsureThreadNamespaceState(void)
 	baseTempCreationPending = false;
 	namespaceUser = InvalidOid;
 	baseSearchPathValid = false;
+	fastpgNamespaceInvalidationGeneration = 0;
 	searchPathCacheValid = false;
 	SearchPathCacheContext = NULL;
 	myTempNamespace = InvalidOid;
@@ -4611,6 +4613,15 @@ recomputeNamespacePath(void)
 	Oid			roleid = GetUserId();
 	bool		pathChanged;
 	const SearchPathCacheEntry *entry;
+
+#ifdef USE_FASTPG
+	if (fastpgNamespaceInvalidationGeneration != FastPgInvalidationGeneration())
+	{
+		fastpgNamespaceInvalidationGeneration = FastPgInvalidationGeneration();
+		baseSearchPathValid = false;
+		searchPathCacheValid = false;
+	}
+#endif
 
 	/* Do nothing if path is already valid. */
 	if (baseSearchPathValid && namespaceUser == roleid)

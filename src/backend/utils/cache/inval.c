@@ -189,6 +189,7 @@ typedef struct InvalMessageArray
 
 #ifdef USE_FASTPG
 static _Thread_local InvalMessageArray InvalMessageArrays[2];
+static uint64 fastpg_invalidation_generation = 1;
 #else
 static InvalMessageArray InvalMessageArrays[2];
 #endif
@@ -623,6 +624,10 @@ static void
 ProcessInvalidationMessages(InvalidationMsgsGroup *group,
 							void (*func) (SharedInvalidationMessage *msg))
 {
+#ifdef USE_FASTPG
+	if (NumMessagesInGroup(group) > 0)
+		FastPgBumpInvalidationGeneration();
+#endif
 	ProcessMessageSubGroup(group, CatCacheMsgs, func(msg));
 	ProcessMessageSubGroup(group, RelCacheMsgs, func(msg));
 }
@@ -835,6 +840,10 @@ InvalidateSystemCachesExtended(bool debug_discard)
 {
 	int			i;
 
+#ifdef USE_FASTPG
+	FastPgBumpInvalidationGeneration();
+#endif
+
 	InvalidateCatalogSnapshot();
 	ResetCatalogCachesExt(debug_discard);
 	RelationCacheInvalidate(debug_discard); /* gets smgr and relmap too */
@@ -966,6 +975,21 @@ InvalidateSystemCaches(void)
 {
 	InvalidateSystemCachesExtended(false);
 }
+
+#ifdef USE_FASTPG
+uint64
+FastPgInvalidationGeneration(void)
+{
+	return __atomic_load_n(&fastpg_invalidation_generation, __ATOMIC_ACQUIRE);
+}
+
+void
+FastPgBumpInvalidationGeneration(void)
+{
+	(void) __atomic_add_fetch(&fastpg_invalidation_generation, 1,
+							  __ATOMIC_ACQ_REL);
+}
+#endif
 
 /*
  * AcceptInvalidationMessages

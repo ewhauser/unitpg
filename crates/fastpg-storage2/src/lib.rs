@@ -319,6 +319,105 @@ pub extern "C" fn fastpg_storage2_relation_block_max_offset(relid: u32, block: u
 #[unsafe(no_mangle)]
 /// # Safety
 ///
+/// C callers must pass valid output pointers.
+pub unsafe extern "C" fn fastpg_storage2_relation_next_scan_block(
+    relid: u32,
+    start_block: u32,
+    include_current_inserted: u8,
+    block_out: *mut u32,
+    max_offset_out: *mut u16,
+) -> bool {
+    let Some((block, max_offset)) = with_storage_read(|state, session| {
+        let mut candidate: Option<(u32, u16)> = None;
+        let mut consider = |block: u32, max_offset: u16| {
+            if max_offset == 0 || block < start_block {
+                return false;
+            }
+            match candidate {
+                Some((candidate_block, candidate_offset)) if block == candidate_block => {
+                    candidate = Some((block, candidate_offset.max(max_offset)));
+                }
+                Some((candidate_block, _)) if block > candidate_block => {}
+                _ => candidate = Some((block, max_offset)),
+            }
+            candidate.is_some_and(|(candidate_block, _)| candidate_block == block)
+        };
+
+        if let Some(relation) = state.relations.get(&relid) {
+            let start_tid = Tid {
+                block: start_block,
+                offset: 0,
+            };
+            let mut consider_relation_tid = |tid: Tid| {
+                let Some(max_offset) = relation
+                    .page(tid.block)
+                    .and_then(|page| u16::try_from(page.line_pointers.len()).ok())
+                else {
+                    return;
+                };
+                consider(tid.block, max_offset);
+            };
+            if let Some(tid) = relation.live_tids.range(start_tid..).next().copied() {
+                consider_relation_tid(tid);
+            }
+            if let Some(tid) = relation
+                .hot_redirect_roots
+                .range(start_tid..)
+                .next()
+                .copied()
+            {
+                consider_relation_tid(tid);
+            }
+            if include_current_inserted != 0 {
+                for tid in relation.update_redirects.keys().copied() {
+                    if tid.block >= start_block {
+                        consider_relation_tid(tid);
+                    }
+                }
+            }
+        }
+
+        for overlay in &session.transaction_stack {
+            if include_current_inserted != 0
+                && let Some(tids) = overlay.inserted_tids.get(&relid)
+            {
+                for tid in tids {
+                    if tid.block >= start_block {
+                        consider(tid.block, tid.offset);
+                    }
+                }
+            }
+            let Some(pages) = overlay.pending_pages.get(&relid) else {
+                continue;
+            };
+            for page in pages {
+                if let Ok(max_offset) = u16::try_from(page.line_pointers.len()) {
+                    consider(page.block, max_offset);
+                }
+            }
+        }
+
+        candidate
+    }) else {
+        return false;
+    };
+
+    if !block_out.is_null() {
+        unsafe {
+            *block_out = block;
+        }
+    }
+    if !max_offset_out.is_null() {
+        unsafe {
+            *max_offset_out = max_offset;
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
 /// C callers must pass a valid output pointer when non-null.
 pub unsafe extern "C" fn fastpg_storage2_relation_visible_tid_at(
     relid: u32,
@@ -375,11 +474,52 @@ pub unsafe extern "C" fn fastpg_storage2_relation_current_session_visible_tid(
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    with_session_storage(|session| {
+    with_storage_read(|state, session| {
         let overlays = &session.transaction_stack;
-        let resolved = resolve_overlay_update_redirect(overlays, relid, tid);
+        let resolved = state.resolve_update_redirect_in_overlays(overlays, relid, tid);
         let curcid = (use_curcid != 0).then_some(curcid);
-        if overlay_visible_tuple_slice(overlays, relid, resolved, curcid).is_none() {
+        let visible = match curcid {
+            Some(curcid) => {
+                state.visible_tuple_slice_in_overlays_at_cid(overlays, relid, resolved, curcid)
+            }
+            None => state.visible_tuple_slice_in_overlays(overlays, relid, resolved),
+        };
+        if visible.is_none() {
+            return false;
+        }
+        if !resolved_tid_out.is_null() {
+            unsafe {
+                *resolved_tid_out = resolved.pack();
+            }
+        }
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_current_session_hot_visible_tid(
+    relid: u32,
+    packed_tid: u64,
+    use_curcid: u8,
+    curcid: u32,
+    resolved_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage_read(|state, session| {
+        let overlays = &session.transaction_stack;
+        let resolved = state.resolve_tid_redirect_in_overlays(overlays, relid, tid);
+        let curcid = (use_curcid != 0).then_some(curcid);
+        let visible = match curcid {
+            Some(curcid) => state
+                .physical_visible_tuple_slice_in_overlays_at_cid(overlays, relid, resolved, curcid),
+            None => state.physical_visible_tuple_slice_in_overlays(overlays, relid, resolved),
+        };
+        if visible.is_none() {
             return false;
         }
         if !resolved_tid_out.is_null() {
@@ -397,6 +537,96 @@ pub extern "C" fn fastpg_storage2_relation_index_tid_all_dead(relid: u32, packed
         return true;
     };
     with_storage_read(|state, session| state.index_tid_all_dead(session, relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_tid_is_hot_redirect_target(
+    relid: u32,
+    packed_tid: u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage_read(|state, session| {
+        overlay_tid_redirect_target(&session.transaction_stack, relid, tid)
+            || state
+                .relations
+                .get(&relid)
+                .is_some_and(|relation| relation.is_hot_redirect_target(tid))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_tid_is_hot_redirect_root(
+    relid: u32,
+    packed_tid: u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage_read(|state, session| {
+        overlay_tid_redirect(&session.transaction_stack, relid, tid).is_some()
+            || state
+                .relations
+                .get(&relid)
+                .is_some_and(|relation| relation.is_hot_redirect_root(tid))
+    })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_tid_has_update_redirect(
+    relid: u32,
+    packed_tid: u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage_read(|state, session| {
+        overlay_update_redirect(&session.transaction_stack, relid, tid).is_some()
+            || state
+                .relations
+                .get(&relid)
+                .is_some_and(|relation| relation.update_redirects.contains_key(&tid))
+    })
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass a valid output pointer when non-null.
+pub unsafe extern "C" fn fastpg_storage2_relation_hot_root_tid(
+    relid: u32,
+    packed_tid: u64,
+    root_tid_out: *mut u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let root = with_storage_read(|state, session| {
+        let overlay_root =
+            overlay_tid_redirect_root_for_target(&session.transaction_stack, relid, tid);
+        overlay_root
+            .and_then(|root| {
+                state
+                    .relations
+                    .get(&relid)
+                    .and_then(|relation| relation.hot_redirect_root_for_target(root))
+                    .or(Some(root))
+            })
+            .or_else(|| {
+                state
+                    .relations
+                    .get(&relid)
+                    .and_then(|relation| relation.hot_redirect_root_for_target(tid))
+            })
+            .unwrap_or(tid)
+    });
+    if !root_tid_out.is_null() {
+        unsafe {
+            *root_tid_out = root.pack();
+        }
+    }
+    true
 }
 
 #[unsafe(no_mangle)]
@@ -647,6 +877,37 @@ pub unsafe extern "C" fn fastpg_storage2_relation_insert_unchecked_with_metadata
         UniqueCheck::Skip,
         Some(InsertMetadata { xid, cid }),
         true,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid row input arrays and an optional valid output pointer.
+pub unsafe extern "C" fn fastpg_storage2_relation_insert_unchecked_with_metadata_record_primary_key(
+    relid: u32,
+    xid: u32,
+    cid: u32,
+    values: *const usize,
+    is_null: *const u8,
+    byval: *const u8,
+    value_lens: *const usize,
+    natts: usize,
+    tid_out: *mut u64,
+    record_primary_key: u8,
+) -> bool {
+    clear_last_storage_error();
+    let Some(input) = input_arrays(values, is_null, byval, value_lens, natts) else {
+        set_last_storage_error(invalid_ffi_argument("invalid row input arrays"));
+        return false;
+    };
+    relation_insert_impl(
+        relid,
+        input,
+        tid_out,
+        UniqueCheck::Skip,
+        Some(InsertMetadata { xid, cid }),
+        record_primary_key != 0,
     )
 }
 
@@ -940,6 +1201,19 @@ pub unsafe extern "C" fn fastpg_storage2_relation_update_hot_if_single_byval_pre
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -> bool {
+    relation_delete_impl(relid, packed_tid, true)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_delete_record_primary_key(
+    relid: u32,
+    packed_tid: u64,
+    record_primary_key: u8,
+) -> bool {
+    relation_delete_impl(relid, packed_tid, record_primary_key != 0)
+}
+
+fn relation_delete_impl(relid: u32, packed_tid: u64, record_primary_key: bool) -> bool {
     clear_last_storage_error();
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
@@ -977,7 +1251,7 @@ pub extern "C" fn fastpg_storage2_relation_delete(relid: u32, packed_tid: u64) -
             .last_mut()
             .expect("transaction was just ensured");
         overlay.invalidate(relid, tid);
-        if let Some(key) = old_primary_key {
+        if record_primary_key && let Some(key) = old_primary_key {
             if own_insert {
                 overlay.remove_primary_key_insert(relid, &key);
             } else {
@@ -1005,10 +1279,11 @@ fn scan_begin_impl(relid: u32, snapshot_curcid: Option<u32>) -> u64 {
         return handle;
     }
     with_storage_read(|state, session| {
-        let overlay_only = state
-            .relations
-            .get(&relid)
-            .is_none_or(|relation| relation.live_tids.is_empty());
+        let overlay_only = state.relations.get(&relid).is_none_or(|relation| {
+            relation.live_tids.is_empty()
+                && relation.pending_tuple_count == 0
+                && relation.physical_blocks.is_empty()
+        });
         let mut high_water_offsets = state
             .relations
             .get(&relid)
@@ -1051,7 +1326,14 @@ fn scan_begin_committed_empty_impl(relid: u32, snapshot_curcid: Option<u32>) -> 
         return None;
     }
 
-    with_session_storage(|session| {
+    with_storage_read(|state, session| {
+        if state
+            .relations
+            .get(&relid)
+            .is_some_and(|relation| !relation.physical_blocks.is_empty())
+        {
+            return None;
+        }
         let has_visibility_deltas = session.transaction_has_visibility_deltas(relid);
         if !has_visibility_deltas {
             return None;
@@ -1144,6 +1426,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next(
         natts,
         tid_out,
         std::ptr::null_mut(),
+        std::ptr::null_mut(),
     )
 }
 
@@ -1167,6 +1450,33 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_with_stored_natts(
         is_null_out,
         natts,
         tid_out,
+        std::ptr::null_mut(),
+        stored_natts_out,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts` entries.
+pub unsafe extern "C" fn fastpg_storage2_scan_next_with_cursor_tid_and_stored_natts(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    tid_out: *mut u64,
+    cursor_tid_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> bool {
+    scan_next_impl(
+        scan_handle,
+        forward,
+        values_out,
+        is_null_out,
+        natts,
+        tid_out,
+        cursor_tid_out,
         stored_natts_out,
     )
 }
@@ -1308,6 +1618,16 @@ fn resolve_overlay_update_redirect(
     tid
 }
 
+fn resolve_overlay_tid_redirect(overlays: &[TransactionOverlay], relid: u32, mut tid: Tid) -> Tid {
+    for _ in 0..1_000_000 {
+        let Some(next_tid) = overlay_tid_redirect(overlays, relid, tid) else {
+            break;
+        };
+        tid = next_tid;
+    }
+    tid
+}
+
 fn visible_overlay_update_redirect_tid_beyond_high_water(
     overlays: &[TransactionOverlay],
     relid: u32,
@@ -1335,11 +1655,33 @@ fn next_overlay_tuple_slice<'a>(
     high_water_offsets: &[u16],
     forward: bool,
     curcid: Option<u32>,
-) -> Option<(Tid, &'a [u8])> {
+) -> Option<VisibleTupleSlice<'a>> {
     loop {
         let tid = next_overlay_candidate_tid(overlays, relid, cursor, high_water_offsets, forward)?;
+        if overlay_tid_redirect_target(overlays, relid, tid) {
+            cursor = if forward {
+                ScanCursor::after(tid)
+            } else {
+                ScanCursor::before(tid)
+            };
+            continue;
+        }
         if let Some(tuple) = overlay_visible_tuple_slice(overlays, relid, tid, curcid) {
-            return Some((tid, tuple));
+            return Some(VisibleTupleSlice {
+                cursor_tid: tid,
+                output_tid: tid,
+                tuple,
+            });
+        }
+        let hot_tid = resolve_overlay_tid_redirect(overlays, relid, tid);
+        if hot_tid != tid
+            && let Some(tuple) = overlay_visible_tuple_slice(overlays, relid, hot_tid, curcid)
+        {
+            return Some(VisibleTupleSlice {
+                cursor_tid: tid,
+                output_tid: hot_tid,
+                tuple,
+            });
         }
         if let Some(redirect_tid) = visible_overlay_update_redirect_tid_beyond_high_water(
             overlays,
@@ -1349,7 +1691,11 @@ fn next_overlay_tuple_slice<'a>(
             curcid,
         ) {
             let tuple = overlay_visible_tuple_slice(overlays, relid, redirect_tid, curcid)?;
-            return Some((redirect_tid, tuple));
+            return Some(VisibleTupleSlice {
+                cursor_tid: tid,
+                output_tid: redirect_tid,
+                tuple,
+            });
         }
         cursor = if forward {
             ScanCursor::after(tid)
@@ -1359,6 +1705,7 @@ fn next_overlay_tuple_slice<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_next_overlay_only_impl(
     scan_handle: u64,
     forward: u8,
@@ -1366,6 +1713,7 @@ fn scan_next_overlay_only_impl(
     is_null_out: *mut u8,
     natts: usize,
     tid_out: *mut u64,
+    cursor_tid_out: *mut u64,
     stored_natts_out: *mut usize,
 ) -> bool {
     with_session_storage(|session| {
@@ -1381,7 +1729,7 @@ fn scan_next_overlay_only_impl(
         } else {
             scan.backward_cursor
         };
-        let Some((tid, copied)) = next_overlay_tuple_slice(
+        let Some((cursor_tid, copied)) = next_overlay_tuple_slice(
             &session.transaction_stack,
             scan.relid,
             cursor,
@@ -1389,12 +1737,12 @@ fn scan_next_overlay_only_impl(
             is_forward,
             scan.snapshot_curcid,
         )
-        .map(|(tid, tuple)| {
+        .map(|visible| {
             (
-                tid,
+                visible.cursor_tid,
                 copy_tuple_to_outputs(
-                    tid,
-                    tuple,
+                    visible.output_tid,
+                    visible.tuple,
                     values_out,
                     is_null_out,
                     natts,
@@ -1419,14 +1767,15 @@ fn scan_next_overlay_only_impl(
         if !copied {
             return false;
         }
+        write_optional_tid(cursor_tid, cursor_tid_out);
         if let Some(scan) = session.scan_slot_mut(scan_handle) {
             if is_forward {
-                scan.forward_cursor = ScanCursor::after(tid);
-                scan.backward_cursor = ScanCursor::before(tid);
+                scan.forward_cursor = ScanCursor::after(cursor_tid);
+                scan.backward_cursor = ScanCursor::before(cursor_tid);
                 scan.backward_exhausted = false;
             } else {
-                scan.backward_cursor = ScanCursor::before(tid);
-                scan.forward_cursor = ScanCursor::after(tid);
+                scan.backward_cursor = ScanCursor::before(cursor_tid);
+                scan.forward_cursor = ScanCursor::after(cursor_tid);
                 scan.forward_exhausted = false;
             }
         }
@@ -1443,6 +1792,7 @@ fn scan_next_overlay_only_batch_impl(
     natts: usize,
     max_rows: usize,
     tids_out: *mut u64,
+    cursor_tids_out: *mut u64,
     stored_natts_out: *mut usize,
 ) -> usize {
     with_session_storage(|session| {
@@ -1466,7 +1816,7 @@ fn scan_next_overlay_only_batch_impl(
             } else {
                 backward_cursor
             };
-            let Some((tid, tuple)) = next_overlay_tuple_slice(
+            let Some(visible) = next_overlay_tuple_slice(
                 &session.transaction_stack,
                 relid,
                 cursor,
@@ -1500,10 +1850,17 @@ fn scan_next_overlay_only_batch_impl(
             // SAFETY: caller provided `max_rows` TID/stored-natts entries and
             // `written < max_rows`.
             let row_tid_out = unsafe { tids_out.add(written) };
+            let row_cursor_tid_out = if cursor_tids_out.is_null() {
+                std::ptr::null_mut()
+            } else {
+                // SAFETY: caller provided `max_rows` cursor TID entries and
+                // `written < max_rows`.
+                unsafe { cursor_tids_out.add(written) }
+            };
             let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
             if !copy_tuple_to_outputs(
-                tid,
-                tuple,
+                visible.output_tid,
+                visible.tuple,
                 row_values_out,
                 row_is_null_out,
                 natts,
@@ -1512,13 +1869,14 @@ fn scan_next_overlay_only_batch_impl(
             ) {
                 break;
             }
+            write_optional_tid(visible.cursor_tid, row_cursor_tid_out);
 
             if is_forward {
-                forward_cursor = ScanCursor::after(tid);
-                backward_cursor = ScanCursor::before(tid);
+                forward_cursor = ScanCursor::after(visible.cursor_tid);
+                backward_cursor = ScanCursor::before(visible.cursor_tid);
             } else {
-                backward_cursor = ScanCursor::before(tid);
-                forward_cursor = ScanCursor::after(tid);
+                backward_cursor = ScanCursor::before(visible.cursor_tid);
+                forward_cursor = ScanCursor::after(visible.cursor_tid);
             }
             written += 1;
         }
@@ -1573,6 +1931,70 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
         return 0;
     }
 
+    scan_next_batch_impl(
+        scan_handle,
+        forward,
+        values_out,
+        is_null_out,
+        natts,
+        max_rows,
+        tids_out,
+        std::ptr::null_mut(),
+        stored_natts_out,
+    )
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid output buffers for `natts * max_rows` value/null
+/// entries and `max_rows` TID/cursor-TID/stored-natts entries.
+pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_cursor_tid_and_stored_natts(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    max_rows: usize,
+    tids_out: *mut u64,
+    cursor_tids_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> usize {
+    if max_rows == 0 {
+        return 0;
+    }
+    if natts > 0 && (values_out.is_null() || is_null_out.is_null()) {
+        return 0;
+    }
+    if tids_out.is_null() || cursor_tids_out.is_null() || stored_natts_out.is_null() {
+        return 0;
+    }
+
+    scan_next_batch_impl(
+        scan_handle,
+        forward,
+        values_out,
+        is_null_out,
+        natts,
+        max_rows,
+        tids_out,
+        cursor_tids_out,
+        stored_natts_out,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_next_batch_impl(
+    scan_handle: u64,
+    forward: u8,
+    values_out: *mut usize,
+    is_null_out: *mut u8,
+    natts: usize,
+    max_rows: usize,
+    tids_out: *mut u64,
+    cursor_tids_out: *mut u64,
+    stored_natts_out: *mut usize,
+) -> usize {
     let (has_visibility_deltas, overlay_only) = with_session_storage(|session| {
         session
             .scan_slot(scan_handle)
@@ -1604,7 +2026,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                     } else {
                         backward_cursor
                     };
-                    let Some((tid, tuple)) = state.next_committed_tuple_slice(
+                    let Some(visible) = state.next_committed_tuple_slice(
                         relid,
                         cursor,
                         &scan.high_water_offsets,
@@ -1636,10 +2058,17 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                     // SAFETY: caller provided `max_rows` TID/stored-natts entries and
                     // `written < max_rows`.
                     let row_tid_out = unsafe { tids_out.add(written) };
+                    let row_cursor_tid_out = if cursor_tids_out.is_null() {
+                        std::ptr::null_mut()
+                    } else {
+                        // SAFETY: caller provided `max_rows` cursor TID entries and
+                        // `written < max_rows`.
+                        unsafe { cursor_tids_out.add(written) }
+                    };
                     let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
                     if !copy_tuple_to_outputs(
-                        tid,
-                        tuple,
+                        visible.output_tid,
+                        visible.tuple,
                         row_values_out,
                         row_is_null_out,
                         natts,
@@ -1648,13 +2077,14 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                     ) {
                         break;
                     }
+                    write_optional_tid(visible.cursor_tid, row_cursor_tid_out);
 
                     if is_forward {
-                        forward_cursor = ScanCursor::after(tid);
-                        backward_cursor = ScanCursor::before(tid);
+                        forward_cursor = ScanCursor::after(visible.cursor_tid);
+                        backward_cursor = ScanCursor::before(visible.cursor_tid);
                     } else {
-                        backward_cursor = ScanCursor::before(tid);
-                        forward_cursor = ScanCursor::after(tid);
+                        backward_cursor = ScanCursor::before(visible.cursor_tid);
+                        forward_cursor = ScanCursor::after(visible.cursor_tid);
                     }
                     written += 1;
                 }
@@ -1695,6 +2125,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
             natts,
             max_rows,
             tids_out,
+            cursor_tids_out,
             stored_natts_out,
         );
     }
@@ -1720,7 +2151,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                 } else {
                     backward_cursor
                 };
-                let tuple = if scan.has_visibility_deltas {
+                let visible = if scan.has_visibility_deltas {
                     state.next_visible_tuple_slice_in_overlays(
                         &session.transaction_stack,
                         relid,
@@ -1737,7 +2168,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                         is_forward,
                     )
                 };
-                let Some((tid, tuple)) = tuple else {
+                let Some(visible) = visible else {
                     if is_forward {
                         backward_cursor = ScanCursor::before_cursor(forward_cursor);
                     } else {
@@ -1764,10 +2195,17 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                 // SAFETY: caller provided `max_rows` TID/stored-natts entries and
                 // `written < max_rows`.
                 let row_tid_out = unsafe { tids_out.add(written) };
+                let row_cursor_tid_out = if cursor_tids_out.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    // SAFETY: caller provided `max_rows` cursor TID entries and
+                    // `written < max_rows`.
+                    unsafe { cursor_tids_out.add(written) }
+                };
                 let row_stored_natts_out = unsafe { stored_natts_out.add(written) };
                 if !copy_tuple_to_outputs(
-                    tid,
-                    tuple,
+                    visible.output_tid,
+                    visible.tuple,
                     row_values_out,
                     row_is_null_out,
                     natts,
@@ -1776,13 +2214,14 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
                 ) {
                     break;
                 }
+                write_optional_tid(visible.cursor_tid, row_cursor_tid_out);
 
                 if is_forward {
-                    forward_cursor = ScanCursor::after(tid);
-                    backward_cursor = ScanCursor::before(tid);
+                    forward_cursor = ScanCursor::after(visible.cursor_tid);
+                    backward_cursor = ScanCursor::before(visible.cursor_tid);
                 } else {
-                    backward_cursor = ScanCursor::before(tid);
-                    forward_cursor = ScanCursor::after(tid);
+                    backward_cursor = ScanCursor::before(visible.cursor_tid);
+                    forward_cursor = ScanCursor::after(visible.cursor_tid);
                 }
                 written += 1;
             }
@@ -1815,6 +2254,7 @@ pub unsafe extern "C" fn fastpg_storage2_scan_next_batch_with_stored_natts(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_next_impl(
     scan_handle: u64,
     forward: u8,
@@ -1822,6 +2262,7 @@ fn scan_next_impl(
     is_null_out: *mut u8,
     natts: usize,
     tid_out: *mut u64,
+    cursor_tid_out: *mut u64,
     stored_natts_out: *mut usize,
 ) -> bool {
     let (has_visibility_deltas, overlay_only) = with_session_storage(|session| {
@@ -1846,7 +2287,7 @@ fn scan_next_impl(
                 scan.backward_cursor
             };
             let relid = scan.relid;
-            let Some((tid, tuple)) = state.next_committed_tuple_slice(
+            let Some(visible) = state.next_committed_tuple_slice(
                 relid,
                 cursor,
                 &scan.high_water_offsets,
@@ -1867,24 +2308,30 @@ fn scan_next_impl(
             };
             if let Some(scan) = session.scan_slot_mut(scan_handle) {
                 if is_forward {
-                    scan.forward_cursor = ScanCursor::after(tid);
-                    scan.backward_cursor = ScanCursor::before(tid);
+                    scan.forward_cursor = ScanCursor::after(visible.cursor_tid);
+                    scan.backward_cursor = ScanCursor::before(visible.cursor_tid);
                     scan.backward_exhausted = false;
                 } else {
-                    scan.backward_cursor = ScanCursor::before(tid);
-                    scan.forward_cursor = ScanCursor::after(tid);
+                    scan.backward_cursor = ScanCursor::before(visible.cursor_tid);
+                    scan.forward_cursor = ScanCursor::after(visible.cursor_tid);
                     scan.forward_exhausted = false;
                 }
             }
             copy_tuple_to_outputs(
-                tid,
-                tuple,
+                visible.output_tid,
+                visible.tuple,
                 values_out,
                 is_null_out,
                 natts,
                 tid_out,
                 stored_natts_out,
-            )
+            ) && {
+                let index_tid = state
+                    .committed_hot_root_for_target(relid, visible.output_tid)
+                    .unwrap_or(visible.cursor_tid);
+                write_optional_tid(index_tid, cursor_tid_out);
+                true
+            }
         });
     }
     if overlay_only {
@@ -1895,6 +2342,7 @@ fn scan_next_impl(
             is_null_out,
             natts,
             tid_out,
+            cursor_tid_out,
             stored_natts_out,
         );
     }
@@ -1913,7 +2361,7 @@ fn scan_next_impl(
             scan.backward_cursor
         };
         let relid = scan.relid;
-        let tuple = if scan.has_visibility_deltas {
+        let copied = if scan.has_visibility_deltas {
             state
                 .next_visible_tuple_slice_in_overlays(
                     &session.transaction_stack,
@@ -1923,13 +2371,39 @@ fn scan_next_impl(
                     is_forward,
                     scan.snapshot_curcid,
                 )
-                .map(|(tid, tuple)| (tid, tuple.to_vec()))
+                .map(|visible| {
+                    (
+                        visible.cursor_tid,
+                        copy_tuple_to_outputs(
+                            visible.output_tid,
+                            visible.tuple,
+                            values_out,
+                            is_null_out,
+                            natts,
+                            tid_out,
+                            stored_natts_out,
+                        ),
+                    )
+                })
         } else {
             state
                 .next_committed_tuple_slice(relid, cursor, &scan.high_water_offsets, is_forward)
-                .map(|(tid, tuple)| (tid, tuple.to_vec()))
+                .map(|visible| {
+                    (
+                        visible.cursor_tid,
+                        copy_tuple_to_outputs(
+                            visible.output_tid,
+                            visible.tuple,
+                            values_out,
+                            is_null_out,
+                            natts,
+                            tid_out,
+                            stored_natts_out,
+                        ),
+                    )
+                })
         };
-        let Some((tid, tuple)) = tuple else {
+        let Some((cursor_tid, copied)) = copied else {
             if let Some(scan) = session.scan_slot_mut(scan_handle) {
                 if is_forward {
                     scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
@@ -1943,27 +2417,31 @@ fn scan_next_impl(
             }
             return false;
         };
+        if !copied {
+            return false;
+        }
         if let Some(scan) = session.scan_slot_mut(scan_handle) {
             if is_forward {
-                scan.forward_cursor = ScanCursor::after(tid);
-                scan.backward_cursor = ScanCursor::before(tid);
+                scan.forward_cursor = ScanCursor::after(cursor_tid);
+                scan.backward_cursor = ScanCursor::before(cursor_tid);
                 scan.backward_exhausted = false;
             } else {
-                scan.backward_cursor = ScanCursor::before(tid);
-                scan.forward_cursor = ScanCursor::after(tid);
+                scan.backward_cursor = ScanCursor::before(cursor_tid);
+                scan.forward_cursor = ScanCursor::after(cursor_tid);
                 scan.forward_exhausted = false;
             }
         }
-        copy_tuple_to_outputs(
-            tid,
-            &tuple,
-            values_out,
-            is_null_out,
-            natts,
-            tid_out,
-            stored_natts_out,
-        )
+        write_optional_tid(cursor_tid, cursor_tid_out);
+        true
     })
+}
+
+fn write_optional_tid(tid: Tid, tid_out: *mut u64) {
+    if !tid_out.is_null() {
+        unsafe {
+            *tid_out = tid.pack();
+        }
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -2032,11 +2510,16 @@ pub unsafe extern "C" fn fastpg_storage2_fetch_current_session_tid_with_stored_n
     let Some(tid) = Tid::unpack(packed_tid) else {
         return false;
     };
-    with_session_storage(|session| {
+    with_storage_read(|state, session| {
         let overlays = &session.transaction_stack;
-        let resolved = resolve_overlay_update_redirect(overlays, relid, tid);
+        let resolved = state.resolve_update_redirect_in_overlays(overlays, relid, tid);
         let curcid = (use_curcid != 0).then_some(curcid);
-        let Some(tuple) = overlay_visible_tuple_slice(overlays, relid, resolved, curcid) else {
+        let Some(tuple) = (match curcid {
+            Some(curcid) => {
+                state.visible_tuple_slice_in_overlays_at_cid(overlays, relid, resolved, curcid)
+            }
+            None => state.visible_tuple_slice_in_overlays(overlays, relid, resolved),
+        }) else {
             return false;
         };
         if !copy_tuple_to_outputs(
@@ -2305,7 +2788,40 @@ enum ConflictLookup {
 }
 
 fn primary_key_overlay_lookup_current_session(relid: u32, key: &IndexKey) -> OverlayLookup {
-    with_session_storage(|session| {
+    if committed_row_count_cached(relid) == 0 {
+        let overlay_lookup = with_session_storage(|session| {
+            for overlay in session.transaction_stack.iter().rev() {
+                if let Some(tid) = overlay
+                    .primary_key_inserts
+                    .get(&relid)
+                    .and_then(|entries| entries.get(key))
+                    .copied()
+                {
+                    let tid =
+                        resolve_overlay_update_redirect(&session.transaction_stack, relid, tid);
+                    if overlay_visible_tuple_slice(&session.transaction_stack, relid, tid, None)
+                        .is_some()
+                        && !overlays_invalidate_tid(&session.transaction_stack, relid, tid)
+                    {
+                        return OverlayLookup::Found(tid);
+                    }
+                }
+                if overlay
+                    .primary_key_deletes
+                    .get(&relid)
+                    .is_some_and(|keys| keys.contains(key))
+                {
+                    return OverlayLookup::Hidden;
+                }
+            }
+            OverlayLookup::Missing
+        });
+        if !matches!(overlay_lookup, OverlayLookup::Missing) {
+            return overlay_lookup;
+        }
+    }
+
+    with_storage_read(|state, session| {
         for overlay in session.transaction_stack.iter().rev() {
             if let Some(tid) = overlay
                 .primary_key_inserts
@@ -2314,12 +2830,11 @@ fn primary_key_overlay_lookup_current_session(relid: u32, key: &IndexKey) -> Ove
                 .copied()
             {
                 let tid = resolve_overlay_update_redirect(&session.transaction_stack, relid, tid);
-                if overlay_pending_tuple_slice(&session.transaction_stack, relid, tid).is_some()
+                if state.find_visible_tuple(session, relid, tid).is_some()
                     && !overlays_invalidate_tid(&session.transaction_stack, relid, tid)
                 {
                     return OverlayLookup::Found(tid);
                 }
-                return OverlayLookup::Hidden;
             }
             if overlay
                 .primary_key_deletes
@@ -2413,6 +2928,7 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_insert_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     values: *const usize,
@@ -2432,6 +2948,7 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_insert_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,
@@ -2457,6 +2974,33 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_insert_with_spec(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_record_primary_key(relid: u32, packed_tid: u64) -> bool {
+    clear_last_storage_error();
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_storage(|state, session| {
+        let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid)) else {
+            return true;
+        };
+        let Some(tuple) = state.find_visible_tuple(session, relid, tid) else {
+            return false;
+        };
+        let Some(key) = index_key_for_decoded(&index_spec, &tuple.values) else {
+            return true;
+        };
+        drop(tuple);
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        overlay.insert_primary_key(relid, key, tid);
+        true
+    })
+}
+
+#[unsafe(no_mangle)]
 /// # Safety
 ///
 /// C callers must pass valid index metadata arrays, key input arrays, and an
@@ -2465,6 +3009,7 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     values: *const usize,
@@ -2481,6 +3026,7 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,
@@ -2514,6 +3060,367 @@ pub unsafe extern "C" fn fastpg_storage2_primary_key_index_lookup_with_spec(
     if !tid_out.is_null() {
         unsafe {
             *tid_out = tid.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata and key input arrays.
+pub unsafe extern "C" fn fastpg_storage2_index_insert_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    type_oids: *const u32,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    packed_tid: u64,
+) -> bool {
+    clear_last_storage_error();
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    let Some((values, is_null)) = key_arrays(values, is_null, nkeys) else {
+        return false;
+    };
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            type_oids,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: false,
+            nulls_not_distinct: true,
+        })
+    }) else {
+        return false;
+    };
+    with_session_storage(|session| {
+        session.ensure_transaction();
+        let overlay = session
+            .transaction_stack
+            .last_mut()
+            .expect("transaction was just ensured");
+        for prefix_len in 1..=nkeys {
+            let mut prefix_spec = index_spec.clone();
+            prefix_spec.columns.truncate(prefix_len);
+            if let Some(key) = index_key_for_key_datums(
+                &prefix_spec,
+                &values[..prefix_len],
+                &is_null[..prefix_len],
+            ) {
+                overlay.insert_index_entry(heap_relid, index_relid, key, tid);
+            }
+        }
+    });
+    true
+}
+
+fn visible_index_candidate_tid(
+    state: &StorageState,
+    session: &SessionStorage,
+    heap_relid: u32,
+    tid: Tid,
+) -> Option<Tid> {
+    let update_tid =
+        state.resolve_update_redirect_in_overlays(&session.transaction_stack, heap_relid, tid);
+    let visible_tid =
+        state.resolve_tid_redirect_in_overlays(&session.transaction_stack, heap_relid, update_tid);
+    state.visible_tuple_slice_in_overlays(&session.transaction_stack, heap_relid, visible_tid)?;
+    Some(visible_tid)
+}
+
+fn visible_overlay_index_candidate_tid(
+    session: &SessionStorage,
+    heap_relid: u32,
+    tid: Tid,
+) -> Option<Tid> {
+    let update_tid = resolve_overlay_update_redirect(&session.transaction_stack, heap_relid, tid);
+    let visible_tid =
+        resolve_overlay_tid_redirect(&session.transaction_stack, heap_relid, update_tid);
+    overlay_visible_tuple_slice(&session.transaction_stack, heap_relid, visible_tid, None)?;
+    Some(visible_tid)
+}
+
+fn collect_index_prefix_matches(
+    state: &StorageState,
+    session: &SessionStorage,
+    heap_relid: u32,
+    index_relid: u32,
+    prefix_key: &IndexKey,
+    max_tids: usize,
+) -> Option<Vec<Tid>> {
+    let mut output = BTreeSet::<Tid>::new();
+    let mut consider_tid = |tid: Tid| -> Option<()> {
+        let visible_tid = visible_index_candidate_tid(state, session, heap_relid, tid)?;
+        output.insert(visible_tid);
+        (output.len() <= max_tids).then_some(())
+    };
+
+    if let Some(tids) = state
+        .relations
+        .get(&heap_relid)
+        .and_then(|relation| relation.indexes.get(&index_relid))
+        .and_then(|index| index.get(prefix_key))
+    {
+        for tid in tids {
+            consider_tid(*tid)?;
+        }
+    }
+
+    for overlay in &session.transaction_stack {
+        let Some(tids) = overlay
+            .index_inserts
+            .get(&heap_relid)
+            .and_then(|index_maps| index_maps.get(&index_relid))
+            .and_then(|index| index.get(prefix_key))
+        else {
+            continue;
+        };
+        for tid in tids {
+            consider_tid(*tid)?;
+        }
+    }
+
+    Some(output.into_iter().collect())
+}
+
+fn collect_overlay_index_prefix_matches(
+    session: &SessionStorage,
+    heap_relid: u32,
+    index_relid: u32,
+    prefix_key: &IndexKey,
+    max_tids: usize,
+) -> Option<Vec<Tid>> {
+    let mut saw_index = false;
+    let mut output = BTreeSet::<Tid>::new();
+    let mut consider_tid = |tid: Tid| -> Option<()> {
+        let visible_tid = visible_overlay_index_candidate_tid(session, heap_relid, tid)?;
+        output.insert(visible_tid);
+        (output.len() <= max_tids).then_some(())
+    };
+
+    for overlay in &session.transaction_stack {
+        let Some(tids) = overlay
+            .index_inserts
+            .get(&heap_relid)
+            .and_then(|index_maps| index_maps.get(&index_relid))
+            .and_then(|index| index.get(prefix_key))
+        else {
+            continue;
+        };
+        saw_index = true;
+        for tid in tids {
+            consider_tid(*tid)?;
+        }
+    }
+
+    saw_index.then(|| output.into_iter().collect())
+}
+
+fn collect_index_candidate_matches(
+    state: &StorageState,
+    session: &SessionStorage,
+    heap_relid: u32,
+    index_relid: u32,
+    max_tids: usize,
+) -> Option<Vec<Tid>> {
+    let mut saw_index = false;
+    let mut output = BTreeSet::<Tid>::new();
+    let mut consider_tid = |tid: Tid| -> Option<()> {
+        let visible_tid = visible_index_candidate_tid(state, session, heap_relid, tid)?;
+        output.insert(visible_tid);
+        (output.len() <= max_tids).then_some(())
+    };
+
+    if let Some(index) = state
+        .relations
+        .get(&heap_relid)
+        .and_then(|relation| relation.indexes.get(&index_relid))
+    {
+        saw_index = true;
+        for tids in index.values() {
+            for tid in tids {
+                consider_tid(*tid)?;
+            }
+        }
+    }
+
+    for overlay in &session.transaction_stack {
+        let Some(index) = overlay
+            .index_inserts
+            .get(&heap_relid)
+            .and_then(|index_maps| index_maps.get(&index_relid))
+        else {
+            continue;
+        };
+        saw_index = true;
+        for tids in index.values() {
+            for tid in tids {
+                consider_tid(*tid)?;
+            }
+        }
+    }
+
+    saw_index.then(|| output.into_iter().collect())
+}
+
+fn collect_overlay_index_candidate_matches(
+    session: &SessionStorage,
+    heap_relid: u32,
+    index_relid: u32,
+    max_tids: usize,
+) -> Option<Vec<Tid>> {
+    let mut saw_index = false;
+    let mut output = BTreeSet::<Tid>::new();
+    let mut consider_tid = |tid: Tid| -> Option<()> {
+        let visible_tid = visible_overlay_index_candidate_tid(session, heap_relid, tid)?;
+        output.insert(visible_tid);
+        (output.len() <= max_tids).then_some(())
+    };
+
+    for overlay in &session.transaction_stack {
+        let Some(index) = overlay
+            .index_inserts
+            .get(&heap_relid)
+            .and_then(|index_maps| index_maps.get(&index_relid))
+        else {
+            continue;
+        };
+        saw_index = true;
+        for tids in index.values() {
+            for tid in tids {
+                consider_tid(*tid)?;
+            }
+        }
+    }
+
+    saw_index.then(|| output.into_iter().collect())
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass valid index metadata, key input arrays, and output
+/// buffers large enough for `max_tids` entries.
+pub unsafe extern "C" fn fastpg_storage2_index_prefix_lookup_with_spec(
+    index_relid: u32,
+    heap_relid: u32,
+    attnums: *const i16,
+    type_oids: *const u32,
+    typbyval: *const u8,
+    typlen: *const i16,
+    values: *const usize,
+    is_null: *const u8,
+    nkeys: usize,
+    tids_out: *mut u64,
+    max_tids: usize,
+    count_out: *mut usize,
+) -> bool {
+    clear_last_storage_error();
+    if tids_out.is_null() || count_out.is_null() || max_tids == 0 {
+        return false;
+    }
+    let Some((values, is_null)) = key_arrays(values, is_null, nkeys) else {
+        return false;
+    };
+    let Some(index_spec) = (unsafe {
+        unique_index_spec_from_ffi(UniqueIndexFfiSpecArgs {
+            index_relid,
+            heap_relid,
+            attnums,
+            type_oids,
+            typbyval,
+            typlen,
+            nkeys,
+            is_primary: false,
+            nulls_not_distinct: false,
+        })
+    }) else {
+        return false;
+    };
+    let Some(prefix_key) = index_key_for_key_datums(&index_spec, values, is_null) else {
+        return false;
+    };
+
+    let matches = if committed_row_count_cached(heap_relid) == 0
+        && let Some(matches) = with_session_storage(|session| {
+            collect_overlay_index_prefix_matches(
+                session,
+                heap_relid,
+                index_relid,
+                &prefix_key,
+                max_tids,
+            )
+        }) {
+        Some(matches)
+    } else {
+        with_storage_read(|state, session| {
+            collect_index_prefix_matches(
+                state,
+                session,
+                heap_relid,
+                index_relid,
+                &prefix_key,
+                max_tids,
+            )
+        })
+    };
+    let Some(matches) = matches else {
+        return false;
+    };
+
+    unsafe {
+        *count_out = matches.len();
+        for (index, tid) in matches.into_iter().enumerate() {
+            *tids_out.add(index) = tid.pack();
+        }
+    }
+    true
+}
+
+#[unsafe(no_mangle)]
+/// # Safety
+///
+/// C callers must pass output buffers large enough for `max_tids` entries.
+pub unsafe extern "C" fn fastpg_storage2_index_candidate_lookup(
+    index_relid: u32,
+    heap_relid: u32,
+    tids_out: *mut u64,
+    max_tids: usize,
+    count_out: *mut usize,
+) -> bool {
+    clear_last_storage_error();
+    if tids_out.is_null() || count_out.is_null() || max_tids == 0 {
+        return false;
+    }
+
+    let matches = if committed_row_count_cached(heap_relid) == 0
+        && let Some(matches) = with_session_storage(|session| {
+            collect_overlay_index_candidate_matches(session, heap_relid, index_relid, max_tids)
+        }) {
+        Some(matches)
+    } else {
+        with_storage_read(|state, session| {
+            collect_index_candidate_matches(state, session, heap_relid, index_relid, max_tids)
+        })
+    };
+    let Some(matches) = matches else {
+        return false;
+    };
+
+    unsafe {
+        *count_out = matches.len();
+        for (index, tid) in matches.into_iter().enumerate() {
+            *tids_out.add(index) = tid.pack();
         }
     }
     true
@@ -2592,6 +3499,7 @@ pub unsafe extern "C" fn fastpg_storage2_rebuild_primary_key_index_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     nkeys: usize,
@@ -2602,6 +3510,7 @@ pub unsafe extern "C" fn fastpg_storage2_rebuild_primary_key_index_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,
@@ -2711,6 +3620,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     values: *const usize,
@@ -2730,6 +3640,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,
@@ -2790,6 +3701,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_validate_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     nkeys: usize,
@@ -2802,6 +3714,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_validate_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,

@@ -222,8 +222,6 @@ static void set_baserel_partition_key_exprs(Relation relation,
 											RelOptInfo *rel);
 static void set_baserel_partition_constraint(Relation relation,
 											 RelOptInfo *rel);
-
-
 /*
  * get_relation_info -
  *	  Retrieves catalog information for a given relation.
@@ -616,10 +614,15 @@ get_relation_info(PlannerInfo *root, Oid relationObjectId, bool inhparent,
 					if ((!IsUnderPostmaster &&
 						 fastpg_use_rust_catalog() &&
 						 RelationGetRelid(indexRelation) >= (Oid) FirstNormalObjectId) ||
-						indexRelation->rd_indam == GetFastPgMemIndexAmRoutine())
+						indexRelation->rd_indam == GetFastPgMemIndexAmRoutine() ||
+						(fastpg_catalog_mode_uses_postgres() &&
+						 info->relam == BTREE_AM_OID &&
+						 RelationGetNumberOfBlocks(indexRelation) == 0))
 					{
-						info->pages = 1;
 						info->tuples = rel->tuples;
+						info->pages = indexRelation->rd_rel->relpages > 0 ?
+							(BlockNumber) indexRelation->rd_rel->relpages :
+							FastPgMemIndexPages(indexRelation, info->tuples);
 					}
 					else
 #endif
@@ -1472,11 +1475,16 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 		if ((!IsUnderPostmaster &&
 			 fastpg_use_rust_catalog() &&
 			 RelationGetRelid(rel) >= (Oid) FirstNormalObjectId) ||
-			rel->rd_indam == GetFastPgMemIndexAmRoutine())
+			rel->rd_indam == GetFastPgMemIndexAmRoutine() ||
+			(fastpg_catalog_mode_uses_postgres() &&
+			 rel->rd_rel->relam == BTREE_AM_OID &&
+			 RelationGetNumberOfBlocks(rel) == 0))
 		{
-			*pages = 1;
 			*tuples = rel->rd_rel->reltuples >= 0 ?
 				(double) rel->rd_rel->reltuples : 1.0;
+			*pages = rel->rd_rel->relpages > 0 ?
+				(BlockNumber) rel->rd_rel->relpages :
+				FastPgMemIndexPages(rel, *tuples);
 			*allvisfrac = 0;
 			return;
 		}
@@ -1574,7 +1582,6 @@ estimate_rel_size(Relation rel, int32 *attr_widths,
 		*allvisfrac = 0;
 	}
 }
-
 
 /*
  * get_rel_data_width

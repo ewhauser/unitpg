@@ -2975,6 +2975,12 @@ index_update_stats(Relation rel,
 #endif
 		{
 			relpages = RelationGetNumberOfBlocks(rel);
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres() &&
+				rel->rd_rel->relkind == RELKIND_INDEX &&
+				rel->rd_indam == GetFastPgMemIndexAmRoutine())
+				relpages = Max(relpages, FastPgMemIndexPages(rel, reltuples));
+#endif
 
 			if (rel->rd_rel->relkind != RELKIND_INDEX)
 				visibilitymap_count(rel, &relallvisible, &relallfrozen);

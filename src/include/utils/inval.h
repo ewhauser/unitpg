@@ -97,6 +97,11 @@ extern void CallSyscacheCallbacks(SysCacheIdentifier cacheid, uint32 hashvalue);
 
 extern void CallRelSyncCallbacks(Oid relid);
 
+#ifdef USE_FASTPG
+extern uint64 FastPgInvalidationGeneration(void);
+extern void FastPgBumpInvalidationGeneration(void);
+#endif
+
 extern void InvalidateSystemCaches(void);
 extern void InvalidateSystemCachesExtended(bool debug_discard);
 

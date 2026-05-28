@@ -43,9 +43,15 @@ typedef struct
 	List	   *triggerlist;
 } EventTriggerCacheEntry;
 
+#ifdef USE_FASTPG
+static _Thread_local HTAB *EventTriggerCache;
+static _Thread_local MemoryContext EventTriggerCacheContext;
+static _Thread_local EventTriggerCacheStateType EventTriggerCacheState = ETCS_NEEDS_REBUILD;
+#else
 static HTAB *EventTriggerCache;
 static MemoryContext EventTriggerCacheContext;
 static EventTriggerCacheStateType EventTriggerCacheState = ETCS_NEEDS_REBUILD;
+#endif
 
 static void BuildEventTriggerCache(void);
 static void InvalidateEventCacheCallback(Datum arg,

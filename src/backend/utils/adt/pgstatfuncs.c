@@ -1195,6 +1195,10 @@ CppConcat(pg_stat_get_db_,stat)(PG_FUNCTION_ARGS)				\
 	int64		result;											\
 	PgStat_StatDBEntry *dbentry;								\
 																\
+	if (fastpg_pgstat_noop_database_int64(dbid, CppAsString(stat), \
+										  &result))				\
+		PG_RETURN_INT64(result);								\
+																\
 	if ((dbentry = pgstat_fetch_stat_dbentry(dbid)) == NULL)	\
 		result = 0;												\
 	else														\
