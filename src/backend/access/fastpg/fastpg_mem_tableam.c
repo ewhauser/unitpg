@@ -10428,9 +10428,9 @@ static const IndexAmRoutine fastpg_mem_index_methods = {
 	.amendscan = fastpg_mem_index_end_scan,
 	.ammarkpos = fastpg_mem_index_mark_pos,
 	.amrestrpos = fastpg_mem_index_restrpos,
-		.amestimateparallelscan = fastpg_mem_index_estimate_parallel_scan,
-		.aminitparallelscan = fastpg_mem_index_init_parallel_scan,
-		.amparallelrescan = fastpg_mem_index_parallel_rescan,
+	.amestimateparallelscan = fastpg_mem_index_estimate_parallel_scan,
+	.aminitparallelscan = fastpg_mem_index_init_parallel_scan,
+	.amparallelrescan = fastpg_mem_index_parallel_rescan,
 	.amtranslatestrategy = NULL,
 	.amtranslatecmptype = NULL,
 };

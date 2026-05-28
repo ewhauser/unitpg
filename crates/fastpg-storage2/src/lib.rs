@@ -1705,6 +1705,7 @@ fn next_overlay_tuple_slice<'a>(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_next_overlay_only_impl(
     scan_handle: u64,
     forward: u8,
@@ -2253,6 +2254,7 @@ fn scan_next_batch_impl(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn scan_next_impl(
     scan_handle: u64,
     forward: u8,
@@ -2359,7 +2361,7 @@ fn scan_next_impl(
             scan.backward_cursor
         };
         let relid = scan.relid;
-        let visible = if scan.has_visibility_deltas {
+        let copied = if scan.has_visibility_deltas {
             state
                 .next_visible_tuple_slice_in_overlays(
                     &session.transaction_stack,
@@ -2372,8 +2374,15 @@ fn scan_next_impl(
                 .map(|visible| {
                     (
                         visible.cursor_tid,
-                        visible.output_tid,
-                        visible.tuple.to_vec(),
+                        copy_tuple_to_outputs(
+                            visible.output_tid,
+                            visible.tuple,
+                            values_out,
+                            is_null_out,
+                            natts,
+                            tid_out,
+                            stored_natts_out,
+                        ),
                     )
                 })
         } else {
@@ -2382,12 +2391,19 @@ fn scan_next_impl(
                 .map(|visible| {
                     (
                         visible.cursor_tid,
-                        visible.output_tid,
-                        visible.tuple.to_vec(),
+                        copy_tuple_to_outputs(
+                            visible.output_tid,
+                            visible.tuple,
+                            values_out,
+                            is_null_out,
+                            natts,
+                            tid_out,
+                            stored_natts_out,
+                        ),
                     )
                 })
         };
-        let Some((cursor_tid, output_tid, tuple)) = visible else {
+        let Some((cursor_tid, copied)) = copied else {
             if let Some(scan) = session.scan_slot_mut(scan_handle) {
                 if is_forward {
                     scan.backward_cursor = ScanCursor::before_cursor(scan.forward_cursor);
@@ -2401,6 +2417,9 @@ fn scan_next_impl(
             }
             return false;
         };
+        if !copied {
+            return false;
+        }
         if let Some(scan) = session.scan_slot_mut(scan_handle) {
             if is_forward {
                 scan.forward_cursor = ScanCursor::after(cursor_tid);
@@ -2412,19 +2431,8 @@ fn scan_next_impl(
                 scan.forward_exhausted = false;
             }
         }
-        let copied = copy_tuple_to_outputs(
-            output_tid,
-            &tuple,
-            values_out,
-            is_null_out,
-            natts,
-            tid_out,
-            stored_natts_out,
-        );
-        if copied {
-            write_optional_tid(cursor_tid, cursor_tid_out);
-        }
-        copied
+        write_optional_tid(cursor_tid, cursor_tid_out);
+        true
     })
 }
 
