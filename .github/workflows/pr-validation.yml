@@ -283,6 +283,7 @@ jobs:
 
     env:
       PGCORE_BUILD_DIR: benches/.build/ci-pgcore-${{ matrix.target }}
+      PACKAGE_CLIENT_BUILD_DIR: benches/.build/ci-package-client-${{ matrix.target }}
       RELEASE_JOBS: 4
       PGVECTOR_VERSION: v0.8.2
 
@@ -335,13 +336,6 @@ jobs:
           meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
           meson test -C "$PGCORE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
 
-      - name: Build pgvector extension
-        run: |
-          ci/build-pgvector.sh \
-            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
-            "$RUNNER_TEMP/pgvector" \
-            "$PGVECTOR_VERSION"
-
       - name: Build Rust server
         env:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
@@ -368,16 +362,20 @@ jobs:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
         run: cargo test -p fastpg-testkit --features postgres-execution,rust-catalog
 
-      - name: Restore pgcore Postgres catalog install for package tools
+      - name: Build package PostgreSQL client install
         run: |
           set -euo pipefail
-          meson configure "$PGCORE_BUILD_DIR" -Dfastpg_catalog_mode=postgres
-          meson setup --reconfigure "$PGCORE_BUILD_DIR" -Dfastpg=true
-          meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
-          meson test -C "$PGCORE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
+          rm -rf "$PACKAGE_CLIENT_BUILD_DIR"
+          meson setup "$PACKAGE_CLIENT_BUILD_DIR" . \
+            --buildtype=release \
+            --auto-features=disabled \
+            -Dtap_tests=disabled \
+            -Dfastpg=false
+          meson compile -C "$PACKAGE_CLIENT_BUILD_DIR" -j "$RELEASE_JOBS"
+          meson test -C "$PACKAGE_CLIENT_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
           ci/build-pgvector.sh \
-            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
-            "$RUNNER_TEMP/pgvector" \
+            "$PACKAGE_CLIENT_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RUNNER_TEMP/pgvector-package" \
             "$PGVECTOR_VERSION"
 
       - name: Package Rust server distribution
@@ -387,7 +385,7 @@ jobs:
           set -euo pipefail
           ci/package-rust-server-dist.sh \
             target/release/fastpg-server \
-            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$PACKAGE_CLIENT_BUILD_DIR/tmp_install/usr/local/pgsql" \
             "$DIST_TARGET" \
             "$RUNNER_TEMP/server-dist"
 
