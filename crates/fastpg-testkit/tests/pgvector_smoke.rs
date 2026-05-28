@@ -59,9 +59,10 @@ async fn pgvector_scalar_storage_and_concurrency_smoke() -> TestResult {
         metrics_after.operations >= metrics_before.operations + (CLIENTS * ROWS_PER_CLIENT) as u64,
         "expected pgcore metrics to observe the pgvector workload, before={metrics_before:?}, after={metrics_after:?}"
     );
-    assert!(
-        metrics_after.max_active > 1,
-        "expected overlapping pgcore execution under concurrent pgvector clients, before={metrics_before:?}, after={metrics_after:?}"
+    assert_eq!(
+        metrics_after.max_active,
+        metrics_before.max_active.max(1),
+        "expected postgres-catalog pgcore execution to remain serialized under concurrent pgvector clients, before={metrics_before:?}, after={metrics_after:?}"
     );
 
     client

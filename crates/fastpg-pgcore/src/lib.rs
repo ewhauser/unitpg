@@ -418,9 +418,9 @@ pub struct PreparedStatement {
     storage2_session: fastpg_storage2::SessionStorageHandle,
 }
 
-// pgcore-backed execution is intentionally allowed to overlap across client
-// tasks so the Rust server's concurrency tests exercise the real concurrent
-// path instead of a single global lane.
+// Prepared statements may move across client tasks. The pgcore lane serializes
+// Postgres-catalog calls because upstream backend state is still process-global;
+// rust-catalog calls can still overlap and exercise the concurrent path.
 unsafe impl Send for PreparedStatement {}
 unsafe impl Sync for PreparedStatement {}
 
