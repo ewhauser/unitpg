@@ -741,6 +741,14 @@ fastpg_pgcore_pgdata(void)
 	return pgdata;
 }
 
+static bool
+fastpg_server_owns_postmaster_pid(void)
+{
+	const char *value = getenv("FASTPG_SERVER_POSTMASTER_PID");
+
+	return value != NULL && value[0] != '\0';
+}
+
 static void
 fastpg_pgcore_set_my_exec_path(void)
 {
@@ -860,7 +868,8 @@ fastpg_pgcore_init_postgres_catalog_once(void)
 
 	checkDataDir();
 	ChangeToDataDir();
-	CreateDataDirLockFile(false);
+	if (!fastpg_server_owns_postmaster_pid())
+		CreateDataDirLockFile(false);
 	LocalProcessControlFile(false);
 	RegisterBuiltinShmemCallbacks();
 	if (!fastpg_pgstat_noop_active())

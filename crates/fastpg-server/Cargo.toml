@@ -11,6 +11,7 @@ postgres-execution = ["fastpg-wire/postgres-execution"]
 rust-catalog = ["fastpg-wire/rust-catalog"]
 
 [dependencies]
+fastpg-compat.workspace = true
 fastpg-wire.workspace = true
 pgwire.workspace = true
 tokio.workspace = true
