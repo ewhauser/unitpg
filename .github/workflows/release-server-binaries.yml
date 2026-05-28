@@ -119,6 +119,18 @@ jobs:
           FASTPG_POSTGRES_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
         run: cargo test -p fastpg-testkit --features postgres-execution,rust-catalog
 
+      - name: Restore pgcore Postgres catalog install for package tools
+        run: |
+          set -euo pipefail
+          meson configure "$PGCORE_BUILD_DIR" -Dfastpg_catalog_mode=postgres
+          meson setup --reconfigure "$PGCORE_BUILD_DIR" -Dfastpg=true
+          meson compile -C "$PGCORE_BUILD_DIR" -j "$RELEASE_JOBS"
+          meson test -C "$PGCORE_BUILD_DIR" --print-errorlogs --num-processes 1 postgresql:tmp_install
+          ci/build-pgvector.sh \
+            "$PGCORE_BUILD_DIR/tmp_install/usr/local/pgsql" \
+            "$RUNNER_TEMP/pgvector" \
+            "$PGVECTOR_VERSION"
+
       - name: Package Rust server distribution
         env:
           DIST_TARGET: ${{ matrix.target }}
