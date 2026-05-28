@@ -17,6 +17,7 @@
 
 #include "postgres.h"
 
+#include "port/atomics.h"
 #include "storage/standby.h"
 #include "utils/fastpg_pgstat_noop.h"
 #include "utils/pgstat_internal.h"
@@ -24,6 +25,11 @@
 
 
 static bool pgstat_should_report_connstat(void);
+
+#ifdef USE_FASTPG
+static pg_atomic_uint64 fastpg_pgstat_noop_parallel_workers_to_launch;
+static pg_atomic_uint64 fastpg_pgstat_noop_parallel_workers_launched;
+#endif
 
 
 #ifdef USE_FASTPG
@@ -49,6 +55,44 @@ static PG_THREAD_LOCAL PgStat_Counter pgLastSessionReportTime = 0;
 static int	pgStatXactCommit = 0;
 static int	pgStatXactRollback = 0;
 static PgStat_Counter pgLastSessionReportTime = 0;
+#endif
+
+
+#ifdef USE_FASTPG
+void
+fastpg_pgstat_noop_update_parallel_workers(int64 workers_to_launch,
+										   int64 workers_launched)
+{
+	if (!fastpg_pgstat_noop_active())
+		return;
+
+	pg_atomic_fetch_add_u64(&fastpg_pgstat_noop_parallel_workers_to_launch,
+							workers_to_launch);
+	pg_atomic_fetch_add_u64(&fastpg_pgstat_noop_parallel_workers_launched,
+							workers_launched);
+}
+
+bool
+fastpg_pgstat_noop_database_int64(Oid dbid, const char *stat, int64 *result)
+{
+	if (!fastpg_pgstat_noop_active() ||
+		!OidIsValid(MyDatabaseId) ||
+		dbid != MyDatabaseId)
+		return false;
+
+	if (strcmp(stat, "parallel_workers_to_launch") == 0)
+	{
+		*result = (int64) pg_atomic_read_u64(&fastpg_pgstat_noop_parallel_workers_to_launch);
+		return true;
+	}
+	if (strcmp(stat, "parallel_workers_launched") == 0)
+	{
+		*result = (int64) pg_atomic_read_u64(&fastpg_pgstat_noop_parallel_workers_launched);
+		return true;
+	}
+
+	return false;
+}
 #endif
 
 
@@ -374,7 +418,11 @@ pgstat_update_parallel_workers_stats(PgStat_Counter workers_to_launch,
 	PgStat_StatDBEntry *dbentry;
 
 	if (fastpg_pgstat_noop_active())
+	{
+		fastpg_pgstat_noop_update_parallel_workers(workers_to_launch,
+												   workers_launched);
 		return;
+	}
 
 	if (!OidIsValid(MyDatabaseId))
 		return;

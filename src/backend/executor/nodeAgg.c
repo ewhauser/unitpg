@@ -248,6 +248,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_catalog.h"
 #include "access/htup_details.h"
 #include "access/parallel.h"
 #include "catalog/objectaccess.h"
@@ -375,6 +376,9 @@ static void initialize_aggregates(AggState *aggstate,
 static void advance_transition_function(AggState *aggstate,
 										AggStatePerTrans pertrans,
 										AggStatePerGroup pergroupstate);
+static void fastpg_advance_combine_with_empty_workers(AggState *aggstate,
+													  AggStatePerTrans pertrans,
+													  AggStatePerGroup pergroupstate);
 static void advance_aggregates(AggState *aggstate);
 static void process_ordered_aggregate_single(AggState *aggstate,
 											 AggStatePerTrans pertrans,
@@ -649,6 +653,7 @@ initialize_aggregate(AggState *aggstate, AggStatePerTrans pertrans,
 	 * still need to do this.
 	 */
 	pergroupstate->noTransValue = pertrans->initValueIsNull;
+	pergroupstate->fastpg_empty_worker_combines = 0;
 }
 
 /*
@@ -802,6 +807,59 @@ advance_transition_function(AggState *aggstate,
 	pergroupstate->transValueIsNull = fcinfo->isnull;
 
 	MemoryContextSwitchTo(oldContext);
+}
+
+/*
+ * FastPG's single-process server can execute a parallel aggregate plan without
+ * launching worker processes.  A plain partial aggregate emits a state row
+ * even for an empty worker.  Combine with the aggregate's initial state for
+ * each emulated worker while finalizing above a Gather, so strict combine
+ * functions see the same input shape they would see from real workers.
+ */
+static int
+fastpg_emulated_parallel_worker_count(AggState *aggstate)
+{
+	Agg		   *node = (Agg *) aggstate->ss.ps.plan;
+	Plan	   *outer;
+
+	if (!fastpg_catalog_mode_uses_postgres() ||
+		IsUnderPostmaster ||
+		!DO_AGGSPLIT_COMBINE(aggstate->aggsplit) ||
+		aggstate->aggstrategy != AGG_PLAIN ||
+		node->numCols != 0)
+		return 0;
+
+	outer = outerPlan(node);
+	if (outer == NULL)
+		return 0;
+
+	if (IsA(outer, Gather))
+		return ((Gather *) outer)->num_workers;
+	if (IsA(outer, GatherMerge))
+		return ((GatherMerge *) outer)->num_workers;
+
+	return 0;
+}
+
+static void
+fastpg_advance_combine_with_empty_workers(AggState *aggstate,
+										  AggStatePerTrans pertrans,
+										  AggStatePerGroup pergroupstate)
+{
+	FunctionCallInfo fcinfo;
+	int			worker_count = fastpg_emulated_parallel_worker_count(aggstate);
+
+	if (worker_count <= 0)
+		return;
+
+	fcinfo = pertrans->transfn_fcinfo;
+	while (pergroupstate->fastpg_empty_worker_combines < worker_count)
+	{
+		pergroupstate->fastpg_empty_worker_combines++;
+		fcinfo->args[1].value = pertrans->initValue;
+		fcinfo->args[1].isnull = pertrans->initValueIsNull;
+		advance_transition_function(aggstate, pertrans, pergroupstate);
+	}
 }
 
 /*
@@ -1054,6 +1112,8 @@ finalize_aggregate(AggState *aggstate,
 	int			i;
 	ListCell   *lc;
 	AggStatePerTrans pertrans = &aggstate->pertrans[peragg->transno];
+
+	fastpg_advance_combine_with_empty_workers(aggstate, pertrans, pergroupstate);
 
 	oldContext = MemoryContextSwitchTo(aggstate->ss.ps.ps_ExprContext->ecxt_per_tuple_memory);
 

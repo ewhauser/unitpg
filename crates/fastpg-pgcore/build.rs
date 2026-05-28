@@ -43,6 +43,9 @@ fn main() {
         "src/backend/commands/tablecmds.c",
         "src/backend/executor/execExprInterp.c",
         "src/backend/executor/nodeModifyTable.c",
+        "src/backend/executor/nodeAgg.c",
+        "src/backend/executor/nodeGather.c",
+        "src/backend/executor/nodeGatherMerge.c",
         "src/backend/optimizer/util/plancat.c",
         "src/backend/storage/buffer/bufmgr.c",
         "src/backend/storage/ipc/ipc.c",
@@ -57,6 +60,8 @@ fn main() {
         "src/backend/tcop/utility.c",
         "src/backend/utils/adt/enum.c",
         "src/backend/utils/adt/mcxtfuncs.c",
+        "src/backend/utils/adt/pgstatfuncs.c",
+        "src/backend/utils/activity/pgstat_database.c",
         "src/backend/utils/activity/pgstat_relation.c",
         "src/backend/utils/cache/catcache.c",
         "src/backend/utils/cache/relcache.c",
@@ -78,6 +83,7 @@ fn main() {
         "src/include/access/fastpg_tableam.h",
         "src/include/catalog/heap.h",
         "src/include/catalog/namespace.h",
+        "src/include/executor/nodeAgg.h",
         "src/include/libpq/libpq.h",
         "src/include/access/xact.h",
         "src/include/miscadmin.h",
@@ -85,6 +91,7 @@ fn main() {
         "src/include/storage/subsystemlist.h",
         "src/include/tcop/tcopprot.h",
         "src/include/utils/elog.h",
+        "src/include/utils/fastpg_pgstat_noop.h",
         "src/include/utils/memutils.h",
         "src/include/utils/palloc.h",
         "src/include/utils/relcache.h",
@@ -185,6 +192,9 @@ fn build_backend_archive(build_dir: &Path, out_dir: &Path, archive: &Path) {
 
     let mut objects = Vec::new();
     collect_backend_objects(build_dir, &mut objects);
+    for object in &objects {
+        println!("cargo:rerun-if-changed={}", object.display());
+    }
     extract_archive_objects(
         build_dir,
         &build_dir.join("src/backend/parser/parser.a"),

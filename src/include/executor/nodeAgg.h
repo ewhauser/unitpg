@@ -264,6 +264,9 @@ typedef struct AggStatePerGroupData
 	 * NULL and not auto-replace it with a later input value. Only the first
 	 * non-NULL input will be auto-substituted.
 	 */
+
+	/* FastPG standalone parallel-aggregate emulation state. */
+	int			fastpg_empty_worker_combines;
 } AggStatePerGroupData;
 
 /*

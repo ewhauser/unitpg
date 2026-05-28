@@ -760,6 +760,7 @@ impl Ord for IndexKey {
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct IndexColumnSpec {
     column_index: usize,
+    type_oid: Oid,
     typbyval: bool,
     typlen: i16,
 }
@@ -3030,6 +3031,7 @@ fn unique_index_spec_for_record(record: &fastpg_catalog::IndexRecord) -> Option<
         let pg_type = lookup_type(column.type_oid)?;
         columns.push(IndexColumnSpec {
             column_index,
+            type_oid: column.type_oid,
             typbyval: pg_type.typbyval,
             typlen: pg_type.typlen,
         });
@@ -3208,7 +3210,7 @@ fn index_key_part(column: &IndexColumnSpec, cell: &Cell) -> Option<IndexKeyPart>
         return Some(IndexKeyPart::ByValue(cell.output_value()));
     }
 
-    let value_ref = byref_key_ref_from_cell(cell, column.typlen)?;
+    let value_ref = byref_key_ref_from_cell(cell, column)?;
     Some(IndexKeyPart::Bytes(value_ref))
 }
 
@@ -3220,18 +3222,35 @@ fn value_ref_bytes(value_ref: &ValueRef) -> &[u8] {
     }
 }
 
-fn byref_key_ref_from_cell(cell: &Cell, typlen: i16) -> Option<ValueRef> {
+fn byref_key_ref_from_cell(cell: &Cell, column: &IndexColumnSpec) -> Option<ValueRef> {
     let StoredDatum::ByRef(mut value_ref) = cell.datum else {
         return None;
     };
     if value_ref.ptr == 0 && value_ref.len > 0 {
         return None;
     }
-    let len = if typlen > 0 {
-        typlen as usize
-    } else if typlen == -1 {
+    if column.type_oid == BPCHAR_OID && column.typlen == -1 {
+        let (offset, len) = varlena_payload_range(cell.output_value())?;
+        if value_ref.len < offset.checked_add(len)? {
+            return None;
+        }
+        value_ref.ptr = value_ref.ptr.checked_add(offset)?;
+        value_ref.len = len;
+        while value_ref.len > 0 {
+            let byte =
+                unsafe { std::ptr::read((value_ref.ptr as *const u8).add(value_ref.len - 1)) };
+            if byte != b' ' {
+                break;
+            }
+            value_ref.len -= 1;
+        }
+        return Some(value_ref);
+    }
+    let len = if column.typlen > 0 {
+        column.typlen as usize
+    } else if column.typlen == -1 {
         varlena_payload_len(cell.output_value())?
-    } else if typlen == -2 {
+    } else if column.typlen == -2 {
         c_string_payload_len(cell.output_value())?
     } else {
         return None;
@@ -3251,6 +3270,16 @@ fn varlena_payload_len(value: usize) -> Option<usize> {
         raw as usize
     };
     (len >= 4).then_some(len)
+}
+
+fn varlena_payload_range(value: usize) -> Option<(usize, usize)> {
+    let raw = unsafe { std::ptr::read_unaligned(value as *const u32) };
+    let len = if cfg!(target_endian = "little") {
+        (raw >> 2) as usize
+    } else {
+        raw as usize
+    };
+    (len >= 4).then_some((4, len - 4))
 }
 
 fn c_string_payload_len(value: usize) -> Option<usize> {
@@ -4928,6 +4957,7 @@ struct UniqueIndexFfiSpecArgs {
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     nkeys: usize,
@@ -4940,6 +4970,7 @@ unsafe fn unique_index_spec_from_ffi(args: UniqueIndexFfiSpecArgs) -> Option<Uni
         index_relid,
         heap_relid,
         attnums,
+        type_oids,
         typbyval,
         typlen,
         nkeys,
@@ -4950,12 +4981,14 @@ unsafe fn unique_index_spec_from_ffi(args: UniqueIndexFfiSpecArgs) -> Option<Uni
     if nkeys == 0
         || nkeys > FASTPG_MAX_INDEX_KEYS
         || attnums.is_null()
+        || type_oids.is_null()
         || typbyval.is_null()
         || typlen.is_null()
     {
         return None;
     }
     let attnums = unsafe { slice::from_raw_parts(attnums, nkeys) };
+    let type_oids = unsafe { slice::from_raw_parts(type_oids, nkeys) };
     let typbyval = unsafe { slice::from_raw_parts(typbyval, nkeys) };
     let typlen = unsafe { slice::from_raw_parts(typlen, nkeys) };
     let mut columns = Vec::with_capacity(nkeys);
@@ -4966,6 +4999,7 @@ unsafe fn unique_index_spec_from_ffi(args: UniqueIndexFfiSpecArgs) -> Option<Uni
         }
         columns.push(IndexColumnSpec {
             column_index: usize::try_from(attnum - 1).ok()?,
+            type_oid: Oid(type_oids[index]),
             typbyval: typbyval[index] != 0,
             typlen: typlen[index],
         });
@@ -4989,6 +5023,7 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     values: *const usize,
@@ -5006,6 +5041,7 @@ pub unsafe extern "C" fn fastpg_rust_primary_key_index_lookup_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,
@@ -5050,6 +5086,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     values: *const usize,
@@ -5069,6 +5106,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_conflict_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,
@@ -5119,6 +5157,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
     index_relid: u32,
     heap_relid: u32,
     attnums: *const i16,
+    type_oids: *const u32,
     typbyval: *const u8,
     typlen: *const i16,
     nkeys: usize,
@@ -5132,6 +5171,7 @@ pub unsafe extern "C" fn fastpg_rust_unique_index_validate_with_spec(
             index_relid,
             heap_relid,
             attnums,
+            type_oids,
             typbyval,
             typlen,
             nkeys,

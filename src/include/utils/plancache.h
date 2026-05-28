@@ -136,6 +136,9 @@ typedef struct CachedPlanSource
 	bool		is_complete;	/* has CompleteCachedPlan been done? */
 	bool		is_saved;		/* has CachedPlanSource been "saved"? */
 	bool		is_valid;		/* is the query_list currently valid? */
+#ifdef USE_FASTPG
+	uint64		fastpg_inval_generation;	/* last catalog inval generation */
+#endif
 	int			generation;		/* increments each time we create a plan */
 	/* If CachedPlanSource has been saved, it is a member of a global list */
 	dlist_node	node;			/* list link, if is_saved */

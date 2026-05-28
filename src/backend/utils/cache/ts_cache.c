@@ -61,22 +61,27 @@
 #define MAXTOKENTYPE	256
 #define MAXDICTSPERTT	100
 
+#ifdef USE_FASTPG
+#define FASTPG_TS_CACHE_LOCAL PG_THREAD_LOCAL
+#else
+#define FASTPG_TS_CACHE_LOCAL
+#endif
 
-static HTAB *TSParserCacheHash = NULL;
-static TSParserCacheEntry *lastUsedParser = NULL;
+static FASTPG_TS_CACHE_LOCAL HTAB *TSParserCacheHash = NULL;
+static FASTPG_TS_CACHE_LOCAL TSParserCacheEntry *lastUsedParser = NULL;
 
-static HTAB *TSDictionaryCacheHash = NULL;
-static TSDictionaryCacheEntry *lastUsedDictionary = NULL;
+static FASTPG_TS_CACHE_LOCAL HTAB *TSDictionaryCacheHash = NULL;
+static FASTPG_TS_CACHE_LOCAL TSDictionaryCacheEntry *lastUsedDictionary = NULL;
 
-static HTAB *TSConfigCacheHash = NULL;
-static TSConfigCacheEntry *lastUsedConfig = NULL;
+static FASTPG_TS_CACHE_LOCAL HTAB *TSConfigCacheHash = NULL;
+static FASTPG_TS_CACHE_LOCAL TSConfigCacheEntry *lastUsedConfig = NULL;
 
 /*
  * GUC default_text_search_config, and a cache of the current config's OID
  */
 char	   *TSCurrentConfig = NULL;
 
-static Oid	TSCurrentConfigCache = InvalidOid;
+static FASTPG_TS_CACHE_LOCAL Oid TSCurrentConfigCache = InvalidOid;
 
 
 /*

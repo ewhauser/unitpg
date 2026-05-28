@@ -40,9 +40,15 @@ volatile sig_atomic_t IdleSessionTimeoutPending = false;
 volatile sig_atomic_t ProcSignalBarrierPending = false;
 volatile sig_atomic_t LogMemoryContextPending = false;
 volatile sig_atomic_t IdleStatsUpdateTimeoutPending = false;
+#ifdef USE_FASTPG
+_Thread_local volatile uint32 InterruptHoldoffCount = 0;
+_Thread_local volatile uint32 QueryCancelHoldoffCount = 0;
+_Thread_local volatile uint32 CritSectionCount = 0;
+#else
 volatile uint32 InterruptHoldoffCount = 0;
 volatile uint32 QueryCancelHoldoffCount = 0;
 volatile uint32 CritSectionCount = 0;
+#endif
 volatile int ProcDieSenderPid = 0;
 volatile int ProcDieSenderUid = 0;
 

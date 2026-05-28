@@ -14,6 +14,7 @@ pub(crate) type RedirectList = SmallVec<[(Tid, Tid); 4]>;
 pub(crate) type BlockList = SmallVec<[u32; 4]>;
 pub(crate) type PageCheckpointList = SmallVec<[(u32, PageCheckpoint); 4]>;
 pub(crate) type PendingPageList = SmallVec<[Page; 4]>;
+pub(crate) type IndexInsertMap = HashMap<u32, BTreeMap<IndexKey, TidList>>;
 
 #[derive(Debug, Default)]
 pub(crate) struct RelidMap<V> {
@@ -179,6 +180,7 @@ pub(crate) struct TransactionOverlay {
     pub(crate) update_redirect_inserts: RelidMap<RedirectList>,
     pub(crate) primary_key_inserts: RelidMap<HashMap<IndexKey, Tid>>,
     pub(crate) primary_key_deletes: RelidMap<HashSet<IndexKey>>,
+    pub(crate) index_inserts: RelidMap<IndexInsertMap>,
     pub(crate) cleared_relations: RelidMap<RelationStorage>,
 }
 
@@ -254,6 +256,7 @@ impl TransactionOverlay {
             && self.update_redirect_inserts.is_empty()
             && self.primary_key_inserts.is_empty()
             && self.primary_key_deletes.is_empty()
+            && self.index_inserts.is_empty()
             && self.cleared_relations.is_empty()
     }
 
@@ -293,12 +296,14 @@ impl TransactionOverlay {
         &mut self,
         relid: u32,
         tuple: &[u8],
+        max_tuples_per_block: Option<u16>,
     ) -> Option<Tid> {
         let pages = self.pending_pages.get_mut(&relid)?;
-        let page = pages
-            .iter_mut()
-            .rev()
-            .find(|page| page.can_fit(tuple.len()))?;
+        let page = pages.iter_mut().rev().find(|page| {
+            page.can_fit(tuple.len())
+                && max_tuples_per_block
+                    .is_none_or(|max| page.line_pointers.len() < usize::from(max))
+        })?;
         page.append_tuple_with_state(tuple, LinePointerState::Pending)
     }
 
@@ -318,11 +323,16 @@ impl TransactionOverlay {
         relid: u32,
         input: &RowInput<'_>,
         tuple_len: usize,
+        max_tuples_per_block: Option<u16>,
     ) -> Result<Option<Tid>, CatalogError> {
         let Some(pages) = self.pending_pages.get_mut(&relid) else {
             return Ok(None);
         };
-        let Some(page) = pages.iter_mut().rev().find(|page| page.can_fit(tuple_len)) else {
+        let Some(page) = pages.iter_mut().rev().find(|page| {
+            page.can_fit(tuple_len)
+                && max_tuples_per_block
+                    .is_none_or(|max| page.line_pointers.len() < usize::from(max))
+        }) else {
             return Ok(None);
         };
         page.append_input_tuple_with_state(input, tuple_len, LinePointerState::Pending)
@@ -513,6 +523,24 @@ impl TransactionOverlay {
             .insert(key, tid);
     }
 
+    pub(crate) fn insert_index_entry(
+        &mut self,
+        relid: u32,
+        index_relid: u32,
+        key: IndexKey,
+        tid: Tid,
+    ) {
+        let tids = self
+            .index_inserts
+            .entry(relid)
+            .or_default()
+            .entry(index_relid)
+            .or_default()
+            .entry(key)
+            .or_default();
+        push_tid_unique(tids, tid);
+    }
+
     pub(crate) fn remove_primary_key_insert(&mut self, relid: u32, key: &IndexKey) {
         if let Some(entries) = self.primary_key_inserts.get_mut(&relid) {
             entries.remove(key);
@@ -523,13 +551,14 @@ impl TransactionOverlay {
     }
 
     pub(crate) fn record_relation_clear(&mut self, relid: u32, mut relation: RelationStorage) {
-        if self.cleared_relations.contains_key(&relid) {
-            return;
-        }
         self.pending_pages.remove(&relid);
         self.inserted_tids.remove(&relid);
         self.inserted_cids.remove(&relid);
         self.primary_key_inserts.remove(&relid);
+        self.index_inserts.remove(&relid);
+        if self.cleared_relations.contains_key(&relid) {
+            return;
+        }
         self.restore_relation_snapshot(relid, &mut relation);
         self.cleared_relations.insert(relid, relation);
     }
@@ -615,6 +644,17 @@ impl TransactionOverlay {
     }
 
     pub(crate) fn append_from(&mut self, other: &mut Self) {
+        for (relid, mut relation) in other.cleared_relations.drain() {
+            self.pending_pages.remove(&relid);
+            self.inserted_tids.remove(&relid);
+            self.inserted_cids.remove(&relid);
+            self.primary_key_inserts.remove(&relid);
+            self.index_inserts.remove(&relid);
+            if !self.cleared_relations.contains_key(&relid) {
+                self.restore_relation_snapshot(relid, &mut relation);
+                self.cleared_relations.insert(relid, relation);
+            }
+        }
         for (relid, pages) in other.pending_pages.drain() {
             self.pending_pages.entry(relid).or_default().extend(pages);
         }
@@ -687,14 +727,16 @@ impl TransactionOverlay {
                 .or_default()
                 .extend(entries);
         }
-        for (relid, mut relation) in other.cleared_relations.drain() {
-            if !self.cleared_relations.contains_key(&relid) {
-                self.pending_pages.remove(&relid);
-                self.inserted_tids.remove(&relid);
-                self.inserted_cids.remove(&relid);
-                self.primary_key_inserts.remove(&relid);
-                self.restore_relation_snapshot(relid, &mut relation);
-                self.cleared_relations.insert(relid, relation);
+        for (relid, index_maps) in other.index_inserts.drain() {
+            let target = self.index_inserts.entry(relid).or_default();
+            for (index_relid, entries) in index_maps {
+                let target_entries = target.entry(index_relid).or_default();
+                for (key, tids) in entries {
+                    let target_tids = target_entries.entry(key).or_default();
+                    for tid in tids {
+                        push_tid_unique(target_tids, tid);
+                    }
+                }
             }
         }
     }
@@ -741,6 +783,15 @@ impl TransactionOverlay {
                 *tid = remap_tid(*tid, remaps);
             }
         }
+        if let Some(index_maps) = self.index_inserts.get_mut(&relid) {
+            for entries in index_maps.values_mut() {
+                for tids in entries.values_mut() {
+                    for tid in tids {
+                        *tid = remap_tid(*tid, remaps);
+                    }
+                }
+            }
+        }
     }
 
     pub(crate) fn accounted_bytes(&self) -> usize {
@@ -749,7 +800,23 @@ impl TransactionOverlay {
             .values()
             .map(|pages| pages.iter().map(|page| page.bytes.len()).sum::<usize>())
             .sum::<usize>();
+        let new_relation_pages = (&self.page_checkpoints)
+            .into_iter()
+            .map(|(relid, checkpoints)| {
+                let prior_pages = self
+                    .relation_checkpoints
+                    .get(relid)
+                    .map(|checkpoint| checkpoint.pages_len)
+                    .unwrap_or_default();
+                checkpoints
+                    .iter()
+                    .filter(|(block, _)| (*block as usize) >= prior_pages)
+                    .count()
+                    .saturating_mul(PAGE_SIZE)
+            })
+            .sum::<usize>();
         pending_pages
+            + new_relation_pages
             + self
                 .new_pages
                 .values()
@@ -796,7 +863,25 @@ impl TransactionOverlay {
                     .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
             })
             .sum::<usize>();
-        inserts + deletes + redirects + update_redirects
+        let index_inserts = self
+            .index_inserts
+            .values()
+            .map(|index_maps| {
+                index_maps
+                    .values()
+                    .map(|entries| {
+                        entries
+                            .iter()
+                            .map(|(key, tids)| {
+                                key.accounted_bytes()
+                                    + tids.len().saturating_mul(std::mem::size_of::<Tid>())
+                            })
+                            .sum::<usize>()
+                    })
+                    .sum::<usize>()
+            })
+            .sum::<usize>();
+        inserts + deletes + redirects + update_redirects + index_inserts
     }
 }
 
@@ -1146,6 +1231,49 @@ pub(crate) fn overlay_tid_redirect(
                     .map(|(_, next_tid)| *next_tid)
             })
     })
+}
+
+pub(crate) fn overlay_tid_redirect_target(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> bool {
+    overlays.iter().rev().any(|overlay| {
+        overlay
+            .hot_redirect_inserts
+            .get(&relid)
+            .is_some_and(|redirects| redirects.iter().any(|(_, next_tid)| *next_tid == tid))
+    })
+}
+
+pub(crate) fn overlay_tid_redirect_root_for_target(
+    overlays: &[TransactionOverlay],
+    relid: u32,
+    tid: Tid,
+) -> Option<Tid> {
+    if !overlay_tid_redirect_target(overlays, relid, tid) {
+        return None;
+    }
+
+    let mut root = tid;
+    for _ in 0..1_000_000 {
+        let Some(previous) = overlays.iter().rev().find_map(|overlay| {
+            overlay
+                .hot_redirect_inserts
+                .get(&relid)
+                .and_then(|redirects| {
+                    redirects
+                        .iter()
+                        .find(|(_, next_tid)| *next_tid == root)
+                        .map(|(old_tid, _)| *old_tid)
+                })
+        }) else {
+            break;
+        };
+        root = previous;
+    }
+
+    (root != tid).then_some(root)
 }
 
 pub(crate) fn overlay_pending_tuple_slice(

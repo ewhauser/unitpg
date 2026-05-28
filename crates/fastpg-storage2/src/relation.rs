@@ -3,8 +3,13 @@ use crate::*;
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RelationStorage {
     pub(crate) pages: Vec<Option<Page>>,
+    pub(crate) physical_blocks: BTreeSet<u32>,
     pub(crate) primary_key_index: HashMap<IndexKey, Tid>,
+    pub(crate) indexes: HashMap<u32, BTreeMap<IndexKey, TidList>>,
     pub(crate) hot_redirects: HashMap<Tid, Tid>,
+    pub(crate) hot_redirect_roots: BTreeSet<Tid>,
+    pub(crate) hot_redirect_targets: HashSet<Tid>,
+    pub(crate) hot_redirect_target_roots: HashMap<Tid, Tid>,
     pub(crate) update_redirects: HashMap<Tid, Tid>,
     pub(crate) row_delete_xids: HashMap<Tid, u32>,
     pub(crate) row_delete_cids: HashMap<Tid, u32>,
@@ -77,6 +82,7 @@ impl RelationStorage {
         }
         let page_block = page.block;
         self.pages[block] = Some(page);
+        self.physical_blocks.insert(page_block);
         self.refresh_appendable_block(page_block);
     }
 
@@ -286,6 +292,51 @@ impl RelationStorage {
         self.live_tids.iter().copied()
     }
 
+    pub(crate) fn insert_index_entry(&mut self, index_relid: u32, key: IndexKey, tid: Tid) {
+        let tids = self
+            .indexes
+            .entry(index_relid)
+            .or_default()
+            .entry(key)
+            .or_default();
+        if !tids.contains(&tid) {
+            tids.push(tid);
+        }
+    }
+
+    pub(crate) fn insert_hot_redirect(&mut self, old_tid: Tid, new_tid: Tid) {
+        let root_tid = self
+            .hot_redirect_target_roots
+            .get(&old_tid)
+            .copied()
+            .unwrap_or(old_tid);
+        if let Some(previous_tid) = self.hot_redirects.insert(old_tid, new_tid)
+            && previous_tid != new_tid
+            && !self
+                .hot_redirects
+                .values()
+                .any(|target_tid| *target_tid == previous_tid)
+        {
+            self.hot_redirect_targets.remove(&previous_tid);
+            self.hot_redirect_target_roots.remove(&previous_tid);
+        }
+        self.hot_redirect_roots.insert(root_tid);
+        self.hot_redirect_targets.insert(new_tid);
+        self.hot_redirect_target_roots.insert(new_tid, root_tid);
+    }
+
+    pub(crate) fn is_hot_redirect_root(&self, tid: Tid) -> bool {
+        self.hot_redirect_roots.contains(&tid)
+    }
+
+    pub(crate) fn is_hot_redirect_target(&self, tid: Tid) -> bool {
+        self.hot_redirect_targets.contains(&tid)
+    }
+
+    pub(crate) fn hot_redirect_root_for_target(&self, tid: Tid) -> Option<Tid> {
+        self.hot_redirect_target_roots.get(&tid).copied()
+    }
+
     pub(crate) fn accounted_bytes(&self) -> usize {
         self.pages
             .iter()
@@ -303,7 +354,7 @@ impl RelationStorage {
     }
 
     pub(crate) fn page_count(&self) -> usize {
-        self.pages.iter().filter(|page| page.is_some()).count()
+        self.physical_blocks.len()
     }
 
     pub(crate) fn block_count(&self) -> usize {
@@ -337,12 +388,10 @@ impl RelationStorage {
 
     fn recompute_appendable_blocks(&mut self) {
         self.appendable_blocks.clear();
-        for (block, page) in self.pages.iter().enumerate() {
-            let Some(page) = page.as_ref() else {
-                continue;
-            };
-            if self.page_can_accept_tuple(page, 1)
-                && let Ok(block) = u32::try_from(block)
+        for block in self.physical_blocks.iter().copied() {
+            if self
+                .page(block)
+                .is_some_and(|page| self.page_can_accept_tuple(page, 1))
             {
                 self.appendable_blocks.insert(block);
             }
@@ -358,8 +407,10 @@ impl RelationStorage {
         self.pending_tuple_bytes = 0;
         self.dead_tuple_bytes = 0;
         self.live_tids.clear();
+        self.physical_blocks.clear();
 
         for page in self.pages.iter().filter_map(Option::as_ref) {
+            self.physical_blocks.insert(page.block);
             for (index, line) in page.line_pointers.iter().enumerate() {
                 let len = line.len as usize;
                 match line.state {
@@ -393,6 +444,18 @@ impl RelationStorage {
             .sum::<usize>()
             + self
                 .hot_redirects
+                .len()
+                .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
+            + self
+                .hot_redirect_roots
+                .len()
+                .saturating_mul(std::mem::size_of::<Tid>())
+            + self
+                .hot_redirect_targets
+                .len()
+                .saturating_mul(std::mem::size_of::<Tid>())
+            + self
+                .hot_redirect_target_roots
                 .len()
                 .saturating_mul(std::mem::size_of::<(Tid, Tid)>())
             + self

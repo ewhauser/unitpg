@@ -114,6 +114,11 @@ static void PlanCacheSysCallback(Datum arg, SysCacheIdentifier cacheid,
 /* ResourceOwner callbacks to track plancache references */
 static void ResOwnerReleaseCachedPlan(Datum res);
 
+#ifdef USE_FASTPG
+static void FastPgRecordPlanSourceInvalidationGeneration(CachedPlanSource *plansource);
+static void FastPgMaybeInvalidatePlanSource(CachedPlanSource *plansource);
+#endif
+
 static const ResourceOwnerDesc planref_resowner_desc =
 {
 	.name = "plancache reference",
@@ -138,6 +143,29 @@ ResourceOwnerForgetPlanCacheRef(ResourceOwner owner, CachedPlan *plan)
 
 /* GUC parameter */
 int			plan_cache_mode = PLAN_CACHE_MODE_AUTO;
+
+#ifdef USE_FASTPG
+static void
+FastPgRecordPlanSourceInvalidationGeneration(CachedPlanSource *plansource)
+{
+	plansource->fastpg_inval_generation = FastPgInvalidationGeneration();
+}
+
+static void
+FastPgMaybeInvalidatePlanSource(CachedPlanSource *plansource)
+{
+	if (!plansource->is_valid)
+		return;
+	if (!StmtPlanRequiresRevalidation(plansource))
+		return;
+	if (plansource->fastpg_inval_generation == FastPgInvalidationGeneration())
+		return;
+
+	plansource->is_valid = false;
+	if (plansource->gplan)
+		plansource->gplan->is_valid = false;
+}
+#endif
 
 /*
  * InitPlanCache: initialize module during InitPostgres.
@@ -502,6 +530,9 @@ CompleteCachedPlan(CachedPlanSource *plansource,
 #endif
 
 	plansource->is_complete = true;
+#ifdef USE_FASTPG
+	FastPgRecordPlanSourceInvalidationGeneration(plansource);
+#endif
 	plansource->is_valid = true;
 }
 
@@ -703,6 +734,10 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 		Assert(plansource->is_valid);
 		return NIL;
 	}
+
+#ifdef USE_FASTPG
+	FastPgMaybeInvalidatePlanSource(plansource);
+#endif
 
 	/*
 	 * If the query is currently valid, we should have a saved search_path ---
@@ -933,6 +968,9 @@ RevalidateCachedQuery(CachedPlanSource *plansource,
 	 * relative costs.
 	 */
 
+#ifdef USE_FASTPG
+	FastPgRecordPlanSourceInvalidationGeneration(plansource);
+#endif
 	plansource->is_valid = true;
 
 	/* Return transient copy of querytrees for possible use in planning */
@@ -1596,6 +1634,10 @@ CachedPlanIsSimplyValid(CachedPlanSource *plansource, CachedPlan *plan,
 	 */
 	Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
 
+#ifdef USE_FASTPG
+	FastPgMaybeInvalidatePlanSource(plansource);
+#endif
+
 	/*
 	 * Has cache invalidation fired on this plan?  We can check this right
 	 * away since there are no locks that we'd need to acquire first.  Note
@@ -1741,6 +1783,10 @@ CopyCachedPlan(CachedPlanSource *plansource)
 	newsource->is_complete = true;
 	newsource->is_saved = false;
 	newsource->is_valid = plansource->is_valid;
+#ifdef USE_FASTPG
+	newsource->fastpg_inval_generation =
+		plansource->fastpg_inval_generation;
+#endif
 	newsource->generation = plansource->generation;
 
 	/* We may as well copy any acquired cost knowledge */
@@ -1766,6 +1812,9 @@ bool
 CachedPlanIsValid(CachedPlanSource *plansource)
 {
 	Assert(plansource->magic == CACHEDPLANSOURCE_MAGIC);
+#ifdef USE_FASTPG
+	FastPgMaybeInvalidatePlanSource(plansource);
+#endif
 	return plansource->is_valid;
 }
 

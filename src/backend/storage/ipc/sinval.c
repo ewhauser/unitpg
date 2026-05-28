@@ -50,6 +50,9 @@ void
 SendSharedInvalidMessages(const SharedInvalidationMessage *msgs, int n)
 {
 #ifdef USE_FASTPG
+	if (n > 0)
+		FastPgBumpInvalidationGeneration();
+
 	/*
 	 * fastpg's Rust server has no shared-memory sinval queue and no sibling
 	 * backend processes.  Command-end local invalidation still runs through
