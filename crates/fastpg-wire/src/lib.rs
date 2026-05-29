@@ -50,14 +50,16 @@ use pgwire::api::store::PortalStore;
 use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionHandle, PgWireServerHandlers, Type};
 use pgwire::api::{PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
+#[cfg(unix)]
+use pgwire::messages::DecodeContext;
+use pgwire::messages::ProtocolVersion;
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
 use pgwire::messages::response::{
     CommandComplete, EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
-#[cfg(unix)]
-use pgwire::messages::{DecodeContext, ProtocolVersion};
+use pgwire::messages::startup::{NegotiateProtocolVersion, Startup};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
 use postgres_types::Kind;
 #[cfg(unix)]
@@ -746,7 +748,13 @@ impl StartupHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         if let PgWireFrontendMessage::Startup(ref startup) = message {
-            pgwire::api::auth::protocol_negotiation(client, startup).await?;
+            let protocol = negotiate_startup_protocol(startup)?;
+            if let Some(response) = protocol.response {
+                client
+                    .send(PgWireBackendMessage::NegotiateProtocolVersion(response))
+                    .await?;
+            }
+            client.set_protocol_version(protocol.version);
             pgwire::api::auth::save_startup_parameters_to_metadata(client, startup);
 
             let (pid, secret_key) = PID_GENERATOR.generate(client);
@@ -2571,6 +2579,50 @@ where
     }
 }
 
+struct StartupProtocolNegotiation {
+    version: ProtocolVersion,
+    response: Option<NegotiateProtocolVersion>,
+}
+
+fn negotiate_startup_protocol(startup: &Startup) -> PgWireResult<StartupProtocolNegotiation> {
+    let unsupported_options = startup
+        .parameters
+        .keys()
+        .filter(|key| key.starts_with("_pq_."))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    let version = match ProtocolVersion::from_version_number(
+        startup.protocol_number_major,
+        startup.protocol_number_minor,
+    ) {
+        Some(version) => version,
+        None if startup.protocol_number_major == Startup::PG_PROTOCOL_LATEST
+            && startup.protocol_number_minor > ProtocolVersion::PROTOCOL3_2.version_number().1 =>
+        {
+            ProtocolVersion::PROTOCOL3_2
+        }
+        None => {
+            return Err(PgWireError::UnsupportedProtocolVersion(
+                startup.protocol_number_major,
+                startup.protocol_number_minor,
+            ));
+        }
+    };
+
+    let (major, minor) = version.version_number();
+    let response = (startup.protocol_number_minor != minor || !unsupported_options.is_empty())
+        .then(|| {
+            NegotiateProtocolVersion::new(pg_protocol_number(major, minor), unsupported_options)
+        });
+
+    Ok(StartupProtocolNegotiation { version, response })
+}
+
+fn pg_protocol_number(major: u16, minor: u16) -> i32 {
+    (((major as u32) << 16) | minor as u32) as i32
+}
+
 fn missing_session_error() -> PgWireError {
     PgWireError::UserError(Box::new(ErrorInfo::new(
         "ERROR".to_owned(),
@@ -3222,6 +3274,7 @@ fn copy_data_error(message: String) -> PgWireError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
@@ -3308,6 +3361,69 @@ mod tests {
         assert!(should_split_simple_query(&split_simple_query_statements(
             query
         )));
+    }
+
+    #[test]
+    fn startup_protocol_grease_negotiates_full_protocol_number() {
+        let negotiation = negotiate_startup_protocol(&startup_with_protocol(
+            3,
+            9999,
+            BTreeMap::from([("_pq_.test_protocol_negotiation".to_owned(), String::new())]),
+        ))
+        .unwrap();
+
+        assert_eq!(negotiation.version, ProtocolVersion::PROTOCOL3_2);
+        let response = negotiation.response.unwrap();
+        assert_eq!(
+            response.newest_minor_protocol,
+            Startup::PROTOCOL_VERSION_3_2
+        );
+        assert_eq!(
+            response.unsupported_options,
+            vec!["_pq_.test_protocol_negotiation".to_owned()]
+        );
+    }
+
+    #[test]
+    fn startup_protocol_reports_options_for_protocol_3_0() {
+        let negotiation = negotiate_startup_protocol(&startup_with_protocol(
+            3,
+            0,
+            BTreeMap::from([("_pq_.future_option".to_owned(), String::new())]),
+        ))
+        .unwrap();
+
+        assert_eq!(negotiation.version, ProtocolVersion::PROTOCOL3_0);
+        let response = negotiation.response.unwrap();
+        assert_eq!(
+            response.newest_minor_protocol,
+            Startup::PROTOCOL_VERSION_3_0
+        );
+        assert_eq!(
+            response.unsupported_options,
+            vec!["_pq_.future_option".to_owned()]
+        );
+    }
+
+    #[test]
+    fn startup_protocol_supported_version_skips_negotiation() {
+        let negotiation =
+            negotiate_startup_protocol(&startup_with_protocol(3, 2, BTreeMap::new())).unwrap();
+
+        assert_eq!(negotiation.version, ProtocolVersion::PROTOCOL3_2);
+        assert!(negotiation.response.is_none());
+    }
+
+    fn startup_with_protocol(
+        major: u16,
+        minor: u16,
+        parameters: BTreeMap<String, String>,
+    ) -> Startup {
+        let mut startup = Startup::new();
+        startup.protocol_number_major = major;
+        startup.protocol_number_minor = minor;
+        startup.parameters = parameters;
+        startup
     }
 
     fn command_complete_tag(response: Response) -> String {

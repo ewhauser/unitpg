@@ -15,6 +15,7 @@ CLIENT_PREFIX="$2"
 TARGET="$3"
 OUTPUT_DIR="$4"
 PACKAGE_NAME="postgres-server-${TARGET}"
+PGCORE_BUILD_DIR="${FASTPG_PGCORE_BUILD_DIR:-${PGCORE_BUILD_DIR:-}}"
 
 if [[ ! -x "$SERVER_BINARY" ]]; then
 	printf 'server binary does not exist or is not executable: %s\n' "$SERVER_BINARY" >&2
@@ -168,6 +169,68 @@ copy_runtime_shared_tree() {
 	done < <(find "$source_root" \( -type f -o -type l \) -print0)
 }
 
+copy_pgcore_shared_object() {
+	local source="$1"
+	local destination="$PACKAGE_DIR/lib/postgresql/$(basename "$source")"
+
+	if [[ ! -e "$source" ]]; then
+		return 1
+	fi
+
+	mkdir -p "$PACKAGE_DIR/lib/postgresql"
+	cp -pP "$source" "$destination"
+	return 0
+}
+
+copy_pgcore_server_module_tree() {
+	local source_root="$1"
+	local suffix="$2"
+	local path
+
+	if [[ ! -d "$source_root" ]]; then
+		return
+	fi
+
+	while IFS= read -r -d '' path; do
+		copy_pgcore_shared_object "$path" || true
+	done < <(find "$source_root" \( -type f -o -type l \) -name "*$suffix" -print0)
+}
+
+copy_pgcore_runtime_shared_objects() {
+	local suffix
+	local required_plpgsql
+
+	if [[ -z "$PGCORE_BUILD_DIR" ]]; then
+		return
+	fi
+	if [[ ! -d "$PGCORE_BUILD_DIR" ]]; then
+		printf 'pgcore build dir does not exist: %s\n' "$PGCORE_BUILD_DIR" >&2
+		exit 1
+	fi
+
+	case "$TARGET" in
+		macos-*)
+			suffix=".dylib"
+			;;
+		*)
+			suffix=".so"
+			;;
+	esac
+
+	required_plpgsql="$PGCORE_BUILD_DIR/src/pl/plpgsql/src/plpgsql$suffix"
+	if ! copy_pgcore_shared_object "$required_plpgsql"; then
+		printf 'missing fastpg pgcore PL/pgSQL library: %s\n' "$required_plpgsql" >&2
+		exit 1
+	fi
+
+	copy_pgcore_server_module_tree "$PGCORE_BUILD_DIR/src/backend" "$suffix"
+	copy_pgcore_server_module_tree "$PGCORE_BUILD_DIR/src/pl" "$suffix"
+	copy_pgcore_server_module_tree "$PGCORE_BUILD_DIR/contrib" "$suffix"
+	copy_pgcore_server_module_tree "$PGCORE_BUILD_DIR/src/test/modules" "$suffix"
+	copy_pgcore_server_module_tree "$PGCORE_BUILD_DIR/src/test/regress" "$suffix"
+	copy_pgcore_server_module_tree "$PGCORE_BUILD_DIR/src/bin/pg_upgrade" "$suffix"
+}
+
 copy_matching_client_binaries
 copy_bootstrap_initdb
 copy_required_client_binary pg_ctl
@@ -180,6 +243,7 @@ cp -pP "$SERVER_BINARY" "$PACKAGE_DIR/bin/postgres"
 if [[ -d "$CLIENT_PREFIX/lib" ]]; then
 	copy_runtime_shared_tree "$CLIENT_PREFIX/lib" "$PACKAGE_DIR/lib"
 fi
+copy_pgcore_runtime_shared_objects
 
 if [[ -d "$CLIENT_PREFIX/share" ]]; then
 	cp -Rp "$CLIENT_PREFIX/share/." "$PACKAGE_DIR/share/"
