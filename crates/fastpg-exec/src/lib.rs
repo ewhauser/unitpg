@@ -18,10 +18,12 @@ use fastpg_catalog::relation_by_name;
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
     ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreNotice,
-    PgCoreParam, PgCoreSession, PgCoreTransactionCommand, PgCoreValue, PreparedStatement,
-    SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
+    PgCoreParam, PgCoreParamFormat, PgCoreSession, PgCoreTransactionCommand, PgCoreValue,
+    PreparedStatement, SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
 };
-use fastpg_types::{Column, PgType, Value};
+#[cfg(feature = "postgres-execution")]
+use fastpg_types::ParameterFormat;
+use fastpg_types::{Column, PgType, QueryParameter, Value};
 
 #[cfg(feature = "postgres-execution")]
 const BPCHAR_OID: u32 = 1042;
@@ -376,6 +378,18 @@ impl QueryExecutor {
     }
 
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
+        let parameters = parameters
+            .iter()
+            .map(QueryParameter::from)
+            .collect::<Vec<_>>();
+        self.execute_with_parameters(sql, &parameters)
+    }
+
+    pub fn execute_with_parameters(
+        &self,
+        sql: &str,
+        parameters: &[QueryParameter],
+    ) -> QueryExecution {
         #[cfg(feature = "postgres-execution")]
         {
             self.execute_pgcore(sql, parameters, PgCoreRowConversion::Typed)
@@ -899,7 +913,7 @@ impl QueryExecutor {
     fn execute_pgcore(
         &self,
         sql: &str,
-        parameters: &[Value],
+        parameters: &[QueryParameter],
         row_conversion: PgCoreRowConversion,
     ) -> QueryExecution {
         self.ensure_pgcore_session_started();
@@ -1221,13 +1235,25 @@ fn pgcore_statement_to_query_execution(
 }
 
 #[cfg(feature = "postgres-execution")]
-fn pgcore_param_value(value: &Value) -> PgCoreParam {
+fn pgcore_param_value(value: &QueryParameter) -> PgCoreParam {
     match value {
-        Value::Int2(value) => PgCoreParam::Datum(*value as usize),
-        Value::Int4(value) => PgCoreParam::Datum(*value as usize),
-        Value::Int8(value) => PgCoreParam::Datum(*value as usize),
-        Value::Text(value) | Value::RawText(value) => PgCoreParam::Text(value.clone()),
-        Value::Null => PgCoreParam::Null,
+        QueryParameter::Int2(value) => PgCoreParam::Datum(*value as usize),
+        QueryParameter::Int4(value) => PgCoreParam::Datum(*value as usize),
+        QueryParameter::Int8(value) => PgCoreParam::Datum(*value as usize),
+        QueryParameter::Text(value) => PgCoreParam::Text(value.clone()),
+        QueryParameter::Raw { format, bytes } => PgCoreParam::Raw {
+            format: pgcore_param_format(*format),
+            bytes: bytes.clone(),
+        },
+        QueryParameter::Null => PgCoreParam::Null,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_param_format(format: ParameterFormat) -> PgCoreParamFormat {
+    match format {
+        ParameterFormat::Text => PgCoreParamFormat::Text,
+        ParameterFormat::Binary => PgCoreParamFormat::Binary,
     }
 }
 

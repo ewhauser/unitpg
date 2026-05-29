@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use bytes::Buf;
 use bytes::{BufMut, Bytes, BytesMut};
 use fastpg_session::{
-    COPY_ERROR_CONTEXT_PREFIX, Column, PgType, QueryDescription, QueryExecution, QueryNotice,
-    QueryResult, ServerState, SessionState, StartupParameters, Value,
+    COPY_ERROR_CONTEXT_PREFIX, Column, ParameterFormat, PgType, QueryDescription, QueryExecution,
+    QueryNotice, QueryParameter, QueryResult, ServerState, SessionState, StartupParameters, Value,
 };
 #[cfg(unix)]
 use futures::Stream;
@@ -252,11 +252,11 @@ impl FastPgWireHandler {
         &self,
         session: Arc<SessionState>,
         query: String,
-        parameters: Vec<Value>,
+        parameters: Vec<QueryParameter>,
     ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
         self.execution
             .run_session_blocking(session, move |session| {
-                let execution = session.execute(&query, &parameters);
+                let execution = session.execute_with_parameters(&query, &parameters);
                 let notices = session.take_notices();
                 (execution, notices)
             })
@@ -916,10 +916,7 @@ impl ExtendedQueryHandler for FastPgWireHandler {
     {
         let session = session_for_client(client)?;
         let query = portal.statement.statement.clone();
-        let parameters = match self.describe_query(session.clone(), query.clone()).await? {
-            Some(description) => decode_parameters(portal, &description)?,
-            None => vec![],
-        };
+        let parameters = collect_bound_parameters(portal)?;
         let (execution, notices) = self
             .execute_query(session.clone(), query, parameters)
             .await?;
@@ -2690,29 +2687,29 @@ fn pgwire_type_for_pg_type(data_type: PgType) -> Type {
     }
 }
 
-fn decode_parameters(
-    portal: &Portal<String>,
-    description: &QueryDescription,
-) -> PgWireResult<Vec<Value>> {
-    description
-        .parameter_types
-        .iter()
-        .enumerate()
-        .map(|(idx, data_type)| match data_type {
-            PgType::Int2 => portal
-                .parameter::<i16>(idx, &Type::INT2)
-                .map(|value| value.map(Value::Int2).unwrap_or(Value::Null)),
-            PgType::Int4 => portal
-                .parameter::<i32>(idx, &Type::INT4)
-                .map(|value| value.map(Value::Int4).unwrap_or(Value::Null)),
-            PgType::Int8 => portal
-                .parameter::<i64>(idx, &Type::INT8)
-                .map(|value| value.map(Value::Int8).unwrap_or(Value::Null)),
-            PgType::Varchar => portal
-                .parameter::<String>(idx, &Type::VARCHAR)
-                .map(|value| value.map(Value::Text).unwrap_or(Value::Null)),
+fn collect_bound_parameters(portal: &Portal<String>) -> PgWireResult<Vec<QueryParameter>> {
+    (0..portal.parameter_len())
+        .map(|idx| {
+            let parameter = portal
+                .parameters
+                .get(idx)
+                .ok_or_else(|| PgWireError::ParameterIndexOutOfBound(idx))?;
+            Ok(match parameter {
+                Some(bytes) => QueryParameter::Raw {
+                    format: parameter_format(portal.parameter_format.format_for(idx)),
+                    bytes: bytes.to_vec(),
+                },
+                None => QueryParameter::Null,
+            })
         })
         .collect()
+}
+
+fn parameter_format(format: FieldFormat) -> ParameterFormat {
+    match format {
+        FieldFormat::Text => ParameterFormat::Text,
+        FieldFormat::Binary => ParameterFormat::Binary,
+    }
 }
 
 fn postgres_catalog_enabled() -> bool {
@@ -3278,6 +3275,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use pgwire::messages::extendedquery::Bind;
     use pgwire::messages::response::CommandComplete;
 
     use super::*;
@@ -3414,6 +3412,47 @@ mod tests {
         assert!(negotiation.response.is_none());
     }
 
+    #[test]
+    fn bound_parameter_collector_preserves_text_binary_and_null_values() {
+        let portal = portal_with_parameters(
+            vec![0, 1],
+            vec![
+                Some(Bytes::from_static(b"text-value")),
+                Some(Bytes::from_static(b"\0\0\0*")),
+            ],
+        );
+
+        assert_eq!(
+            collect_bound_parameters(&portal).unwrap(),
+            vec![
+                QueryParameter::Raw {
+                    format: ParameterFormat::Text,
+                    bytes: b"text-value".to_vec(),
+                },
+                QueryParameter::Raw {
+                    format: ParameterFormat::Binary,
+                    bytes: b"\0\0\0*".to_vec(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn bound_parameter_collector_uses_unified_text_default_and_preserves_null() {
+        let portal = portal_with_parameters(vec![], vec![Some(Bytes::from_static(b"42")), None]);
+
+        assert_eq!(
+            collect_bound_parameters(&portal).unwrap(),
+            vec![
+                QueryParameter::Raw {
+                    format: ParameterFormat::Text,
+                    bytes: b"42".to_vec(),
+                },
+                QueryParameter::Null,
+            ]
+        );
+    }
+
     fn startup_with_protocol(
         major: u16,
         minor: u16,
@@ -3432,6 +3471,14 @@ mod tests {
         };
         let command_complete = CommandComplete::from(tag);
         command_complete.tag
+    }
+
+    fn portal_with_parameters(
+        parameter_format_codes: Vec<i16>,
+        parameters: Vec<Option<Bytes>>,
+    ) -> Portal<String> {
+        let bind = Bind::new(None, None, parameter_format_codes, parameters, Vec::new());
+        Portal::try_new(&bind, Arc::new(StoredStatement::default())).unwrap()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
