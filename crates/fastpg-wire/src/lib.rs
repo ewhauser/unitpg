@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use bytes::Buf;
 use bytes::{BufMut, Bytes, BytesMut};
 use fastpg_session::{
-    COPY_ERROR_CONTEXT_PREFIX, Column, PgType, QueryDescription, QueryExecution, QueryNotice,
-    QueryResult, ServerState, SessionState, StartupParameters, Value,
+    COPY_ERROR_CONTEXT_PREFIX, Column, ParameterFormat, PgType, QueryDescription, QueryExecution,
+    QueryNotice, QueryParameter, QueryResult, ServerState, SessionState, StartupParameters, Value,
 };
 #[cfg(unix)]
 use futures::Stream;
@@ -252,11 +252,11 @@ impl FastPgWireHandler {
         &self,
         session: Arc<SessionState>,
         query: String,
-        parameters: Vec<Value>,
+        parameters: Vec<QueryParameter>,
     ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
         self.execution
             .run_session_blocking(session, move |session| {
-                let execution = session.execute(&query, &parameters);
+                let execution = session.execute_with_parameters(&query, &parameters);
                 let notices = session.take_notices();
                 (execution, notices)
             })
@@ -916,10 +916,7 @@ impl ExtendedQueryHandler for FastPgWireHandler {
     {
         let session = session_for_client(client)?;
         let query = portal.statement.statement.clone();
-        let parameters = match self.describe_query(session.clone(), query.clone()).await? {
-            Some(description) => decode_parameters(portal, &description)?,
-            None => vec![],
-        };
+        let parameters = collect_bound_parameters(portal)?;
         let (execution, notices) = self
             .execute_query(session.clone(), query, parameters)
             .await?;
@@ -2690,72 +2687,29 @@ fn pgwire_type_for_pg_type(data_type: PgType) -> Type {
     }
 }
 
-const INT8_ARRAY_OID: u32 = 1016;
-
-fn decode_parameters(
-    portal: &Portal<String>,
-    description: &QueryDescription,
-) -> PgWireResult<Vec<Value>> {
-    description
-        .parameter_types
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(idx, data_type)| {
-            let type_oid = description
-                .parameter_type_oids
+fn collect_bound_parameters(portal: &Portal<String>) -> PgWireResult<Vec<QueryParameter>> {
+    (0..portal.parameter_len())
+        .map(|idx| {
+            let parameter = portal
+                .parameters
                 .get(idx)
-                .copied()
-                .unwrap_or_else(|| data_type.default_type_oid());
-            decode_parameter(portal, idx, type_oid, data_type)
+                .ok_or_else(|| PgWireError::ParameterIndexOutOfBound(idx))?;
+            Ok(match parameter {
+                Some(bytes) => QueryParameter::Raw {
+                    format: parameter_format(portal.parameter_format.format_for(idx)),
+                    bytes: bytes.to_vec(),
+                },
+                None => QueryParameter::Null,
+            })
         })
         .collect()
 }
 
-fn decode_parameter(
-    portal: &Portal<String>,
-    idx: usize,
-    type_oid: u32,
-    data_type: PgType,
-) -> PgWireResult<Value> {
-    match type_oid {
-        INT8_ARRAY_OID => portal
-            .parameter::<Vec<Option<i64>>>(idx, &Type::INT8_ARRAY)
-            .map(|value| {
-                value
-                    .map(|values| Value::Text(int8_array_literal(&values)))
-                    .unwrap_or(Value::Null)
-            }),
-        _ => match data_type {
-            PgType::Int2 => portal
-                .parameter::<i16>(idx, &Type::INT2)
-                .map(|value| value.map(Value::Int2).unwrap_or(Value::Null)),
-            PgType::Int4 => portal
-                .parameter::<i32>(idx, &Type::INT4)
-                .map(|value| value.map(Value::Int4).unwrap_or(Value::Null)),
-            PgType::Int8 => portal
-                .parameter::<i64>(idx, &Type::INT8)
-                .map(|value| value.map(Value::Int8).unwrap_or(Value::Null)),
-            PgType::Varchar => portal
-                .parameter::<String>(idx, &Type::VARCHAR)
-                .map(|value| value.map(Value::Text).unwrap_or(Value::Null)),
-        },
+fn parameter_format(format: FieldFormat) -> ParameterFormat {
+    match format {
+        FieldFormat::Text => ParameterFormat::Text,
+        FieldFormat::Binary => ParameterFormat::Binary,
     }
-}
-
-fn int8_array_literal(values: &[Option<i64>]) -> String {
-    let mut literal = String::from("{");
-    for (idx, value) in values.iter().enumerate() {
-        if idx > 0 {
-            literal.push(',');
-        }
-        match value {
-            Some(value) => write!(&mut literal, "{value}").expect("writing to String cannot fail"),
-            None => literal.push_str("NULL"),
-        }
-    }
-    literal.push('}');
-    literal
 }
 
 fn postgres_catalog_enabled() -> bool {
@@ -3323,7 +3277,6 @@ mod tests {
 
     use pgwire::messages::extendedquery::Bind;
     use pgwire::messages::response::CommandComplete;
-    use postgres_types::ToSql;
 
     use super::*;
 
@@ -3460,23 +3413,43 @@ mod tests {
     }
 
     #[test]
-    fn binary_int8_array_parameter_uses_type_oid_for_decoding() {
-        let portal = portal_with_binary_parameter(encode_int8_array_parameter(vec![Some(1)]));
-        let description =
-            QueryDescription::with_type_oids(vec![PgType::Varchar], vec![INT8_ARRAY_OID], vec![]);
+    fn bound_parameter_collector_preserves_text_binary_and_null_values() {
+        let portal = portal_with_parameters(
+            vec![0, 1],
+            vec![
+                Some(Bytes::from_static(b"text-value")),
+                Some(Bytes::from_static(b"\0\0\0*")),
+            ],
+        );
 
         assert_eq!(
-            decode_parameters(&portal, &description).unwrap(),
-            vec![Value::Text("{1}".to_owned())]
+            collect_bound_parameters(&portal).unwrap(),
+            vec![
+                QueryParameter::Raw {
+                    format: ParameterFormat::Text,
+                    bytes: b"text-value".to_vec(),
+                },
+                QueryParameter::Raw {
+                    format: ParameterFormat::Binary,
+                    bytes: b"\0\0\0*".to_vec(),
+                },
+            ]
         );
     }
 
     #[test]
-    fn int8_array_literal_formats_empty_nulls_and_values() {
-        assert_eq!(int8_array_literal(&[]), "{}");
+    fn bound_parameter_collector_uses_unified_text_default_and_preserves_null() {
+        let portal = portal_with_parameters(vec![], vec![Some(Bytes::from_static(b"42")), None]);
+
         assert_eq!(
-            int8_array_literal(&[Some(-1), None, Some(3)]),
-            "{-1,NULL,3}"
+            collect_bound_parameters(&portal).unwrap(),
+            vec![
+                QueryParameter::Raw {
+                    format: ParameterFormat::Text,
+                    bytes: b"42".to_vec(),
+                },
+                QueryParameter::Null,
+            ]
         );
     }
 
@@ -3500,17 +3473,12 @@ mod tests {
         command_complete.tag
     }
 
-    fn portal_with_binary_parameter(parameter: Bytes) -> Portal<String> {
-        let bind = Bind::new(None, None, vec![1], vec![Some(parameter)], Vec::new());
+    fn portal_with_parameters(
+        parameter_format_codes: Vec<i16>,
+        parameters: Vec<Option<Bytes>>,
+    ) -> Portal<String> {
+        let bind = Bind::new(None, None, parameter_format_codes, parameters, Vec::new());
         Portal::try_new(&bind, Arc::new(StoredStatement::default())).unwrap()
-    }
-
-    fn encode_int8_array_parameter(values: Vec<Option<i64>>) -> Bytes {
-        let mut buffer = BytesMut::new();
-        values
-            .to_sql(&Type::INT8_ARRAY, &mut buffer)
-            .expect("int8 array should encode");
-        buffer.freeze()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

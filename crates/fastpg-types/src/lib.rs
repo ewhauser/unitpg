@@ -63,3 +63,34 @@ pub enum Value {
     RawText(String),
     Null,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ParameterFormat {
+    Text,
+    Binary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryParameter {
+    Int2(i16),
+    Int4(i32),
+    Int8(i64),
+    Text(String),
+    Raw {
+        format: ParameterFormat,
+        bytes: Vec<u8>,
+    },
+    Null,
+}
+
+impl From<&Value> for QueryParameter {
+    fn from(value: &Value) -> Self {
+        match value {
+            Value::Int2(value) => QueryParameter::Int2(*value),
+            Value::Int4(value) => QueryParameter::Int4(*value),
+            Value::Int8(value) => QueryParameter::Int8(*value),
+            Value::Text(value) | Value::RawText(value) => QueryParameter::Text(value.clone()),
+            Value::Null => QueryParameter::Null,
+        }
+    }
+}

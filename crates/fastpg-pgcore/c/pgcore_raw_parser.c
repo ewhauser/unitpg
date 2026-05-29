@@ -20,6 +20,7 @@
 #include "access/session.h"
 #include "access/fastpg_catalog.h"
 #include "access/fastpg_tableam.h"
+#include "access/htup_details.h"
 #include "access/table.h"
 #include "access/transam.h"
 #include "access/tupdesc.h"
@@ -51,6 +52,7 @@
 #include "libpq/libpq.h"
 #include "libpq/protocol.h"
 #include "libpq/pqsignal.h"
+#include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/bitmapset.h"
@@ -173,6 +175,24 @@ fastpg_pgcore_cursor_options(void)
 }
 #else
 #define FASTPG_PGCORE_CATALOG_ERROR_CLEANUP() ((void) 0)
+
+static void
+fastpg_pgcore_ensure_standalone_user_id(void)
+{
+	if (!OidIsValid(GetAuthenticatedUserId()))
+		InitializeSessionUserIdStandalone();
+	if (!OidIsValid(GetSessionUserId()) ||
+		!OidIsValid(GetOuterUserId()) ||
+		!OidIsValid(GetUserId()))
+	{
+		SetSessionAuthorization(BOOTSTRAP_SUPERUSERID, true);
+		SetCurrentRoleId(InvalidOid, false);
+	}
+	if (MyProc != NULL)
+		MyProc->roleId = BOOTSTRAP_SUPERUSERID;
+}
+
+#define FastPgEnsureStandaloneUserId() fastpg_pgcore_ensure_standalone_user_id()
 #endif
 
 typedef struct FastPgPgCoreParseResult
@@ -3483,6 +3503,8 @@ fastpg_pgcore_prepared_field_type_modifier(const FastPgPgCorePrepared *prepared,
 static ParamListInfo
 fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 						   const char *const *parameter_values,
+						   const int32 *parameter_lengths,
+						   const int16 *parameter_formats,
 						   const bool *parameter_is_null,
 						   const Datum *parameter_datums,
 						   const bool *parameter_is_datum,
@@ -3502,7 +3524,8 @@ fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("fastpg pgcore prepared statement has no parameter type table")));
-	if (parameter_values == NULL || parameter_is_null == NULL)
+	if (parameter_values == NULL || parameter_lengths == NULL ||
+		parameter_formats == NULL || parameter_is_null == NULL)
 		ereport(ERROR,
 				(errcode(ERRCODE_PROTOCOL_VIOLATION),
 				 errmsg("fastpg pgcore parameter buffers are missing")));
@@ -3538,22 +3561,69 @@ fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 		}
 		else
 		{
-			Oid			typinput;
-			Oid			typioparam;
+			int32		parameter_length = parameter_lengths[i];
+			int16		parameter_format = parameter_formats[i];
 
 			if (parameter_values[i] == NULL)
 				ereport(ERROR,
 						(errcode(ERRCODE_PROTOCOL_VIOLATION),
-						 errmsg("fastpg pgcore parameter %d is missing text data",
+						 errmsg("fastpg pgcore parameter %d is missing parameter data",
+								i + 1)));
+			if (parameter_length < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_PROTOCOL_VIOLATION),
+						 errmsg("fastpg pgcore parameter %d has invalid length",
 								i + 1)));
 
-			getTypeInputInfo(parameter_type, &typinput, &typioparam);
-			param->isnull = false;
-			param->value =
-				OidInputFunctionCall(typinput,
-									 (char *) parameter_values[i],
-									 typioparam,
-									 -1);
+			if (parameter_format == 0)
+			{
+				Oid			typinput;
+				Oid			typioparam;
+				char	   *terminated;
+				char	   *pstring;
+
+				getTypeInputInfo(parameter_type, &typinput, &typioparam);
+				terminated = pnstrdup(parameter_values[i], parameter_length);
+				pstring = pg_client_to_server(terminated, parameter_length);
+				param->isnull = false;
+				param->value =
+					OidInputFunctionCall(typinput,
+										 pstring,
+										 typioparam,
+										 -1);
+				if (pstring != terminated)
+					pfree(pstring);
+				pfree(terminated);
+			}
+			else if (parameter_format == 1)
+			{
+				Oid			typreceive;
+				Oid			typioparam;
+				StringInfoData pbuf;
+
+				getTypeBinaryInputInfo(parameter_type, &typreceive, &typioparam);
+				initReadOnlyStringInfo(&pbuf,
+									   unconstify(char *, parameter_values[i]),
+									   parameter_length);
+				param->isnull = false;
+				param->value =
+					OidReceiveFunctionCall(typreceive,
+										   &pbuf,
+										   typioparam,
+										   -1);
+				if (pbuf.cursor != pbuf.len)
+					ereport(ERROR,
+							(errcode(ERRCODE_INVALID_BINARY_REPRESENTATION),
+							 errmsg("incorrect binary data format in bind parameter %d",
+									i + 1)));
+			}
+			else
+			{
+				ereport(ERROR,
+						(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+						 errmsg("unsupported parameter format code: %d",
+								parameter_format)));
+			}
 		}
 	}
 
@@ -3563,6 +3633,8 @@ fastpg_pgcore_build_params(const FastPgPgCorePrepared *prepared,
 FastPgPgCoreExecuteResult *
 fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 							 const char *const *parameter_values,
+							 const int32 *parameter_lengths,
+							 const int16 *parameter_formats,
 							 const bool *parameter_is_null,
 							 const Datum *parameter_datums,
 							 const bool *parameter_is_datum,
@@ -3629,6 +3701,8 @@ fastpg_pgcore_execute_params(const FastPgPgCorePrepared *prepared,
 		MemoryContextSwitchTo(result->context);
 		params = fastpg_pgcore_build_params(prepared,
 											parameter_values,
+											parameter_lengths,
+											parameter_formats,
 											parameter_is_null,
 											parameter_datums,
 											parameter_is_datum,
@@ -4024,7 +4098,14 @@ finish_statement:
 FastPgPgCoreExecuteResult *
 fastpg_pgcore_execute(const FastPgPgCorePrepared *prepared)
 {
-	return fastpg_pgcore_execute_params(prepared, NULL, NULL, NULL, NULL, 0);
+	return fastpg_pgcore_execute_params(prepared,
+									   NULL,
+									   NULL,
+									   NULL,
+									   NULL,
+									   NULL,
+									   NULL,
+									   0);
 }
 
 FastPgPgCoreExecuteResult *

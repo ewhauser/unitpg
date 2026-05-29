@@ -112,6 +112,30 @@ async fn extended_query_accepts_binary_bigint_array_parameter() -> Result<(), Bo
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_query_accepts_other_binary_parameter_types() -> Result<(), Box<dyn Error>> {
+    let _guard = PGWIRE_TEST_MUTEX.lock().await;
+    let server = TestServer::start().await?;
+    let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+
+    let row = client.query_one("SELECT $1::bool", &[&true]).await?;
+    let value: bool = row.get(0);
+    assert!(value);
+
+    let bytes = b"a\0b".to_vec();
+    let row = client
+        .query_one("SELECT encode($1::bytea, 'hex')", &[&bytes])
+        .await?;
+    let value: String = row.get(0);
+    assert_eq!(value, "610062");
+
+    drop(client);
+    connection_task.abort();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_are_isolated_per_client() -> Result<(), Box<dyn Error>> {
     let _guard = PGWIRE_TEST_MUTEX.lock().await;
     let server = TestServer::start().await?;

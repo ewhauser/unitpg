@@ -163,7 +163,17 @@ pub enum PgCoreValue {
 pub enum PgCoreParam {
     Text(String),
     Datum(usize),
+    Raw {
+        format: PgCoreParamFormat,
+        bytes: Vec<u8>,
+    },
     Null,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PgCoreParamFormat {
+    Text,
+    Binary,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -507,8 +517,8 @@ mod inner {
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyColumn, PgCoreCopyIn, PgCoreCopyOut,
         PgCoreError, PgCoreErrorFields, PgCoreField, PgCoreInputDatum, PgCoreLaneMetrics,
-        PgCoreNotice, PgCoreParam, PgCoreTransactionCommand, PgCoreValue, RawParseSummary,
-        SimpleExecutionResult, StatementDescription,
+        PgCoreNotice, PgCoreParam, PgCoreParamFormat, PgCoreTransactionCommand, PgCoreValue,
+        RawParseSummary, SimpleExecutionResult, StatementDescription,
     };
 
     static PGCORE_OPERATIONS: AtomicU64 = AtomicU64::new(0);
@@ -766,6 +776,8 @@ mod inner {
         fn fastpg_pgcore_execute_params(
             prepared: *const FastPgPgCorePrepared,
             parameter_values: *const *const c_char,
+            parameter_lengths: *const i32,
+            parameter_formats: *const i16,
             parameter_is_null: *const bool,
             parameter_datums: *const usize,
             parameter_is_datum: *const bool,
@@ -1580,12 +1592,18 @@ mod inner {
 
     struct EncodedParams {
         encoded_text_params: Vec<CString>,
+        raw_params: Vec<Vec<u8>>,
         parameter_values: Vec<*const c_char>,
+        parameter_lengths: Vec<i32>,
+        parameter_formats: Vec<i16>,
         parameter_is_null: Vec<bool>,
         parameter_datums: Vec<usize>,
         parameter_is_datum: Vec<bool>,
         param_count: i32,
     }
+
+    const PGCORE_PARAM_FORMAT_TEXT: i16 = 0;
+    const PGCORE_PARAM_FORMAT_BINARY: i16 = 1;
 
     impl EncodedParams {
         fn new(params: &[PgCoreParam]) -> Result<Self, PgCoreError> {
@@ -1593,13 +1611,23 @@ mod inner {
                 PgCoreError::new("54000", "too many parameters for PostgreSQL execution", 0)
             })?;
             let mut encoded_text_params = Vec::with_capacity(params.len());
+            let mut raw_params = Vec::with_capacity(params.len());
             let mut parameter_values = Vec::with_capacity(params.len());
+            let mut parameter_lengths = Vec::with_capacity(params.len());
+            let mut parameter_formats = Vec::with_capacity(params.len());
             let mut parameter_is_null = Vec::with_capacity(params.len());
             let mut parameter_datums = Vec::with_capacity(params.len());
             let mut parameter_is_datum = Vec::with_capacity(params.len());
             for param in params {
                 match param {
                     PgCoreParam::Text(value) => {
+                        let length = i32::try_from(value.len()).map_err(|_| {
+                            PgCoreError::new(
+                                "54000",
+                                "query parameter is too large for PostgreSQL execution",
+                                0,
+                            )
+                        })?;
                         let value = CString::new(value.as_str()).map_err(|_| {
                             PgCoreError::new(
                                 "22023",
@@ -1608,6 +1636,8 @@ mod inner {
                             )
                         })?;
                         parameter_values.push(value.as_ptr());
+                        parameter_lengths.push(length);
+                        parameter_formats.push(PGCORE_PARAM_FORMAT_TEXT);
                         parameter_is_null.push(false);
                         parameter_datums.push(0);
                         parameter_is_datum.push(false);
@@ -1615,12 +1645,33 @@ mod inner {
                     }
                     PgCoreParam::Datum(value) => {
                         parameter_values.push(ptr::null());
+                        parameter_lengths.push(0);
+                        parameter_formats.push(PGCORE_PARAM_FORMAT_TEXT);
                         parameter_is_null.push(false);
                         parameter_datums.push(*value);
                         parameter_is_datum.push(true);
                     }
+                    PgCoreParam::Raw { format, bytes } => {
+                        let length = i32::try_from(bytes.len()).map_err(|_| {
+                            PgCoreError::new(
+                                "54000",
+                                "query parameter is too large for PostgreSQL execution",
+                                0,
+                            )
+                        })?;
+                        raw_params.push(bytes.clone());
+                        let bytes = raw_params.last().expect("raw parameter was just pushed");
+                        parameter_values.push(bytes.as_ptr() as *const c_char);
+                        parameter_lengths.push(length);
+                        parameter_formats.push(pgcore_param_format_code(*format));
+                        parameter_is_null.push(false);
+                        parameter_datums.push(0);
+                        parameter_is_datum.push(false);
+                    }
                     PgCoreParam::Null => {
                         parameter_values.push(ptr::null());
+                        parameter_lengths.push(0);
+                        parameter_formats.push(PGCORE_PARAM_FORMAT_TEXT);
                         parameter_is_null.push(true);
                         parameter_datums.push(0);
                         parameter_is_datum.push(false);
@@ -1629,7 +1680,10 @@ mod inner {
             }
             Ok(Self {
                 encoded_text_params,
+                raw_params,
                 parameter_values,
+                parameter_lengths,
+                parameter_formats,
                 parameter_is_null,
                 parameter_datums,
                 parameter_is_datum,
@@ -1643,6 +1697,7 @@ mod inner {
         params: &EncodedParams,
     ) -> Result<ExecutionResult, PgCoreError> {
         let _keep_text_params_alive = &params.encoded_text_params;
+        let _keep_raw_params_alive = &params.raw_params;
         let mut prepared_notices = prepared_notices_from_ptr(prepared);
         let result = if params.param_count == 0 {
             unsafe { fastpg_pgcore_execute(prepared) }
@@ -1651,6 +1706,8 @@ mod inner {
                 fastpg_pgcore_execute_params(
                     prepared,
                     params.parameter_values.as_ptr(),
+                    params.parameter_lengths.as_ptr(),
+                    params.parameter_formats.as_ptr(),
                     params.parameter_is_null.as_ptr(),
                     params.parameter_datums.as_ptr(),
                     params.parameter_is_datum.as_ptr(),
@@ -1673,6 +1730,13 @@ mod inner {
                 }
                 Err(error)
             }
+        }
+    }
+
+    fn pgcore_param_format_code(format: PgCoreParamFormat) -> i16 {
+        match format {
+            PgCoreParamFormat::Text => PGCORE_PARAM_FORMAT_TEXT,
+            PgCoreParamFormat::Binary => PGCORE_PARAM_FORMAT_BINARY,
         }
     }
 
@@ -2410,6 +2474,28 @@ mod tests {
         )
     }
 
+    fn raw_binary_param(bytes: impl Into<Vec<u8>>) -> PgCoreParam {
+        PgCoreParam::Raw {
+            format: PgCoreParamFormat::Binary,
+            bytes: bytes.into(),
+        }
+    }
+
+    fn binary_int8_array(values: impl IntoIterator<Item = i64>) -> Vec<u8> {
+        let values = values.into_iter().collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&INT8_OID.to_be_bytes());
+        bytes.extend_from_slice(&(values.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&8_i32.to_be_bytes());
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
     #[test]
     fn raw_parse_smoke() {
         let summary = raw_parse("select 1").unwrap();
@@ -2546,6 +2632,70 @@ mod tests {
 
         let result = statement.execute_with_params(&[PgCoreParam::Null]).unwrap();
         assert_eq!(result.statements[0].rows, vec![vec![PgCoreValue::Null]]);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_accepts_raw_binary_int4_parameter() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select $1::int4").unwrap();
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param(42_i32.to_be_bytes())])
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("42".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_accepts_raw_binary_bool_parameter() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select $1::bool").unwrap();
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param([1])])
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("t".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_accepts_raw_binary_bytea_with_embedded_nul() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select encode($1::bytea, 'hex')").unwrap();
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param(b"a\0b".to_vec())])
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("610062".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_accepts_raw_binary_int8_array_parameter() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select unnest($1::bigint[])").unwrap();
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param(binary_int8_array([1]))])
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("1".to_owned())]]
+        );
     }
 
     #[cfg(feature = "postgres-execution")]

@@ -3,7 +3,7 @@
 pub use fastpg_exec::{
     CopyOutput, CopyTarget, QueryDescription, QueryExecution, QueryNotice, QueryResult,
 };
-pub use fastpg_types::{Column, PgType, Value};
+pub use fastpg_types::{Column, ParameterFormat, PgType, QueryParameter, Value};
 
 use std::any::Any;
 use std::collections::{BTreeMap, VecDeque};
@@ -267,6 +267,14 @@ impl SessionState {
 
     pub fn execute(&self, sql: &str, parameters: &[Value]) -> QueryExecution {
         self.executor.execute(sql, parameters)
+    }
+
+    pub fn execute_with_parameters(
+        &self,
+        sql: &str,
+        parameters: &[QueryParameter],
+    ) -> QueryExecution {
+        self.executor.execute_with_parameters(sql, parameters)
     }
 
     pub fn execute_simple_text(&self, sql: &str) -> QueryExecution {
