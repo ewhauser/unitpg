@@ -66,6 +66,52 @@ async fn tokio_postgres_extended_query_smoke() -> Result<(), Box<dyn Error>> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn extended_query_accepts_binary_bigint_array_parameter() -> Result<(), Box<dyn Error>> {
+    let _guard = PGWIRE_TEST_MUTEX.lock().await;
+    let server = TestServer::start().await?;
+    let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let table = format!("river_migration_{}", std::process::id());
+
+    client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await?;
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table}(created_at text NOT NULL DEFAULT 'now', version bigint NOT NULL)"
+        ))
+        .await?;
+
+    let versions = vec![1_i64];
+    let rows = client
+        .query(
+            &format!(
+                "INSERT INTO {table} (version) \
+                 SELECT unnest($1::bigint[]) \
+                 RETURNING created_at, version"
+            ),
+            &[&versions],
+        )
+        .await?;
+
+    assert_eq!(rows.len(), 1);
+    let messages = client
+        .simple_query(&format!("SELECT version FROM {table}"))
+        .await?;
+    let inserted = rows_only(&messages);
+    assert_eq!(inserted.len(), 1);
+    assert_eq!(inserted[0].get("version"), Some("1"));
+
+    client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await?;
+    drop(client);
+    connection_task.abort();
+
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn transactions_are_isolated_per_client() -> Result<(), Box<dyn Error>> {
     let _guard = PGWIRE_TEST_MUTEX.lock().await;
     let server = TestServer::start().await?;

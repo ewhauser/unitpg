@@ -2690,6 +2690,8 @@ fn pgwire_type_for_pg_type(data_type: PgType) -> Type {
     }
 }
 
+const INT8_ARRAY_OID: u32 = 1016;
+
 fn decode_parameters(
     portal: &Portal<String>,
     description: &QueryDescription,
@@ -2697,8 +2699,34 @@ fn decode_parameters(
     description
         .parameter_types
         .iter()
+        .copied()
         .enumerate()
-        .map(|(idx, data_type)| match data_type {
+        .map(|(idx, data_type)| {
+            let type_oid = description
+                .parameter_type_oids
+                .get(idx)
+                .copied()
+                .unwrap_or_else(|| data_type.default_type_oid());
+            decode_parameter(portal, idx, type_oid, data_type)
+        })
+        .collect()
+}
+
+fn decode_parameter(
+    portal: &Portal<String>,
+    idx: usize,
+    type_oid: u32,
+    data_type: PgType,
+) -> PgWireResult<Value> {
+    match type_oid {
+        INT8_ARRAY_OID => portal
+            .parameter::<Vec<Option<i64>>>(idx, &Type::INT8_ARRAY)
+            .map(|value| {
+                value
+                    .map(|values| Value::Text(int8_array_literal(&values)))
+                    .unwrap_or(Value::Null)
+            }),
+        _ => match data_type {
             PgType::Int2 => portal
                 .parameter::<i16>(idx, &Type::INT2)
                 .map(|value| value.map(Value::Int2).unwrap_or(Value::Null)),
@@ -2711,8 +2739,23 @@ fn decode_parameters(
             PgType::Varchar => portal
                 .parameter::<String>(idx, &Type::VARCHAR)
                 .map(|value| value.map(Value::Text).unwrap_or(Value::Null)),
-        })
-        .collect()
+        },
+    }
+}
+
+fn int8_array_literal(values: &[Option<i64>]) -> String {
+    let mut literal = String::from("{");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            literal.push(',');
+        }
+        match value {
+            Some(value) => write!(&mut literal, "{value}").expect("writing to String cannot fail"),
+            None => literal.push_str("NULL"),
+        }
+    }
+    literal.push('}');
+    literal
 }
 
 fn postgres_catalog_enabled() -> bool {
@@ -3278,7 +3321,9 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
+    use pgwire::messages::extendedquery::Bind;
     use pgwire::messages::response::CommandComplete;
+    use postgres_types::ToSql;
 
     use super::*;
 
@@ -3414,6 +3459,27 @@ mod tests {
         assert!(negotiation.response.is_none());
     }
 
+    #[test]
+    fn binary_int8_array_parameter_uses_type_oid_for_decoding() {
+        let portal = portal_with_binary_parameter(encode_int8_array_parameter(vec![Some(1)]));
+        let description =
+            QueryDescription::with_type_oids(vec![PgType::Varchar], vec![INT8_ARRAY_OID], vec![]);
+
+        assert_eq!(
+            decode_parameters(&portal, &description).unwrap(),
+            vec![Value::Text("{1}".to_owned())]
+        );
+    }
+
+    #[test]
+    fn int8_array_literal_formats_empty_nulls_and_values() {
+        assert_eq!(int8_array_literal(&[]), "{}");
+        assert_eq!(
+            int8_array_literal(&[Some(-1), None, Some(3)]),
+            "{-1,NULL,3}"
+        );
+    }
+
     fn startup_with_protocol(
         major: u16,
         minor: u16,
@@ -3432,6 +3498,19 @@ mod tests {
         };
         let command_complete = CommandComplete::from(tag);
         command_complete.tag
+    }
+
+    fn portal_with_binary_parameter(parameter: Bytes) -> Portal<String> {
+        let bind = Bind::new(None, None, vec![1], vec![Some(parameter)], Vec::new());
+        Portal::try_new(&bind, Arc::new(StoredStatement::default())).unwrap()
+    }
+
+    fn encode_int8_array_parameter(values: Vec<Option<i64>>) -> Bytes {
+        let mut buffer = BytesMut::new();
+        values
+            .to_sql(&Type::INT8_ARRAY, &mut buffer)
+            .expect("int8 array should encode");
+        buffer.freeze()
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
