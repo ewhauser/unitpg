@@ -82,19 +82,26 @@ async fn extended_query_accepts_binary_bigint_array_parameter() -> Result<(), Bo
         ))
         .await?;
 
+    let sql = format!(
+        "INSERT INTO {table} (version) \
+         SELECT unnest($1::bigint[]) \
+         RETURNING created_at, version"
+    );
+    let statement = client.prepare(&sql).await?;
+    assert_eq!(statement.columns().len(), 2);
+    assert_eq!(statement.columns()[0].name(), "created_at");
+    assert_eq!(statement.columns()[1].name(), "version");
+
     let versions = vec![1_i64];
-    let rows = client
-        .query(
-            &format!(
-                "INSERT INTO {table} (version) \
-                 SELECT unnest($1::bigint[]) \
-                 RETURNING created_at, version"
-            ),
-            &[&versions],
-        )
-        .await?;
+    let rows = client.query(&statement, &[&versions]).await?;
 
     assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].columns().len(), 2);
+    let created_at: String = rows[0].try_get("created_at")?;
+    let version: i64 = rows[0].try_get("version")?;
+    assert_eq!(created_at, "now");
+    assert_eq!(version, 1);
+
     let messages = client
         .simple_query(&format!("SELECT version FROM {table}"))
         .await?;
