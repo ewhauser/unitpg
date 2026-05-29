@@ -2700,6 +2700,57 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn prepare_describes_insert_returning_columns() {
+        const TIMESTAMP_OID: u32 = 1114;
+
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fastpg_pgcore_returning");
+        session
+            .prepare(&format!(
+                "create table {table}(created_at timestamp not null default current_timestamp, version bigint not null)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let statement = session
+            .prepare(&format!(
+                "insert into {table} (version) \
+                 select unnest($1::bigint[]) \
+                 returning created_at, version"
+            ))
+            .unwrap();
+        let description = statement.describe();
+        assert_eq!(description.fields.len(), 2);
+        assert_eq!(description.fields[0].name, "created_at");
+        assert_eq!(description.fields[0].type_oid, TIMESTAMP_OID);
+        assert_eq!(description.fields[1].name, "version");
+        assert_eq!(description.fields[1].type_oid, INT8_OID);
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param(binary_int8_array([1]))])
+            .unwrap();
+        assert_eq!(result.statements[0].fields.len(), 2);
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(result.statements[0].rows[0].len(), 2);
+        assert!(matches!(
+            result.statements[0].rows[0][0],
+            PgCoreValue::Text(_)
+        ));
+        assert_eq!(
+            result.statements[0].rows[0][1],
+            PgCoreValue::Text("1".to_owned())
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_parameter_count_mismatch_is_protocol_error() {
         let session = PgCoreSession::new();
         let statement = session.prepare("select $1::int4").unwrap();

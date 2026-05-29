@@ -2808,13 +2808,21 @@ fastpg_pgcore_should_noop_system_catalog_write(const PlannedStmt *statement)
 static void
 fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
 {
+	List	   *target_list;
 	ListCell   *lc;
 	int			field_index = 0;
 
 	if (result->query == NULL)
 		return;
 
-	foreach(lc, result->query->targetList)
+	if (result->query->returningList != NIL)
+		target_list = result->query->returningList;
+	else if (result->query->commandType == CMD_SELECT)
+		target_list = result->query->targetList;
+	else
+		target_list = NIL;
+
+	foreach(lc, target_list)
 	{
 		const TargetEntry *target = lfirst_node(TargetEntry, lc);
 
@@ -2826,7 +2834,7 @@ fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
 		return;
 
 	result->fields = palloc0_array(FastPgPgCoreField, result->field_count);
-	foreach(lc, result->query->targetList)
+	foreach(lc, target_list)
 	{
 		const TargetEntry *target = lfirst_node(TargetEntry, lc);
 
