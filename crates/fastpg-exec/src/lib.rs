@@ -30,6 +30,7 @@ const BPCHAR_OID: u32 = 1042;
 pub const COPY_HEADER_MATCH: i32 = -1;
 pub const COPY_HEADER_FALSE: i32 = 0;
 pub const COPY_FORMAT_TEXT: i32 = 0;
+pub const COPY_FORMAT_BINARY: i32 = 1;
 pub const COPY_FORMAT_CSV: i32 = 2;
 pub const COPY_ON_ERROR_STOP: i32 = 0;
 pub const COPY_ON_ERROR_IGNORE: i32 = 1;
@@ -382,7 +383,18 @@ impl QueryExecutor {
             .iter()
             .map(QueryParameter::from)
             .collect::<Vec<_>>();
-        self.execute_with_parameters(sql, &parameters)
+        #[cfg(feature = "postgres-execution")]
+        {
+            self.execute_pgcore(sql, &parameters, PgCoreRowConversion::Typed)
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            let _ = (sql, parameters);
+            execution_error(
+                "0A000",
+                "fastpg-exec was built without PostgreSQL execution",
+            )
+        }
     }
 
     pub fn execute_with_parameters(
@@ -392,7 +404,11 @@ impl QueryExecutor {
     ) -> QueryExecution {
         #[cfg(feature = "postgres-execution")]
         {
-            self.execute_pgcore(sql, parameters, PgCoreRowConversion::Typed)
+            self.execute_pgcore(
+                sql,
+                parameters,
+                PgCoreRowConversion::TypedWithBinaryFallback,
+            )
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
@@ -617,6 +633,26 @@ impl QueryExecutor {
         Ok(None)
     }
 
+    pub fn copy_target_buffered_bytes(
+        &self,
+        target: &CopyTarget,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        #[cfg(feature = "postgres-execution")]
+        {
+            self.ensure_pgcore_session_started();
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            let _storage2_guard =
+                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
+            if postgres_catalog_enabled() {
+                return self.copy_buffered_bytes_postgres_catalog(target, data);
+            }
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        let _ = (target, data);
+        Err("binary COPY FROM requires PostgreSQL execution".to_owned())
+    }
+
     pub fn begin_copy(&self) -> bool {
         #[cfg(feature = "postgres-execution")]
         {
@@ -771,6 +807,47 @@ impl QueryExecutor {
                 .saturating_sub(target.header_lines_to_skip().min(lines.len()))),
             other => Err(format!("unexpected COPY execution result: {other:?}")),
         }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn copy_buffered_bytes_postgres_catalog(
+        &self,
+        target: &CopyTarget,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        if target.source_sql.is_empty() {
+            return Err("binary COPY target is missing source SQL".to_owned());
+        }
+
+        let result = match self
+            .pgcore_session
+            .execute_copy_from_stdin(&target.source_sql, data)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.replace_notices(
+                    error
+                        .notices
+                        .iter()
+                        .cloned()
+                        .map(pgcore_notice_to_query_notice)
+                        .collect(),
+                );
+                return Err(pgcore_copy_error(error));
+            }
+        };
+        self.replace_notices(
+            result
+                .notices
+                .iter()
+                .cloned()
+                .map(pgcore_notice_to_query_notice)
+                .collect(),
+        );
+        let Some(statement) = result.statements.into_iter().next() else {
+            return Ok(0);
+        };
+        Ok(statement.command_rows.unwrap_or(0))
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -1066,6 +1143,7 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PgCoreRowConversion {
     Typed,
+    TypedWithBinaryFallback,
     PreserveText,
 }
 
@@ -1275,26 +1353,74 @@ fn pgcore_value_to_value(
     row_conversion: PgCoreRowConversion,
 ) -> Result<Value, String> {
     match (value, data_type, row_conversion) {
-        (PgCoreValue::Text(value), _, PgCoreRowConversion::PreserveText) => {
+        (PgCoreValue::Text(value), _, PgCoreRowConversion::PreserveText)
+        | (PgCoreValue::TextWithBinary { text: value, .. }, _, PgCoreRowConversion::PreserveText) => {
             Ok(Value::RawText(value))
         }
         (PgCoreValue::Null, _, PgCoreRowConversion::PreserveText) => Ok(Value::Null),
-        (PgCoreValue::Null, _, PgCoreRowConversion::Typed) => Ok(Value::Null),
-        (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::Typed) => value
+        (PgCoreValue::Null, _, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Null, _, PgCoreRowConversion::TypedWithBinaryFallback) => Ok(Value::Null),
+        (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::TypedWithBinaryFallback)
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int2,
+            PgCoreRowConversion::Typed,
+        )
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int2,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => value
             .parse::<i16>()
             .map(Value::Int2)
             .map_err(|error| format!("cannot decode PostgreSQL int2 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::Typed) => value
+        (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::TypedWithBinaryFallback)
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int4,
+            PgCoreRowConversion::Typed,
+        )
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int4,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => value
             .parse::<i32>()
             .map(Value::Int4)
             .map_err(|error| format!("cannot decode PostgreSQL int4 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::Typed) => value
+        (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::TypedWithBinaryFallback)
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int8,
+            PgCoreRowConversion::Typed,
+        )
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int8,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => value
             .parse::<i64>()
             .map(Value::Int8)
             .map_err(|error| format!("cannot decode PostgreSQL int8 value {value:?}: {error}")),
         (PgCoreValue::Text(value), PgType::Varchar, PgCoreRowConversion::Typed) => {
             Ok(Value::Text(value))
         }
+        (PgCoreValue::TextWithBinary { text, .. }, PgType::Varchar, PgCoreRowConversion::Typed) => {
+            Ok(Value::Text(text))
+        }
+        (
+            PgCoreValue::TextWithBinary { text, binary },
+            PgType::Varchar,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => Ok(Value::TextWithBinary { text, binary }),
+        (
+            PgCoreValue::Text(value),
+            PgType::Varchar,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => Ok(Value::Text(value)),
     }
 }
 

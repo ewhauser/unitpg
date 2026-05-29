@@ -61,6 +61,7 @@ pub enum Value {
     Int8(i64),
     Text(String),
     RawText(String),
+    TextWithBinary { text: String, binary: Vec<u8> },
     Null,
 }
 
@@ -90,6 +91,7 @@ impl From<&Value> for QueryParameter {
             Value::Int4(value) => QueryParameter::Int4(*value),
             Value::Int8(value) => QueryParameter::Int8(*value),
             Value::Text(value) | Value::RawText(value) => QueryParameter::Text(value.clone()),
+            Value::TextWithBinary { text, .. } => QueryParameter::Text(text.clone()),
             Value::Null => QueryParameter::Null,
         }
     }

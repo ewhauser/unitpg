@@ -213,6 +213,7 @@ typedef struct FastPgPgCoreField
 	Oid			type_oid;
 	int32		type_modifier;
 	Oid			output_oid;
+	Oid			binary_output_oid;
 } FastPgPgCoreField;
 
 typedef struct FastPgPgCoreCopyColumn
@@ -254,6 +255,9 @@ typedef struct FastPgPgCoreExecuteCell
 {
 	bool		is_null;
 	char	   *value_text;
+	bool		has_value_binary;
+	char	   *value_binary;
+	int			value_binary_len;
 } FastPgPgCoreExecuteCell;
 
 typedef struct FastPgPgCoreExecuteRow
@@ -392,6 +396,7 @@ typedef struct FastPgPgCoreCaptureDestReceiver
 static DestReceiver *fastpg_pgcore_create_capture_receiver(FastPgPgCoreExecuteStatement *statement,
 														   MemoryContext context);
 static char *fastpg_pgcore_strdup(const char *value);
+static bool fastpg_pgcore_catalog_lane_turn_ready_locked(void);
 static void fastpg_pgcore_lock_catalog_read(void);
 static void fastpg_pgcore_unlock_catalog_read(void);
 static void fastpg_pgcore_lock_catalog_utility(void);
@@ -518,6 +523,10 @@ static _Thread_local struct
 
 static pthread_mutex_t fastpg_pgcore_notice_hook_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_rwlock_t fastpg_pgcore_catalog_lock = PTHREAD_RWLOCK_INITIALIZER;
+static pthread_mutex_t fastpg_pgcore_catalog_owner_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t fastpg_pgcore_catalog_owner_cond = PTHREAD_COND_INITIALIZER;
+static bool fastpg_pgcore_catalog_write_owner_valid = false;
+static pthread_t fastpg_pgcore_catalog_write_owner;
 static _Thread_local int fastpg_pgcore_catalog_read_lock_depth = 0;
 static _Thread_local int fastpg_pgcore_catalog_write_lock_depth = 0;
 static _Thread_local bool fastpg_pgcore_catalog_dirty_xact = false;
@@ -2541,6 +2550,62 @@ fastpg_pgcore_unlock_catalog_read(void)
 		pthread_rwlock_unlock(&fastpg_pgcore_catalog_lock);
 }
 
+static bool
+fastpg_pgcore_catalog_lane_turn_ready_locked(void)
+{
+	return !fastpg_pgcore_catalog_write_owner_valid ||
+		pthread_equal(fastpg_pgcore_catalog_write_owner, pthread_self());
+}
+
+bool
+fastpg_pgcore_catalog_lane_turn_ready(void)
+{
+	bool		ready;
+
+	if (!fastpg_catalog_mode_uses_postgres())
+		return true;
+
+	pthread_mutex_lock(&fastpg_pgcore_catalog_owner_mutex);
+	ready = fastpg_pgcore_catalog_lane_turn_ready_locked();
+	pthread_mutex_unlock(&fastpg_pgcore_catalog_owner_mutex);
+	return ready;
+}
+
+void
+fastpg_pgcore_wait_catalog_lane_turn(void)
+{
+	if (!fastpg_catalog_mode_uses_postgres())
+		return;
+
+	pthread_mutex_lock(&fastpg_pgcore_catalog_owner_mutex);
+	while (!fastpg_pgcore_catalog_lane_turn_ready_locked())
+		pthread_cond_wait(&fastpg_pgcore_catalog_owner_cond,
+						  &fastpg_pgcore_catalog_owner_mutex);
+	pthread_mutex_unlock(&fastpg_pgcore_catalog_owner_mutex);
+}
+
+static void
+fastpg_pgcore_mark_catalog_write_owner(void)
+{
+	pthread_mutex_lock(&fastpg_pgcore_catalog_owner_mutex);
+	fastpg_pgcore_catalog_write_owner = pthread_self();
+	fastpg_pgcore_catalog_write_owner_valid = true;
+	pthread_mutex_unlock(&fastpg_pgcore_catalog_owner_mutex);
+}
+
+static void
+fastpg_pgcore_clear_catalog_write_owner(void)
+{
+	pthread_mutex_lock(&fastpg_pgcore_catalog_owner_mutex);
+	if (fastpg_pgcore_catalog_write_owner_valid &&
+		pthread_equal(fastpg_pgcore_catalog_write_owner, pthread_self()))
+	{
+		fastpg_pgcore_catalog_write_owner_valid = false;
+		pthread_cond_broadcast(&fastpg_pgcore_catalog_owner_cond);
+	}
+	pthread_mutex_unlock(&fastpg_pgcore_catalog_owner_mutex);
+}
+
 static void
 fastpg_pgcore_lock_catalog_utility(void)
 {
@@ -2550,6 +2615,7 @@ fastpg_pgcore_lock_catalog_utility(void)
 	while (fastpg_pgcore_catalog_read_lock_depth > 0)
 		fastpg_pgcore_unlock_catalog_read();
 	pthread_rwlock_wrlock(&fastpg_pgcore_catalog_lock);
+	fastpg_pgcore_mark_catalog_write_owner();
 	fastpg_pgcore_catalog_write_lock_depth = 1;
 }
 
@@ -2567,6 +2633,7 @@ fastpg_pgcore_unlock_catalog_utility(void)
 		return;
 
 	fastpg_pgcore_catalog_write_lock_depth = 0;
+	fastpg_pgcore_clear_catalog_write_owner();
 	pthread_rwlock_unlock(&fastpg_pgcore_catalog_lock);
 }
 
@@ -2611,6 +2678,65 @@ fastpg_pgcore_rawstmt_source_text(const char *source_text, const RawStmt *rawstm
 	memcpy(statement_text, start, (Size) len);
 	statement_text[len] = '\0';
 	return statement_text;
+}
+
+static bool
+fastpg_pgcore_raw_param_ref_walker(Node *node, void *context)
+{
+	if (node == NULL)
+		return false;
+	if (IsA(node, ParamRef))
+		return true;
+	return raw_expression_tree_walker(node,
+									  fastpg_pgcore_raw_param_ref_walker,
+									  context);
+}
+
+static bool
+fastpg_pgcore_raw_node_has_param_ref(Node *node)
+{
+	if (node == NULL)
+		return false;
+
+	switch (nodeTag(node))
+	{
+		case T_InsertStmt:
+		case T_DeleteStmt:
+		case T_UpdateStmt:
+		case T_MergeStmt:
+		case T_SelectStmt:
+		case T_ReturnStmt:
+		case T_PLAssignStmt:
+			return fastpg_pgcore_raw_param_ref_walker(node, NULL);
+		case T_DeclareCursorStmt:
+			return fastpg_pgcore_raw_node_has_param_ref(((DeclareCursorStmt *) node)->query);
+		case T_ExplainStmt:
+			return fastpg_pgcore_raw_node_has_param_ref(((ExplainStmt *) node)->query);
+		case T_CreateTableAsStmt:
+			return fastpg_pgcore_raw_node_has_param_ref(((CreateTableAsStmt *) node)->query);
+		case T_CallStmt:
+			return fastpg_pgcore_raw_param_ref_walker((Node *) ((CallStmt *) node)->funccall,
+													  NULL);
+		default:
+			return false;
+	}
+}
+
+static bool
+fastpg_pgcore_raw_parsetrees_have_param_ref(List *raw_parsetrees)
+{
+	ListCell   *lc;
+
+	foreach(lc, raw_parsetrees)
+	{
+		RawStmt    *rawstmt = lfirst_node(RawStmt, lc);
+
+		if (rawstmt != NULL &&
+			fastpg_pgcore_raw_node_has_param_ref(rawstmt->stmt))
+			return true;
+	}
+
+	return false;
 }
 
 static PlannedStmt *
@@ -2808,13 +2934,21 @@ fastpg_pgcore_should_noop_system_catalog_write(const PlannedStmt *statement)
 static void
 fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
 {
+	List	   *target_list;
 	ListCell   *lc;
 	int			field_index = 0;
 
 	if (result->query == NULL)
 		return;
 
-	foreach(lc, result->query->targetList)
+	if (result->query->returningList != NIL)
+		target_list = result->query->returningList;
+	else if (result->query->commandType == CMD_SELECT)
+		target_list = result->query->targetList;
+	else
+		target_list = NIL;
+
+	foreach(lc, target_list)
 	{
 		const TargetEntry *target = lfirst_node(TargetEntry, lc);
 
@@ -2826,7 +2960,7 @@ fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
 		return;
 
 	result->fields = palloc0_array(FastPgPgCoreField, result->field_count);
-	foreach(lc, result->query->targetList)
+	foreach(lc, target_list)
 	{
 		const TargetEntry *target = lfirst_node(TargetEntry, lc);
 
@@ -2851,6 +2985,24 @@ fastpg_pgcore_capture_analyze_fields(FastPgPgCorePrepared *result)
 		}
 		field_index++;
 	}
+}
+
+static Oid
+fastpg_pgcore_type_binary_output_oid(Oid type_oid)
+{
+	HeapTuple	type_tuple;
+	Form_pg_type type;
+	Oid			output_oid = InvalidOid;
+
+	type_tuple = SearchSysCache1(TYPEOID, ObjectIdGetDatum(type_oid));
+	if (!HeapTupleIsValid(type_tuple))
+		return InvalidOid;
+
+	type = (Form_pg_type) GETSTRUCT(type_tuple);
+	if (type->typisdefined)
+		output_oid = type->typsend;
+	ReleaseSysCache(type_tuple);
+	return output_oid;
 }
 
 static void
@@ -2880,6 +3032,8 @@ fastpg_pgcore_capture_startup(DestReceiver *self, int operation, TupleDesc typei
 		getTypeOutputInfo(attr->atttypid,
 						  &statement->columns[index].output_oid,
 						  &type_is_varlena);
+		statement->columns[index].binary_output_oid =
+			fastpg_pgcore_type_binary_output_oid(attr->atttypid);
 	}
 
 	MemoryContextSwitchTo(oldcontext);
@@ -2936,8 +3090,27 @@ fastpg_pgcore_capture_receive_slot(TupleTableSlot *slot, DestReceiver *self)
 		row->cells[index].is_null = is_null;
 
 		if (!is_null)
+		{
 			row->cells[index].value_text =
 				OidOutputFunctionCall(statement->columns[index].output_oid, value);
+			if (OidIsValid(statement->columns[index].binary_output_oid))
+			{
+				bytea	   *output_bytes =
+					OidSendFunctionCall(statement->columns[index].binary_output_oid,
+										value);
+				int			output_len = VARSIZE(output_bytes) - VARHDRSZ;
+
+				row->cells[index].has_value_binary = true;
+				row->cells[index].value_binary_len = output_len;
+				if (output_len > 0)
+				{
+					row->cells[index].value_binary = palloc(output_len);
+					memcpy(row->cells[index].value_binary,
+						   VARDATA(output_bytes),
+						   output_len);
+				}
+			}
+		}
 	}
 
 	statement->row_count++;
@@ -3146,7 +3319,8 @@ fastpg_pgcore_prepare(const char *query)
 #else
 			cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif
-			if (raw_count != 1 && strchr(result->source_text, '$') != NULL)
+			if (raw_count != 1 &&
+				fastpg_pgcore_raw_parsetrees_have_param_ref(result->raw_parsetrees))
 			{
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -4289,11 +4463,6 @@ fastpg_pgcore_execute_simple(const char *query)
 #else
 		cursor_options = CURSOR_OPT_PARALLEL_OK;
 #endif
-		if (raw_count != 1 && strchr(source_text, '$') != NULL)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("fastpg pgcore does not support parameters in multi-statement queries")));
-
 		result->statement_count = 0;
 		result->statements = NULL;
 		foreach(raw_lc, raw_parsetrees)
@@ -5685,4 +5854,42 @@ fastpg_pgcore_execute_value_text(const FastPgPgCoreExecuteResult *result,
 		return NULL;
 	statement = &result->statements[statement_index];
 	return statement->rows[row_index].cells[column_index].value_text;
+}
+
+const char *
+fastpg_pgcore_execute_value_binary(const FastPgPgCoreExecuteResult *result,
+								   int statement_index,
+								   int row_index,
+								   int column_index)
+{
+	FastPgPgCoreExecuteStatement *statement;
+	FastPgPgCoreExecuteCell *cell;
+
+	if (fastpg_pgcore_execute_value_is_null(result,
+											statement_index,
+											row_index,
+											column_index))
+		return NULL;
+	statement = &result->statements[statement_index];
+	cell = &statement->rows[row_index].cells[column_index];
+	return cell->has_value_binary ? cell->value_binary : NULL;
+}
+
+int
+fastpg_pgcore_execute_value_binary_len(const FastPgPgCoreExecuteResult *result,
+									   int statement_index,
+									   int row_index,
+									   int column_index)
+{
+	FastPgPgCoreExecuteStatement *statement;
+	FastPgPgCoreExecuteCell *cell;
+
+	if (fastpg_pgcore_execute_value_is_null(result,
+											statement_index,
+											row_index,
+											column_index))
+		return -1;
+	statement = &result->statements[statement_index];
+	cell = &statement->rows[row_index].cells[column_index];
+	return cell->has_value_binary ? cell->value_binary_len : -1;
 }

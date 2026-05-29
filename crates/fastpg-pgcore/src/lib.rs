@@ -153,10 +153,51 @@ pub struct StatementDescription {
     pub fields: Vec<PgCoreField>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum PgCoreValue {
     Text(String),
+    TextWithBinary { text: String, binary: Vec<u8> },
     Null,
+}
+
+impl PartialEq for PgCoreValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Text(left), Self::Text(right)) => left == right,
+            (Self::Text(left), Self::TextWithBinary { text: right, .. })
+            | (Self::TextWithBinary { text: left, .. }, Self::Text(right)) => left == right,
+            (
+                Self::TextWithBinary {
+                    text: left_text,
+                    binary: left_binary,
+                },
+                Self::TextWithBinary {
+                    text: right_text,
+                    binary: right_binary,
+                },
+            ) => left_text == right_text && left_binary == right_binary,
+            (Self::Null, Self::Null) => true,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for PgCoreValue {}
+
+impl PgCoreValue {
+    pub fn text(&self) -> Option<&str> {
+        match self {
+            Self::Text(value) | Self::TextWithBinary { text: value, .. } => Some(value),
+            Self::Null => None,
+        }
+    }
+
+    pub fn binary(&self) -> Option<&[u8]> {
+        match self {
+            Self::TextWithBinary { binary, .. } => Some(binary),
+            Self::Text(_) | Self::Null => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -550,12 +591,29 @@ mod inner {
     fn enter_pgcore_lane(_operation: &'static str) -> PgCoreLaneGuard {
         // The embedded upstream backend still has process-global state in
         // Postgres-catalog mode, including session reset and login hooks.
-        let lock = postgres_catalog_enabled().then(lock_pgcore_lane);
+        let lock = if postgres_catalog_enabled() {
+            Some(lock_pgcore_lane_when_catalog_turn_is_ready())
+        } else {
+            None
+        };
         let active = PGCORE_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
         PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         update_max_active(active);
         refresh_pgcore_caches_if_catalog_changed();
         PgCoreLaneGuard { _lock: lock }
+    }
+
+    fn lock_pgcore_lane_when_catalog_turn_is_ready() -> MutexGuard<'static, ()> {
+        loop {
+            unsafe {
+                fastpg_pgcore_wait_catalog_lane_turn();
+            }
+            let lock = lock_pgcore_lane();
+            if unsafe { fastpg_pgcore_catalog_lane_turn_ready() } {
+                return lock;
+            }
+            drop(lock);
+        }
     }
 
     fn lock_pgcore_lane() -> MutexGuard<'static, ()> {
@@ -672,6 +730,8 @@ mod inner {
         fn fastpg_xid_rollback();
         fn fastpg_pgcore_invalidate_system_caches();
         fn fastpg_pgcore_set_database(database_oid: u32);
+        fn fastpg_pgcore_wait_catalog_lane_turn();
+        fn fastpg_pgcore_catalog_lane_turn_ready() -> bool;
         fn fastpg_pgcore_notice_capture_begin();
         fn fastpg_pgcore_notice_capture_end();
         fn fastpg_pgcore_notice_capture_clear();
@@ -1012,6 +1072,18 @@ mod inner {
             row_index: i32,
             column_index: i32,
         ) -> *const c_char;
+        fn fastpg_pgcore_execute_value_binary(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            row_index: i32,
+            column_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_value_binary_len(
+            result: *const FastPgPgCoreExecuteResult,
+            statement_index: i32,
+            row_index: i32,
+            column_index: i32,
+        ) -> i32;
         fn fastpg_pgcore_input_text_datum(
             type_oid: u32,
             typmod: i32,
@@ -2312,14 +2384,48 @@ mod inner {
                         } {
                             row.push(PgCoreValue::Null);
                         } else {
-                            row.push(PgCoreValue::Text(unsafe {
+                            let text = unsafe {
                                 c_string(fastpg_pgcore_execute_value_text(
                                     self.as_ptr(),
                                     statement_index,
                                     row_index,
                                     column_index,
                                 ))
-                            }));
+                            };
+                            let binary_len = unsafe {
+                                fastpg_pgcore_execute_value_binary_len(
+                                    self.as_ptr(),
+                                    statement_index,
+                                    row_index,
+                                    column_index,
+                                )
+                            };
+                            if binary_len >= 0 {
+                                let binary_ptr = unsafe {
+                                    fastpg_pgcore_execute_value_binary(
+                                        self.as_ptr(),
+                                        statement_index,
+                                        row_index,
+                                        column_index,
+                                    )
+                                };
+                                let binary = if binary_len == 0 {
+                                    Vec::new()
+                                } else if binary_ptr.is_null() {
+                                    Vec::new()
+                                } else {
+                                    unsafe {
+                                        std::slice::from_raw_parts(
+                                            binary_ptr.cast::<u8>(),
+                                            binary_len as usize,
+                                        )
+                                    }
+                                    .to_vec()
+                                };
+                                row.push(PgCoreValue::TextWithBinary { text, binary });
+                            } else {
+                                row.push(PgCoreValue::Text(text));
+                            }
                         }
                     }
                     rows.push(row);
@@ -2492,6 +2598,24 @@ mod tests {
         for value in values {
             bytes.extend_from_slice(&8_i32.to_be_bytes());
             bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes
+    }
+
+    fn binary_jsonb_array(values: impl IntoIterator<Item = &'static [u8]>) -> Vec<u8> {
+        const JSONB_OID: u32 = 3802;
+
+        let values = values.into_iter().collect::<Vec<_>>();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        bytes.extend_from_slice(&0_i32.to_be_bytes());
+        bytes.extend_from_slice(&JSONB_OID.to_be_bytes());
+        bytes.extend_from_slice(&(values.len() as i32).to_be_bytes());
+        bytes.extend_from_slice(&1_i32.to_be_bytes());
+        for value in values {
+            bytes.extend_from_slice(&((value.len() + 1) as i32).to_be_bytes());
+            bytes.push(1);
+            bytes.extend_from_slice(value);
         }
         bytes
     }
@@ -2684,6 +2808,46 @@ mod tests {
 
     #[cfg(feature = "postgres-execution")]
     #[test]
+    fn execute_captures_binary_result_values() {
+        let session = PgCoreSession::new();
+        let statement = session
+            .prepare("select $1::int4, $2::bool, $3::bytea")
+            .unwrap();
+
+        let result = statement
+            .execute_with_params(&[
+                raw_binary_param(42_i32.to_be_bytes()),
+                raw_binary_param([1]),
+                raw_binary_param(b"a\0b".to_vec()),
+            ])
+            .unwrap();
+
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(
+            result.statements[0].rows[0][0],
+            PgCoreValue::TextWithBinary {
+                text: "42".to_owned(),
+                binary: 42_i32.to_be_bytes().to_vec(),
+            }
+        );
+        assert_eq!(
+            result.statements[0].rows[0][1],
+            PgCoreValue::TextWithBinary {
+                text: "t".to_owned(),
+                binary: vec![1],
+            }
+        );
+        assert_eq!(
+            result.statements[0].rows[0][2],
+            PgCoreValue::TextWithBinary {
+                text: "\\x610062".to_owned(),
+                binary: b"a\0b".to_vec(),
+            }
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
     fn execute_accepts_raw_binary_int8_array_parameter() {
         let session = PgCoreSession::new();
         let statement = session.prepare("select unnest($1::bigint[])").unwrap();
@@ -2696,6 +2860,144 @@ mod tests {
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("1".to_owned())]]
         );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_accepts_raw_binary_jsonb_array_parameter() {
+        let session = PgCoreSession::new();
+        let statement = session.prepare("select unnest($1::jsonb[])").unwrap();
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param(binary_jsonb_array([
+                br#"{"noteId":1}"#.as_slice()
+            ]))])
+            .unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("{\"noteId\": 1}".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn prepare_describes_insert_returning_columns() {
+        const TIMESTAMP_OID: u32 = 1114;
+
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fastpg_pgcore_returning");
+        session
+            .prepare(&format!(
+                "create table {table}(created_at timestamp not null default current_timestamp, version bigint not null)"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let statement = session
+            .prepare(&format!(
+                "insert into {table} (version) \
+                 select unnest($1::bigint[]) \
+                 returning created_at, version"
+            ))
+            .unwrap();
+        let description = statement.describe();
+        assert_eq!(description.fields.len(), 2);
+        assert_eq!(description.fields[0].name, "created_at");
+        assert_eq!(description.fields[0].type_oid, TIMESTAMP_OID);
+        assert_eq!(description.fields[1].name, "version");
+        assert_eq!(description.fields[1].type_oid, INT8_OID);
+
+        let result = statement
+            .execute_with_params(&[raw_binary_param(binary_int8_array([1]))])
+            .unwrap();
+        assert_eq!(result.statements[0].fields.len(), 2);
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(result.statements[0].rows[0].len(), 2);
+        assert!(matches!(
+            result.statements[0].rows[0][0],
+            PgCoreValue::TextWithBinary { .. }
+        ));
+        assert_eq!(
+            result.statements[0].rows[0][1],
+            PgCoreValue::TextWithBinary {
+                text: "1".to_owned(),
+                binary: 1_i64.to_be_bytes().to_vec(),
+            }
+        );
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn prepare_describes_insert_returning_explicit_column_order() {
+        const TIMESTAMPTZ_OID: u32 = 1184;
+
+        let session = PgCoreSession::new();
+        let table = unique_pg_name("fastpg_pgcore_returning_line");
+        session
+            .prepare(&format!(
+                "create table {table}(line text not null, version bigint not null, created_at timestamptz not null default now())"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let statement = session
+            .prepare(&format!(
+                "insert into {table} (line, version) \
+                 select $1, unnest($2::bigint[]) \
+                 returning line, version, created_at"
+            ))
+            .unwrap();
+        let description = statement.describe();
+        assert_eq!(description.fields.len(), 3);
+        assert_eq!(description.fields[0].name, "line");
+        assert_eq!(description.fields[0].type_oid, TEXT_OID);
+        assert_eq!(description.fields[1].name, "version");
+        assert_eq!(description.fields[1].type_oid, INT8_OID);
+        assert_eq!(description.fields[2].name, "created_at");
+        assert_eq!(description.fields[2].type_oid, TIMESTAMPTZ_OID);
+
+        let result = statement
+            .execute_with_params(&[
+                PgCoreParam::Text("main".to_owned()),
+                raw_binary_param(binary_int8_array([5])),
+            ])
+            .unwrap();
+        assert_eq!(result.statements[0].fields.len(), 3);
+        assert_eq!(result.statements[0].rows.len(), 1);
+        assert_eq!(result.statements[0].rows[0].len(), 3);
+        assert_eq!(
+            result.statements[0].rows[0][0],
+            PgCoreValue::TextWithBinary {
+                text: "main".to_owned(),
+                binary: b"main".to_vec(),
+            }
+        );
+        assert_eq!(
+            result.statements[0].rows[0][1],
+            PgCoreValue::TextWithBinary {
+                text: "5".to_owned(),
+                binary: 5_i64.to_be_bytes().to_vec(),
+            }
+        );
+        assert!(matches!(
+            result.statements[0].rows[0][2],
+            PgCoreValue::TextWithBinary { .. }
+        ));
+
+        session
+            .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -2852,6 +3154,71 @@ mod tests {
         session
             .execute_simple(&format!("drop table if exists {table}"))
             .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_simple_multi_statement_allows_dollar_quoted_function() {
+        let session = PgCoreSession::new();
+        let function = unique_pg_name("fastpg_pgcore_dollar_body");
+        let _ = session.execute_simple(&format!("drop function if exists {function}()"));
+
+        let result = session
+            .execute_simple(&format!(
+                "create or replace function {function}() \
+                 returns int \
+                 as $$ \
+                   select 1; \
+                 $$ \
+                 language sql; \
+                 select {function}();"
+            ))
+            .unwrap();
+
+        assert_eq!(result.statements[0].command_tag, "CREATE FUNCTION");
+        assert_eq!(
+            result.statements[1].rows,
+            vec![vec![PgCoreValue::Text("1".to_owned())]]
+        );
+
+        session
+            .execute_simple(&format!("drop function if exists {function}()"))
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn prepare_multi_statement_allows_dollar_quoted_string_without_params() {
+        let session = PgCoreSession::new();
+        let statement = session
+            .prepare("select '$1'::text; select 2::int4")
+            .unwrap();
+        let result = statement.execute().unwrap();
+
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("$1".to_owned())]]
+        );
+        assert_eq!(
+            result.statements[1].rows,
+            vec![vec![PgCoreValue::Text("2".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn prepare_multi_statement_rejects_actual_param_refs() {
+        let session = PgCoreSession::new();
+        let error = session
+            .prepare("select $1::int4; select 2::int4")
+            .unwrap_err();
+
+        assert_eq!(error.sqlstate, "0A000");
+        assert!(
+            error
+                .message
+                .contains("does not support parameters in multi-statement queries")
+        );
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -3261,10 +3628,11 @@ mod tests {
             .unwrap()
             .execute()
             .unwrap();
-        assert!(matches!(
-            &view_definition.statements[0].rows[0][0],
-            PgCoreValue::Text(value) if value.contains(&table)
-        ));
+        assert!(
+            view_definition.statements[0].rows[0][0]
+                .text()
+                .is_some_and(|value| value.contains(&table))
+        );
 
         let select = session
             .prepare(&format!("select id, label from {view}"))

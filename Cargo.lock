@@ -498,6 +498,7 @@ version = "0.1.0"
 dependencies = [
  "fastpg-pgcore",
  "fastpg-server",
+ "futures",
  "tokio",
  "tokio-postgres",
 ]

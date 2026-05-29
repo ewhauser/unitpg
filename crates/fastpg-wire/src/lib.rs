@@ -42,8 +42,8 @@ use pgwire::api::query::{
     ExtendedQueryHandler, SimpleQueryHandler, send_execution_response, send_query_response,
 };
 use pgwire::api::results::{
-    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
-    FieldInfo, QueryResponse, Response, Tag,
+    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
@@ -923,7 +923,7 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         send_notices(client, notices).await?;
         remember_copy_target(&session, &execution);
 
-        execution_to_response(execution, portal.result_column_format.format_for(0))
+        execution_to_response_with_format(execution, &portal.result_column_format)
     }
 }
 
@@ -1700,6 +1700,7 @@ fn encoded_text_field_len(value: &Value) -> usize {
         Value::Int4(value) => 4 + decimal_i64_len(i64::from(*value)),
         Value::Int8(value) => 4 + decimal_i64_len(*value),
         Value::Text(value) | Value::RawText(value) => 4 + value.len(),
+        Value::TextWithBinary { text, .. } => 4 + text.len(),
     }
 }
 
@@ -2195,6 +2196,7 @@ fn encode_function_result(
         (FastpathReturnType::Bytea, Value::Text(value) | Value::RawText(value)) => {
             parse_bytea_text(&value).map(Some)
         }
+        (FastpathReturnType::Bytea, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (FastpathReturnType::Int4, Value::Int4(value)) => Ok(Some(value.to_be_bytes().to_vec())),
         (FastpathReturnType::Int4, Value::Text(value) | Value::RawText(value)) => {
             let value = value
@@ -2202,6 +2204,7 @@ fn encode_function_result(
                 .map_err(|error| protocol_error(format!("invalid int4 result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
+        (FastpathReturnType::Int4, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (FastpathReturnType::Int8, Value::Int8(value)) => Ok(Some(value.to_be_bytes().to_vec())),
         (FastpathReturnType::Int8, Value::Text(value) | Value::RawText(value)) => {
             let value = value
@@ -2209,6 +2212,7 @@ fn encode_function_result(
                 .map_err(|error| protocol_error(format!("invalid int8 result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
+        (FastpathReturnType::Int8, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (FastpathReturnType::Oid, Value::Int4(value)) => {
             Ok(Some((value as u32).to_be_bytes().to_vec()))
         }
@@ -2218,6 +2222,7 @@ fn encode_function_result(
                 .map_err(|error| protocol_error(format!("invalid oid result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
+        (FastpathReturnType::Oid, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (expected, actual) => Err(protocol_error(format!(
             "cannot encode fastpath result {actual:?} as {expected:?}"
         ))),
@@ -2944,8 +2949,21 @@ fn dollar_quote_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWireResult<Response> {
+    let format = match format {
+        FieldFormat::Text => Format::UnifiedText,
+        FieldFormat::Binary => Format::UnifiedBinary,
+    };
+    execution_to_response_with_format(execution, &format)
+}
+
+fn execution_to_response_with_format(
+    execution: QueryExecution,
+    format: &Format,
+) -> PgWireResult<Response> {
     match execution {
-        QueryExecution::WithNotices { execution, .. } => execution_to_response(*execution, format),
+        QueryExecution::WithNotices { execution, .. } => {
+            execution_to_response_with_format(*execution, format)
+        }
         QueryExecution::Empty => Ok(Response::EmptyQuery),
         QueryExecution::Batch(_) => Ok(error_response(
             "0A000",
@@ -3024,8 +3042,8 @@ fn execution_is_error(execution: &QueryExecution) -> bool {
     }
 }
 
-fn query_result_response(result: QueryResult, format: FieldFormat) -> PgWireResult<Response> {
-    let schema = Arc::new(field_infos(&result.fields, format));
+fn query_result_response(result: QueryResult, format: &Format) -> PgWireResult<Response> {
+    let schema = Arc::new(portal_field_infos(&result.fields, format));
     let fields = result.fields;
     let command_tag = result
         .command_tag
@@ -3057,6 +3075,14 @@ fn encode_row(
     fields: &[Column],
     values: &[Value],
 ) -> PgWireResult<DataRow> {
+    if fields.len() != values.len() {
+        return Err(protocol_error(format!(
+            "number of field descriptions must equal number of values, got {} and {}",
+            fields.len(),
+            values.len()
+        )));
+    }
+
     if schema
         .iter()
         .all(|field| field.format() == FieldFormat::Text)
@@ -3068,11 +3094,14 @@ fn encode_row(
         return Ok(DataRow::new(row, values.len() as i16));
     }
 
-    let mut encoder = DataRowEncoder::new(schema);
-    for (field, value) in fields.iter().zip(values) {
-        encode_value(&mut encoder, field.data_type, value)?;
+    let mut row = BytesMut::with_capacity(128);
+    for ((field_info, field), value) in schema.iter().zip(fields).zip(values) {
+        match field_info.format() {
+            FieldFormat::Text => encode_text_field(&mut row, value),
+            FieldFormat::Binary => encode_binary_field(&mut row, field.data_type, value)?,
+        }
     }
-    Ok(encoder.take_row())
+    Ok(DataRow::new(row, values.len() as i16))
 }
 
 fn encode_text_field(row: &mut BytesMut, value: &Value) {
@@ -3082,6 +3111,7 @@ fn encode_text_field(row: &mut BytesMut, value: &Value) {
         Value::Int4(value) => encode_text_bytes(row, value.to_string().as_bytes()),
         Value::Int8(value) => encode_text_bytes(row, value.to_string().as_bytes()),
         Value::Text(value) | Value::RawText(value) => encode_text_bytes(row, value.as_bytes()),
+        Value::TextWithBinary { text, .. } => encode_text_bytes(row, text.as_bytes()),
     }
 }
 
@@ -3090,38 +3120,34 @@ fn encode_text_bytes(row: &mut BytesMut, bytes: &[u8]) {
     row.put_slice(bytes);
 }
 
-fn encode_value(
-    encoder: &mut DataRowEncoder,
-    data_type: PgType,
-    value: &Value,
-) -> PgWireResult<()> {
+fn encode_binary_field(row: &mut BytesMut, data_type: PgType, value: &Value) -> PgWireResult<()> {
     match (data_type, value) {
-        (PgType::Int2, Value::Int2(value)) => encoder.encode_field(&Some(*value)),
-        (PgType::Int4, Value::Int4(value)) => encoder.encode_field(&Some(*value)),
-        (PgType::Int8, Value::Int8(value)) => encoder.encode_field(&Some(*value)),
-        (PgType::Varchar, Value::Text(value)) => encoder.encode_field(&Some(value.as_str())),
-        (PgType::Varchar, Value::RawText(value)) => encoder.encode_field(&Some(value.as_str())),
+        (_, Value::Null) => row.put_i32(-1),
+        (_, Value::TextWithBinary { binary, .. }) => encode_text_bytes(row, binary),
+        (PgType::Int2, Value::Int2(value)) => encode_text_bytes(row, &value.to_be_bytes()),
+        (PgType::Int4, Value::Int4(value)) => encode_text_bytes(row, &value.to_be_bytes()),
+        (PgType::Int8, Value::Int8(value)) => encode_text_bytes(row, &value.to_be_bytes()),
+        (PgType::Varchar, Value::Text(value) | Value::RawText(value)) => {
+            encode_text_bytes(row, value.as_bytes())
+        }
         (PgType::Int2, Value::RawText(value)) => {
             let value = parse_binary_text_value::<i16>(value, "int2")?;
-            encoder.encode_field(&Some(value))
+            encode_text_bytes(row, &value.to_be_bytes())
         }
         (PgType::Int4, Value::RawText(value)) => {
             let value = parse_binary_text_value::<i32>(value, "int4")?;
-            encoder.encode_field(&Some(value))
+            encode_text_bytes(row, &value.to_be_bytes())
         }
         (PgType::Int8, Value::RawText(value)) => {
             let value = parse_binary_text_value::<i64>(value, "int8")?;
-            encoder.encode_field(&Some(value))
+            encode_text_bytes(row, &value.to_be_bytes())
         }
-        (PgType::Int2, Value::Null) => encoder.encode_field(&Option::<i16>::None),
-        (PgType::Int4, Value::Null) => encoder.encode_field(&Option::<i32>::None),
-        (PgType::Int8, Value::Null) => encoder.encode_field(&Option::<i64>::None),
-        (PgType::Varchar, Value::Null) => encoder.encode_field(&Option::<&str>::None),
         (expected, actual) => Err(PgWireError::ApiError(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("cannot encode {actual:?} as {expected:?}"),
-        )))),
+        ))))?,
     }
+    Ok(())
 }
 
 fn parse_binary_text_value<T>(value: &str, type_name: &'static str) -> PgWireResult<T>
@@ -3451,6 +3477,43 @@ mod tests {
                 QueryParameter::Null,
             ]
         );
+    }
+
+    #[test]
+    fn row_encoder_honors_individual_result_formats() {
+        let fields = vec![
+            Column::with_type_oid("line", PgType::Varchar, 25),
+            Column::new("version", PgType::Int8),
+            Column::with_type_oid("created_at", PgType::Varchar, 1184),
+        ];
+        let schema = Arc::new(portal_field_infos(
+            &fields,
+            &Format::Individual(vec![0, 1, 1]),
+        ));
+        let row = encode_row(
+            schema.clone(),
+            &fields,
+            &[
+                Value::Text("main".to_owned()),
+                Value::Int8(5),
+                Value::TextWithBinary {
+                    text: "timestamp text".to_owned(),
+                    binary: 42_i64.to_be_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(schema[0].format(), FieldFormat::Text);
+        assert_eq!(schema[1].format(), FieldFormat::Binary);
+        assert_eq!(schema[2].format(), FieldFormat::Binary);
+        assert_eq!(row.field_count, 3);
+
+        let mut expected = BytesMut::new();
+        encode_text_bytes(&mut expected, b"main");
+        encode_text_bytes(&mut expected, &5_i64.to_be_bytes());
+        encode_text_bytes(&mut expected, &42_i64.to_be_bytes());
+        assert_eq!(row.data, expected);
     }
 
     fn startup_with_protocol(

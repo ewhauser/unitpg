@@ -17,7 +17,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use fastpg_exec::{COPY_HEADER_MATCH, QueryExecutor, QueryExecutorShared};
+use fastpg_exec::{COPY_FORMAT_BINARY, COPY_HEADER_MATCH, QueryExecutor, QueryExecutorShared};
 
 pub type SessionId = u64;
 pub const COPY_ERROR_CONTEXT_PREFIX: &str = "\x1ffastpg-copy-context\n";
@@ -438,6 +438,7 @@ impl Default for SessionState {
 struct SessionCopyState {
     target: CopyTarget,
     pending: String,
+    bytes: Vec<u8>,
     lines: Vec<(usize, String)>,
     rows: usize,
     done: bool,
@@ -450,6 +451,7 @@ impl SessionCopyState {
         Self {
             target,
             pending: String::new(),
+            bytes: Vec::new(),
             lines: Vec::new(),
             rows: 0,
             done: false,
@@ -459,6 +461,12 @@ impl SessionCopyState {
     }
 
     fn push_data(&mut self, executor: &QueryExecutor, data: &[u8]) -> Result<(), String> {
+        if self.target.format == COPY_FORMAT_BINARY {
+            let _ = executor;
+            self.bytes.extend_from_slice(data);
+            return Ok(());
+        }
+
         let chunk = std::str::from_utf8(data).map_err(|error| error.to_string())?;
         self.pending.push_str(chunk);
 
@@ -472,6 +480,12 @@ impl SessionCopyState {
     }
 
     fn finish(&mut self, executor: &QueryExecutor) -> Result<usize, String> {
+        if self.target.format == COPY_FORMAT_BINARY {
+            let rows = executor.copy_target_buffered_bytes(&self.target, &self.bytes)?;
+            self.rows = rows;
+            return Ok(rows);
+        }
+
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
             self.process_line(executor, line.trim_end_matches('\r'))?;

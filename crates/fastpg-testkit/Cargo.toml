@@ -16,4 +16,5 @@ fastpg-server.workspace = true
 tokio.workspace = true
 
 [dev-dependencies]
+futures.workspace = true
 tokio-postgres.workspace = true
