@@ -303,11 +303,11 @@ impl PgCoreSession {
     ) -> Self {
         let database = database.into();
         let database_oid = if inner::postgres_catalog_enabled() {
-            if !database.eq_ignore_ascii_case("postgres") {
-                panic!(
-                    "Postgres catalog mode only supports database \"postgres\" in this experiment"
-                );
-            }
+            // PostgreSQL catalog mode currently boots a single backend database.
+            // Treat client-requested database names as aliases for that catalog
+            // so PostgreSQL-shaped test launchers can create and connect to
+            // disposable per-test databases.
+            let _ = database;
             5
         } else {
             fastpg_catalog::ensure_database(&database).0
@@ -2445,6 +2445,17 @@ mod tests {
         let statement = session.prepare("select 1").unwrap();
         let result = statement.execute().unwrap();
         assert_eq!(result.statements.len(), 1);
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text("1".to_owned())]]
+        );
+    }
+
+    #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
+    #[test]
+    fn postgres_catalog_accepts_named_database_aliases() {
+        let session = PgCoreSession::with_database("fastpg_repro");
+        let result = session.execute_simple("select 1").unwrap();
         assert_eq!(
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("1".to_owned())]]

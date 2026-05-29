@@ -381,6 +381,7 @@ jobs:
       - name: Package Rust server distribution
         env:
           DIST_TARGET: ${{ matrix.target }}
+          FASTPG_PGCORE_BUILD_DIR: ${{ env.PGCORE_BUILD_DIR }}
         run: |
           set -euo pipefail
           ci/package-rust-server-dist.sh \
@@ -406,6 +407,11 @@ jobs:
           "$dist/bin/fastpg-server" --version | grep -F "fastpg-server"
           "$dist/bin/postgres" --version | grep -F "postgres (PostgreSQL)"
           test -f "$dist/README.server.txt"
+          case "$DIST_TARGET" in
+            macos-*) plpgsql_lib="$dist/lib/postgresql/plpgsql.dylib" ;;
+            *) plpgsql_lib="$dist/lib/postgresql/plpgsql.so" ;;
+          esac
+          test -f "$plpgsql_lib"
           test -n "$(find "$dist/lib" -maxdepth 3 -name 'vector*' -print -quit)"
           test -f "$dist/share/extension/vector.control"
           test -n "$(find "$dist/share/extension" -maxdepth 1 -name 'vector--*.sql' -print -quit)"
@@ -451,7 +457,6 @@ jobs:
           synchronous_commit=off
           full_page_writes=off
           EOF
-          PGMAXPROTOCOLVERSION=3.0 \
           PGSSLMODE=disable \
           PGGSSENCMODE=disable \
             "$dist/bin/postgres" -D "$pgdata" >"$workdir/fastpg-server.log" 2>&1 &
@@ -462,7 +467,7 @@ jobs:
           trap cleanup EXIT
           ready=0
           for _ in {1..100}; do
-            if PGMAXPROTOCOLVERSION=3.0 PGSSLMODE=disable PGGSSENCMODE=disable \
+            if PGSSLMODE=disable PGGSSENCMODE=disable \
               "$dist/bin/pg_isready" -h 127.0.0.1 -p "$port" -d postgres >/dev/null 2>&1; then
               ready=1
               break
@@ -477,8 +482,15 @@ jobs:
             dump_smoke_logs
             exit 1
           fi
-          if [[ "$(PGMAXPROTOCOLVERSION=3.0 PGSSLMODE=disable PGGSSENCMODE=disable \
+          if [[ "$(PGSSLMODE=disable PGGSSENCMODE=disable \
             "$dist/bin/psql" -XAt -h 127.0.0.1 -p "$port" -U postgres -d postgres -c "select 1" >"$workdir/psql.log" 2>&1 && cat "$workdir/psql.log")" != 1 ]]; then
+            dump_smoke_logs
+            exit 1
+          fi
+          if ! PGSSLMODE=disable PGGSSENCMODE=disable \
+            "$dist/bin/psql" -XAt -h 127.0.0.1 -p "$port" -U postgres -d postgres \
+            -c 'CREATE OR REPLACE FUNCTION public.fastpg_min_crash() RETURNS void AS $$ BEGIN PERFORM 1; END; $$ LANGUAGE plpgsql;' \
+            >>"$workdir/psql.log" 2>&1; then
             dump_smoke_logs
             exit 1
           fi
