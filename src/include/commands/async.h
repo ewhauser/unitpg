@@ -17,7 +17,11 @@
 
 extern PGDLLIMPORT bool Trace_notify;
 extern PGDLLIMPORT int max_notify_queue_pages;
+#ifdef USE_FASTPG
+extern PGDLLIMPORT PG_THREAD_LOCAL volatile sig_atomic_t notifyInterruptPending;
+#else
 extern PGDLLIMPORT volatile sig_atomic_t notifyInterruptPending;
+#endif
 
 extern void NotifyMyFrontEnd(const char *channel,
 							 const char *payload,

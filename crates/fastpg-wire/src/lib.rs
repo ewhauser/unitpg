@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::any::Any;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::fmt::Debug;
 use std::fmt::Write;
@@ -13,8 +14,11 @@ use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::LazyLock;
+use std::sync::Mutex;
+use std::sync::mpsc as std_mpsc;
 #[cfg(unix)]
 use std::task::{Context, Poll};
+use std::thread;
 
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -22,7 +26,9 @@ use bytes::Buf;
 use bytes::{BufMut, Bytes, BytesMut};
 use fastpg_session::{
     COPY_ERROR_CONTEXT_PREFIX, Column, ParameterFormat, PgType, QueryDescription, QueryExecution,
-    QueryNotice, QueryParameter, QueryResult, ServerState, SessionState, StartupParameters, Value,
+    QueryListenAction, QueryNotice, QueryNotification, QueryParameter, QueryResult, ServerState,
+    SessionId, SessionState, StartupParameters, StartupValidationError, Value,
+    validate_startup_parameters,
 };
 #[cfg(unix)]
 use futures::Stream;
@@ -42,12 +48,14 @@ use pgwire::api::query::{
     ExtendedQueryHandler, SimpleQueryHandler, send_execution_response, send_query_response,
 };
 use pgwire::api::results::{
-    CopyResponse, DataRowEncoder, DescribePortalResponse, DescribeStatementResponse, FieldFormat,
-    FieldInfo, QueryResponse, Response, Tag,
+    CopyResponse, DescribePortalResponse, DescribeStatementResponse, FieldFormat, FieldInfo,
+    QueryResponse, Response, Tag,
 };
 use pgwire::api::stmt::{NoopQueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
-use pgwire::api::{ClientInfo, ClientPortalStore, ConnectionHandle, PgWireServerHandlers, Type};
+use pgwire::api::{
+    ClientInfo, ClientPortalStore, ConnectionHandle, ErrorHandler, PgWireServerHandlers, Type,
+};
 use pgwire::api::{PgWireConnectionState, PidSecretKeyGenerator, RandomPidSecretKeyGenerator};
 use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 #[cfg(unix)]
@@ -56,18 +64,27 @@ use pgwire::messages::ProtocolVersion;
 use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use pgwire::messages::data::{DataRow, FieldDescription, RowDescription};
 use pgwire::messages::response::{
-    CommandComplete, EmptyQueryResponse, NoticeResponse, ReadyForQuery, TransactionStatus,
+    CommandComplete, EmptyQueryResponse, NoticeResponse, NotificationResponse, ReadyForQuery,
+    TransactionStatus,
 };
 use pgwire::messages::simplequery::Query;
 use pgwire::messages::startup::{NegotiateProtocolVersion, Startup};
 use pgwire::messages::{PgWireBackendMessage, PgWireFrontendMessage};
+#[cfg(unix)]
+use pgwire::tokio::server::{
+    MaybeTls, PgWireMessageServerCodec, negotiate_tls, process_error, process_message,
+};
 use postgres_types::Kind;
 #[cfg(unix)]
 use tokio::io::AsyncWriteExt;
 #[cfg(unix)]
-use tokio::net::UnixStream;
+use tokio::net::{TcpStream, UnixStream};
 #[cfg(unix)]
-use tokio::sync::{Semaphore, TryAcquireError, oneshot};
+use tokio::sync::{
+    Semaphore, TryAcquireError, mpsc, mpsc::UnboundedReceiver, mpsc::UnboundedSender, oneshot,
+};
+#[cfg(unix)]
+use tokio::time::{Duration, sleep};
 #[cfg(unix)]
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -79,6 +96,125 @@ pub struct FastPgServerHandlers {
 static PID_GENERATOR: LazyLock<RandomPidSecretKeyGenerator> =
     LazyLock::new(RandomPidSecretKeyGenerator::default);
 const COPY_ERROR_FIELDS_PREFIX: &str = "\x1ffastpg-copy-error-fields\n";
+
+#[cfg(unix)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct WireNotification {
+    pid: i32,
+    channel: String,
+    payload: String,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct NotificationSubscriber {
+    sender: UnboundedSender<WireNotification>,
+    channels: HashSet<String>,
+}
+
+#[cfg(unix)]
+#[derive(Debug, Default)]
+struct NotificationHub {
+    subscribers: Mutex<HashMap<SessionId, NotificationSubscriber>>,
+}
+
+#[cfg(unix)]
+impl NotificationHub {
+    fn register(&self, session_id: SessionId) -> UnboundedReceiver<WireNotification> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.subscribers
+            .lock()
+            .expect("fastpg notification hub mutex poisoned")
+            .insert(
+                session_id,
+                NotificationSubscriber {
+                    sender,
+                    channels: HashSet::new(),
+                },
+            );
+        receiver
+    }
+
+    fn unregister(&self, session_id: SessionId) {
+        self.subscribers
+            .lock()
+            .expect("fastpg notification hub mutex poisoned")
+            .remove(&session_id);
+    }
+
+    fn apply_listen_actions(&self, session_id: SessionId, actions: Vec<QueryListenAction>) {
+        if actions.is_empty() {
+            return;
+        }
+
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("fastpg notification hub mutex poisoned");
+        let Some(subscriber) = subscribers.get_mut(&session_id) else {
+            return;
+        };
+        for action in actions {
+            match action {
+                QueryListenAction::Listen(channel) => {
+                    subscriber.channels.insert(channel);
+                }
+                QueryListenAction::Unlisten(channel) => {
+                    subscriber.channels.remove(&channel);
+                }
+            }
+        }
+    }
+
+    fn broadcast(&self, pid: i32, notifications: Vec<QueryNotification>) {
+        if notifications.is_empty() {
+            return;
+        }
+
+        let mut subscribers = self
+            .subscribers
+            .lock()
+            .expect("fastpg notification hub mutex poisoned");
+        let mut dead_sessions = Vec::new();
+        for (session_id, subscriber) in subscribers.iter() {
+            for notification in &notifications {
+                if !subscriber.channels.contains(&notification.channel) {
+                    continue;
+                }
+                if subscriber
+                    .sender
+                    .send(WireNotification {
+                        pid,
+                        channel: notification.channel.clone(),
+                        payload: notification.payload.clone(),
+                    })
+                    .is_err()
+                {
+                    dead_sessions.push(*session_id);
+                    break;
+                }
+            }
+        }
+        for session_id in dead_sessions {
+            subscribers.remove(&session_id);
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+struct QueryEvents {
+    notices: Vec<QueryNotice>,
+    notifications: Vec<QueryNotification>,
+    listen_actions: Vec<QueryListenAction>,
+}
+
+fn take_query_events(session: &SessionState) -> QueryEvents {
+    QueryEvents {
+        notices: session.take_notices(),
+        notifications: session.take_notifications(),
+        listen_actions: session.take_listen_actions(),
+    }
+}
 
 impl FastPgServerHandlers {
     pub fn new() -> Self {
@@ -181,6 +317,8 @@ pub struct FastPgWireHandler {
     query_parser: Arc<NoopQueryParser>,
     execution: ExecutionDispatcher,
     inline_session_execution: bool,
+    #[cfg(unix)]
+    notifications: Arc<NotificationHub>,
 }
 
 impl FastPgWireHandler {
@@ -235,6 +373,8 @@ impl FastPgWireHandler {
             query_parser: Arc::new(NoopQueryParser::new()),
             execution: ExecutionDispatcher::new(max_concurrency, inline_session_execution),
             inline_session_execution,
+            #[cfg(unix)]
+            notifications: Arc::new(NotificationHub::default()),
         }
     }
 
@@ -253,12 +393,12 @@ impl FastPgWireHandler {
         session: Arc<SessionState>,
         query: String,
         parameters: Vec<QueryParameter>,
-    ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
+    ) -> PgWireResult<(QueryExecution, QueryEvents)> {
         self.execution
             .run_session_blocking(session, move |session| {
                 let execution = session.execute_with_parameters(&query, &parameters);
-                let notices = session.take_notices();
-                (execution, notices)
+                let events = take_query_events(&session);
+                (execution, events)
             })
             .await
     }
@@ -267,12 +407,12 @@ impl FastPgWireHandler {
         &self,
         session: Arc<SessionState>,
         query: String,
-    ) -> PgWireResult<(QueryExecution, Vec<QueryNotice>)> {
+    ) -> PgWireResult<(QueryExecution, QueryEvents)> {
         self.execution
             .run_session_blocking(session, move |session| {
                 let execution = session.execute_simple_text(&query);
-                let notices = session.take_notices();
-                (execution, notices)
+                let events = take_query_events(&session);
+                (execution, events)
             })
             .await
     }
@@ -281,12 +421,33 @@ impl FastPgWireHandler {
         &self,
         session: Arc<SessionState>,
         query: &str,
-    ) -> Option<PgWireResult<(QueryExecution, Vec<QueryNotice>)>> {
+    ) -> Option<PgWireResult<(QueryExecution, QueryEvents)>> {
         self.execution.try_run_session_inline(session, |session| {
             let execution = session.execute_simple_text(query);
-            let notices = session.take_notices();
-            (execution, notices)
+            let events = take_query_events(&session);
+            (execution, events)
         })
+    }
+
+    async fn validate_startup(&self, startup: StartupParameters) -> PgWireResult<()> {
+        self.execution
+            .run_global_blocking(move || validate_startup_parameters(&startup))
+            .await?
+            .map_err(startup_validation_error)
+    }
+
+    async fn create_session(&self, startup: StartupParameters) -> PgWireResult<SessionState> {
+        let server = self.server.clone();
+        let inline_session_execution = self.inline_session_execution;
+        self.execution
+            .run_global_blocking(move || {
+                if inline_session_execution {
+                    SessionState::new_inline_execution(server, startup)
+                } else {
+                    SessionState::new(server, startup)
+                }
+            })
+            .await
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -294,12 +455,40 @@ impl FastPgWireHandler {
         &self,
         session: Arc<SessionState>,
         query: &CStr,
-    ) -> Option<PgWireResult<(QueryExecution, Vec<QueryNotice>)>> {
+    ) -> Option<PgWireResult<(QueryExecution, QueryEvents)>> {
         self.execution.try_run_session_inline(session, |session| {
             let execution = session.execute_simple_cstr(query);
-            let notices = session.take_notices();
-            (execution, notices)
+            let events = take_query_events(&session);
+            (execution, events)
         })
+    }
+
+    async fn send_query_events<C>(
+        &self,
+        client: &mut C,
+        session: &SessionState,
+        events: QueryEvents,
+    ) -> PgWireResult<()>
+    where
+        C: ClientInfo + Sink<PgWireBackendMessage> + Unpin,
+        C::Error: Debug,
+        PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
+    {
+        send_notices(client, events.notices).await?;
+        #[cfg(unix)]
+        {
+            self.notifications
+                .apply_listen_actions(session.id(), events.listen_actions);
+            let (pid, _) = client.pid_and_secret_key();
+            self.notifications.broadcast(pid, events.notifications);
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = session;
+            let _ = events.listen_actions;
+            let _ = events.notifications;
+        }
+        Ok(())
     }
 
     async fn execute_simple_message<C>(
@@ -314,8 +503,8 @@ impl FastPgWireHandler {
     {
         let session = session_for_client(client)?;
         if postgres_catalog_enabled() && !simple_query_may_copy_from_stdin(&query) {
-            let (execution, notices) = self.execute_simple_query(session.clone(), query).await?;
-            send_notices(client, notices).await?;
+            let (execution, events) = self.execute_simple_query(session.clone(), query).await?;
+            self.send_query_events(client, &session, events).await?;
             remember_copy_target(&session, &execution);
             return Ok(execution);
         }
@@ -324,10 +513,10 @@ impl FastPgWireHandler {
         if statements.len() > 1 && should_split_simple_query(&statements) {
             let mut executions = Vec::with_capacity(statements.len());
             for (statement_index, statement) in statements.iter().enumerate() {
-                let (execution, notices) = self
+                let (execution, events) = self
                     .execute_simple_query(session.clone(), (*statement).to_owned())
                     .await?;
-                send_notices(client, notices).await?;
+                self.send_query_events(client, &session, events).await?;
                 let enters_copy = execution_enters_copy(&execution);
                 let stop_batch = enters_copy || execution_is_error(&execution);
                 if enters_copy {
@@ -347,8 +536,8 @@ impl FastPgWireHandler {
             return Ok(QueryExecution::Batch(executions));
         }
 
-        let (execution, notices) = self.execute_simple_query(session.clone(), query).await?;
-        send_notices(client, notices).await?;
+        let (execution, events) = self.execute_simple_query(session.clone(), query).await?;
+        self.send_query_events(client, &session, events).await?;
         remember_copy_target(&session, &execution);
         Ok(execution)
     }
@@ -363,12 +552,12 @@ impl FastPgWireHandler {
     async fn finish_copy(
         &self,
         session: Arc<SessionState>,
-    ) -> PgWireResult<(Result<usize, String>, Vec<QueryNotice>)> {
+    ) -> PgWireResult<(Result<usize, String>, QueryEvents)> {
         self.execution
             .run_session_blocking(session, move |session| {
                 let result = session.finish_active_copy();
-                let notices = session.take_notices();
-                (result, notices)
+                let events = take_query_events(&session);
+                (result, events)
             })
             .await
     }
@@ -385,10 +574,10 @@ impl FastPgWireHandler {
     {
         let mut pending = session.take_pending_simple_statements();
         while let Some(statement) = pending.pop_front() {
-            let (execution, notices) = self
+            let (execution, events) = self
                 .execute_query(session.clone(), statement, vec![])
                 .await?;
-            send_notices(client, notices).await?;
+            self.send_query_events(client, &session, events).await?;
             let enters_copy = execution_enters_copy(&execution);
             let stops_batch = enters_copy || execution_is_error(&execution);
             remember_copy_target(&session, &execution);
@@ -764,11 +953,8 @@ impl StartupHandler for FastPgWireHandler {
             parameters.server_version = self.server.server_version().to_owned();
 
             let startup = startup_parameters(client, &message);
-            let session = if self.inline_session_execution {
-                SessionState::new_inline_execution(self.server.clone(), startup)
-            } else {
-                SessionState::new(self.server.clone(), startup)
-            };
+            self.validate_startup(startup.clone()).await?;
+            let session = self.create_session(startup).await?;
             client.session_extensions().insert(session);
 
             pgwire::api::auth::finish_authentication(client, &parameters).await?;
@@ -917,13 +1103,13 @@ impl ExtendedQueryHandler for FastPgWireHandler {
         let session = session_for_client(client)?;
         let query = portal.statement.statement.clone();
         let parameters = collect_bound_parameters(portal)?;
-        let (execution, notices) = self
+        let (execution, events) = self
             .execute_query(session.clone(), query, parameters)
             .await?;
-        send_notices(client, notices).await?;
+        self.send_query_events(client, &session, events).await?;
         remember_copy_target(&session, &execution);
 
-        execution_to_response(execution, portal.result_column_format.format_for(0))
+        execution_to_response_with_format(execution, &portal.result_column_format)
     }
 }
 
@@ -948,8 +1134,8 @@ impl CopyHandler for FastPgWireHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = session_for_client(client)?;
-        let (result, notices) = self.finish_copy(session.clone()).await?;
-        send_notices(client, notices).await?;
+        let (result, events) = self.finish_copy(session.clone()).await?;
+        self.send_query_events(client, &session, events).await?;
         let rows = result.map_err(copy_data_error)?;
 
         client
@@ -1261,6 +1447,110 @@ impl ClientPortalStore for FastPgUnixSocket {
 }
 
 #[cfg(unix)]
+pub async fn process_socket(
+    tcp_socket: TcpStream,
+    tls_acceptor: Option<pgwire::tokio::TlsAcceptor>,
+    handlers: Arc<FastPgServerHandlers>,
+) -> Result<(), io::Error> {
+    let startup_timeout = sleep(Duration::from_millis(60_000));
+    tokio::pin!(startup_timeout);
+
+    let socket: Option<Framed<MaybeTls, PgWireMessageServerCodec<String>>> = tokio::select! {
+        _ = &mut startup_timeout => return Ok(()),
+        socket = negotiate_tls(tcp_socket, tls_acceptor) => socket?,
+    };
+    let Some(mut socket) = socket else {
+        return Ok(());
+    };
+
+    let fastpg_handler = handlers.handler.clone();
+    let cancel_handler = handlers.cancel_handler();
+    let error_handler = handlers.error_handler();
+    let mut notification_rx: Option<UnboundedReceiver<WireNotification>> = None;
+    let mut notification_session_id: Option<SessionId> = None;
+
+    loop {
+        let message = if matches!(
+            socket.state(),
+            PgWireConnectionState::AwaitingStartup
+                | PgWireConnectionState::AuthenticationInProgress
+        ) {
+            tokio::select! {
+                _ = &mut startup_timeout => None,
+                notification = recv_notification(&mut notification_rx) => {
+                    match notification {
+                        Some(notification) => {
+                            send_notification(&mut socket, notification).await?;
+                            continue;
+                        }
+                        None => {
+                            notification_rx = None;
+                            continue;
+                        }
+                    }
+                }
+                message = socket.next() => message,
+            }
+        } else {
+            tokio::select! {
+                notification = recv_notification(&mut notification_rx) => {
+                    match notification {
+                        Some(notification) => {
+                            send_notification(&mut socket, notification).await?;
+                            continue;
+                        }
+                        None => {
+                            notification_rx = None;
+                            continue;
+                        }
+                    }
+                }
+                message = socket.next() => message,
+            }
+        };
+
+        let Some(message) = message else {
+            break;
+        };
+
+        if let Ok(message) = message {
+            let is_extended_query = match socket.state() {
+                PgWireConnectionState::CopyInProgress(is_extended_query) => is_extended_query,
+                _ => message.is_extended_query(),
+            };
+            if let Err(mut error) = process_message(
+                message,
+                &mut socket,
+                fastpg_handler.clone(),
+                fastpg_handler.clone(),
+                fastpg_handler.clone(),
+                fastpg_handler.clone(),
+                cancel_handler.clone(),
+            )
+            .await
+            {
+                error_handler.on_error(&mut socket, &mut error);
+                process_error(&mut socket, error, is_extended_query).await?;
+            }
+        } else {
+            break;
+        }
+
+        register_notification_session(
+            &socket,
+            &handlers.handler,
+            &mut notification_rx,
+            &mut notification_session_id,
+        );
+    }
+
+    if let Some(session_id) = notification_session_id {
+        handlers.handler.notifications.unregister(session_id);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 pub async fn process_socket_unix(
     unix_socket: UnixStream,
     handlers: Arc<FastPgServerHandlers>,
@@ -1269,9 +1559,25 @@ pub async fn process_socket_unix(
     let client_info = DefaultClient::new(addr, false);
     let mut socket = FastPgUnixSocket::new(unix_socket, FastPgUnixServerCodec::new(client_info));
     socket.set_state(PgWireConnectionState::AwaitingStartup);
+    let mut notification_rx: Option<UnboundedReceiver<WireNotification>> = None;
+    let mut notification_session_id: Option<SessionId> = None;
 
     loop {
-        let message = socket.next().await;
+        let message = tokio::select! {
+            notification = recv_notification(&mut notification_rx) => {
+                match notification {
+                    Some(notification) => {
+                        send_notification(&mut socket, notification).await?;
+                        continue;
+                    }
+                    None => {
+                        notification_rx = None;
+                        continue;
+                    }
+                }
+            }
+            message = socket.next() => message,
+        };
 
         let Some(message) = message else {
             break;
@@ -1303,9 +1609,64 @@ pub async fn process_socket_unix(
         if let Err((error, wait_for_sync)) = result {
             process_unix_error(&mut socket, error, wait_for_sync).await?;
         }
+
+        register_notification_session(
+            &socket,
+            &handlers.handler,
+            &mut notification_rx,
+            &mut notification_session_id,
+        );
     }
 
+    if let Some(session_id) = notification_session_id {
+        handlers.handler.notifications.unregister(session_id);
+    }
     Ok(())
+}
+
+#[cfg(unix)]
+fn register_notification_session<C>(
+    client: &C,
+    handler: &FastPgWireHandler,
+    notification_rx: &mut Option<UnboundedReceiver<WireNotification>>,
+    notification_session_id: &mut Option<SessionId>,
+) where
+    C: ClientInfo,
+{
+    if notification_rx.is_some() {
+        return;
+    }
+    let Some(session) = client.session_extensions().get::<SessionState>() else {
+        return;
+    };
+    *notification_session_id = Some(session.id());
+    *notification_rx = Some(handler.notifications.register(session.id()));
+}
+
+#[cfg(unix)]
+async fn recv_notification(
+    receiver: &mut Option<UnboundedReceiver<WireNotification>>,
+) -> Option<WireNotification> {
+    match receiver {
+        Some(receiver) => receiver.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+#[cfg(unix)]
+async fn send_notification<C>(
+    socket: &mut C,
+    notification: WireNotification,
+) -> Result<(), io::Error>
+where
+    C: Sink<PgWireBackendMessage, Error = io::Error> + Unpin,
+{
+    socket
+        .send(PgWireBackendMessage::NotificationResponse(
+            NotificationResponse::new(notification.pid, notification.channel, notification.payload),
+        ))
+        .await?;
+    socket.flush().await
 }
 
 #[cfg(unix)]
@@ -1485,7 +1846,7 @@ async fn process_simple_query_unix_fast_path_str(
                 .handler
                 .try_execute_simple_query_inline(session.clone(), query)
         };
-        let (execution, notices) = match inline_result {
+        let (execution, events) = match inline_result {
             Some(result) => result?,
             None => {
                 handlers
@@ -1495,8 +1856,14 @@ async fn process_simple_query_unix_fast_path_str(
             }
         };
 
-        if !notices.is_empty() {
-            send_notices(socket, notices).await?;
+        if !events.notices.is_empty()
+            || !events.notifications.is_empty()
+            || !events.listen_actions.is_empty()
+        {
+            handlers
+                .handler
+                .send_query_events(socket, &session, events)
+                .await?;
             feed_simple_execution(socket, execution, &mut transaction_status).await?;
             if !matches!(socket.state(), PgWireConnectionState::CopyInProgress(_)) {
                 socket.set_state(PgWireConnectionState::ReadyForQuery);
@@ -1700,6 +2067,7 @@ fn encoded_text_field_len(value: &Value) -> usize {
         Value::Int4(value) => 4 + decimal_i64_len(i64::from(*value)),
         Value::Int8(value) => 4 + decimal_i64_len(*value),
         Value::Text(value) | Value::RawText(value) => 4 + value.len(),
+        Value::TextWithBinary { text, .. } => 4 + text.len(),
     }
 }
 
@@ -1875,9 +2243,13 @@ async fn process_function_call(
     socket.set_state(PgWireConnectionState::QueryInProgress);
 
     let session = session_for_client(socket)?;
-    let result = handlers
+    let (result, events) = handlers
         .handler
-        .execute_fastpath_function(session, function_call)
+        .execute_fastpath_function(session.clone(), function_call)
+        .await?;
+    handlers
+        .handler
+        .send_query_events(socket, &session, events)
         .await?;
     send_function_call_response(socket, result.as_deref()).await?;
 
@@ -1897,7 +2269,7 @@ impl FastPgWireHandler {
         &self,
         session: Arc<SessionState>,
         function_call: FunctionCall,
-    ) -> PgWireResult<Option<Vec<u8>>> {
+    ) -> PgWireResult<(Option<Vec<u8>>, QueryEvents)> {
         let spec = fastpath_function(function_call.function_id)?;
         if function_call.args.len() != spec.args.len() {
             return Err(protocol_error(format!(
@@ -1935,9 +2307,9 @@ impl FastPgWireHandler {
         }
         sql.push(')');
 
-        let (execution, _notices) = self.execute_query(session, sql, vec![]).await?;
+        let (execution, events) = self.execute_query(session, sql, vec![]).await?;
         match execution {
-            QueryExecution::Rows(result) => encode_function_result(result, spec.ret),
+            QueryExecution::Rows(result) => Ok((encode_function_result(result, spec.ret)?, events)),
             QueryExecution::Error {
                 sqlstate,
                 message,
@@ -2195,6 +2567,7 @@ fn encode_function_result(
         (FastpathReturnType::Bytea, Value::Text(value) | Value::RawText(value)) => {
             parse_bytea_text(&value).map(Some)
         }
+        (FastpathReturnType::Bytea, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (FastpathReturnType::Int4, Value::Int4(value)) => Ok(Some(value.to_be_bytes().to_vec())),
         (FastpathReturnType::Int4, Value::Text(value) | Value::RawText(value)) => {
             let value = value
@@ -2202,6 +2575,7 @@ fn encode_function_result(
                 .map_err(|error| protocol_error(format!("invalid int4 result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
+        (FastpathReturnType::Int4, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (FastpathReturnType::Int8, Value::Int8(value)) => Ok(Some(value.to_be_bytes().to_vec())),
         (FastpathReturnType::Int8, Value::Text(value) | Value::RawText(value)) => {
             let value = value
@@ -2209,6 +2583,7 @@ fn encode_function_result(
                 .map_err(|error| protocol_error(format!("invalid int8 result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
+        (FastpathReturnType::Int8, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (FastpathReturnType::Oid, Value::Int4(value)) => {
             Ok(Some((value as u32).to_be_bytes().to_vec()))
         }
@@ -2218,6 +2593,7 @@ fn encode_function_result(
                 .map_err(|error| protocol_error(format!("invalid oid result: {error}")))?;
             Ok(Some(value.to_be_bytes().to_vec()))
         }
+        (FastpathReturnType::Oid, Value::TextWithBinary { binary, .. }) => Ok(Some(binary)),
         (expected, actual) => Err(protocol_error(format!(
             "cannot encode fastpath result {actual:?} as {expected:?}"
         ))),
@@ -2432,6 +2808,21 @@ fn protocol_error(message: String) -> PgWireError {
     )))
 }
 
+fn startup_validation_error(error: StartupValidationError) -> PgWireError {
+    let mut info = ErrorInfo::new("FATAL".to_owned(), error.sqlstate, error.message);
+    info.detail = error.detail;
+    info.hint = error.hint;
+    info.where_context = error.context;
+    if error.cursorpos > 0 {
+        info.position = Some(error.cursorpos.to_string());
+    }
+    if error.internalpos > 0 {
+        info.internal_position = Some(error.internalpos.to_string());
+    }
+    info.internal_query = error.internal_query;
+    PgWireError::UserError(Box::new(info))
+}
+
 fn default_execution_concurrency() -> NonZeroUsize {
     std::thread::available_parallelism().unwrap_or(NonZeroUsize::MIN)
 }
@@ -2439,6 +2830,7 @@ fn default_execution_concurrency() -> NonZeroUsize {
 #[derive(Clone, Debug)]
 struct ExecutionDispatcher {
     permits: Arc<Semaphore>,
+    global_worker: Arc<GlobalBlockingWorker>,
     inline_session_execution: bool,
 }
 
@@ -2446,7 +2838,37 @@ impl ExecutionDispatcher {
     fn new(max_concurrency: NonZeroUsize, inline_session_execution: bool) -> Self {
         Self {
             permits: Arc::new(Semaphore::new(max_concurrency.get())),
+            global_worker: Arc::new(GlobalBlockingWorker::new()),
             inline_session_execution,
+        }
+    }
+
+    async fn run_global_blocking<R>(
+        &self,
+        operation: impl FnOnce() -> R + Send + 'static,
+    ) -> PgWireResult<R>
+    where
+        R: Send + 'static,
+    {
+        let permit = self
+            .permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(api_io_error)?;
+        let (sender, receiver) = oneshot::channel::<Result<R, Box<dyn Any + Send + 'static>>>();
+        self.global_worker
+            .enqueue(Box::new(move || {
+                let _permit = permit;
+                let result = catch_unwind(AssertUnwindSafe(operation));
+                let _ = sender.send(result);
+            }))
+            .map_err(|_| api_io_error(io::Error::other("fastpg global blocking worker exited")))?;
+
+        let result = receiver.await.map_err(api_io_error)?;
+        match result {
+            Ok(result) => Ok(result),
+            Err(payload) => resume_unwind(payload),
         }
     }
 
@@ -2500,16 +2922,9 @@ impl ExecutionDispatcher {
             }
         }
 
-        let permit = self
-            .permits
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(api_io_error)?;
         let (sender, receiver) = oneshot::channel::<Result<R, Box<dyn Any + Send + 'static>>>();
         let operation_session = session.clone();
         session.enqueue_on_backend(move || {
-            let _permit = permit;
             let result = catch_unwind(AssertUnwindSafe(|| operation(operation_session)));
             let _ = sender.send(result);
         });
@@ -2541,6 +2956,45 @@ impl ExecutionDispatcher {
             Err(TryAcquireError::NoPermits) => None,
             Err(error) => Some(Err(api_io_error(error))),
         }
+    }
+}
+
+type GlobalBlockingJob = Box<dyn FnOnce() + Send + 'static>;
+const GLOBAL_POSTGRES_SAFE_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
+
+struct GlobalBlockingWorker {
+    sender: std_mpsc::Sender<GlobalBlockingJob>,
+}
+
+impl GlobalBlockingWorker {
+    fn new() -> Self {
+        let (sender, receiver) = std_mpsc::channel::<GlobalBlockingJob>();
+        thread::Builder::new()
+            .name("fastpg-global-backend".to_owned())
+            .stack_size(GLOBAL_POSTGRES_SAFE_THREAD_STACK_SIZE)
+            .spawn(move || {
+                while let Ok(job) = receiver.recv() {
+                    job();
+                }
+            })
+            .expect("failed to spawn fastpg global backend thread");
+
+        Self { sender }
+    }
+
+    fn enqueue(
+        &self,
+        job: GlobalBlockingJob,
+    ) -> Result<(), std_mpsc::SendError<GlobalBlockingJob>> {
+        self.sender.send(job)
+    }
+}
+
+impl Debug for GlobalBlockingWorker {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GlobalBlockingWorker")
+            .finish_non_exhaustive()
     }
 }
 
@@ -2944,8 +3398,21 @@ fn dollar_quote_end(bytes: &[u8]) -> Option<usize> {
 }
 
 fn execution_to_response(execution: QueryExecution, format: FieldFormat) -> PgWireResult<Response> {
+    let format = match format {
+        FieldFormat::Text => Format::UnifiedText,
+        FieldFormat::Binary => Format::UnifiedBinary,
+    };
+    execution_to_response_with_format(execution, &format)
+}
+
+fn execution_to_response_with_format(
+    execution: QueryExecution,
+    format: &Format,
+) -> PgWireResult<Response> {
     match execution {
-        QueryExecution::WithNotices { execution, .. } => execution_to_response(*execution, format),
+        QueryExecution::WithNotices { execution, .. } => {
+            execution_to_response_with_format(*execution, format)
+        }
         QueryExecution::Empty => Ok(Response::EmptyQuery),
         QueryExecution::Batch(_) => Ok(error_response(
             "0A000",
@@ -3024,8 +3491,8 @@ fn execution_is_error(execution: &QueryExecution) -> bool {
     }
 }
 
-fn query_result_response(result: QueryResult, format: FieldFormat) -> PgWireResult<Response> {
-    let schema = Arc::new(field_infos(&result.fields, format));
+fn query_result_response(result: QueryResult, format: &Format) -> PgWireResult<Response> {
+    let schema = Arc::new(portal_field_infos(&result.fields, format));
     let fields = result.fields;
     let command_tag = result
         .command_tag
@@ -3057,6 +3524,14 @@ fn encode_row(
     fields: &[Column],
     values: &[Value],
 ) -> PgWireResult<DataRow> {
+    if fields.len() != values.len() {
+        return Err(protocol_error(format!(
+            "number of field descriptions must equal number of values, got {} and {}",
+            fields.len(),
+            values.len()
+        )));
+    }
+
     if schema
         .iter()
         .all(|field| field.format() == FieldFormat::Text)
@@ -3068,11 +3543,14 @@ fn encode_row(
         return Ok(DataRow::new(row, values.len() as i16));
     }
 
-    let mut encoder = DataRowEncoder::new(schema);
-    for (field, value) in fields.iter().zip(values) {
-        encode_value(&mut encoder, field.data_type, value)?;
+    let mut row = BytesMut::with_capacity(128);
+    for ((field_info, field), value) in schema.iter().zip(fields).zip(values) {
+        match field_info.format() {
+            FieldFormat::Text => encode_text_field(&mut row, value),
+            FieldFormat::Binary => encode_binary_field(&mut row, field.data_type, value)?,
+        }
     }
-    Ok(encoder.take_row())
+    Ok(DataRow::new(row, values.len() as i16))
 }
 
 fn encode_text_field(row: &mut BytesMut, value: &Value) {
@@ -3082,6 +3560,7 @@ fn encode_text_field(row: &mut BytesMut, value: &Value) {
         Value::Int4(value) => encode_text_bytes(row, value.to_string().as_bytes()),
         Value::Int8(value) => encode_text_bytes(row, value.to_string().as_bytes()),
         Value::Text(value) | Value::RawText(value) => encode_text_bytes(row, value.as_bytes()),
+        Value::TextWithBinary { text, .. } => encode_text_bytes(row, text.as_bytes()),
     }
 }
 
@@ -3090,38 +3569,34 @@ fn encode_text_bytes(row: &mut BytesMut, bytes: &[u8]) {
     row.put_slice(bytes);
 }
 
-fn encode_value(
-    encoder: &mut DataRowEncoder,
-    data_type: PgType,
-    value: &Value,
-) -> PgWireResult<()> {
+fn encode_binary_field(row: &mut BytesMut, data_type: PgType, value: &Value) -> PgWireResult<()> {
     match (data_type, value) {
-        (PgType::Int2, Value::Int2(value)) => encoder.encode_field(&Some(*value)),
-        (PgType::Int4, Value::Int4(value)) => encoder.encode_field(&Some(*value)),
-        (PgType::Int8, Value::Int8(value)) => encoder.encode_field(&Some(*value)),
-        (PgType::Varchar, Value::Text(value)) => encoder.encode_field(&Some(value.as_str())),
-        (PgType::Varchar, Value::RawText(value)) => encoder.encode_field(&Some(value.as_str())),
+        (_, Value::Null) => row.put_i32(-1),
+        (_, Value::TextWithBinary { binary, .. }) => encode_text_bytes(row, binary),
+        (PgType::Int2, Value::Int2(value)) => encode_text_bytes(row, &value.to_be_bytes()),
+        (PgType::Int4, Value::Int4(value)) => encode_text_bytes(row, &value.to_be_bytes()),
+        (PgType::Int8, Value::Int8(value)) => encode_text_bytes(row, &value.to_be_bytes()),
+        (PgType::Varchar, Value::Text(value) | Value::RawText(value)) => {
+            encode_text_bytes(row, value.as_bytes())
+        }
         (PgType::Int2, Value::RawText(value)) => {
             let value = parse_binary_text_value::<i16>(value, "int2")?;
-            encoder.encode_field(&Some(value))
+            encode_text_bytes(row, &value.to_be_bytes())
         }
         (PgType::Int4, Value::RawText(value)) => {
             let value = parse_binary_text_value::<i32>(value, "int4")?;
-            encoder.encode_field(&Some(value))
+            encode_text_bytes(row, &value.to_be_bytes())
         }
         (PgType::Int8, Value::RawText(value)) => {
             let value = parse_binary_text_value::<i64>(value, "int8")?;
-            encoder.encode_field(&Some(value))
+            encode_text_bytes(row, &value.to_be_bytes())
         }
-        (PgType::Int2, Value::Null) => encoder.encode_field(&Option::<i16>::None),
-        (PgType::Int4, Value::Null) => encoder.encode_field(&Option::<i32>::None),
-        (PgType::Int8, Value::Null) => encoder.encode_field(&Option::<i64>::None),
-        (PgType::Varchar, Value::Null) => encoder.encode_field(&Option::<&str>::None),
         (expected, actual) => Err(PgWireError::ApiError(Box::new(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             format!("cannot encode {actual:?} as {expected:?}"),
-        )))),
+        ))))?,
     }
+    Ok(())
 }
 
 fn parse_binary_text_value<T>(value: &str, type_name: &'static str) -> PgWireResult<T>
@@ -3451,6 +3926,43 @@ mod tests {
                 QueryParameter::Null,
             ]
         );
+    }
+
+    #[test]
+    fn row_encoder_honors_individual_result_formats() {
+        let fields = vec![
+            Column::with_type_oid("line", PgType::Varchar, 25),
+            Column::new("version", PgType::Int8),
+            Column::with_type_oid("created_at", PgType::Varchar, 1184),
+        ];
+        let schema = Arc::new(portal_field_infos(
+            &fields,
+            &Format::Individual(vec![0, 1, 1]),
+        ));
+        let row = encode_row(
+            schema.clone(),
+            &fields,
+            &[
+                Value::Text("main".to_owned()),
+                Value::Int8(5),
+                Value::TextWithBinary {
+                    text: "timestamp text".to_owned(),
+                    binary: 42_i64.to_be_bytes().to_vec(),
+                },
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(schema[0].format(), FieldFormat::Text);
+        assert_eq!(schema[1].format(), FieldFormat::Binary);
+        assert_eq!(schema[2].format(), FieldFormat::Binary);
+        assert_eq!(row.field_count, 3);
+
+        let mut expected = BytesMut::new();
+        encode_text_bytes(&mut expected, b"main");
+        encode_text_bytes(&mut expected, &5_i64.to_be_bytes());
+        encode_text_bytes(&mut expected, &42_i64.to_be_bytes());
+        assert_eq!(row.data, expected);
     }
 
     fn startup_with_protocol(

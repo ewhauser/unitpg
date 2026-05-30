@@ -29,6 +29,9 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/htup_details.h"
 #include "access/relation.h"
@@ -79,6 +82,50 @@ char	   *Extension_control_path;
 /* Globally visible state variables */
 bool		creating_extension = false;
 Oid			CurrentExtensionObject = InvalidOid;
+
+#ifdef USE_FASTPG
+Oid FastPgSchemaDatabaseId(void);
+
+static char *
+fastpg_extension_catalog_name(const char *extname)
+{
+	Oid			database_id;
+
+	if (!fastpg_catalog_mode_uses_postgres())
+		return pstrdup(extname);
+
+	database_id = FastPgSchemaDatabaseId();
+	if (!OidIsValid(database_id))
+		return pstrdup(extname);
+
+	return psprintf("fastpg_db_%u.%s", database_id, extname);
+}
+
+static char *
+fastpg_extension_user_name(const char *extname)
+{
+	Oid			database_id;
+	char	   *prefix;
+	size_t		prefix_len;
+	char	   *result;
+
+	if (!fastpg_catalog_mode_uses_postgres())
+		return pstrdup(extname);
+
+	database_id = FastPgSchemaDatabaseId();
+	if (!OidIsValid(database_id))
+		return pstrdup(extname);
+
+	prefix = psprintf("fastpg_db_%u.", database_id);
+	prefix_len = strlen(prefix);
+	if (strncmp(extname, prefix, prefix_len) == 0)
+		result = pstrdup(extname + prefix_len);
+	else
+		result = pstrdup(extname);
+	pfree(prefix);
+	return result;
+}
+#endif
 
 /*
  * Internal data structure to hold the results of parsing a control file
@@ -229,9 +276,16 @@ Oid
 get_extension_oid(const char *extname, bool missing_ok)
 {
 	Oid			result;
+#ifdef USE_FASTPG
+	char	   *catalog_extname = fastpg_extension_catalog_name(extname);
 
 	result = GetSysCacheOid1(EXTENSIONNAME, Anum_pg_extension_oid,
+							 CStringGetDatum(catalog_extname));
+	pfree(catalog_extname);
+#else
+	result = GetSysCacheOid1(EXTENSIONNAME, Anum_pg_extension_oid,
 							 CStringGetDatum(extname));
+#endif
 
 	if (!OidIsValid(result) && !missing_ok)
 		ereport(ERROR,
@@ -260,6 +314,16 @@ get_extension_name(Oid ext_oid)
 
 	result = pstrdup(NameStr(((Form_pg_extension) GETSTRUCT(tuple))->extname));
 	ReleaseSysCache(tuple);
+
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres())
+	{
+		char	   *user_name = fastpg_extension_user_name(result);
+
+		pfree(result);
+		result = user_name;
+	}
+#endif
 
 	return result;
 }
@@ -2256,6 +2320,11 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 	ObjectAddress nsp;
 	ObjectAddresses *refobjs;
 	ListCell   *lc;
+#ifdef USE_FASTPG
+	char	   *catalog_extname = fastpg_extension_catalog_name(extName);
+#else
+	const char *catalog_extname = extName;
+#endif
 
 	/*
 	 * Build and insert the pg_extension tuple
@@ -2269,7 +2338,7 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 									  Anum_pg_extension_oid);
 	values[Anum_pg_extension_oid - 1] = ObjectIdGetDatum(extensionOid);
 	values[Anum_pg_extension_extname - 1] =
-		DirectFunctionCall1(namein, CStringGetDatum(extName));
+		DirectFunctionCall1(namein, CStringGetDatum(catalog_extname));
 	values[Anum_pg_extension_extowner - 1] = ObjectIdGetDatum(extOwner);
 	values[Anum_pg_extension_extnamespace - 1] = ObjectIdGetDatum(schemaOid);
 	values[Anum_pg_extension_extrelocatable - 1] = BoolGetDatum(relocatable);
@@ -2291,6 +2360,9 @@ InsertExtensionTuple(const char *extName, Oid extOwner,
 
 	heap_freetuple(tuple);
 	table_close(rel, RowExclusiveLock);
+#ifdef USE_FASTPG
+	pfree(catalog_extname);
+#endif
 
 	/*
 	 * Record dependencies on owner, schema, and prerequisite extensions

@@ -15,6 +15,7 @@
 
 #include "access/amapi.h"
 #include "access/tableam.h"
+#include "nodes/execnodes.h"
 
 extern const TableAmRoutine *GetFastPgMemTableAmRoutine(void);
 extern const IndexAmRoutine *GetFastPgMemIndexAmRoutine(void);
@@ -46,6 +47,19 @@ extern bool FastPgMemIndexCheckUniqueConflict(Relation heapRelation,
 											  const ItemPointerData *tupleid,
 											  bool *satisfies,
 											  ItemPointer conflictTid);
+extern IndexBuildResult *FastPgMemBtreeBuild(Relation heapRelation,
+											 Relation indexRelation,
+											 IndexInfo *indexInfo);
+extern bool FastPgMemBtreeCanHandleIndex(Relation heapRelation,
+										 Relation indexRelation);
+extern bool FastPgMemBtreeInsert(Relation indexRelation,
+								 Datum *values,
+								 bool *isnull,
+								 ItemPointer heap_tid,
+								 Relation heapRelation,
+								 IndexUniqueCheck checkUnique,
+								 bool indexUnchanged,
+								 IndexInfo *indexInfo);
 
 #endif							/* USE_FASTPG */
 

@@ -16,6 +16,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/reloptions.h"
 #include "access/twophase.h"
 #include "access/xact.h"
@@ -82,6 +85,26 @@ static void ProcessUtilitySlow(ParseState *pstate,
 							   DestReceiver *dest,
 							   QueryCompletion *qc);
 static void ExecDropStmt(DropStmt *stmt, bool isTopLevel);
+
+#ifdef USE_FASTPG
+static bool
+fastpg_should_skip_extension_index_build(const IndexStmt *stmt)
+{
+	if (!fastpg_catalog_mode_uses_postgres() ||
+		stmt == NULL ||
+		stmt->accessMethod == NULL)
+		return false;
+
+	/*
+	 * pgvector's AMs assume storage-manager state that FastPG's in-process
+	 * execution facade does not provide yet.  Keep the cataloged index
+	 * definition for migration compatibility, but skip the unsupported
+	 * physical build.
+	 */
+	return pg_strcasecmp(stmt->accessMethod, "ivfflat") == 0 ||
+		pg_strcasecmp(stmt->accessMethod, "hnsw") == 0;
+}
+#endif
 
 /*
  * CommandIsReadOnly: is an executable query read-only?
@@ -1462,6 +1485,7 @@ ProcessUtilitySlow(ParseState *pstate,
 					LOCKMODE	lockmode;
 					int			nparts = -1;
 					bool		is_alter_table;
+					bool		skip_build = false;
 
 					if (stmt->concurrent)
 						PreventInTransactionBlock(isTopLevel,
@@ -1541,6 +1565,9 @@ ProcessUtilitySlow(ParseState *pstate,
 
 					/* Run parse analysis ... */
 					stmt = transformIndexStmt(relid, stmt, queryString);
+#ifdef USE_FASTPG
+					skip_build = fastpg_should_skip_extension_index_build(stmt);
+#endif
 
 					/* ... and do it */
 					EventTriggerAlterTableStart(parsetree);
@@ -1555,7 +1582,7 @@ ProcessUtilitySlow(ParseState *pstate,
 									is_alter_table,
 									true,	/* check_rights */
 									true,	/* check_not_in_use */
-									false,	/* skip_build */
+									skip_build,
 									false); /* quiet */
 
 					/*

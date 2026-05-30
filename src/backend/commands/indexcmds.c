@@ -2449,6 +2449,11 @@ GetDefaultOpClass(Oid type_id, Oid am_id)
 		/* ignore altogether if not a default opclass */
 		if (!opclass->opcdefault)
 			continue;
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres() &&
+			!OpclassIsVisible(opclass->oid))
+			continue;
+#endif
 		if (opclass->opcintype == type_id)
 		{
 			nexact++;

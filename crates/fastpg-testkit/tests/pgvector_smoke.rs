@@ -74,6 +74,80 @@ async fn pgvector_scalar_storage_and_concurrency_smoke() -> TestResult {
     Ok(())
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pgvector_ivfflat_index_definition_smoke() -> TestResult {
+    let server = TestServer::start().await?;
+    let (client, connection) = tokio_postgres::connect(&server.connection_string(), NoTls).await?;
+    let connection_task = tokio::spawn(connection);
+    let table = format!("fastpg_pgvector_ivfflat_{}", std::process::id());
+    let index = format!("fastpg_pgvector_ivfflat_idx_{}", std::process::id());
+
+    client
+        .simple_query("CREATE EXTENSION IF NOT EXISTS vector")
+        .await?;
+    client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await?;
+    client
+        .simple_query(&format!(
+            "CREATE TABLE {table}(id int not null, embedding vector(3))"
+        ))
+        .await?;
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} VALUES (1, '[1,2,3]'::vector)"
+        ))
+        .await?;
+    client
+        .simple_query(&format!(
+            "CREATE INDEX {index} ON {table} USING ivfflat \
+             (embedding vector_cosine_ops) WITH (lists = 1)"
+        ))
+        .await?;
+    client
+        .simple_query(&format!(
+            "INSERT INTO {table} VALUES (2, '[3,2,1]'::vector)"
+        ))
+        .await?;
+    client.simple_query(&format!("ANALYZE {table}")).await?;
+
+    let messages = client
+        .simple_query(&format!("SELECT count(*) AS row_count FROM {table}"))
+        .await?;
+    let rows = rows_only(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("row_count"), Some("2"));
+
+    let messages = client
+        .simple_query(&format!(
+            "SELECT count(*) AS index_count FROM pg_indexes \
+             WHERE tablename = '{table}' AND indexname = '{index}'"
+        ))
+        .await?;
+    let rows = rows_only(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("index_count"), Some("1"));
+
+    let messages = client
+        .simple_query(&format!(
+            "SELECT id FROM {table} \
+             ORDER BY embedding <=> '[1,2,3]'::vector, id \
+             LIMIT 1"
+        ))
+        .await?;
+    let rows = rows_only(&messages);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("id"), Some("1"));
+
+    client
+        .simple_query(&format!("DROP TABLE IF EXISTS {table}"))
+        .await?;
+    drop(client);
+    connection_task.abort();
+
+    Ok(())
+}
+
 async fn run_pgvector_client(
     client_index: usize,
     connection_string: &str,

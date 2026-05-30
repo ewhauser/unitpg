@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use fastpg_catalog::relation_by_name;
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
-    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreNotice,
-    PgCoreParam, PgCoreParamFormat, PgCoreSession, PgCoreTransactionCommand, PgCoreValue,
-    PreparedStatement, SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
+    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreListenAction,
+    PgCoreNotice, PgCoreNotification, PgCoreParam, PgCoreParamFormat, PgCoreSession,
+    PgCoreTransactionCommand, PgCoreValue, PreparedStatement,
+    SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
 };
 #[cfg(feature = "postgres-execution")]
 use fastpg_types::ParameterFormat;
@@ -30,6 +31,7 @@ const BPCHAR_OID: u32 = 1042;
 pub const COPY_HEADER_MATCH: i32 = -1;
 pub const COPY_HEADER_FALSE: i32 = 0;
 pub const COPY_FORMAT_TEXT: i32 = 0;
+pub const COPY_FORMAT_BINARY: i32 = 1;
 pub const COPY_FORMAT_CSV: i32 = 2;
 pub const COPY_ON_ERROR_STOP: i32 = 0;
 pub const COPY_ON_ERROR_IGNORE: i32 = 1;
@@ -213,6 +215,60 @@ pub struct QueryNotice {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupValidationError {
+    pub sqlstate: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub context: Option<String>,
+    pub cursorpos: i32,
+    pub internal_query: Option<String>,
+    pub internalpos: i32,
+}
+
+impl StartupValidationError {
+    #[cfg(feature = "postgres-execution")]
+    fn from_pgcore(error: fastpg_pgcore::PgCoreError) -> Self {
+        let error = error.into_fields();
+        Self {
+            sqlstate: error.sqlstate,
+            message: error.message,
+            detail: error.detail,
+            hint: error.hint,
+            context: error.context,
+            cursorpos: error.cursorpos,
+            internal_query: error.internal_query,
+            internalpos: error.internalpos,
+        }
+    }
+}
+
+pub fn validate_startup(database: &str, user: &str) -> Result<(), StartupValidationError> {
+    #[cfg(feature = "postgres-execution")]
+    {
+        fastpg_pgcore::validate_client_startup(database, user)
+            .map_err(StartupValidationError::from_pgcore)
+    }
+    #[cfg(not(feature = "postgres-execution"))]
+    {
+        let _ = (database, user);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryNotification {
+    pub channel: String,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryListenAction {
+    Listen(String),
+    Unlisten(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryExecution {
     WithNotices {
         notices: Vec<QueryNotice>,
@@ -281,6 +337,12 @@ pub struct QueryExecutor {
     #[cfg(feature = "postgres-execution")]
     notice_count: AtomicUsize,
     notices: Mutex<Vec<QueryNotice>>,
+    #[cfg(feature = "postgres-execution")]
+    notification_count: AtomicUsize,
+    notifications: Mutex<Vec<QueryNotification>>,
+    #[cfg(feature = "postgres-execution")]
+    listen_action_count: AtomicUsize,
+    listen_actions: Mutex<Vec<QueryListenAction>>,
 }
 
 #[cfg(feature = "postgres-execution")]
@@ -335,14 +397,23 @@ impl QueryExecutor {
         shared: Arc<QueryExecutorShared>,
         database: impl Into<String>,
     ) -> Self {
+        Self::with_shared_for_database_and_user(shared, database, "postgres")
+    }
+
+    pub fn with_shared_for_database_and_user(
+        shared: Arc<QueryExecutorShared>,
+        database: impl Into<String>,
+        user: impl Into<String>,
+    ) -> Self {
         #[cfg(feature = "postgres-execution")]
         {
             let storage_session = fastpg_storage::new_session_storage();
             let storage2_session = fastpg_storage2::new_session_storage();
-            let pgcore_session = PgCoreSession::with_storage_sessions_and_database(
+            let pgcore_session = PgCoreSession::with_storage_sessions_database_and_user(
                 storage_session.clone(),
                 storage2_session.clone(),
                 database,
+                user,
             );
             Self {
                 shared,
@@ -353,14 +424,21 @@ impl QueryExecutor {
                 pgcore_start_lock: Mutex::new(()),
                 notice_count: AtomicUsize::new(0),
                 notices: Mutex::new(Vec::new()),
+                notification_count: AtomicUsize::new(0),
+                notifications: Mutex::new(Vec::new()),
+                listen_action_count: AtomicUsize::new(0),
+                listen_actions: Mutex::new(Vec::new()),
             }
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
             let _ = database.into();
+            let _ = user.into();
             Self {
                 shared,
                 notices: Mutex::new(Vec::new()),
+                notifications: Mutex::new(Vec::new()),
+                listen_actions: Mutex::new(Vec::new()),
             }
         }
     }
@@ -382,7 +460,18 @@ impl QueryExecutor {
             .iter()
             .map(QueryParameter::from)
             .collect::<Vec<_>>();
-        self.execute_with_parameters(sql, &parameters)
+        #[cfg(feature = "postgres-execution")]
+        {
+            self.execute_pgcore(sql, &parameters, PgCoreRowConversion::Typed)
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        {
+            let _ = (sql, parameters);
+            execution_error(
+                "0A000",
+                "fastpg-exec was built without PostgreSQL execution",
+            )
+        }
     }
 
     pub fn execute_with_parameters(
@@ -392,7 +481,11 @@ impl QueryExecutor {
     ) -> QueryExecution {
         #[cfg(feature = "postgres-execution")]
         {
-            self.execute_pgcore(sql, parameters, PgCoreRowConversion::Typed)
+            self.execute_pgcore(
+                sql,
+                parameters,
+                PgCoreRowConversion::TypedWithBinaryFallback,
+            )
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
@@ -429,16 +522,11 @@ impl QueryExecutor {
                 Ok(result) => {
                     let PgCoreExecutionResult {
                         notices,
+                        notifications,
+                        listen_actions,
                         statements,
                     } = result;
-                    if !notices.is_empty() {
-                        self.replace_notices(
-                            notices
-                                .into_iter()
-                                .map(pgcore_notice_to_query_notice)
-                                .collect(),
-                        );
-                    }
+                    self.store_pgcore_events(notices, notifications, listen_actions);
                     pgcore_statements_to_query_execution(
                         statements,
                         PgCoreRowConversion::PreserveText,
@@ -448,30 +536,24 @@ impl QueryExecutor {
             };
         }
         match self.pgcore_session.execute_simple_cstr_fast(sql) {
-            Ok(PgCoreSimpleExecutionResult::Command { notices, tag, rows }) => {
-                if !notices.is_empty() {
-                    self.replace_notices(
-                        notices
-                            .into_iter()
-                            .map(pgcore_notice_to_query_notice)
-                            .collect(),
-                    );
-                }
+            Ok(PgCoreSimpleExecutionResult::Command {
+                notices,
+                notifications,
+                listen_actions,
+                tag,
+                rows,
+            }) => {
+                self.store_pgcore_events(notices, notifications, listen_actions);
                 QueryExecution::Command { tag, rows }
             }
             Ok(PgCoreSimpleExecutionResult::Full(result)) => {
                 let PgCoreExecutionResult {
                     notices,
+                    notifications,
+                    listen_actions,
                     statements,
                 } = result;
-                if !notices.is_empty() {
-                    self.replace_notices(
-                        notices
-                            .into_iter()
-                            .map(pgcore_notice_to_query_notice)
-                            .collect(),
-                    );
-                }
+                self.store_pgcore_events(notices, notifications, listen_actions);
                 pgcore_statements_to_query_execution(statements, PgCoreRowConversion::PreserveText)
             }
             Err(error) => {
@@ -507,6 +589,40 @@ impl QueryExecutor {
         notices
     }
 
+    pub fn take_notifications(&self) -> Vec<QueryNotification> {
+        #[cfg(feature = "postgres-execution")]
+        if self.notification_count.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+
+        let notifications = std::mem::take(
+            &mut *self
+                .notifications
+                .lock()
+                .expect("fastpg executor notification mutex poisoned"),
+        );
+        #[cfg(feature = "postgres-execution")]
+        self.notification_count.store(0, Ordering::Relaxed);
+        notifications
+    }
+
+    pub fn take_listen_actions(&self) -> Vec<QueryListenAction> {
+        #[cfg(feature = "postgres-execution")]
+        if self.listen_action_count.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+
+        let listen_actions = std::mem::take(
+            &mut *self
+                .listen_actions
+                .lock()
+                .expect("fastpg executor listen-action mutex poisoned"),
+        );
+        #[cfg(feature = "postgres-execution")]
+        self.listen_action_count.store(0, Ordering::Relaxed);
+        listen_actions
+    }
+
     #[cfg(feature = "postgres-execution")]
     fn replace_notices(&self, notices: Vec<QueryNotice>) {
         if notices.is_empty() {
@@ -524,6 +640,71 @@ impl QueryExecutor {
         }
         self.notice_count
             .store(stored_notices.len(), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn replace_notifications(&self, notifications: Vec<QueryNotification>) {
+        if notifications.is_empty() {
+            return;
+        }
+
+        let mut stored_notifications = self
+            .notifications
+            .lock()
+            .expect("fastpg executor notification mutex poisoned");
+        if stored_notifications.is_empty() {
+            *stored_notifications = notifications;
+        } else {
+            stored_notifications.extend(notifications);
+        }
+        self.notification_count
+            .store(stored_notifications.len(), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn replace_listen_actions(&self, listen_actions: Vec<QueryListenAction>) {
+        if listen_actions.is_empty() {
+            return;
+        }
+
+        let mut stored_listen_actions = self
+            .listen_actions
+            .lock()
+            .expect("fastpg executor listen-action mutex poisoned");
+        if stored_listen_actions.is_empty() {
+            *stored_listen_actions = listen_actions;
+        } else {
+            stored_listen_actions.extend(listen_actions);
+        }
+        self.listen_action_count
+            .store(stored_listen_actions.len(), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn store_pgcore_events(
+        &self,
+        notices: Vec<PgCoreNotice>,
+        notifications: Vec<PgCoreNotification>,
+        listen_actions: Vec<PgCoreListenAction>,
+    ) {
+        self.replace_notices(
+            notices
+                .into_iter()
+                .map(pgcore_notice_to_query_notice)
+                .collect(),
+        );
+        self.replace_notifications(
+            notifications
+                .into_iter()
+                .map(pgcore_notification_to_query_notification)
+                .collect(),
+        );
+        self.replace_listen_actions(
+            listen_actions
+                .into_iter()
+                .map(pgcore_listen_action_to_query_listen_action)
+                .collect(),
+        );
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -615,6 +796,26 @@ impl QueryExecutor {
         #[cfg(not(feature = "postgres-execution"))]
         let _ = (target, lines);
         Ok(None)
+    }
+
+    pub fn copy_target_buffered_bytes(
+        &self,
+        target: &CopyTarget,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        #[cfg(feature = "postgres-execution")]
+        {
+            self.ensure_pgcore_session_started();
+            let _guard = fastpg_storage::enter_session_storage(self.storage_session.clone());
+            let _storage2_guard =
+                fastpg_storage2::enter_session_storage(self.storage2_session.clone());
+            if postgres_catalog_enabled() {
+                return self.copy_buffered_bytes_postgres_catalog(target, data);
+            }
+        }
+        #[cfg(not(feature = "postgres-execution"))]
+        let _ = (target, data);
+        Err("binary COPY FROM requires PostgreSQL execution".to_owned())
     }
 
     pub fn begin_copy(&self) -> bool {
@@ -732,15 +933,14 @@ impl QueryExecutor {
                     return Err(pgcore_copy_error(error));
                 }
             };
-            self.replace_notices(
-                result
-                    .notices
-                    .iter()
-                    .cloned()
-                    .map(pgcore_notice_to_query_notice)
-                    .collect(),
-            );
-            let Some(statement) = result.statements.into_iter().next() else {
+            let PgCoreExecutionResult {
+                notices,
+                notifications,
+                listen_actions,
+                statements,
+            } = result;
+            self.store_pgcore_events(notices, notifications, listen_actions);
+            let Some(statement) = statements.into_iter().next() else {
                 return Ok(lines
                     .len()
                     .saturating_sub(target.header_lines_to_skip().min(lines.len())));
@@ -771,6 +971,46 @@ impl QueryExecutor {
                 .saturating_sub(target.header_lines_to_skip().min(lines.len()))),
             other => Err(format!("unexpected COPY execution result: {other:?}")),
         }
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn copy_buffered_bytes_postgres_catalog(
+        &self,
+        target: &CopyTarget,
+        data: &[u8],
+    ) -> Result<usize, String> {
+        if target.source_sql.is_empty() {
+            return Err("binary COPY target is missing source SQL".to_owned());
+        }
+
+        let result = match self
+            .pgcore_session
+            .execute_copy_from_stdin(&target.source_sql, data)
+        {
+            Ok(result) => result,
+            Err(error) => {
+                self.replace_notices(
+                    error
+                        .notices
+                        .iter()
+                        .cloned()
+                        .map(pgcore_notice_to_query_notice)
+                        .collect(),
+                );
+                return Err(pgcore_copy_error(error));
+            }
+        };
+        let PgCoreExecutionResult {
+            notices,
+            notifications,
+            listen_actions,
+            statements,
+        } = result;
+        self.store_pgcore_events(notices, notifications, listen_actions);
+        let Some(statement) = statements.into_iter().next() else {
+            return Ok(0);
+        };
+        Ok(statement.command_rows.unwrap_or(0))
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -924,16 +1164,11 @@ impl QueryExecutor {
                 Ok(result) => {
                     let PgCoreExecutionResult {
                         notices,
+                        notifications,
+                        listen_actions,
                         statements,
                     } = result;
-                    if !notices.is_empty() {
-                        self.replace_notices(
-                            notices
-                                .into_iter()
-                                .map(pgcore_notice_to_query_notice)
-                                .collect(),
-                        );
-                    }
+                    self.store_pgcore_events(notices, notifications, listen_actions);
                     pgcore_statements_to_query_execution(statements, row_conversion)
                 }
                 Err(error) => pgcore_error_execution(error),
@@ -956,16 +1191,11 @@ impl QueryExecutor {
             Ok(result) => {
                 let PgCoreExecutionResult {
                     notices,
+                    notifications,
+                    listen_actions,
                     statements,
                 } = result;
-                if !notices.is_empty() {
-                    self.replace_notices(
-                        notices
-                            .into_iter()
-                            .map(pgcore_notice_to_query_notice)
-                            .collect(),
-                    );
-                }
+                self.store_pgcore_events(notices, notifications, listen_actions);
                 pgcore_statements_to_query_execution(statements, row_conversion)
             }
             Err(error) => {
@@ -1066,6 +1296,7 @@ fn pgcore_error_execution(error: fastpg_pgcore::PgCoreError) -> QueryExecution {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PgCoreRowConversion {
     Typed,
+    TypedWithBinaryFallback,
     PreserveText,
 }
 
@@ -1079,6 +1310,24 @@ fn pgcore_notice_to_query_notice(notice: PgCoreNotice) -> QueryNotice {
         hint: notice.hint,
         context: notice.context,
         cursorpos: notice.cursorpos,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_notification_to_query_notification(
+    notification: PgCoreNotification,
+) -> QueryNotification {
+    QueryNotification {
+        channel: notification.channel,
+        payload: notification.payload,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_listen_action_to_query_listen_action(action: PgCoreListenAction) -> QueryListenAction {
+    match action {
+        PgCoreListenAction::Listen(channel) => QueryListenAction::Listen(channel),
+        PgCoreListenAction::Unlisten(channel) => QueryListenAction::Unlisten(channel),
     }
 }
 
@@ -1275,26 +1524,74 @@ fn pgcore_value_to_value(
     row_conversion: PgCoreRowConversion,
 ) -> Result<Value, String> {
     match (value, data_type, row_conversion) {
-        (PgCoreValue::Text(value), _, PgCoreRowConversion::PreserveText) => {
+        (PgCoreValue::Text(value), _, PgCoreRowConversion::PreserveText)
+        | (PgCoreValue::TextWithBinary { text: value, .. }, _, PgCoreRowConversion::PreserveText) => {
             Ok(Value::RawText(value))
         }
         (PgCoreValue::Null, _, PgCoreRowConversion::PreserveText) => Ok(Value::Null),
-        (PgCoreValue::Null, _, PgCoreRowConversion::Typed) => Ok(Value::Null),
-        (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::Typed) => value
+        (PgCoreValue::Null, _, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Null, _, PgCoreRowConversion::TypedWithBinaryFallback) => Ok(Value::Null),
+        (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Text(value), PgType::Int2, PgCoreRowConversion::TypedWithBinaryFallback)
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int2,
+            PgCoreRowConversion::Typed,
+        )
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int2,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => value
             .parse::<i16>()
             .map(Value::Int2)
             .map_err(|error| format!("cannot decode PostgreSQL int2 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::Typed) => value
+        (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Text(value), PgType::Int4, PgCoreRowConversion::TypedWithBinaryFallback)
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int4,
+            PgCoreRowConversion::Typed,
+        )
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int4,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => value
             .parse::<i32>()
             .map(Value::Int4)
             .map_err(|error| format!("cannot decode PostgreSQL int4 value {value:?}: {error}")),
-        (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::Typed) => value
+        (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::Typed)
+        | (PgCoreValue::Text(value), PgType::Int8, PgCoreRowConversion::TypedWithBinaryFallback)
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int8,
+            PgCoreRowConversion::Typed,
+        )
+        | (
+            PgCoreValue::TextWithBinary { text: value, .. },
+            PgType::Int8,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => value
             .parse::<i64>()
             .map(Value::Int8)
             .map_err(|error| format!("cannot decode PostgreSQL int8 value {value:?}: {error}")),
         (PgCoreValue::Text(value), PgType::Varchar, PgCoreRowConversion::Typed) => {
             Ok(Value::Text(value))
         }
+        (PgCoreValue::TextWithBinary { text, .. }, PgType::Varchar, PgCoreRowConversion::Typed) => {
+            Ok(Value::Text(text))
+        }
+        (
+            PgCoreValue::TextWithBinary { text, binary },
+            PgType::Varchar,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => Ok(Value::TextWithBinary { text, binary }),
+        (
+            PgCoreValue::Text(value),
+            PgType::Varchar,
+            PgCoreRowConversion::TypedWithBinaryFallback,
+        ) => Ok(Value::Text(value)),
     }
 }
 

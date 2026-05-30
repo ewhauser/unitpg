@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub use fastpg_exec::{
-    CopyOutput, CopyTarget, QueryDescription, QueryExecution, QueryNotice, QueryResult,
+    CopyOutput, CopyTarget, QueryDescription, QueryExecution, QueryListenAction, QueryNotice,
+    QueryNotification, QueryResult, StartupValidationError,
 };
 pub use fastpg_types::{Column, ParameterFormat, PgType, QueryParameter, Value};
 
@@ -17,7 +18,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::thread;
 
-use fastpg_exec::{COPY_HEADER_MATCH, QueryExecutor, QueryExecutorShared};
+use fastpg_exec::{COPY_FORMAT_BINARY, COPY_HEADER_MATCH, QueryExecutor, QueryExecutorShared};
 
 pub type SessionId = u64;
 pub const COPY_ERROR_CONTEXT_PREFIX: &str = "\x1ffastpg-copy-context\n";
@@ -70,6 +71,12 @@ impl From<BTreeMap<String, String>> for StartupParameters {
     fn from(parameters: BTreeMap<String, String>) -> Self {
         Self::new(parameters)
     }
+}
+
+pub fn validate_startup_parameters(
+    startup: &StartupParameters,
+) -> Result<(), StartupValidationError> {
+    fastpg_exec::validate_startup(startup.database(), startup.user())
 }
 
 #[derive(Debug)]
@@ -165,6 +172,16 @@ impl SessionBackendExecutor {
             .send(SessionBackendMessage::Run(Box::new(operation)))
             .expect("fastpg session backend thread exited");
     }
+
+    fn enqueue_shutdown_detached(&mut self, operation: SessionBackendJob) {
+        let _ = self.sender.send(SessionBackendMessage::Run(operation));
+        let _ = self.sender.send(SessionBackendMessage::Shutdown);
+        let _ = self
+            .handle
+            .lock()
+            .expect("fastpg session backend handle mutex poisoned")
+            .take();
+    }
 }
 
 impl fmt::Debug for SessionBackendExecutor {
@@ -216,8 +233,11 @@ impl SessionState {
         inline_execution: bool,
     ) -> Self {
         let id = server.allocate_session_id();
-        let executor =
-            QueryExecutor::with_shared_for_database(server.executor.clone(), startup.database());
+        let executor = QueryExecutor::with_shared_for_database_and_user(
+            server.executor.clone(),
+            startup.database(),
+            startup.user(),
+        );
         Self {
             id,
             server,
@@ -307,6 +327,14 @@ impl SessionState {
 
     pub fn take_notices(&self) -> Vec<QueryNotice> {
         self.executor.take_notices()
+    }
+
+    pub fn take_notifications(&self) -> Vec<QueryNotification> {
+        self.executor.take_notifications()
+    }
+
+    pub fn take_listen_actions(&self) -> Vec<QueryListenAction> {
+        self.executor.take_listen_actions()
     }
 
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
@@ -414,8 +442,8 @@ impl Drop for SessionState {
             if let Some(close_work) = self.executor.close_work(active_copy_owned_transaction) {
                 if self.inline_execution {
                     close_work.run();
-                } else if let Some(backend) = &self.backend {
-                    backend.run(move || close_work.run());
+                } else if let Some(mut backend) = self.backend.take() {
+                    backend.enqueue_shutdown_detached(Box::new(move || close_work.run()));
                 }
             }
         }
@@ -438,6 +466,7 @@ impl Default for SessionState {
 struct SessionCopyState {
     target: CopyTarget,
     pending: String,
+    bytes: Vec<u8>,
     lines: Vec<(usize, String)>,
     rows: usize,
     done: bool,
@@ -450,6 +479,7 @@ impl SessionCopyState {
         Self {
             target,
             pending: String::new(),
+            bytes: Vec::new(),
             lines: Vec::new(),
             rows: 0,
             done: false,
@@ -459,6 +489,12 @@ impl SessionCopyState {
     }
 
     fn push_data(&mut self, executor: &QueryExecutor, data: &[u8]) -> Result<(), String> {
+        if self.target.format == COPY_FORMAT_BINARY {
+            let _ = executor;
+            self.bytes.extend_from_slice(data);
+            return Ok(());
+        }
+
         let chunk = std::str::from_utf8(data).map_err(|error| error.to_string())?;
         self.pending.push_str(chunk);
 
@@ -472,6 +508,12 @@ impl SessionCopyState {
     }
 
     fn finish(&mut self, executor: &QueryExecutor) -> Result<usize, String> {
+        if self.target.format == COPY_FORMAT_BINARY {
+            let rows = executor.copy_target_buffered_bytes(&self.target, &self.bytes)?;
+            self.rows = rows;
+            return Ok(rows);
+        }
+
         if !self.pending.is_empty() {
             let line = std::mem::take(&mut self.pending);
             self.process_line(executor, line.trim_end_matches('\r'))?;

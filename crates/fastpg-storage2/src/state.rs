@@ -2,6 +2,8 @@ use crate::*;
 use smallvec::SmallVec;
 
 const MAX_HOT_REDIRECT_HOPS: usize = 1_000_000;
+pub(crate) const DEFAULT_DATABASE_OID: u32 = 5;
+const SHARED_DATABASE_OID: u32 = 0;
 
 pub(crate) struct VisibleTupleSlice<'a> {
     pub(crate) cursor_tid: Tid,
@@ -9,11 +11,184 @@ pub(crate) struct VisibleTupleSlice<'a> {
     pub(crate) tuple: &'a [u8],
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RelationKey {
+    database_oid: u32,
+    relid: u32,
+}
+
+impl Hash for RelationKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64((u64::from(self.database_oid) << 32) | u64::from(self.relid));
+    }
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct RelationMap {
+    entries: HashMap<RelationKey, RelationStorage>,
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct StorageState {
-    pub(crate) relations: HashMap<u32, RelationStorage>,
+    pub(crate) relations: RelationMap,
     pub(crate) epoch: u64,
     pub(crate) generation: u64,
+}
+
+fn relation_key(relid: u32) -> RelationKey {
+    RelationKey {
+        database_oid: relation_database_oid(relid),
+        relid,
+    }
+}
+
+fn relation_database_oid(relid: u32) -> u32 {
+    if shared_relation_oid(relid) {
+        SHARED_DATABASE_OID
+    } else {
+        current_database_oid()
+    }
+}
+
+fn shared_relation_oid(relid: u32) -> bool {
+    matches!(
+        relid,
+        1213 | 1214
+            | 1232
+            | 1233
+            | 1260
+            | 1261
+            | 1262
+            | 2396
+            | 2397
+            | 2671
+            | 2672
+            | 2676
+            | 2677
+            | 2694
+            | 2695
+            | 2697
+            | 2698
+            | 2846
+            | 2847
+            | 2964
+            | 2965
+            | 2966
+            | 2967
+            | 3592
+            | 3593
+            | 4060
+            | 4061
+            | 4177
+            | 4178
+            | 4183
+            | 4184
+            | 4185
+            | 4186
+            | 6000
+            | 6001
+            | 6002
+            | 6100
+            | 6114
+            | 6115
+            | 6243
+            | 6244
+            | 6245
+            | 6246
+            | 6247
+            | 6302
+            | 6303
+    )
+}
+
+impl RelationMap {
+    pub(crate) fn entry(
+        &mut self,
+        relid: u32,
+    ) -> std::collections::hash_map::Entry<'_, RelationKey, RelationStorage> {
+        self.entries.entry(relation_key(relid))
+    }
+
+    pub(crate) fn get(&self, relid: &u32) -> Option<&RelationStorage> {
+        self.entries.get(&relation_key(*relid))
+    }
+
+    pub(crate) fn get_mut(&mut self, relid: &u32) -> Option<&mut RelationStorage> {
+        self.entries.get_mut(&relation_key(*relid))
+    }
+
+    pub(crate) fn insert(
+        &mut self,
+        relid: u32,
+        relation: RelationStorage,
+    ) -> Option<RelationStorage> {
+        self.entries.insert(relation_key(relid), relation)
+    }
+
+    pub(crate) fn remove(&mut self, relid: &u32) -> Option<RelationStorage> {
+        self.entries.remove(&relation_key(*relid))
+    }
+
+    pub(crate) fn values(&self) -> impl Iterator<Item = &RelationStorage> {
+        self.entries.values()
+    }
+
+    fn clone_database(
+        &mut self,
+        dst_database_oid: u32,
+        src_database_oid: u32,
+    ) -> Vec<(RelationKey, usize)> {
+        let dst_database_oid = if dst_database_oid == 0 {
+            DEFAULT_DATABASE_OID
+        } else {
+            dst_database_oid
+        };
+        let src_database_oid = if src_database_oid == 0 {
+            DEFAULT_DATABASE_OID
+        } else {
+            src_database_oid
+        };
+        if dst_database_oid == src_database_oid {
+            return Vec::new();
+        }
+
+        self.entries
+            .retain(|key, _| key.database_oid != dst_database_oid);
+
+        let mut copied = self.clone_database_from_source(dst_database_oid, src_database_oid);
+        if copied.is_empty() && src_database_oid != DEFAULT_DATABASE_OID {
+            copied = self.clone_database_from_source(dst_database_oid, DEFAULT_DATABASE_OID);
+        }
+        copied
+    }
+
+    fn clone_database_from_source(
+        &mut self,
+        dst_database_oid: u32,
+        src_database_oid: u32,
+    ) -> Vec<(RelationKey, usize)> {
+        let relations = self
+            .entries
+            .iter()
+            .filter(|(key, _)| key.database_oid == src_database_oid)
+            .filter(|(key, _)| !shared_relation_oid(key.relid))
+            .map(|(key, relation)| {
+                (
+                    RelationKey {
+                        database_oid: dst_database_oid,
+                        relid: key.relid,
+                    },
+                    relation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let counts = relations
+            .iter()
+            .map(|(key, relation)| (*key, relation.live_tuple_count))
+            .collect::<Vec<_>>();
+        self.entries.extend(relations);
+        counts
+    }
 }
 
 fn add_row_count_delta(deltas: &mut SmallVec<[(u32, isize); 4]>, relid: u32, delta: isize) {
@@ -557,7 +732,7 @@ impl StorageState {
             && overlay
                 .inserted_tids
                 .get(&relid)
-                .is_some_and(|tids| tids.contains(&tid))
+                .is_some_and(|tids| tids.binary_search(&tid).is_ok())
         {
             overlay.set_insert_cid(relid, tid, cid);
             if !overlay.set_pending_insert_metadata(relid, tid, xid, cid) {
@@ -578,7 +753,7 @@ impl StorageState {
             && overlay
                 .invalidated_tids
                 .get(&relid)
-                .is_some_and(|tids| tids.contains(&tid))
+                .is_some_and(|tids| tids.binary_search(&tid).is_ok())
         {
             overlay.set_invalidate_metadata(relid, tid, xid, cid);
         }
@@ -595,7 +770,7 @@ impl StorageState {
             && overlay
                 .inserted_tids
                 .get(&relid)
-                .is_some_and(|tids| tids.contains(&tid))
+                .is_some_and(|tids| tids.binary_search(&tid).is_ok())
             && !overlay.set_pending_row_xmax(relid, tid, xmax)
         {
             self.set_row_xmax(relid, tid, xmax);
@@ -1217,11 +1392,13 @@ impl StorageState {
             let Some(tids) = overlay.inserted_tids.get(&relid) else {
                 continue;
             };
-            for tid in tids.iter().copied() {
-                if tid < start_tid || tid_beyond_high_water(tid, high_water_offsets) {
+            let start = tids.partition_point(|tid| *tid < start_tid);
+            for tid in tids[start..].iter().copied() {
+                if tid_beyond_high_water(tid, high_water_offsets) {
                     continue;
                 }
                 candidate = Some(candidate.map_or(tid, |current| current.min(tid)));
+                break;
             }
         }
 
@@ -1261,11 +1438,13 @@ impl StorageState {
             let Some(tids) = overlay.inserted_tids.get(&relid) else {
                 continue;
             };
-            for tid in tids.iter().copied() {
-                if tid > end_tid || tid_beyond_high_water(tid, high_water_offsets) {
+            let end = tids.partition_point(|tid| *tid <= end_tid);
+            for tid in tids[..end].iter().rev().copied() {
+                if tid_beyond_high_water(tid, high_water_offsets) {
                     continue;
                 }
                 candidate = Some(candidate.map_or(tid, |current| current.max(tid)));
+                break;
             }
         }
 
@@ -1521,14 +1700,25 @@ impl StorageState {
             return None;
         }
 
-        self.visible_tids(session, relid).into_iter().find(|tid| {
-            Some(*tid) != replacing_tid
-                && self
-                    .find_visible_tuple(session, relid, *tid)
-                    .and_then(|tuple| index_key_for_decoded(index_spec, &tuple.values))
-                    .as_ref()
-                    == Some(key)
-        })
+        for tid in self.visible_tids(session, relid) {
+            let resolved_tid = self.resolve_tid_redirect_in_overlays_compress(
+                &session.transaction_stack,
+                relid,
+                tid,
+            );
+            if Some(resolved_tid) == replacing_tid {
+                continue;
+            }
+            if self
+                .find_visible_tuple(session, relid, tid)
+                .and_then(|tuple| index_key_for_decoded(index_spec, &tuple.values))
+                .as_ref()
+                == Some(key)
+            {
+                return Some(resolved_tid);
+            }
+        }
+        None
     }
 
     pub(crate) fn find_visible_by_index_key_excluding_read(
@@ -1551,14 +1741,75 @@ impl StorageState {
             return None;
         }
 
-        self.visible_tids(session, relid).into_iter().find(|tid| {
-            Some(*tid) != replacing_tid
-                && self
-                    .find_visible_tuple(session, relid, *tid)
-                    .and_then(|tuple| index_key_for_decoded(index_spec, &tuple.values))
-                    .as_ref()
-                    == Some(key)
-        })
+        for tid in self.visible_tids(session, relid) {
+            let resolved_tid =
+                self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
+            if Some(resolved_tid) == replacing_tid {
+                continue;
+            }
+            if self
+                .find_visible_tuple(session, relid, tid)
+                .and_then(|tuple| index_key_for_decoded(index_spec, &tuple.values))
+                .as_ref()
+                == Some(key)
+            {
+                return Some(resolved_tid);
+            }
+        }
+        None
+    }
+
+    pub(crate) fn find_visible_by_recorded_index_key_excluding_read(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        index_spec: &UniqueIndexSpec,
+        key: &IndexKey,
+        replacing_tid: Option<Tid>,
+    ) -> Option<Tid> {
+        let replacing_tid = replacing_tid.map(|tid| {
+            self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
+        });
+        let consider_tid = |tid: Tid| -> Option<Tid> {
+            let resolved_tid =
+                self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
+            if Some(resolved_tid) == replacing_tid {
+                return None;
+            }
+            self.visible_tuple_slice_in_overlays(&session.transaction_stack, relid, resolved_tid)?;
+            Some(resolved_tid)
+        };
+
+        if let Some(tids) = self
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.indexes.get(&index_spec.index_oid.0))
+            .and_then(|index| index.get(key))
+        {
+            for tid in tids {
+                if let Some(visible_tid) = consider_tid(*tid) {
+                    return Some(visible_tid);
+                }
+            }
+        }
+
+        for overlay in &session.transaction_stack {
+            let Some(tids) = overlay
+                .index_inserts
+                .get(&relid)
+                .and_then(|index_maps| index_maps.get(&index_spec.index_oid.0))
+                .and_then(|index| index.get(key))
+            else {
+                continue;
+            };
+            for tid in tids {
+                if let Some(visible_tid) = consider_tid(*tid) {
+                    return Some(visible_tid);
+                }
+            }
+        }
+
+        None
     }
 
     pub(crate) fn unique_index_conflict_for_input(
@@ -1678,68 +1929,74 @@ pub(crate) fn reset_storage_for_tests() {
     ROW_COUNT_COUNTER_CACHE.with(|cache| cache.borrow_mut().clear());
 }
 
-fn row_counts() -> &'static Mutex<HashMap<u32, Arc<AtomicUsize>>> {
+fn row_counts() -> &'static Mutex<HashMap<RelationKey, Arc<AtomicUsize>>> {
     STORAGE2_ROW_COUNTS.get_or_init(|| Mutex::new(HashMap::default()))
 }
 
 thread_local! {
-    static ROW_COUNT_COUNTER_CACHE: RefCell<Vec<(u32, Arc<AtomicUsize>)>> = const { RefCell::new(Vec::new()) };
+    static ROW_COUNT_COUNTER_CACHE: RefCell<Vec<(RelationKey, Arc<AtomicUsize>)>> = const { RefCell::new(Vec::new()) };
 }
 
 fn cached_row_count_counter(relid: u32) -> Option<Arc<AtomicUsize>> {
+    let key = relation_key(relid);
     ROW_COUNT_COUNTER_CACHE.with(|cache| {
         cache
             .borrow()
             .iter()
-            .find(|(cached_relid, _)| *cached_relid == relid)
+            .find(|(cached_key, _)| *cached_key == key)
             .map(|(_, counter)| counter.clone())
     })
 }
 
-fn remember_row_count_counter(relid: u32, counter: Arc<AtomicUsize>) {
+fn remember_row_count_counter(key: RelationKey, counter: Arc<AtomicUsize>) {
     ROW_COUNT_COUNTER_CACHE.with(|cache| {
         let mut cache = cache.borrow_mut();
-        if let Some((_, existing)) = cache
-            .iter_mut()
-            .find(|(cached_relid, _)| *cached_relid == relid)
-        {
+        if let Some((_, existing)) = cache.iter_mut().find(|(cached_key, _)| *cached_key == key) {
             *existing = counter;
             return;
         }
         if cache.len() >= 8 {
             cache.remove(0);
         }
-        cache.push((relid, counter));
+        cache.push((key, counter));
     });
 }
 
-fn row_count_counter(relid: u32) -> Arc<AtomicUsize> {
-    let mut counts = row_counts().lock();
-    counts
-        .entry(relid)
-        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
-        .clone()
+fn store_committed_row_count(relid: u32, row_count: usize) {
+    store_committed_row_count_for_key(relation_key(relid), row_count);
 }
 
-fn store_committed_row_count(relid: u32, row_count: usize) {
-    if let Some(counter) = cached_row_count_counter(relid) {
+fn store_committed_row_count_for_key(key: RelationKey, row_count: usize) {
+    let cached = ROW_COUNT_COUNTER_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .find(|(cached_key, _)| *cached_key == key)
+            .map(|(_, counter)| counter.clone())
+    });
+    if let Some(counter) = cached {
         counter.store(row_count, Ordering::Relaxed);
         return;
     }
 
-    let counter = row_count_counter(relid);
+    let mut counts = row_counts().lock();
+    let counter = counts
+        .entry(key)
+        .or_insert_with(|| Arc::new(AtomicUsize::new(0)))
+        .clone();
     counter.store(row_count, Ordering::Relaxed);
-    remember_row_count_counter(relid, counter);
+    remember_row_count_counter(key, counter);
 }
 
 fn load_committed_row_count(relid: u32) -> usize {
+    let key = relation_key(relid);
     let counter = cached_row_count_counter(relid).or_else(|| {
         let counter = {
             let counts = row_counts().lock();
-            counts.get(&relid).cloned()
+            counts.get(&key).cloned()
         };
         if let Some(counter) = counter.as_ref() {
-            remember_row_count_counter(relid, counter.clone());
+            remember_row_count_counter(key, counter.clone());
         }
         counter
     });
@@ -1748,8 +2005,44 @@ fn load_committed_row_count(relid: u32) -> usize {
         .unwrap_or_default()
 }
 
+fn clear_database_row_counts(database_oid: u32) {
+    row_counts()
+        .lock()
+        .retain(|key, _| key.database_oid != database_oid);
+    ROW_COUNT_COUNTER_CACHE.with(|cache| {
+        cache
+            .borrow_mut()
+            .retain(|(key, _)| key.database_oid != database_oid);
+    });
+}
+
 pub(crate) fn committed_row_count_cached(relid: u32) -> usize {
     load_committed_row_count(relid)
+}
+
+pub(crate) fn clone_database_storage(dst_database_oid: u32, src_database_oid: u32) -> bool {
+    let dst_database_oid = if dst_database_oid == 0 {
+        DEFAULT_DATABASE_OID
+    } else {
+        dst_database_oid
+    };
+    if dst_database_oid == SHARED_DATABASE_OID {
+        return false;
+    }
+
+    let counts = {
+        let mut state = storage().write();
+        let counts = state
+            .relations
+            .clone_database(dst_database_oid, src_database_oid);
+        state.generation = state.generation.saturating_add(1);
+        counts
+    };
+    clear_database_row_counts(dst_database_oid);
+    for (key, row_count) in counts {
+        store_committed_row_count_for_key(key, row_count);
+    }
+    true
 }
 
 pub(crate) fn visible_row_count_cached(relid: u32) -> usize {

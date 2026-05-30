@@ -185,8 +185,8 @@ pub(crate) struct TransactionOverlay {
 }
 
 fn push_tid_unique(tids: &mut TidList, tid: Tid) {
-    if !tids.contains(&tid) {
-        tids.push(tid);
+    if let Err(index) = tids.binary_search(&tid) {
+        tids.insert(index, tid);
     }
 }
 
@@ -208,19 +208,17 @@ fn upsert_page_checkpoint(
 }
 
 fn upsert_tid_cid(entries: &mut TidCidList, tid: Tid, cid: u32) {
-    if let Some((_, existing)) = entries.iter_mut().find(|(entry_tid, _)| *entry_tid == tid) {
-        *existing = cid;
-        return;
+    match entries.binary_search_by_key(&tid, |(entry_tid, _)| *entry_tid) {
+        Ok(index) => entries[index].1 = cid,
+        Err(index) => entries.insert(index, (tid, cid)),
     }
-    entries.push((tid, cid));
 }
 
 fn upsert_tid_metadata(entries: &mut TidMetadataList, tid: Tid, metadata: DeleteMetadata) {
-    if let Some((_, existing)) = entries.iter_mut().find(|(entry_tid, _)| *entry_tid == tid) {
-        *existing = metadata;
-        return;
+    match entries.binary_search_by_key(&tid, |(entry_tid, _)| *entry_tid) {
+        Ok(index) => entries[index].1 = metadata,
+        Err(index) => entries.insert(index, (tid, metadata)),
     }
-    entries.push((tid, metadata));
 }
 
 fn upsert_redirect(entries: &mut RedirectList, old_tid: Tid, new_tid: Tid) {
@@ -573,7 +571,7 @@ impl TransactionOverlay {
     pub(crate) fn contains_inserted_tid(&self, relid: u32, tid: Tid) -> bool {
         self.inserted_tids
             .get(&relid)
-            .is_some_and(|tids| tids.contains(&tid))
+            .is_some_and(|tids| tids.binary_search(&tid).is_ok())
     }
 
     pub(crate) fn inserted_cid(&self, relid: u32, tid: Tid) -> Option<u32> {
@@ -584,9 +582,9 @@ impl TransactionOverlay {
             self.inserted_cids
                 .get(&relid)
                 .and_then(|cids| {
-                    cids.iter()
-                        .find(|(entry_tid, _)| *entry_tid == tid)
-                        .map(|(_, cid)| *cid)
+                    cids.binary_search_by_key(&tid, |(entry_tid, _)| *entry_tid)
+                        .ok()
+                        .map(|index| cids[index].1)
                 })
                 .unwrap_or_default(),
         )
@@ -595,7 +593,7 @@ impl TransactionOverlay {
     pub(crate) fn contains_invalidated_tid(&self, relid: u32, tid: Tid) -> bool {
         self.invalidated_tids
             .get(&relid)
-            .is_some_and(|tids| tids.contains(&tid))
+            .is_some_and(|tids| tids.binary_search(&tid).is_ok())
     }
 
     pub(crate) fn invalidated_cid(&self, relid: u32, tid: Tid) -> Option<u32> {
@@ -607,9 +605,9 @@ impl TransactionOverlay {
                 .get(&relid)
                 .and_then(|entries| {
                     entries
-                        .iter()
-                        .find(|(entry_tid, _)| *entry_tid == tid)
-                        .map(|(_, metadata)| metadata.cid)
+                        .binary_search_by_key(&tid, |(entry_tid, _)| *entry_tid)
+                        .ok()
+                        .map(|index| entries[index].1.cid)
                 })
                 .unwrap_or_default(),
         )
@@ -887,6 +885,7 @@ impl TransactionOverlay {
 
 #[derive(Debug, Default)]
 pub struct SessionStorage {
+    pub(crate) database_oid: u32,
     pub(crate) transaction_stack: Vec<TransactionOverlay>,
     pub(crate) explicit_transaction: bool,
     pub(crate) scans: Vec<Option<ScanState>>,
@@ -1102,7 +1101,7 @@ pub(crate) fn overlays_own_inserted_tid(
         if overlay
             .inserted_tids
             .get(&relid)
-            .is_some_and(|tids| tids.contains(&tid))
+            .is_some_and(|tids| tids.binary_search(&tid).is_ok())
         {
             return true;
         }
@@ -1118,7 +1117,7 @@ pub(crate) fn overlays_clear_tid(overlays: &[TransactionOverlay], relid: u32, ti
         if overlay
             .inserted_tids
             .get(&relid)
-            .is_some_and(|tids| tids.contains(&tid))
+            .is_some_and(|tids| tids.binary_search(&tid).is_ok())
         {
             return false;
         }
@@ -1138,7 +1137,7 @@ pub(crate) fn overlay_inserted_cid(
         if !overlay
             .inserted_tids
             .get(&relid)
-            .is_some_and(|tids| tids.contains(&tid))
+            .is_some_and(|tids| tids.binary_search(&tid).is_ok())
         {
             return None;
         }
@@ -1147,9 +1146,9 @@ pub(crate) fn overlay_inserted_cid(
                 .inserted_cids
                 .get(&relid)
                 .and_then(|cids| {
-                    cids.iter()
-                        .find(|(entry_tid, _)| *entry_tid == tid)
-                        .map(|(_, cid)| *cid)
+                    cids.binary_search_by_key(&tid, |(entry_tid, _)| *entry_tid)
+                        .ok()
+                        .map(|index| cids[index].1)
                 })
                 .unwrap_or_default(),
         )
@@ -1162,7 +1161,8 @@ pub(crate) fn overlays_own_inserted_tid_before(
     tid: Tid,
     curcid: u32,
 ) -> bool {
-    overlay_inserted_cid(overlays, relid, tid).is_some_and(|cid| cid < curcid)
+    overlay_inserted_cid(overlays, relid, tid)
+        .is_some_and(|cid| cid_visible_before_snapshot(cid, curcid))
 }
 
 pub(crate) fn overlays_invalidate_tid(
@@ -1194,12 +1194,12 @@ pub(crate) fn overlays_invalidate_tid_before(
     let mut later_insert_cid = None;
     for overlay in overlays.iter().rev() {
         if let Some(insert_cid) = overlay.inserted_cid(relid, tid)
-            && insert_cid < curcid
+            && cid_visible_before_snapshot(insert_cid, curcid)
         {
             later_insert_cid = Some(insert_cid);
         }
         if let Some(invalidated_cid) = overlay.invalidated_cid(relid, tid)
-            && invalidated_cid < curcid
+            && cid_visible_before_snapshot(invalidated_cid, curcid)
         {
             return !(overlay.cleared_relations.contains_key(&relid)
                 && later_insert_cid.is_some_and(|insert_cid| {
@@ -1314,16 +1314,17 @@ pub(crate) fn single_overlay_tid_visibility(
         invalidated.then(|| overlay.invalidated_cid(relid, tid).unwrap_or_default());
 
     if let Some(curcid) = curcid {
-        if invalidated_cid.is_some_and(|cid| cid < curcid)
+        if invalidated_cid.is_some_and(|cid| cid_visible_before_snapshot(cid, curcid))
             && !(relation_cleared
                 && inserted_cid
-                    .filter(|cid| *cid < curcid)
+                    .filter(|cid| cid_visible_before_snapshot(*cid, curcid))
                     .is_some_and(|cid| insert_shadows_invalidation(cid, invalidated_cid)))
         {
             return None;
         }
 
-        let include_pending = inserted_cid.is_some_and(|cid| cid < curcid);
+        let include_pending =
+            inserted_cid.is_some_and(|cid| cid_visible_before_snapshot(cid, curcid));
         if inserted_cid.is_some() && !include_pending {
             return None;
         }
@@ -1411,7 +1412,10 @@ pub(crate) fn overlay_update_redirect(
 pub type SessionStorageHandle = Arc<Mutex<SessionStorage>>;
 
 pub fn new_session_storage() -> SessionStorageHandle {
-    Arc::new(Mutex::new(SessionStorage::default()))
+    Arc::new(Mutex::new(SessionStorage {
+        database_oid: DEFAULT_DATABASE_OID,
+        ..SessionStorage::default()
+    }))
 }
 
 static DEFAULT_SESSION_STORAGE: OnceLock<SessionStorageHandle> = OnceLock::new();
@@ -1419,17 +1423,37 @@ static DEFAULT_SESSION_STORAGE: OnceLock<SessionStorageHandle> = OnceLock::new()
 thread_local! {
     static CURRENT_SESSION_STORAGE: RefCell<Option<SessionStorageHandle>> = const { RefCell::new(None) };
     static BORROWED_SESSION_STORAGE: Cell<Option<NonNull<SessionStorage>>> = const { Cell::new(None) };
+    static CURRENT_DATABASE_OID: Cell<u32> = const { Cell::new(DEFAULT_DATABASE_OID) };
+    static ALLOW_EQUAL_CID_VISIBILITY: Cell<bool> = const { Cell::new(false) };
     pub(crate) static LAST_STORAGE_ERROR: RefCell<Option<CatalogError>> = const { RefCell::new(None) };
+}
+
+pub(crate) fn enable_equal_cid_visibility() {
+    ALLOW_EQUAL_CID_VISIBILITY.with(|value| value.set(true));
+}
+
+fn cid_visible_before_snapshot(cid: u32, curcid: u32) -> bool {
+    cid < curcid || (cid == curcid && ALLOW_EQUAL_CID_VISIBILITY.with(Cell::get))
 }
 
 #[derive(Debug)]
 pub struct SessionStorageGuard {
     previous: Option<SessionStorageHandle>,
+    previous_database_oid: u32,
 }
 
 pub fn enter_session_storage(handle: SessionStorageHandle) -> SessionStorageGuard {
+    let database_oid = handle.lock().database_oid;
+    let previous_database_oid = CURRENT_DATABASE_OID.with(|current| {
+        let previous = current.get();
+        current.set(database_oid);
+        previous
+    });
     let previous = CURRENT_SESSION_STORAGE.with(|slot| slot.replace(Some(handle)));
-    SessionStorageGuard { previous }
+    SessionStorageGuard {
+        previous,
+        previous_database_oid,
+    }
 }
 
 impl Drop for SessionStorageGuard {
@@ -1437,6 +1461,7 @@ impl Drop for SessionStorageGuard {
         CURRENT_SESSION_STORAGE.with(|slot| {
             slot.replace(self.previous.take());
         });
+        CURRENT_DATABASE_OID.with(|current| current.set(self.previous_database_oid));
     }
 }
 
@@ -1503,5 +1528,31 @@ pub(crate) fn with_current_session_storage<R>(f: impl FnOnce(&mut SessionStorage
 
     let session = current_session_storage();
     let mut session = session.lock();
+    let _borrowed = enter_borrowed_session_storage(&mut session);
     f(&mut session)
+}
+
+pub fn set_database_oid(database_oid: u32) {
+    let database_oid = if database_oid == 0 {
+        DEFAULT_DATABASE_OID
+    } else {
+        database_oid
+    };
+
+    CURRENT_DATABASE_OID.with(|current| current.set(database_oid));
+    if let Some(mut borrowed) = BORROWED_SESSION_STORAGE.with(Cell::get) {
+        // SAFETY: see with_current_session_storage.
+        unsafe {
+            borrowed.as_mut().database_oid = database_oid;
+        }
+        return;
+    }
+
+    if let Some(handle) = CURRENT_SESSION_STORAGE.with(|slot| slot.borrow().clone()) {
+        handle.lock().database_oid = database_oid;
+    }
+}
+
+pub(crate) fn current_database_oid() -> u32 {
+    CURRENT_DATABASE_OID.with(Cell::get)
 }

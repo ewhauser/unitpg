@@ -36,11 +36,15 @@
  * the status of the last requested roleid.  The cache can be flushed
  * at need by watching for cache update events on pg_authid.
  */
+#ifdef USE_FASTPG
+static PG_THREAD_LOCAL Oid last_roleid = InvalidOid;	/* InvalidOid == cache not valid */
+static PG_THREAD_LOCAL bool last_roleid_is_super = false;
+static PG_THREAD_LOCAL bool roleid_callback_registered = false;
+static PG_THREAD_LOCAL uint64 last_roleid_fastpg_inval_generation = 0;
+#else
 static Oid	last_roleid = InvalidOid;	/* InvalidOid == cache not valid */
 static bool last_roleid_is_super = false;
 static bool roleid_callback_registered = false;
-#ifdef USE_FASTPG
-static uint64 last_roleid_fastpg_inval_generation = 0;
 #endif
 
 static void RoleidCallback(Datum arg, SysCacheIdentifier cacheid,

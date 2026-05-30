@@ -18,6 +18,7 @@
  */
 #include "postgres.h"
 
+#include "access/fastpg_tableam.h"
 #include "access/nbtree.h"
 #include "access/relscan.h"
 #include "access/stratnum.h"
@@ -211,6 +212,24 @@ btinsert(Relation rel, Datum *values, bool *isnull,
 {
 	bool		result;
 	IndexTuple	itup;
+
+#ifdef USE_FASTPG
+	if (heapRel != NULL &&
+		heapRel->rd_tableam == GetFastPgMemTableAmRoutine() &&
+		FastPgMemBtreeCanHandleIndex(heapRel, rel))
+	{
+		result = FastPgMemBtreeInsert(rel,
+									  values,
+									  isnull,
+									  ht_ctid,
+									  heapRel,
+									  checkUnique,
+									  indexUnchanged,
+									  indexInfo);
+		if (!result)
+			return false;
+	}
+#endif
 
 	/* generate an index tuple */
 	itup = index_form_tuple(RelationGetDescr(rel), values, isnull);

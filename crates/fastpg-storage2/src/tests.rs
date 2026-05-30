@@ -484,6 +484,147 @@ fn unique_conflict_sees_prior_direct_pending_insert() {
             values.len(),
             0,
             0,
+            0,
+            second_tid,
+            &mut conflict_tid,
+        )
+    });
+    assert_eq!(conflict_tid, first_tid);
+}
+
+#[test]
+fn unique_conflict_ignores_pending_insert_deleted_before_update() {
+    let _guard = test_guard();
+    let relid = 4571;
+    let index_relid = 45710;
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let type_oids = [INT4_OID.0];
+    let typlen = [4i16];
+    let values = [7usize];
+    let nulls = [0u8];
+    let byval = [1u8];
+    let lens = [0usize];
+    let mut conflict_tid = 0u64;
+    let mut updated_tid = 0u64;
+
+    fastpg_storage2_relation_set_max_tuples_per_block(relid, 8);
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 7);
+    fastpg_storage2_xact_commit();
+
+    fastpg_storage2_xact_begin();
+    fastpg_storage2_subxact_begin();
+    let speculative_tid = insert_i32(relid, 7);
+    assert!(fastpg_storage2_relation_delete_record_primary_key(
+        relid,
+        speculative_tid,
+        0
+    ));
+    fastpg_storage2_subxact_commit();
+    assert!(unsafe {
+        fastpg_storage2_relation_update_hot_unchecked_with_metadata(
+            relid,
+            first_tid,
+            1,
+            1,
+            1,
+            1,
+            1,
+            values.as_ptr(),
+            nulls.as_ptr(),
+            byval.as_ptr(),
+            lens.as_ptr(),
+            values.len(),
+            &mut updated_tid,
+        )
+    });
+
+    assert!(!unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            0,
+            0,
+            updated_tid,
+            &mut conflict_tid,
+        )
+    });
+}
+
+#[test]
+fn unique_conflict_recorded_index_only_ignores_heap_rows_without_index_entries() {
+    let _guard = test_guard();
+    let relid = 4572;
+    let index_relid = 45720;
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let type_oids = [INT4_OID.0];
+    let typlen = [4i16];
+    let values = [7usize];
+    let nulls = [0u8];
+    let mut conflict_tid = 0u64;
+
+    fastpg_storage2_relation_set_max_tuples_per_block(relid, 8);
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 7);
+    let second_tid = insert_i32(relid, 7);
+
+    assert!(!unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            0,
+            1,
+            second_tid,
+            &mut conflict_tid,
+        )
+    });
+
+    assert!(unsafe {
+        fastpg_storage2_index_insert_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            first_tid,
+        )
+    });
+    assert!(unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            0,
+            1,
             second_tid,
             &mut conflict_tid,
         )
@@ -535,6 +676,7 @@ fn primary_key_conflict_sees_direct_pending_index_entry() {
             nulls.as_ptr(),
             values.len(),
             1,
+            0,
             0,
             second_tid,
             &mut conflict_tid,
@@ -677,6 +819,26 @@ fn aborted_append_to_existing_page_does_not_reuse_ctid() {
     assert_eq!(fetch_i32(relid, aborted_tid), None);
     assert_eq!(fetch_i32(relid, committed_tid), Some(3));
     assert_eq!(fastpg_storage2_relation_row_count(relid), 2);
+}
+
+#[test]
+fn current_session_invalidates_tid_tracks_update_overlay() {
+    let _guard = test_guard();
+    let relid = 433;
+
+    fastpg_storage2_xact_begin();
+    let old_tid = insert_i32(relid, 1);
+    fastpg_storage2_xact_commit();
+
+    fastpg_storage2_xact_begin();
+    let new_tid = update_i32(relid, old_tid, 2);
+
+    assert!(fastpg_storage2_relation_current_session_invalidates_tid(
+        relid, old_tid
+    ));
+    assert!(!fastpg_storage2_relation_current_session_invalidates_tid(
+        relid, new_tid
+    ));
 }
 
 #[test]
@@ -1776,6 +1938,7 @@ fn explicitly_recorded_primary_key_survives_pending_tid_commit_remap() {
             key_values.len(),
             1,
             0,
+            0,
             inserted_tid,
             &mut conflict_tid,
         )
@@ -1824,6 +1987,7 @@ fn explicitly_recorded_primary_key_survives_pending_tid_commit_remap() {
             nulls.as_ptr(),
             key_values.len(),
             1,
+            0,
             0,
             second_tid,
             &mut conflict_tid,
@@ -2066,11 +2230,38 @@ fn replace_relation_from_is_transactional() {
 }
 
 #[test]
+fn database_storage_is_isolated_and_cloneable() {
+    let _guard = test_guard();
+    let relid = 464;
+
+    fastpg_storage2_set_database(11);
+    fastpg_storage2_xact_begin();
+    insert_i32(relid, 1);
+    fastpg_storage2_xact_commit();
+    assert_eq!(fastpg_storage2_relation_row_count(relid), 1);
+
+    fastpg_storage2_set_database(12);
+    assert_eq!(fastpg_storage2_relation_row_count(relid), 0);
+    assert_eq!(scan_i32_values(relid), Vec::<i32>::new());
+
+    assert!(fastpg_storage2_clone_database(12, 11));
+    assert_eq!(scan_i32_values(relid), vec![1]);
+
+    fastpg_storage2_xact_begin();
+    insert_i32(relid, 2);
+    fastpg_storage2_xact_commit();
+    assert_eq!(scan_i32_values(relid), vec![1, 2]);
+
+    fastpg_storage2_set_database(11);
+    assert_eq!(scan_i32_values(relid), vec![1]);
+}
+
+#[test]
 fn replace_relation_from_hides_old_rows_from_unique_validation() {
     let _guard = test_guard();
-    let dst_relid = 464;
-    let src_relid = 465;
-    let index_relid = 4640;
+    let dst_relid = 465;
+    let src_relid = 466;
+    let index_relid = 4650;
     let attnums = [1i16];
     let typbyval = [1u8];
     let type_oids = [INT4_OID.0];
@@ -2418,6 +2609,7 @@ fn ffi_index_specs_scan_storage_without_rust_catalog_metadata() {
             values.as_ptr(),
             nulls.as_ptr(),
             values.len(),
+            0,
             0,
             0,
             second_tid,

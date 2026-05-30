@@ -49,6 +49,17 @@
 #include "utils/tuplestore.h"
 #include "utils/wait_event.h"
 
+#ifdef USE_FASTPG
+Oid FastPgLogicalDatabaseId(void);
+
+Oid
+__attribute__((weak))
+FastPgLogicalDatabaseId(void)
+{
+	return MyDatabaseId;
+}
+#endif
+
 
 /*
  * structure to cache metadata needed in pg_input_is_valid_common
@@ -211,10 +222,14 @@ Datum
 current_database(PG_FUNCTION_ARGS)
 {
 	Name		db;
+	Oid			database_id = MyDatabaseId;
 
 	db = (Name) palloc(NAMEDATALEN);
 
-	namestrcpy(db, get_database_name(MyDatabaseId));
+#ifdef USE_FASTPG
+	database_id = FastPgLogicalDatabaseId();
+#endif
+	namestrcpy(db, get_database_name(database_id));
 	PG_RETURN_NAME(db);
 }
 
