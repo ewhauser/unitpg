@@ -64,6 +64,8 @@ if get_option('fastpg')
     '../../crates/fastpg-storage2/src/tid.rs',
     '../../crates/fastpg-storage2/src/transaction.rs',
     '../../crates/fastpg-storage2/src/tuple.rs',
+    '../../crates/fastpg-backend/Cargo.toml',
+    '../../crates/fastpg-backend/src/lib.rs',
     '../../crates/fastpg-types/Cargo.toml',
     '../../crates/fastpg-types/src/lib.rs',
   )

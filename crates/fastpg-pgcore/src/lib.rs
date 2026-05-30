@@ -581,7 +581,7 @@ impl Portal {
 #[cfg(feature = "postgres-execution")]
 mod inner {
     use std::borrow::Cow;
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::ffi::{CStr, CString, c_char};
     use std::mem::MaybeUninit;
     use std::ptr;
@@ -610,6 +610,8 @@ mod inner {
     thread_local! {
         static CURRENT_DATABASE_OID: Cell<u32> = const { Cell::new(0) };
         static PGCORE_LANE_DEPTH: Cell<usize> = const { Cell::new(0) };
+        static PGCORE_LANE_LOCK_GUARD: RefCell<Option<MutexGuard<'static, ()>>> =
+            const { RefCell::new(None) };
     }
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
@@ -623,7 +625,7 @@ mod inner {
     }
 
     struct PgCoreLaneGuard {
-        _lock: Option<MutexGuard<'static, ()>>,
+        owns_lane_lock: bool,
         catalog_lane_entered: bool,
         previous_catalog_lane_token: u64,
     }
@@ -644,26 +646,31 @@ mod inner {
         } else {
             0
         };
-        let lock = if catalog_lane_entered {
+        let owns_lane_lock = if catalog_lane_entered {
             let already_entered = PGCORE_LANE_DEPTH.with(|depth| {
                 let current = depth.get();
                 depth.set(current + 1);
                 current > 0
             });
             if already_entered {
-                None
+                false
             } else {
-                Some(lock_pgcore_lane_when_catalog_turn_is_ready())
+                let lock = lock_pgcore_lane_when_catalog_turn_is_ready();
+                PGCORE_LANE_LOCK_GUARD.with(|slot| {
+                    let previous = slot.borrow_mut().replace(lock);
+                    debug_assert!(previous.is_none());
+                });
+                true
             }
         } else {
-            None
+            false
         };
         let active = PGCORE_ACTIVE.fetch_add(1, Ordering::Relaxed) + 1;
         PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         update_max_active(active);
         refresh_pgcore_caches_if_catalog_changed();
         PgCoreLaneGuard {
-            _lock: lock,
+            owns_lane_lock,
             catalog_lane_entered,
             previous_catalog_lane_token,
         }
@@ -697,9 +704,39 @@ mod inner {
                 unsafe {
                     fastpg_pgcore_set_catalog_lane_token(self.previous_catalog_lane_token);
                 }
+                if self.owns_lane_lock {
+                    PGCORE_LANE_LOCK_GUARD.with(|slot| {
+                        drop(slot.borrow_mut().take());
+                    });
+                }
             }
             PGCORE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
         }
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fastpg_pgcore_suspend_lane_for_wait() -> bool {
+        if !postgres_catalog_enabled() {
+            return false;
+        }
+
+        let lock = PGCORE_LANE_LOCK_GUARD.with(|slot| slot.borrow_mut().take());
+        let suspended = lock.is_some();
+        drop(lock);
+        suspended
+    }
+
+    #[unsafe(no_mangle)]
+    pub extern "C" fn fastpg_pgcore_resume_lane_after_wait(suspended: bool) {
+        if !suspended || !postgres_catalog_enabled() {
+            return;
+        }
+
+        let lock = lock_pgcore_lane_when_catalog_turn_is_ready();
+        PGCORE_LANE_LOCK_GUARD.with(|slot| {
+            let previous = slot.borrow_mut().replace(lock);
+            debug_assert!(previous.is_none());
+        });
     }
 
     fn update_max_active(active: u64) {

@@ -3686,6 +3686,7 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
     nkeys: usize,
     is_primary: u8,
     nulls_not_distinct: u8,
+    recorded_index_only: u8,
     replacing_tid: u64,
     tid_out: *mut u64,
 ) -> bool {
@@ -3731,13 +3732,23 @@ pub unsafe extern "C" fn fastpg_storage2_unique_index_conflict_with_spec(
         }
     }
     let conflict = with_storage_read(|state, session| {
-        state.find_visible_by_index_key_excluding_read(
-            session,
-            heap_relid,
-            &index_spec,
-            &key,
-            replacing_tid,
-        )
+        if recorded_index_only != 0 && !index_spec.is_primary {
+            state.find_visible_by_recorded_index_key_excluding_read(
+                session,
+                heap_relid,
+                &index_spec,
+                &key,
+                replacing_tid,
+            )
+        } else {
+            state.find_visible_by_index_key_excluding_read(
+                session,
+                heap_relid,
+                &index_spec,
+                &key,
+                replacing_tid,
+            )
+        }
     });
     let Some(tid) = conflict else {
         return false;

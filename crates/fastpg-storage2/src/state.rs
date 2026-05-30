@@ -1759,6 +1759,59 @@ impl StorageState {
         None
     }
 
+    pub(crate) fn find_visible_by_recorded_index_key_excluding_read(
+        &self,
+        session: &SessionStorage,
+        relid: u32,
+        index_spec: &UniqueIndexSpec,
+        key: &IndexKey,
+        replacing_tid: Option<Tid>,
+    ) -> Option<Tid> {
+        let replacing_tid = replacing_tid.map(|tid| {
+            self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid)
+        });
+        let consider_tid = |tid: Tid| -> Option<Tid> {
+            let resolved_tid =
+                self.resolve_tid_redirect_in_overlays(&session.transaction_stack, relid, tid);
+            if Some(resolved_tid) == replacing_tid {
+                return None;
+            }
+            self.visible_tuple_slice_in_overlays(&session.transaction_stack, relid, resolved_tid)?;
+            Some(resolved_tid)
+        };
+
+        if let Some(tids) = self
+            .relations
+            .get(&relid)
+            .and_then(|relation| relation.indexes.get(&index_spec.index_oid.0))
+            .and_then(|index| index.get(key))
+        {
+            for tid in tids {
+                if let Some(visible_tid) = consider_tid(*tid) {
+                    return Some(visible_tid);
+                }
+            }
+        }
+
+        for overlay in &session.transaction_stack {
+            let Some(tids) = overlay
+                .index_inserts
+                .get(&relid)
+                .and_then(|index_maps| index_maps.get(&index_spec.index_oid.0))
+                .and_then(|index| index.get(key))
+            else {
+                continue;
+            };
+            for tid in tids {
+                if let Some(visible_tid) = consider_tid(*tid) {
+                    return Some(visible_tid);
+                }
+            }
+        }
+
+        None
+    }
+
     pub(crate) fn unique_index_conflict_for_input(
         &mut self,
         session: &SessionStorage,

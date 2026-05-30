@@ -484,6 +484,7 @@ fn unique_conflict_sees_prior_direct_pending_insert() {
             values.len(),
             0,
             0,
+            0,
             second_tid,
             &mut conflict_tid,
         )
@@ -552,10 +553,83 @@ fn unique_conflict_ignores_pending_insert_deleted_before_update() {
             values.len(),
             0,
             0,
+            0,
             updated_tid,
             &mut conflict_tid,
         )
     });
+}
+
+#[test]
+fn unique_conflict_recorded_index_only_ignores_heap_rows_without_index_entries() {
+    let _guard = test_guard();
+    let relid = 4572;
+    let index_relid = 45720;
+    let attnums = [1i16];
+    let typbyval = [1u8];
+    let type_oids = [INT4_OID.0];
+    let typlen = [4i16];
+    let values = [7usize];
+    let nulls = [0u8];
+    let mut conflict_tid = 0u64;
+
+    fastpg_storage2_relation_set_max_tuples_per_block(relid, 8);
+    fastpg_storage2_xact_begin();
+    let first_tid = insert_i32(relid, 7);
+    let second_tid = insert_i32(relid, 7);
+
+    assert!(!unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            0,
+            1,
+            second_tid,
+            &mut conflict_tid,
+        )
+    });
+
+    assert!(unsafe {
+        fastpg_storage2_index_insert_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            first_tid,
+        )
+    });
+    assert!(unsafe {
+        fastpg_storage2_unique_index_conflict_with_spec(
+            index_relid,
+            relid,
+            attnums.as_ptr(),
+            type_oids.as_ptr(),
+            typbyval.as_ptr(),
+            typlen.as_ptr(),
+            values.as_ptr(),
+            nulls.as_ptr(),
+            values.len(),
+            0,
+            0,
+            1,
+            second_tid,
+            &mut conflict_tid,
+        )
+    });
+    assert_eq!(conflict_tid, first_tid);
 }
 
 #[test]
@@ -602,6 +676,7 @@ fn primary_key_conflict_sees_direct_pending_index_entry() {
             nulls.as_ptr(),
             values.len(),
             1,
+            0,
             0,
             second_tid,
             &mut conflict_tid,
@@ -1863,6 +1938,7 @@ fn explicitly_recorded_primary_key_survives_pending_tid_commit_remap() {
             key_values.len(),
             1,
             0,
+            0,
             inserted_tid,
             &mut conflict_tid,
         )
@@ -1911,6 +1987,7 @@ fn explicitly_recorded_primary_key_survives_pending_tid_commit_remap() {
             nulls.as_ptr(),
             key_values.len(),
             1,
+            0,
             0,
             second_tid,
             &mut conflict_tid,
@@ -2532,6 +2609,7 @@ fn ffi_index_specs_scan_storage_without_rust_catalog_metadata() {
             values.as_ptr(),
             nulls.as_ptr(),
             values.len(),
+            0,
             0,
             0,
             second_tid,

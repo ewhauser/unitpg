@@ -40,6 +40,7 @@
 
 #include "postgres.h"
 
+#include "access/fastpg_tableam.h"
 #include "access/nbtree.h"
 #include "access/parallel.h"
 #include "access/relscan.h"
@@ -315,6 +316,13 @@ btbuild(Relation heap, Relation index, IndexInfo *indexInfo)
 	buildstate.spool2 = NULL;
 	buildstate.indtuples = 0;
 	buildstate.btleader = NULL;
+
+#ifdef USE_FASTPG
+	if (heap != NULL &&
+		heap->rd_tableam == GetFastPgMemTableAmRoutine() &&
+		FastPgMemBtreeCanHandleIndex(heap, index))
+		(void) FastPgMemBtreeBuild(heap, index, indexInfo);
+#endif
 
 	/*
 	 * We expect to be called exactly once for any index relation. If that's
