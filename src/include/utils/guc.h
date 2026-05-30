@@ -449,6 +449,12 @@ extern int	set_config_option(const char *name, const char *value,
 							  GucContext context, GucSource source,
 							  GucAction action, bool changeVal, int elevel,
 							  bool is_reload);
+#ifdef USE_FASTPG
+extern int	FastPgSetConfigOptionNoStack(const char *name, const char *value,
+										 GucContext context, GucSource source,
+										 bool changeVal, int elevel,
+										 bool is_reload);
+#endif
 extern int	set_config_option_ext(const char *name, const char *value,
 								  GucContext context, GucSource source,
 								  Oid srole,

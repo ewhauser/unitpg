@@ -12,6 +12,9 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/htup_details.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -620,6 +623,20 @@ pg_safe_snapshot_blocking_pids(PG_FUNCTION_ARGS)
 #define SET_LOCKTAG_INT32(tag, key1, key2) \
 	SET_LOCKTAG_ADVISORY(tag, MyDatabaseId, key1, key2, 2)
 
+#ifdef USE_FASTPG
+/*
+ * FastPG runs PostgreSQL execution through a single serialized pgcore lane.
+ * PostgreSQL's blocking advisory-lock calls can sleep while holding that lane,
+ * preventing the lock owner from running its COMMIT/ROLLBACK and releasing the
+ * lock. Keep pg_try_* and unlock functions real, but make the blocking variants
+ * best-effort no-ops in FastPG so a contended test lock cannot starve the whole
+ * server.
+ */
+#define FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK() PG_RETURN_VOID()
+#else
+#define FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK() ((void) 0)
+#endif
+
 /*
  * pg_advisory_lock(int8) - acquire exclusive lock on an int8 key
  */
@@ -628,6 +645,8 @@ pg_advisory_lock_int8(PG_FUNCTION_ARGS)
 {
 	int64		key = PG_GETARG_INT64(0);
 	LOCKTAG		tag;
+
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
 
 	SET_LOCKTAG_INT64(tag, key);
 
@@ -646,6 +665,8 @@ pg_advisory_xact_lock_int8(PG_FUNCTION_ARGS)
 	int64		key = PG_GETARG_INT64(0);
 	LOCKTAG		tag;
 
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
+
 	SET_LOCKTAG_INT64(tag, key);
 
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
@@ -661,6 +682,8 @@ pg_advisory_lock_shared_int8(PG_FUNCTION_ARGS)
 {
 	int64		key = PG_GETARG_INT64(0);
 	LOCKTAG		tag;
+
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
 
 	SET_LOCKTAG_INT64(tag, key);
 
@@ -678,6 +701,8 @@ pg_advisory_xact_lock_shared_int8(PG_FUNCTION_ARGS)
 {
 	int64		key = PG_GETARG_INT64(0);
 	LOCKTAG		tag;
+
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
 
 	SET_LOCKTAG_INT64(tag, key);
 
@@ -812,6 +837,8 @@ pg_advisory_lock_int4(PG_FUNCTION_ARGS)
 	int32		key2 = PG_GETARG_INT32(1);
 	LOCKTAG		tag;
 
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
+
 	SET_LOCKTAG_INT32(tag, key1, key2);
 
 	(void) LockAcquire(&tag, ExclusiveLock, true, false);
@@ -830,6 +857,8 @@ pg_advisory_xact_lock_int4(PG_FUNCTION_ARGS)
 	int32		key2 = PG_GETARG_INT32(1);
 	LOCKTAG		tag;
 
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
+
 	SET_LOCKTAG_INT32(tag, key1, key2);
 
 	(void) LockAcquire(&tag, ExclusiveLock, false, false);
@@ -846,6 +875,8 @@ pg_advisory_lock_shared_int4(PG_FUNCTION_ARGS)
 	int32		key1 = PG_GETARG_INT32(0);
 	int32		key2 = PG_GETARG_INT32(1);
 	LOCKTAG		tag;
+
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
 
@@ -864,6 +895,8 @@ pg_advisory_xact_lock_shared_int4(PG_FUNCTION_ARGS)
 	int32		key1 = PG_GETARG_INT32(0);
 	int32		key2 = PG_GETARG_INT32(1);
 	LOCKTAG		tag;
+
+	FASTPG_RETURN_FROM_BLOCKING_ADVISORY_LOCK();
 
 	SET_LOCKTAG_INT32(tag, key1, key2);
 

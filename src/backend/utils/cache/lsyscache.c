@@ -88,7 +88,6 @@ get_attavgwidth_hook_type get_attavgwidth_hook = NULL;
 #define FASTPG_NEQJOINSEL_PROC 106
 #define FASTPG_SCALARLTJOINSEL_PROC 107
 #define FASTPG_SCALARGTJOINSEL_PROC 108
-#define FASTPG_RELNAME_RELID_CACHE_SIZE 32
 
 typedef struct FastPgBuiltinTypeInfo
 {
@@ -98,23 +97,9 @@ typedef struct FastPgBuiltinTypeInfo
 	Oid			typcollation;
 } FastPgBuiltinTypeInfo;
 
-typedef struct FastPgRelnameRelidCacheEntry
-{
-	bool		valid;
-	uint64		inval_count;
-	Oid			relnamespace;
-	Oid			relid;
-	char		relname[NAMEDATALEN];
-} FastPgRelnameRelidCacheEntry;
-
-static _Thread_local FastPgRelnameRelidCacheEntry fastpg_relname_relid_cache[FASTPG_RELNAME_RELID_CACHE_SIZE];
-static _Thread_local int fastpg_relname_relid_cache_next = 0;
-
 void
 fastpg_relname_relid_cache_reset(void)
 {
-	memset(fastpg_relname_relid_cache, 0, sizeof(fastpg_relname_relid_cache));
-	fastpg_relname_relid_cache_next = 0;
 }
 
 static bool
@@ -205,49 +190,6 @@ fastpg_lookup_type(Oid typid, FastPgRustCatalogType *type)
 		return false;
 
 	return fastpg_rust_catalog_type_by_oid((uint32_t) typid, type);
-}
-
-static bool
-fastpg_relname_relid_cache_lookup(const char *relname, Oid relnamespace,
-								  Oid *relid_out)
-{
-	int			index;
-	uint64		inval_count = SharedInvalidMessageCounter;
-
-	for (index = 0; index < FASTPG_RELNAME_RELID_CACHE_SIZE; index++)
-	{
-		FastPgRelnameRelidCacheEntry *entry = &fastpg_relname_relid_cache[index];
-
-		if (entry->valid &&
-			entry->inval_count == inval_count &&
-			entry->relnamespace == relnamespace &&
-			strncmp(entry->relname, relname, NAMEDATALEN) == 0)
-		{
-			*relid_out = entry->relid;
-			return true;
-		}
-	}
-	return false;
-}
-
-static void
-fastpg_relname_relid_cache_store(const char *relname, Oid relnamespace,
-								 Oid relid)
-{
-	FastPgRelnameRelidCacheEntry *entry;
-
-	if (!OidIsValid(relid))
-		return;
-
-	entry = &fastpg_relname_relid_cache[fastpg_relname_relid_cache_next];
-	fastpg_relname_relid_cache_next =
-		(fastpg_relname_relid_cache_next + 1) % FASTPG_RELNAME_RELID_CACHE_SIZE;
-
-	entry->valid = true;
-	entry->inval_count = SharedInvalidMessageCounter;
-	entry->relnamespace = relnamespace;
-	entry->relid = relid;
-	strlcpy(entry->relname, relname, NAMEDATALEN);
 }
 
 static bool
@@ -2814,7 +2756,6 @@ get_relname_relid(const char *relname, Oid relnamespace)
 {
 #ifdef USE_FASTPG
 	uint32_t	fastpg_oid;
-	Oid			cached_oid;
 
 	if (fastpg_use_rust_catalog() &&
 		fastpg_rust_catalog_relation_oid_by_name(relname,
@@ -2831,9 +2772,6 @@ get_relname_relid(const char *relname, Oid relnamespace)
 	if (fastpg_use_rust_catalog() && !IsUnderPostmaster)
 		return InvalidOid;
 
-	if (fastpg_catalog_mode_uses_postgres() &&
-		fastpg_relname_relid_cache_lookup(relname, relnamespace, &cached_oid))
-		return cached_oid;
 #endif
 
 	{
@@ -2842,10 +2780,6 @@ get_relname_relid(const char *relname, Oid relnamespace)
 		relid = GetSysCacheOid2(RELNAMENSP, Anum_pg_class_oid,
 								PointerGetDatum(relname),
 								ObjectIdGetDatum(relnamespace));
-#ifdef USE_FASTPG
-		if (fastpg_catalog_mode_uses_postgres())
-			fastpg_relname_relid_cache_store(relname, relnamespace, relid);
-#endif
 		return relid;
 	}
 }

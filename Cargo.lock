@@ -499,6 +499,7 @@ dependencies = [
  "fastpg-pgcore",
  "fastpg-server",
  "futures",
+ "postgres-types",
  "tokio",
  "tokio-postgres",
 ]

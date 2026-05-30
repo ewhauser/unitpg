@@ -2,7 +2,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::ffi::c_char;
-use std::hash::{BuildHasherDefault, Hasher};
+use std::hash::{BuildHasherDefault, Hash, Hasher};
 use std::ptr::NonNull;
 use std::slice;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
@@ -110,7 +110,7 @@ impl Hasher for FastPgStorageHasher {
 pub(crate) static STORAGE2_ARENA_REWINDS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static STORAGE2_ARENA_DROPS: AtomicU64 = AtomicU64::new(0);
 pub(crate) static STORAGE2_METADATA_CACHE: OnceLock<Mutex<Storage2MetadataCache>> = OnceLock::new();
-pub(crate) static STORAGE2_ROW_COUNTS: OnceLock<Mutex<HashMap<u32, Arc<AtomicUsize>>>> =
+pub(crate) static STORAGE2_ROW_COUNTS: OnceLock<Mutex<HashMap<RelationKey, Arc<AtomicUsize>>>> =
     OnceLock::new();
 
 mod copy;
@@ -133,7 +133,7 @@ pub use metrics::FastPgStorage2Metrics;
 pub use tid::Tid;
 pub use transaction::{
     LockedSessionStorageGuard, SessionStorageGuard, SessionStorageHandle,
-    enter_locked_session_storage, enter_session_storage, new_session_storage,
+    enter_locked_session_storage, enter_session_storage, new_session_storage, set_database_oid,
 };
 
 pub(crate) use error::*;
@@ -144,6 +144,19 @@ pub(crate) use scan::*;
 pub(crate) use state::*;
 pub(crate) use transaction::*;
 pub(crate) use tuple::*;
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_set_database(database_oid: u32) {
+    set_database_oid(database_oid);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_clone_database(
+    dst_database_oid: u32,
+    src_database_oid: u32,
+) -> bool {
+    clone_database_storage(dst_database_oid, src_database_oid)
+}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fastpg_storage2_xact_begin() {
@@ -193,6 +206,11 @@ pub extern "C" fn fastpg_storage2_xact_abort_if_implicit() {
         return;
     }
     with_storage(|state, session| state.abort_implicit_transaction(session));
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_enable_equal_cid_visibility() {
+    enable_equal_cid_visibility();
 }
 
 #[unsafe(no_mangle)]
@@ -458,6 +476,46 @@ pub extern "C" fn fastpg_storage2_relation_current_session_owns_inserted_tid(
         return false;
     };
     with_session_storage(|session| session.owns_inserted_tid(relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_current_session_invalidates_tid(
+    relid: u32,
+    packed_tid: u64,
+) -> bool {
+    let Some(tid) = Tid::unpack(packed_tid) else {
+        return false;
+    };
+    with_session_storage(|session| overlays_invalidate_tid(&session.transaction_stack, relid, tid))
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn fastpg_storage2_relation_tids_share_primary_key(
+    relid: u32,
+    left_packed_tid: u64,
+    right_packed_tid: u64,
+) -> bool {
+    let Some(left_tid) = Tid::unpack(left_packed_tid) else {
+        return false;
+    };
+    let Some(right_tid) = Tid::unpack(right_packed_tid) else {
+        return false;
+    };
+    with_storage_read(|state, session| {
+        let Some(index_spec) = primary_index_spec_for_relation_oid(Oid(relid)) else {
+            return false;
+        };
+        let Some(left_tuple) = state.find_visible_tuple(session, relid, left_tid) else {
+            return false;
+        };
+        let Some(left_key) = index_key_for_decoded(&index_spec, &left_tuple.values) else {
+            return false;
+        };
+        let Some(right_tuple) = state.find_visible_tuple(session, relid, right_tid) else {
+            return false;
+        };
+        index_key_for_decoded(&index_spec, &right_tuple.values).as_ref() == Some(&left_key)
+    })
 }
 
 #[unsafe(no_mangle)]

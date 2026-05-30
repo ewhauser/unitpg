@@ -30,6 +30,18 @@ pub struct PgCoreNotice {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PgCoreNotification {
+    pub channel: String,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PgCoreListenAction {
+    Listen(String),
+    Unlisten(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PgCoreError {
     inner: Box<PgCoreErrorInfo>,
 }
@@ -125,6 +137,10 @@ impl PgCoreError {
 
 pub fn raw_parse(sql: &str) -> Result<RawParseSummary, PgCoreError> {
     inner::raw_parse(sql)
+}
+
+pub fn validate_client_startup(database: &str, user: &str) -> Result<(), PgCoreError> {
+    inner::validate_client_startup(database, user)
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -276,6 +292,8 @@ pub struct ExecutionStatement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ExecutionResult {
     pub notices: Vec<PgCoreNotice>,
+    pub notifications: Vec<PgCoreNotification>,
+    pub listen_actions: Vec<PgCoreListenAction>,
     pub statements: Vec<ExecutionStatement>,
 }
 
@@ -283,6 +301,8 @@ pub struct ExecutionResult {
 pub enum SimpleExecutionResult {
     Command {
         notices: Vec<PgCoreNotice>,
+        notifications: Vec<PgCoreNotification>,
+        listen_actions: Vec<PgCoreListenAction>,
         tag: Cow<'static, str>,
         rows: Option<usize>,
     },
@@ -329,10 +349,15 @@ impl PgCoreSession {
     }
 
     pub fn with_database(database: impl Into<String>) -> Self {
-        Self::with_storage_sessions_and_database(
+        Self::with_database_and_user(database, "postgres")
+    }
+
+    pub fn with_database_and_user(database: impl Into<String>, user: impl Into<String>) -> Self {
+        Self::with_storage_sessions_database_and_user(
             fastpg_storage::new_session_storage(),
             fastpg_storage2::new_session_storage(),
             database,
+            user,
         )
     }
 
@@ -352,19 +377,28 @@ impl PgCoreSession {
         storage2_session: fastpg_storage2::SessionStorageHandle,
         database: impl Into<String>,
     ) -> Self {
+        Self::with_storage_sessions_database_and_user(
+            storage_session,
+            storage2_session,
+            database,
+            "postgres",
+        )
+    }
+
+    pub fn with_storage_sessions_database_and_user(
+        storage_session: fastpg_storage::SessionStorageHandle,
+        storage2_session: fastpg_storage2::SessionStorageHandle,
+        database: impl Into<String>,
+        user: impl Into<String>,
+    ) -> Self {
         let database = database.into();
         let database_oid = if inner::postgres_catalog_enabled() {
-            // PostgreSQL catalog mode currently boots a single backend database.
-            // Treat client-requested database names as aliases for that catalog
-            // so PostgreSQL-shaped test launchers can create and connect to
-            // disposable per-test databases.
-            let _ = database;
-            5
+            inner::postgres_database_oid(&database)
         } else {
             fastpg_catalog::ensure_database(&database).0
         };
         Self {
-            inner: inner::PgCoreSession::new(database_oid),
+            inner: inner::PgCoreSession::new(database_oid, user.into()),
             storage_session,
             storage2_session,
         }
@@ -552,14 +586,16 @@ mod inner {
     use std::mem::MaybeUninit;
     use std::ptr;
     use std::ptr::NonNull;
+    use std::slice;
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::{Arc, Mutex, MutexGuard};
 
     use super::{
         ExecutionResult, ExecutionStatement, PgCoreCopyColumn, PgCoreCopyIn, PgCoreCopyOut,
         PgCoreError, PgCoreErrorFields, PgCoreField, PgCoreInputDatum, PgCoreLaneMetrics,
-        PgCoreNotice, PgCoreParam, PgCoreParamFormat, PgCoreTransactionCommand, PgCoreValue,
-        RawParseSummary, SimpleExecutionResult, StatementDescription,
+        PgCoreListenAction, PgCoreNotice, PgCoreNotification, PgCoreParam, PgCoreParamFormat,
+        PgCoreTransactionCommand, PgCoreValue, RawParseSummary, SimpleExecutionResult,
+        StatementDescription,
     };
 
     static PGCORE_OPERATIONS: AtomicU64 = AtomicU64::new(0);
@@ -567,11 +603,13 @@ mod inner {
     static PGCORE_MAX_ACTIVE: AtomicU64 = AtomicU64::new(0);
     static PGCORE_EXECUTION_NANOS: AtomicU64 = AtomicU64::new(0);
     static PGCORE_CATALOG_GENERATION: AtomicU64 = AtomicU64::new(0);
+    static NEXT_PGCORE_SESSION_TOKEN: AtomicU64 = AtomicU64::new(1);
     static PGCORE_LANE_LOCK: Mutex<()> = Mutex::new(());
     const STACK_SQL_BUFFER_LEN: usize = 1024;
 
     thread_local! {
         static CURRENT_DATABASE_OID: Cell<u32> = const { Cell::new(0) };
+        static PGCORE_LANE_DEPTH: Cell<usize> = const { Cell::new(0) };
     }
 
     pub fn pgcore_lane_metrics() -> PgCoreLaneMetrics {
@@ -586,13 +624,37 @@ mod inner {
 
     struct PgCoreLaneGuard {
         _lock: Option<MutexGuard<'static, ()>>,
+        catalog_lane_entered: bool,
+        previous_catalog_lane_token: u64,
     }
 
     fn enter_pgcore_lane(_operation: &'static str) -> PgCoreLaneGuard {
+        enter_pgcore_lane_with_token(_operation, 0)
+    }
+
+    fn enter_pgcore_lane_with_token(
+        _operation: &'static str,
+        catalog_lane_token: u64,
+    ) -> PgCoreLaneGuard {
         // The embedded upstream backend still has process-global state in
         // Postgres-catalog mode, including session reset and login hooks.
-        let lock = if postgres_catalog_enabled() {
-            Some(lock_pgcore_lane_when_catalog_turn_is_ready())
+        let catalog_lane_entered = postgres_catalog_enabled();
+        let previous_catalog_lane_token = if catalog_lane_entered {
+            unsafe { fastpg_pgcore_set_catalog_lane_token(catalog_lane_token) }
+        } else {
+            0
+        };
+        let lock = if catalog_lane_entered {
+            let already_entered = PGCORE_LANE_DEPTH.with(|depth| {
+                let current = depth.get();
+                depth.set(current + 1);
+                current > 0
+            });
+            if already_entered {
+                None
+            } else {
+                Some(lock_pgcore_lane_when_catalog_turn_is_ready())
+            }
         } else {
             None
         };
@@ -600,7 +662,11 @@ mod inner {
         PGCORE_OPERATIONS.fetch_add(1, Ordering::Relaxed);
         update_max_active(active);
         refresh_pgcore_caches_if_catalog_changed();
-        PgCoreLaneGuard { _lock: lock }
+        PgCoreLaneGuard {
+            _lock: lock,
+            catalog_lane_entered,
+            previous_catalog_lane_token,
+        }
     }
 
     fn lock_pgcore_lane_when_catalog_turn_is_ready() -> MutexGuard<'static, ()> {
@@ -624,6 +690,14 @@ mod inner {
 
     impl Drop for PgCoreLaneGuard {
         fn drop(&mut self) {
+            if self.catalog_lane_entered {
+                PGCORE_LANE_DEPTH.with(|depth| {
+                    depth.set(depth.get().saturating_sub(1));
+                });
+                unsafe {
+                    fastpg_pgcore_set_catalog_lane_token(self.previous_catalog_lane_token);
+                }
+            }
             PGCORE_ACTIVE.fetch_sub(1, Ordering::Relaxed);
         }
     }
@@ -658,7 +732,8 @@ mod inner {
     }
 
     fn set_pgcore_database(database_oid: u32) {
-        if database_oid != 0 {
+        fastpg_storage2::set_database_oid(database_oid);
+        if database_oid != 0 && !postgres_catalog_enabled() {
             let current = CURRENT_DATABASE_OID.with(Cell::get);
             if current == database_oid {
                 return;
@@ -669,6 +744,44 @@ mod inner {
             fastpg_pgcore_set_database(database_oid);
         }
         CURRENT_DATABASE_OID.with(|current| current.set(database_oid));
+    }
+
+    pub(super) fn postgres_database_oid(database: &str) -> u32 {
+        let _guard = enter_pgcore_lane("database_oid");
+        let database = cstring_or_postgres(database.to_owned());
+        let oid = unsafe { fastpg_pgcore_database_oid(database.as_ptr()) };
+        if oid == 0 { 5 } else { oid }
+    }
+
+    pub(super) fn validate_client_startup(database: &str, user: &str) -> Result<(), PgCoreError> {
+        let _guard = enter_pgcore_lane("validate_client_startup");
+        let database_name = if database.is_empty() {
+            "postgres"
+        } else {
+            database
+        };
+        let database_c = cstring_or_postgres(database_name.to_owned());
+        let database_oid = unsafe { fastpg_pgcore_database_oid(database_c.as_ptr()) };
+        if database_oid == 0 {
+            return Err(PgCoreError::new(
+                "3D000",
+                format!("database \"{database_name}\" does not exist"),
+                0,
+            ));
+        }
+
+        let user_name = if user.is_empty() { "postgres" } else { user };
+        let user_c = cstring_or_postgres(user_name.to_owned());
+        let role_exists = unsafe { fastpg_pgcore_role_exists(user_c.as_ptr()) };
+        if !role_exists {
+            return Err(PgCoreError::new(
+                "28000",
+                format!("role \"{user_name}\" does not exist"),
+                0,
+            ));
+        }
+
+        Ok(())
     }
 
     pub(super) fn postgres_catalog_enabled() -> bool {
@@ -729,9 +842,16 @@ mod inner {
         fn fastpg_xid_commit();
         fn fastpg_xid_rollback();
         fn fastpg_pgcore_invalidate_system_caches();
+        fn fastpg_pgcore_database_oid(database_name: *const c_char) -> u32;
         fn fastpg_pgcore_set_database(database_oid: u32);
+        fn fastpg_pgcore_role_exists(user_name: *const c_char) -> bool;
         fn fastpg_pgcore_wait_catalog_lane_turn();
         fn fastpg_pgcore_catalog_lane_turn_ready() -> bool;
+        fn fastpg_pgcore_set_catalog_lane_token(token: u64) -> u64;
+        fn fastpg_pgcore_capture_guc_state(state: *mut *mut u8, state_len: *mut usize) -> bool;
+        fn fastpg_pgcore_restore_guc_state(state: *const u8, state_len: usize) -> bool;
+        fn fastpg_pgcore_guc_state_free(state: *mut u8);
+        fn fastpg_pgcore_set_database_search_path();
         fn fastpg_pgcore_notice_capture_begin();
         fn fastpg_pgcore_notice_capture_end();
         fn fastpg_pgcore_notice_capture_clear();
@@ -744,7 +864,7 @@ mod inner {
         fn fastpg_pgcore_notice_capture_context(index: i32) -> *const c_char;
         fn fastpg_pgcore_notice_capture_cursorpos(index: i32) -> i32;
         fn fastpg_pgcore_reset_session_state();
-        fn fastpg_pgcore_start_client_session();
+        fn fastpg_pgcore_start_client_session(user_name: *const c_char) -> bool;
         fn fastpg_pgcore_end_client_session();
         fn fastpg_pgcore_parse_result_free(result: *mut FastPgPgCoreParseResult);
         fn fastpg_pgcore_parse_result_ok(result: *const FastPgPgCoreParseResult) -> bool;
@@ -901,6 +1021,28 @@ mod inner {
             result: *const FastPgPgCoreExecuteResult,
             notice_index: i32,
         ) -> i32;
+        fn fastpg_pgcore_execute_notification_count(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> i32;
+        fn fastpg_pgcore_execute_notification_channel(
+            result: *const FastPgPgCoreExecuteResult,
+            notification_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_notification_payload(
+            result: *const FastPgPgCoreExecuteResult,
+            notification_index: i32,
+        ) -> *const c_char;
+        fn fastpg_pgcore_execute_listen_action_count(
+            result: *const FastPgPgCoreExecuteResult,
+        ) -> i32;
+        fn fastpg_pgcore_execute_listen_action_kind(
+            result: *const FastPgPgCoreExecuteResult,
+            action_index: i32,
+        ) -> i32;
+        fn fastpg_pgcore_execute_listen_action_channel(
+            result: *const FastPgPgCoreExecuteResult,
+            action_index: i32,
+        ) -> *const c_char;
         fn fastpg_pgcore_execute_statement_count(result: *const FastPgPgCoreExecuteResult) -> i32;
         fn fastpg_pgcore_execute_statement_summaries(
             result: *const FastPgPgCoreExecuteResult,
@@ -1153,6 +1295,48 @@ mod inner {
         f(c_sql.as_ptr())
     }
 
+    fn cstring_or_postgres(value: String) -> CString {
+        CString::new(value).unwrap_or_else(|_| CString::new("postgres").expect("valid C string"))
+    }
+
+    fn capture_guc_state() -> Result<Vec<u8>, PgCoreError> {
+        let mut state = ptr::null_mut();
+        let mut state_len = 0usize;
+        let ok = unsafe { fastpg_pgcore_capture_guc_state(&mut state, &mut state_len) };
+        if !ok {
+            return Err(PgCoreError::new(
+                "XX000",
+                "PostgreSQL GUC state capture failed",
+                0,
+            ));
+        }
+        let captured = if state.is_null() || state_len == 0 {
+            Vec::new()
+        } else {
+            unsafe { slice::from_raw_parts(state, state_len) }.to_vec()
+        };
+        unsafe {
+            fastpg_pgcore_guc_state_free(state);
+        }
+        Ok(captured)
+    }
+
+    fn restore_guc_state(state: Option<&[u8]>) -> Result<(), PgCoreError> {
+        let Some(state) = state else {
+            return Ok(());
+        };
+        let ok = unsafe { fastpg_pgcore_restore_guc_state(state.as_ptr(), state.len()) };
+        if ok {
+            Ok(())
+        } else {
+            Err(PgCoreError::new(
+                "XX000",
+                "PostgreSQL GUC state restore failed",
+                0,
+            ))
+        }
+    }
+
     pub fn raw_parse(sql: &str) -> Result<RawParseSummary, PgCoreError> {
         check_sql(sql)?;
         let _guard = enter_pgcore_lane("raw_parse");
@@ -1311,37 +1495,89 @@ mod inner {
     #[derive(Clone, Debug)]
     pub struct PgCoreSession {
         database_oid: u32,
+        catalog_lane_token: u64,
+        user: CString,
+        guc_state: Arc<Mutex<Option<Vec<u8>>>>,
     }
 
     impl PgCoreSession {
-        pub fn new(database_oid: u32) -> Self {
+        pub fn new(database_oid: u32, user: String) -> Self {
             let _ = fastpg_storage::fastpg_rust_relation_row_count(0);
-            Self { database_oid }
+            Self {
+                database_oid,
+                catalog_lane_token: NEXT_PGCORE_SESSION_TOKEN.fetch_add(1, Ordering::Relaxed),
+                user: cstring_or_postgres(user),
+                guc_state: Arc::new(Mutex::new(None)),
+            }
         }
 
         fn set_database(&self) {
             set_pgcore_database(self.database_oid);
         }
 
+        fn clear_guc_state(&self) {
+            *self
+                .guc_state
+                .lock()
+                .expect("fastpg pgcore GUC-state mutex poisoned") = None;
+        }
+
+        fn save_guc_state(&self) -> Result<(), PgCoreError> {
+            let captured = capture_guc_state()?;
+            *self
+                .guc_state
+                .lock()
+                .expect("fastpg pgcore GUC-state mutex poisoned") = Some(captured);
+            Ok(())
+        }
+
+        fn with_guc_state<R>(
+            &self,
+            operation: impl FnOnce() -> Result<R, PgCoreError>,
+        ) -> Result<R, PgCoreError> {
+            let mut guc_state = self
+                .guc_state
+                .lock()
+                .expect("fastpg pgcore GUC-state mutex poisoned");
+            restore_guc_state(guc_state.as_deref())?;
+            unsafe {
+                fastpg_pgcore_set_database_search_path();
+            }
+            let result = operation();
+            match capture_guc_state() {
+                Ok(captured) => {
+                    *guc_state = Some(captured);
+                }
+                Err(error) if result.is_ok() => return Err(error),
+                Err(_) => {}
+            }
+            result
+        }
+
         pub fn reset_session_state(&self) {
-            let _guard = enter_pgcore_lane("reset_session_state");
+            let _guard =
+                enter_pgcore_lane_with_token("reset_session_state", self.catalog_lane_token);
             unsafe {
                 fastpg_pgcore_reset_session_state();
             }
+            self.clear_guc_state();
         }
 
         pub fn start_client_session(&self) -> Vec<PgCoreNotice> {
-            let _guard = enter_pgcore_lane("start_client_session");
+            let _guard =
+                enter_pgcore_lane_with_token("start_client_session", self.catalog_lane_token);
             self.set_database();
             let notice_capture = NoticeCaptureGuard::begin();
             unsafe {
-                fastpg_pgcore_start_client_session();
+                fastpg_pgcore_start_client_session(self.user.as_ptr());
             }
+            let _ = self.save_guc_state();
             notice_capture.finish()
         }
 
         pub fn end_client_session(&self) {
-            let _guard = enter_pgcore_lane("end_client_session");
+            let _guard =
+                enter_pgcore_lane_with_token("end_client_session", self.catalog_lane_token);
             unsafe {
                 fastpg_pgcore_end_client_session();
             }
@@ -1349,125 +1585,141 @@ mod inner {
 
         pub fn prepare(&self, sql: &str) -> Result<PreparedStatement, PgCoreError> {
             check_sql(sql)?;
-            let _guard = enter_pgcore_lane("prepare");
+            let _guard = enter_pgcore_lane_with_token("prepare", self.catalog_lane_token);
             self.set_database();
-            let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
-            let Some(prepared) = NonNull::new(prepared) else {
-                return Err(PgCoreError::new(
-                    "XX000",
-                    "PostgreSQL prepare returned a null result",
-                    0,
-                ));
-            };
-            let prepared = PreparedStatement {
-                prepared,
-                database_oid: self.database_oid,
-            };
-            if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
-                drop(_guard);
-                Ok(prepared)
-            } else {
-                let error = PgCoreError::with_fields(
-                    unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared.as_ptr())) },
-                    unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
-                    PgCoreErrorFields {
-                        detail: unsafe {
-                            optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr()))
+            self.with_guc_state(|| {
+                let prepared = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_prepare(c_sql) });
+                let Some(prepared) = NonNull::new(prepared) else {
+                    return Err(PgCoreError::new(
+                        "XX000",
+                        "PostgreSQL prepare returned a null result",
+                        0,
+                    ));
+                };
+                let prepared = PreparedStatement {
+                    prepared,
+                    database_oid: self.database_oid,
+                    catalog_lane_token: self.catalog_lane_token,
+                    guc_state: self.guc_state.clone(),
+                };
+                if unsafe { fastpg_pgcore_prepared_ok(prepared.as_ptr()) } {
+                    Ok(prepared)
+                } else {
+                    let error = PgCoreError::with_fields(
+                        unsafe { c_string(fastpg_pgcore_prepared_sqlstate(prepared.as_ptr())) },
+                        unsafe { c_string(fastpg_pgcore_prepared_message(prepared.as_ptr())) },
+                        PgCoreErrorFields {
+                            detail: unsafe {
+                                optional_c_string(fastpg_pgcore_prepared_detail(prepared.as_ptr()))
+                            },
+                            hint: unsafe {
+                                optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr()))
+                            },
+                            context: unsafe {
+                                optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr()))
+                            },
+                            cursorpos: unsafe {
+                                fastpg_pgcore_prepared_cursorpos(prepared.as_ptr())
+                            },
+                            internal_query: unsafe {
+                                optional_c_string(fastpg_pgcore_prepared_internal_query(
+                                    prepared.as_ptr(),
+                                ))
+                            },
+                            internalpos: unsafe {
+                                fastpg_pgcore_prepared_internalpos(prepared.as_ptr())
+                            },
+                            notices: prepared_notices_from_ptr(prepared.as_ptr()),
+                            ..Default::default()
                         },
-                        hint: unsafe {
-                            optional_c_string(fastpg_pgcore_prepared_hint(prepared.as_ptr()))
-                        },
-                        context: unsafe {
-                            optional_c_string(fastpg_pgcore_prepared_context(prepared.as_ptr()))
-                        },
-                        cursorpos: unsafe { fastpg_pgcore_prepared_cursorpos(prepared.as_ptr()) },
-                        internal_query: unsafe {
-                            optional_c_string(fastpg_pgcore_prepared_internal_query(
-                                prepared.as_ptr(),
-                            ))
-                        },
-                        internalpos: unsafe {
-                            fastpg_pgcore_prepared_internalpos(prepared.as_ptr())
-                        },
-                        notices: prepared_notices_from_ptr(prepared.as_ptr()),
-                        ..Default::default()
-                    },
-                );
-                drop(_guard);
-                Err(error)
-            }
+                    );
+                    Err(error)
+                }
+            })
         }
 
         pub fn execute_simple(&self, sql: &str) -> Result<ExecutionResult, PgCoreError> {
             check_sql(sql)?;
-            let _guard = enter_pgcore_lane("execute_simple");
+            let _guard = enter_pgcore_lane_with_token("execute_simple", self.catalog_lane_token);
             self.set_database();
-            let result = with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_execute_simple(c_sql) });
-            execution_result_from_ptr(result)
+            self.with_guc_state(|| {
+                let result =
+                    with_c_sql(sql, |c_sql| unsafe { fastpg_pgcore_execute_simple(c_sql) });
+                execution_result_from_ptr(result)
+            })
         }
 
         pub fn execute_simple_cstr(&self, sql: &CStr) -> Result<ExecutionResult, PgCoreError> {
-            let _guard = enter_pgcore_lane("execute_simple");
+            let _guard = enter_pgcore_lane_with_token("execute_simple", self.catalog_lane_token);
             self.set_database();
-            let result = unsafe { fastpg_pgcore_execute_simple(sql.as_ptr()) };
-            execution_result_from_ptr(result)
+            self.with_guc_state(|| {
+                let result = unsafe { fastpg_pgcore_execute_simple(sql.as_ptr()) };
+                execution_result_from_ptr(result)
+            })
         }
 
         pub fn execute_simple_cstr_fast(
             &self,
             sql: &CStr,
         ) -> Result<SimpleExecutionResult, PgCoreError> {
-            let _guard = enter_pgcore_lane("execute_simple");
+            let _guard = enter_pgcore_lane_with_token("execute_simple", self.catalog_lane_token);
             self.set_database();
-            let result = unsafe { fastpg_pgcore_execute_simple(sql.as_ptr()) };
-            simple_execution_result_from_ptr(result)
+            self.with_guc_state(|| {
+                let result = unsafe { fastpg_pgcore_execute_simple(sql.as_ptr()) };
+                simple_execution_result_from_ptr(result)
+            })
         }
 
         pub fn execute_transaction_command(
             &self,
             command: PgCoreTransactionCommand,
         ) -> Result<ExecutionResult, PgCoreError> {
-            let _guard = enter_pgcore_lane("transaction_command");
+            let _guard =
+                enter_pgcore_lane_with_token("transaction_command", self.catalog_lane_token);
             self.set_database();
-            if postgres_catalog_enabled() {
-                let result =
-                    unsafe { fastpg_pgcore_execute_transaction_command(command.pgcore_code()) };
-                return execution_result_from_ptr(result);
-            }
-            match command {
-                PgCoreTransactionCommand::Begin => {
-                    unsafe {
-                        fastpg_xid_begin();
-                    }
-                    fastpg_storage::begin_explicit_transaction();
-                    fastpg_storage2::fastpg_storage2_xact_begin();
+            self.with_guc_state(|| {
+                if postgres_catalog_enabled() {
+                    let result =
+                        unsafe { fastpg_pgcore_execute_transaction_command(command.pgcore_code()) };
+                    return execution_result_from_ptr(result);
                 }
-                PgCoreTransactionCommand::Commit => {
-                    unsafe {
-                        fastpg_xid_commit();
+                match command {
+                    PgCoreTransactionCommand::Begin => {
+                        unsafe {
+                            fastpg_xid_begin();
+                        }
+                        fastpg_storage::begin_explicit_transaction();
+                        fastpg_storage2::fastpg_storage2_xact_begin();
                     }
-                    fastpg_storage::commit_explicit_transaction();
-                    fastpg_storage2::fastpg_storage2_xact_commit();
-                }
-                PgCoreTransactionCommand::Rollback => {
-                    unsafe {
-                        fastpg_xid_rollback();
+                    PgCoreTransactionCommand::Commit => {
+                        unsafe {
+                            fastpg_xid_commit();
+                        }
+                        fastpg_storage::commit_explicit_transaction();
+                        fastpg_storage2::fastpg_storage2_xact_commit();
                     }
-                    fastpg_storage::abort_explicit_transaction();
-                    fastpg_storage2::fastpg_storage2_xact_abort();
+                    PgCoreTransactionCommand::Rollback => {
+                        unsafe {
+                            fastpg_xid_rollback();
+                        }
+                        fastpg_storage::abort_explicit_transaction();
+                        fastpg_storage2::fastpg_storage2_xact_abort();
+                    }
                 }
-            }
-            Ok(ExecutionResult {
-                statements: vec![ExecutionStatement {
-                    command_tag: command.command_tag().into(),
-                    command_rows: None,
-                    is_select: false,
-                    fields: Vec::new(),
-                    rows: Vec::new(),
-                    copy_in: None,
-                    copy_out: None,
-                }],
-                notices: Vec::new(),
+                Ok(ExecutionResult {
+                    statements: vec![ExecutionStatement {
+                        command_tag: command.command_tag().into(),
+                        command_rows: None,
+                        is_select: false,
+                        fields: Vec::new(),
+                        rows: Vec::new(),
+                        copy_in: None,
+                        copy_out: None,
+                    }],
+                    notices: Vec::new(),
+                    notifications: Vec::new(),
+                    listen_actions: Vec::new(),
+                })
             })
         }
 
@@ -1477,16 +1729,18 @@ mod inner {
             data: &[u8],
         ) -> Result<ExecutionResult, PgCoreError> {
             check_sql(sql)?;
-            let _guard = enter_pgcore_lane("copy_from_stdin");
+            let _guard = enter_pgcore_lane_with_token("copy_from_stdin", self.catalog_lane_token);
             self.set_database();
-            let result = with_c_sql(sql, |c_sql| unsafe {
-                fastpg_pgcore_execute_copy_from_stdin(
-                    c_sql,
-                    data.as_ptr().cast::<c_char>(),
-                    data.len(),
-                )
-            });
-            execution_result_from_ptr(result)
+            self.with_guc_state(|| {
+                let result = with_c_sql(sql, |c_sql| unsafe {
+                    fastpg_pgcore_execute_copy_from_stdin(
+                        c_sql,
+                        data.as_ptr().cast::<c_char>(),
+                        data.len(),
+                    )
+                });
+                execution_result_from_ptr(result)
+            })
         }
 
         pub fn input_text_datum(
@@ -1498,74 +1752,82 @@ mod inner {
             let value = CString::new(value).map_err(|_| {
                 PgCoreError::new("22023", "COPY text value contains an embedded NUL byte", 0)
             })?;
-            let _guard = enter_pgcore_lane("input_text_datum");
+            let _guard = enter_pgcore_lane_with_token("input_text_datum", self.catalog_lane_token);
             self.set_database();
-            let result =
-                unsafe { fastpg_pgcore_input_text_datum(type_oid, typmod, value.as_ptr()) };
-            let Some(result) = NonNull::new(result) else {
-                return Err(PgCoreError::new(
-                    "XX000",
-                    "PostgreSQL type input returned a null result",
-                    0,
-                ));
-            };
-            let result = InputDatumResult(result);
-            if unsafe { fastpg_pgcore_input_datum_result_ok(result.as_ptr()) } {
-                let typbyval =
-                    unsafe { fastpg_pgcore_input_datum_result_typbyval(result.as_ptr()) };
-                let value = unsafe { fastpg_pgcore_input_datum_result_value(result.as_ptr()) };
-                let typlen = unsafe { fastpg_pgcore_input_datum_result_typlen(result.as_ptr()) };
-                let payload = if typbyval {
-                    None
-                } else {
-                    let len =
-                        unsafe { fastpg_pgcore_input_datum_result_value_len(result.as_ptr()) };
-                    let ptr = unsafe { fastpg_pgcore_input_datum_result_payload(result.as_ptr()) };
-                    if len == 0 {
-                        Some(Vec::new())
-                    } else if ptr.is_null() {
-                        return Err(PgCoreError::new(
-                            "XX000",
-                            "PostgreSQL type input returned a null by-reference payload",
-                            0,
-                        ));
-                    } else {
-                        Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
-                    }
+            self.with_guc_state(|| {
+                let result =
+                    unsafe { fastpg_pgcore_input_text_datum(type_oid, typmod, value.as_ptr()) };
+                let Some(result) = NonNull::new(result) else {
+                    return Err(PgCoreError::new(
+                        "XX000",
+                        "PostgreSQL type input returned a null result",
+                        0,
+                    ));
                 };
-                Ok(PgCoreInputDatum {
-                    value,
-                    typbyval,
-                    typlen,
-                    payload,
-                })
-            } else {
-                Err(PgCoreError::with_fields(
-                    unsafe { c_string(fastpg_pgcore_input_datum_result_sqlstate(result.as_ptr())) },
-                    unsafe { c_string(fastpg_pgcore_input_datum_result_message(result.as_ptr())) },
-                    PgCoreErrorFields {
-                        detail: unsafe {
-                            optional_c_string(fastpg_pgcore_input_datum_result_detail(
-                                result.as_ptr(),
-                            ))
+                let result = InputDatumResult(result);
+                if unsafe { fastpg_pgcore_input_datum_result_ok(result.as_ptr()) } {
+                    let typbyval =
+                        unsafe { fastpg_pgcore_input_datum_result_typbyval(result.as_ptr()) };
+                    let value = unsafe { fastpg_pgcore_input_datum_result_value(result.as_ptr()) };
+                    let typlen =
+                        unsafe { fastpg_pgcore_input_datum_result_typlen(result.as_ptr()) };
+                    let payload = if typbyval {
+                        None
+                    } else {
+                        let len =
+                            unsafe { fastpg_pgcore_input_datum_result_value_len(result.as_ptr()) };
+                        let ptr =
+                            unsafe { fastpg_pgcore_input_datum_result_payload(result.as_ptr()) };
+                        if len == 0 {
+                            Some(Vec::new())
+                        } else if ptr.is_null() {
+                            return Err(PgCoreError::new(
+                                "XX000",
+                                "PostgreSQL type input returned a null by-reference payload",
+                                0,
+                            ));
+                        } else {
+                            Some(unsafe { std::slice::from_raw_parts(ptr, len) }.to_vec())
+                        }
+                    };
+                    Ok(PgCoreInputDatum {
+                        value,
+                        typbyval,
+                        typlen,
+                        payload,
+                    })
+                } else {
+                    Err(PgCoreError::with_fields(
+                        unsafe {
+                            c_string(fastpg_pgcore_input_datum_result_sqlstate(result.as_ptr()))
                         },
-                        hint: unsafe {
-                            optional_c_string(fastpg_pgcore_input_datum_result_hint(
-                                result.as_ptr(),
-                            ))
+                        unsafe {
+                            c_string(fastpg_pgcore_input_datum_result_message(result.as_ptr()))
                         },
-                        context: unsafe {
-                            optional_c_string(fastpg_pgcore_input_datum_result_context(
-                                result.as_ptr(),
-                            ))
+                        PgCoreErrorFields {
+                            detail: unsafe {
+                                optional_c_string(fastpg_pgcore_input_datum_result_detail(
+                                    result.as_ptr(),
+                                ))
+                            },
+                            hint: unsafe {
+                                optional_c_string(fastpg_pgcore_input_datum_result_hint(
+                                    result.as_ptr(),
+                                ))
+                            },
+                            context: unsafe {
+                                optional_c_string(fastpg_pgcore_input_datum_result_context(
+                                    result.as_ptr(),
+                                ))
+                            },
+                            cursorpos: unsafe {
+                                fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr())
+                            },
+                            ..Default::default()
                         },
-                        cursorpos: unsafe {
-                            fastpg_pgcore_input_datum_result_cursorpos(result.as_ptr())
-                        },
-                        ..Default::default()
-                    },
-                ))
-            }
+                    ))
+                }
+            })
         }
     }
 
@@ -1589,6 +1851,8 @@ mod inner {
     pub struct PreparedStatement {
         prepared: NonNull<FastPgPgCorePrepared>,
         database_oid: u32,
+        catalog_lane_token: u64,
+        guc_state: Arc<Mutex<Option<Vec<u8>>>>,
     }
 
     impl PreparedStatement {
@@ -1600,8 +1864,31 @@ mod inner {
             set_pgcore_database(self.database_oid);
         }
 
+        fn with_guc_state<R>(
+            &self,
+            operation: impl FnOnce() -> Result<R, PgCoreError>,
+        ) -> Result<R, PgCoreError> {
+            let mut guc_state = self
+                .guc_state
+                .lock()
+                .expect("fastpg pgcore GUC-state mutex poisoned");
+            restore_guc_state(guc_state.as_deref())?;
+            unsafe {
+                fastpg_pgcore_set_database_search_path();
+            }
+            let result = operation();
+            match capture_guc_state() {
+                Ok(captured) => {
+                    *guc_state = Some(captured);
+                }
+                Err(error) if result.is_ok() => return Err(error),
+                Err(_) => {}
+            }
+            result
+        }
+
         pub fn describe(&self) -> StatementDescription {
-            let _guard = enter_pgcore_lane("describe");
+            let _guard = enter_pgcore_lane_with_token("describe", self.catalog_lane_token);
             self.set_database();
             let parameter_count =
                 unsafe { fastpg_pgcore_prepared_parameter_count(self.as_ptr()) }.max(0);
@@ -1637,11 +1924,13 @@ mod inner {
             params: &[PgCoreParam],
         ) -> Result<ExecutionResult, PgCoreError> {
             if params.is_empty() {
-                let _guard = enter_pgcore_lane("execute");
+                let _guard = enter_pgcore_lane_with_token("execute", self.catalog_lane_token);
                 self.set_database();
                 let notice_capture = NoticeCaptureGuard::begin();
-                let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
-                let result = execution_result_from_ptr(result);
+                let result = self.with_guc_state(|| {
+                    let result = unsafe { fastpg_pgcore_execute(self.as_ptr()) };
+                    execution_result_from_ptr(result)
+                });
                 let notices = notice_capture.finish();
                 return result.map(|mut result| {
                     result.notices = notices;
@@ -1650,10 +1939,12 @@ mod inner {
             }
 
             let encoded_params = EncodedParams::new(params)?;
-            let _guard = enter_pgcore_lane("execute");
+            let _guard = enter_pgcore_lane_with_token("execute", self.catalog_lane_token);
             self.set_database();
             let notice_capture = NoticeCaptureGuard::begin();
-            let result = execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params);
+            let result = self.with_guc_state(|| {
+                execute_prepared_ptr_with_params(self.as_ptr(), &encoded_params)
+            });
             let notices = notice_capture.finish();
             result.map(|mut result| {
                 result.notices = notices;
@@ -1915,7 +2206,15 @@ mod inner {
         if unsafe { fastpg_pgcore_execute_result_ok(result.as_ptr()) } {
             if let Some((tag, rows)) = result.to_single_command() {
                 let notices = result.to_notices();
-                Ok(SimpleExecutionResult::Command { notices, tag, rows })
+                let notifications = result.to_notifications();
+                let listen_actions = result.to_listen_actions();
+                Ok(SimpleExecutionResult::Command {
+                    notices,
+                    notifications,
+                    listen_actions,
+                    tag,
+                    rows,
+                })
             } else {
                 Ok(SimpleExecutionResult::Full(result.to_execution_result()))
             }
@@ -1954,7 +2253,7 @@ mod inner {
 
     impl Drop for PreparedStatement {
         fn drop(&mut self) {
-            let _guard = enter_pgcore_lane("prepared_free");
+            let _guard = enter_pgcore_lane_with_token("prepared_free", self.catalog_lane_token);
             unsafe {
                 fastpg_pgcore_prepared_free(self.prepared.as_ptr());
             }
@@ -2019,6 +2318,51 @@ mod inner {
             notices
         }
 
+        fn to_notifications(&self) -> Vec<PgCoreNotification> {
+            let notification_count =
+                unsafe { fastpg_pgcore_execute_notification_count(self.as_ptr()) }.max(0);
+            let mut notifications = Vec::with_capacity(notification_count as usize);
+            for notification_index in 0..notification_count {
+                notifications.push(PgCoreNotification {
+                    channel: unsafe {
+                        c_string(fastpg_pgcore_execute_notification_channel(
+                            self.as_ptr(),
+                            notification_index,
+                        ))
+                    },
+                    payload: unsafe {
+                        c_string(fastpg_pgcore_execute_notification_payload(
+                            self.as_ptr(),
+                            notification_index,
+                        ))
+                    },
+                });
+            }
+            notifications
+        }
+
+        fn to_listen_actions(&self) -> Vec<PgCoreListenAction> {
+            let action_count =
+                unsafe { fastpg_pgcore_execute_listen_action_count(self.as_ptr()) }.max(0);
+            let mut actions = Vec::with_capacity(action_count as usize);
+            for action_index in 0..action_count {
+                let channel = unsafe {
+                    c_string(fastpg_pgcore_execute_listen_action_channel(
+                        self.as_ptr(),
+                        action_index,
+                    ))
+                };
+                match unsafe {
+                    fastpg_pgcore_execute_listen_action_kind(self.as_ptr(), action_index)
+                } {
+                    0 => actions.push(PgCoreListenAction::Listen(channel)),
+                    1 => actions.push(PgCoreListenAction::Unlisten(channel)),
+                    _ => {}
+                }
+            }
+            actions
+        }
+
         fn to_single_command(&self) -> Option<(Cow<'static, str>, Option<usize>)> {
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
@@ -2048,6 +2392,8 @@ mod inner {
 
         fn to_execution_result(&self) -> ExecutionResult {
             let notices = self.to_notices();
+            let notifications = self.to_notifications();
+            let listen_actions = self.to_listen_actions();
             let statement_count =
                 unsafe { fastpg_pgcore_execute_statement_count(self.as_ptr()) }.max(0);
             let statement_len = statement_count as usize;
@@ -2442,6 +2788,8 @@ mod inner {
             }
             ExecutionResult {
                 notices,
+                notifications,
+                listen_actions,
                 statements,
             }
         }
@@ -2471,6 +2819,14 @@ mod inner {
         false
     }
 
+    pub(super) fn postgres_database_oid(_database: &str) -> u32 {
+        5
+    }
+
+    pub(super) fn validate_client_startup(_database: &str, _user: &str) -> Result<(), PgCoreError> {
+        Ok(())
+    }
+
     pub fn raw_parse(_sql: &str) -> Result<RawParseSummary, PgCoreError> {
         Ok(RawParseSummary { statement_count: 0 })
     }
@@ -2479,7 +2835,7 @@ mod inner {
     pub struct PgCoreSession;
 
     impl PgCoreSession {
-        pub fn new(_database_oid: u32) -> Self {
+        pub fn new(_database_oid: u32, _user: String) -> Self {
             Self
         }
 
@@ -2706,6 +3062,83 @@ mod tests {
         assert_eq!(
             result.statements[0].rows,
             vec![vec![PgCoreValue::Text("public".to_owned())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn custom_guc_state_is_isolated_between_pgcore_sessions() {
+        let first = PgCoreSession::new();
+        let second = PgCoreSession::new();
+        let third = PgCoreSession::new();
+
+        first.execute_simple("select 1").unwrap();
+        second.execute_simple("select 1").unwrap();
+        third.execute_simple("select 1").unwrap();
+
+        first
+            .execute_simple("select set_config('app.current_health_system_id', '123', false)")
+            .unwrap();
+        second
+            .execute_simple("select set_config('app.current_health_system_id', '321', false)")
+            .unwrap();
+
+        let first_current = first
+            .prepare("select current_setting('app.current_health_system_id', true)")
+            .unwrap();
+        let second_current = second
+            .prepare("select current_setting('app.current_health_system_id', true)")
+            .unwrap();
+
+        assert_eq!(
+            second_current.execute().unwrap().statements[0].rows,
+            vec![vec![PgCoreValue::Text("321".to_owned())]]
+        );
+        assert_eq!(
+            first_current.execute().unwrap().statements[0].rows,
+            vec![vec![PgCoreValue::Text("123".to_owned())]]
+        );
+
+        let result = third
+            .execute_simple(
+                "select coalesce(current_setting('app.current_health_system_id', true), '')",
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text(String::new())]]
+        );
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn custom_guc_set_inside_explicit_transaction_survives_until_rollback() {
+        let session = PgCoreSession::new();
+
+        session.execute_simple("begin").unwrap();
+        session
+            .execute_simple("select set_config('app.current_health_system_id', '*', false)")
+            .unwrap();
+
+        for _ in 0..3 {
+            let result = session
+                .execute_simple("select current_setting('app.current_health_system_id', true)")
+                .unwrap();
+            assert_eq!(
+                result.statements[0].rows,
+                vec![vec![PgCoreValue::Text("*".to_owned())]]
+            );
+        }
+
+        session.execute_simple("rollback").unwrap();
+        let result = session
+            .execute_simple(
+                "select coalesce(current_setting('app.current_health_system_id', true), '')",
+            )
+            .unwrap();
+        assert_eq!(
+            result.statements[0].rows,
+            vec![vec![PgCoreValue::Text(String::new())]]
         );
     }
 
@@ -3184,6 +3617,29 @@ mod tests {
         session
             .execute_simple(&format!("drop function if exists {function}()"))
             .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn execute_simple_many_statement_results_survive_statement_growth() {
+        let session = PgCoreSession::new();
+        let sql = (0..48)
+            .map(|value| format!("select {value}::bigint"))
+            .collect::<Vec<_>>()
+            .join("; ");
+
+        let result = session.execute_simple(&sql).unwrap();
+
+        assert_eq!(result.statements.len(), 48);
+        for (index, statement) in result.statements.iter().enumerate() {
+            assert_eq!(
+                statement.rows,
+                vec![vec![PgCoreValue::TextWithBinary {
+                    text: index.to_string(),
+                    binary: (index as i64).to_be_bytes().to_vec(),
+                }]]
+            );
+        }
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -3904,6 +4360,62 @@ mod tests {
 
         session
             .prepare(&format!("drop table if exists {table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    #[test]
+    fn schema_grant_allows_non_owner_to_create_in_public() {
+        let admin = PgCoreSession::new();
+        let role = unique_pg_name("fastpg_schema_grantee");
+        let table = unique_pg_name("fastpg_schema_grant_table");
+
+        admin
+            .prepare(&format!("drop table if exists public.{table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        admin
+            .prepare(&format!("drop role if exists {role}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        admin
+            .prepare(&format!("create role {role} login"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        let grant = admin
+            .prepare(&format!("grant create, usage on schema public to {role}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        assert_eq!(grant.statements[0].command_tag, "GRANT");
+
+        let grantee = PgCoreSession::with_database_and_user("postgres", &role);
+        grantee
+            .prepare(&format!("create table public.{table}(id int not null)"))
+            .unwrap()
+            .execute()
+            .unwrap();
+
+        admin
+            .prepare(&format!("drop table if exists public.{table}"))
+            .unwrap()
+            .execute()
+            .unwrap();
+        admin
+            .prepare(&format!(
+                "revoke create, usage on schema public from {role}"
+            ))
+            .unwrap()
+            .execute()
+            .unwrap();
+        admin
+            .prepare(&format!("drop role if exists {role}"))
             .unwrap()
             .execute()
             .unwrap();

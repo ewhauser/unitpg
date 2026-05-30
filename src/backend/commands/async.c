@@ -189,6 +189,42 @@
 #include "utils/snapmgr.h"
 #include "utils/timestamp.h"
 
+#ifdef USE_FASTPG
+#ifdef __GNUC__
+#define FASTPG_ASYNC_WEAK __attribute__((weak))
+
+void
+FastPgCaptureCommittedListenAction(int action, const char *channel)
+	FASTPG_ASYNC_WEAK;
+
+void
+FastPgCaptureCommittedListenAction(int action, const char *channel)
+{
+	(void) action;
+	(void) channel;
+}
+
+void
+FastPgCaptureCommittedNotify(const char *channel, const char *payload)
+	FASTPG_ASYNC_WEAK;
+
+void
+FastPgCaptureCommittedNotify(const char *channel, const char *payload)
+{
+	(void) channel;
+	(void) payload;
+}
+#else
+extern void FastPgCaptureCommittedListenAction(int action, const char *channel);
+extern void FastPgCaptureCommittedNotify(const char *channel, const char *payload);
+#endif
+#endif
+
+#ifdef USE_FASTPG
+#define FASTPG_ASYNC_THREAD_LOCAL _Thread_local
+#else
+#define FASTPG_ASYNC_THREAD_LOCAL
+#endif
 
 /*
  * Maximum size of a NOTIFY payload, including terminating NULL.  This
@@ -419,7 +455,7 @@ static dsa_area *globalChannelDSA = NULL;
  * (including those we have staged to be listened on, but not yet committed).
  * Used by IsListeningOn() for fast lookups when reading notifications.
  */
-static HTAB *localChannelTable = NULL;
+static FASTPG_ASYNC_THREAD_LOCAL HTAB *localChannelTable = NULL;
 
 /* We test this condition to detect that we're not listening at all */
 #define LocalChannelTableIsEmpty() \
@@ -455,7 +491,7 @@ typedef struct ActionList
 	struct ActionList *upper;	/* details for upper transaction levels */
 } ActionList;
 
-static ActionList *pendingActions = NULL;
+static FASTPG_ASYNC_THREAD_LOCAL ActionList *pendingActions = NULL;
 
 /*
  * Hash table recording the final listen/unlisten intent per channel for
@@ -477,7 +513,7 @@ typedef struct PendingListenEntry
 	PendingListenAction action; /* which action should we perform? */
 } PendingListenEntry;
 
-static HTAB *pendingListenActions = NULL;
+static FASTPG_ASYNC_THREAD_LOCAL HTAB *pendingListenActions = NULL;
 
 /*
  * State for outbound notifies consists of a list of all channels+payloads
@@ -531,7 +567,7 @@ struct NotificationHash
 	Notification *event;		/* => the actual Notification struct */
 };
 
-static NotificationList *pendingNotifies = NULL;
+static FASTPG_ASYNC_THREAD_LOCAL NotificationList *pendingNotifies = NULL;
 
 /*
  * Hash entry in NotificationList.uniqueChannelHash or localChannelTable
@@ -549,13 +585,13 @@ typedef struct ChannelName
  * latch. ProcessNotifyInterrupt() will then be called whenever it's safe to
  * actually deal with the interrupt.
  */
-volatile sig_atomic_t notifyInterruptPending = false;
+FASTPG_ASYNC_THREAD_LOCAL volatile sig_atomic_t notifyInterruptPending = false;
 
 /* True if we've registered an on_shmem_exit cleanup */
-static bool unlistenExitRegistered = false;
+static FASTPG_ASYNC_THREAD_LOCAL bool unlistenExitRegistered = false;
 
 /* True if we're currently registered as a listener in asyncQueueControl */
-static bool amRegisteredListener = false;
+static FASTPG_ASYNC_THREAD_LOCAL bool amRegisteredListener = false;
 
 /*
  * Queue head positions for direct advancement.
@@ -563,19 +599,19 @@ static bool amRegisteredListener = false;
  * lock on database 0, ensuring no other backend can insert notifications
  * between them.  SignalBackends uses these to advance idle backends.
  */
-static QueuePosition queueHeadBeforeWrite;
-static QueuePosition queueHeadAfterWrite;
+static FASTPG_ASYNC_THREAD_LOCAL QueuePosition queueHeadBeforeWrite;
+static FASTPG_ASYNC_THREAD_LOCAL QueuePosition queueHeadAfterWrite;
 
 /*
  * Workspace arrays for SignalBackends.  These are preallocated in
  * PreCommit_Notify to avoid needing memory allocation after committing to
  * clog.
  */
-static int32 *signalPids = NULL;
-static ProcNumber *signalProcnos = NULL;
+static FASTPG_ASYNC_THREAD_LOCAL int32 *signalPids = NULL;
+static FASTPG_ASYNC_THREAD_LOCAL ProcNumber *signalProcnos = NULL;
 
 /* have we advanced to a page that's a multiple of QUEUE_CLEANUP_DELAY? */
-static bool tryAdvanceTail = false;
+static FASTPG_ASYNC_THREAD_LOCAL bool tryAdvanceTail = false;
 
 /* GUC parameters */
 bool		Trace_notify = false;
@@ -1389,6 +1425,20 @@ AtCommit_Notify(void)
 
 	/* Apply staged listen/unlisten changes */
 	ApplyPendingListenActions(true);
+#ifdef USE_FASTPG
+	if (FastPgCaptureCommittedListenAction != NULL &&
+		pendingListenActions != NULL)
+	{
+		HASH_SEQ_STATUS fastpg_seq;
+		PendingListenEntry *fastpg_pending;
+
+		hash_seq_init(&fastpg_seq, pendingListenActions);
+		while ((fastpg_pending =
+					(PendingListenEntry *) hash_seq_search(&fastpg_seq)) != NULL)
+			FastPgCaptureCommittedListenAction(fastpg_pending->action,
+											   fastpg_pending->channel);
+	}
+#endif
 
 	/* If no longer listening to anything, get out of listener array */
 	if (amRegisteredListener && LocalChannelTableIsEmpty())
@@ -1400,7 +1450,22 @@ AtCommit_Notify(void)
 	 * PreCommit_Notify().
 	 */
 	if (pendingNotifies != NULL)
+	{
+#ifdef USE_FASTPG
+		if (FastPgCaptureCommittedNotify != NULL)
+		{
+			foreach_ptr(Notification, fastpg_notify, pendingNotifies->events)
+			{
+				const char *channel = fastpg_notify->data;
+				const char *payload =
+					fastpg_notify->data + fastpg_notify->channel_len + 1;
+
+				FastPgCaptureCommittedNotify(channel, payload);
+			}
+		}
+#endif
 		SignalBackends();
+	}
 
 	/*
 	 * If it's time to try to advance the global tail pointer, do that.

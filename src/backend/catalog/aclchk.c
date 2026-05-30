@@ -3759,6 +3759,16 @@ pg_namespace_aclmask_ext(Oid nsp_oid, Oid roleid,
 
 	ownerId = ((Form_pg_namespace) GETSTRUCT(tuple))->nspowner;
 
+#ifdef USE_FASTPG
+	if (fastpg_catalog_mode_uses_postgres() &&
+		strncmp(NameStr(((Form_pg_namespace) GETSTRUCT(tuple))->nspname),
+				"fastpg_db_", strlen("fastpg_db_")) == 0)
+	{
+		ReleaseSysCache(tuple);
+		return mask & ACL_ALL_RIGHTS_SCHEMA;
+	}
+#endif
+
 	aclDatum = SysCacheGetAttr(NAMESPACEOID, tuple, Anum_pg_namespace_nspacl,
 							   &isNull);
 	if (isNull)
@@ -4031,6 +4041,13 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 							  AclMode mode, AclMaskHow how,
 							  bool *is_missing)
 {
+	AclResult	result;
+	HeapTuple	classTuple;
+	Form_pg_class classForm;
+	Oid			ownerId;
+	AttrNumber	nattrs;
+	AttrNumber	curr_att;
+
 #ifdef USE_FASTPG
 	if (fastpg_use_rust_catalog())
 	{
@@ -4039,12 +4056,6 @@ pg_attribute_aclcheck_all_ext(Oid table_oid, Oid roleid,
 		return ACLCHECK_OK;
 	}
 #endif
-	AclResult	result;
-	HeapTuple	classTuple;
-	Form_pg_class classForm;
-	Oid			ownerId;
-	AttrNumber	nattrs;
-	AttrNumber	curr_att;
 
 #ifdef USE_FASTPG
 	{
@@ -4202,6 +4213,9 @@ pg_parameter_aclcheck(const char *name, Oid roleid, AclMode mode)
 {
 #ifdef USE_FASTPG
 	if (fastpg_use_rust_catalog())
+		return ACLCHECK_OK;
+	if (fastpg_catalog_mode_uses_postgres() &&
+		strcmp(name, "session_replication_role") == 0)
 		return ACLCHECK_OK;
 #endif
 

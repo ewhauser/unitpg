@@ -838,6 +838,47 @@ discard_stack_value(struct config_generic *gconf, config_var_value *val)
 	set_extra_field(gconf, &(val->extra), NULL);
 }
 
+#ifdef USE_FASTPG
+/*
+ * FastPG multiplexes logical client sessions through one PostgreSQL backend.
+ * Restoring a saved session GUC while inside an explicit transaction should
+ * not make that restore behave like a client-issued SET inside the transaction,
+ * because rollback would then undo the session bridge itself.
+ */
+int
+FastPgSetConfigOptionNoStack(const char *name, const char *value,
+							 GucContext context, GucSource source,
+							 bool changeVal, int elevel,
+							 bool is_reload)
+{
+	struct config_generic *gconf;
+	GucStack   *old_stack;
+	int			result;
+
+	gconf = find_option(name, true, true, elevel);
+	old_stack = gconf != NULL ? gconf->stack : NULL;
+	result = set_config_option(name, value, context, source,
+							   GUC_ACTION_SET, changeVal, elevel, is_reload);
+	if (result <= 0 || gconf == NULL || old_stack != NULL)
+		return result;
+
+	pthread_mutex_lock(&FastPgGucStackMutex);
+	if (gconf->stack != NULL && gconf->stack->prev == NULL)
+	{
+		GucStack   *stack = gconf->stack;
+
+		gconf->stack = NULL;
+		slist_delete(&guc_stack_list, &gconf->stack_link);
+		discard_stack_value(gconf, &stack->prior);
+		discard_stack_value(gconf, &stack->masked);
+		pfree(stack);
+	}
+	pthread_mutex_unlock(&FastPgGucStackMutex);
+
+	return result;
+}
+#endif
+
 
 /*
  * Fetch a palloc'd, sorted array of GUC struct pointers

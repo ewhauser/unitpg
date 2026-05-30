@@ -57,11 +57,15 @@
  */
 #include "postgres.h"
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/heaptoast.h"
 #include "access/sysattr.h"
 #include "access/htup_details.h"
 #include "access/tupdesc_details.h"
 #include "access/xact.h"
+#include "catalog/pg_namespace.h"
 #include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/tidbitmap.h"
@@ -97,6 +101,7 @@ extern uint32_t fastpg_storage2_relation_row_cmin(uint32_t relid, uint64_t row_i
 extern bool fastpg_mem_tableoid_tid_to_row_id(uint32_t relid, ItemPointer tid,
 											  uint64_t *row_id);
 extern bool fastpg_mem_tableoid_uses_storage2(uint32_t relid);
+extern Oid FastPgSchemaDatabaseId(void);
 
 static bool
 fastpg_slot_system_attrs_available(TupleTableSlot *slot)
@@ -148,6 +153,50 @@ fastpg_slot_row_cmin(uint32_t relid, uint64_t row_id)
 	return fastpg_mem_tableoid_uses_storage2(relid) ?
 		fastpg_storage2_relation_row_cmin(relid, row_id) :
 		fastpg_rust_relation_row_cmin(relid, row_id);
+}
+
+static void
+fastpg_rewrite_logical_namespace_slot(TupleTableSlot *slot)
+{
+	Oid			schema_database_id;
+	Oid			namespace_oid;
+	char		backing_name[NAMEDATALEN];
+	Name		namespace_name;
+
+	if (!fastpg_catalog_mode_uses_postgres() ||
+		slot->tts_nvalid < Anum_pg_namespace_nspname ||
+		slot->tts_isnull[Anum_pg_namespace_oid - 1] ||
+		slot->tts_isnull[Anum_pg_namespace_nspname - 1])
+		return;
+
+	schema_database_id = FastPgSchemaDatabaseId();
+	if (!OidIsValid(schema_database_id))
+		return;
+
+	namespace_oid = DatumGetObjectId(slot->tts_values[Anum_pg_namespace_oid - 1]);
+	snprintf(backing_name, sizeof(backing_name), "fastpg_db_%u",
+			 schema_database_id);
+
+	namespace_name = DatumGetName(slot->tts_values[Anum_pg_namespace_nspname - 1]);
+	if (strncmp(NameStr(*namespace_name), backing_name, NAMEDATALEN) != 0 &&
+		namespace_oid != PG_PUBLIC_NAMESPACE)
+		return;
+
+	namespace_name = (Name) palloc0(NAMEDATALEN);
+	namestrcpy(namespace_name, "public");
+	slot->tts_values[Anum_pg_namespace_nspname - 1] = NameGetDatum(namespace_name);
+
+	if (namespace_oid == PG_PUBLIC_NAMESPACE)
+		slot->tts_values[Anum_pg_namespace_oid - 1] =
+			ObjectIdGetDatum(schema_database_id);
+}
+
+static pg_attribute_always_inline void
+fastpg_maybe_rewrite_logical_namespace_slot(TupleTableSlot *slot)
+{
+	if (unlikely(TTS_IS_BUFFERTUPLE(slot) &&
+				 slot->tts_tableOid == NamespaceRelationId))
+		fastpg_rewrite_logical_namespace_slot(slot);
 }
 #endif
 
@@ -1539,12 +1588,18 @@ slot_deform_heap_tuple(TupleTableSlot *slot, HeapTuple tuple, uint32 *offp,
 		 */
 		*offp = off;
 		slot_getmissingattrs(slot, attnum, reqnatts);
+#ifdef USE_FASTPG
+		fastpg_maybe_rewrite_logical_namespace_slot(slot);
+#endif
 		return;
 	}
 done:
 
 	/* Save current offset for next execution */
 	*offp = off;
+#ifdef USE_FASTPG
+	fastpg_maybe_rewrite_logical_namespace_slot(slot);
+#endif
 }
 
 const TupleTableSlotOps TTSOpsVirtual = {

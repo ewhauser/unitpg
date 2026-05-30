@@ -17,6 +17,9 @@
 
 #include <limits.h>
 
+#ifdef USE_FASTPG
+#include "access/fastpg_catalog.h"
+#endif
 #include "access/genam.h"
 #include "access/hash.h"
 #include "access/htup_details.h"
@@ -25,6 +28,7 @@
 #include "catalog/catalog.h"
 #include "catalog/dependency.h"
 #include "catalog/indexing.h"
+#include "catalog/namespace.h"
 #include "catalog/objectaccess.h"
 #include "catalog/pg_am.h"
 #include "catalog/pg_amop.h"
@@ -652,6 +656,11 @@ DefineOpClass(CreateOpClassStmt *stmt)
 		{
 			Form_pg_opclass opclass = (Form_pg_opclass) GETSTRUCT(tup);
 
+#ifdef USE_FASTPG
+			if (fastpg_catalog_mode_uses_postgres() &&
+				!OpclassIsVisible(opclass->oid))
+				continue;
+#endif
 			if (opclass->opcintype == typeoid && opclass->opcdefault)
 				ereport(ERROR,
 						(errcode(ERRCODE_DUPLICATE_OBJECT),

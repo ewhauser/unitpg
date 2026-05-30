@@ -666,7 +666,7 @@ GRANT SELECT ON column_udt_usage TO PUBLIC;
 
 CREATE VIEW columns AS
     SELECT CAST(current_database() AS sql_identifier) AS table_catalog,
-           CAST(nc.nspname AS sql_identifier) AS table_schema,
+           CAST(CASE WHEN nc.nspname LIKE 'fastpg_db_%' THEN 'public' ELSE nc.nspname END AS sql_identifier) AS table_schema,
            CAST(c.relname AS sql_identifier) AS table_name,
            CAST(a.attname AS sql_identifier) AS column_name,
            CAST(a.attnum AS cardinal_number) AS ordinal_position,
@@ -781,6 +781,9 @@ CREATE VIEW columns AS
 
           AND a.attnum > 0 AND NOT a.attisdropped
           AND c.relkind IN ('r', 'v', 'f', 'p')
+
+          AND (nc.nspname NOT LIKE 'fastpg_db_%'
+               OR nc.nspname = ANY (current_schemas(false)))
 
           AND (pg_has_role(c.relowner, 'USAGE')
                OR has_column_privilege(c.oid, a.attnum,
@@ -1947,7 +1950,7 @@ GRANT SELECT ON role_table_grants TO PUBLIC;
 
 CREATE VIEW tables AS
     SELECT CAST(current_database() AS sql_identifier) AS table_catalog,
-           CAST(nc.nspname AS sql_identifier) AS table_schema,
+           CAST(CASE WHEN nc.nspname LIKE 'fastpg_db_%' THEN 'public' ELSE nc.nspname END AS sql_identifier) AS table_schema,
            CAST(c.relname AS sql_identifier) AS table_name,
 
            CAST(
@@ -1979,6 +1982,8 @@ CREATE VIEW tables AS
 
     WHERE c.relkind IN ('r', 'v', 'f', 'p')
           AND (NOT pg_is_other_temp_schema(nc.oid))
+          AND (nc.nspname NOT LIKE 'fastpg_db_%'
+               OR nc.nspname = ANY (current_schemas(false)))
           AND (pg_has_role(c.relowner, 'USAGE')
                OR has_table_privilege(c.oid, 'SELECT, INSERT, UPDATE, DELETE, TRUNCATE, REFERENCES, TRIGGER')
                OR has_any_column_privilege(c.oid, 'SELECT, INSERT, UPDATE, REFERENCES') );

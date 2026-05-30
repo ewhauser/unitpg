@@ -74,6 +74,9 @@
 #include "catalog/pg_type.h"
 #include "catalog/schemapg.h"
 #include "catalog/storage.h"
+#ifdef USE_FASTPG
+#include "commands/defrem.h"
+#endif
 #include "commands/policy.h"
 #include "commands/publicationcmds.h"
 #include "commands/trigger.h"
@@ -6041,6 +6044,35 @@ RelationGetFKeyList(Relation relation)
 	return result;
 }
 
+#ifdef USE_FASTPG
+static bool
+fastpg_should_hide_unmaintained_extension_index(Oid indexrelid)
+{
+	Oid			relam;
+	Oid			ivfflat_am_oid;
+	Oid			hnsw_am_oid;
+
+	if (!fastpg_catalog_mode_uses_postgres() || !criticalRelcachesBuilt)
+		return false;
+
+	relam = get_rel_relam(indexrelid);
+	if (!OidIsValid(relam))
+		return false;
+
+	/*
+	 * FastPG can store pgvector columns and execute vector expressions, but it
+	 * does not maintain pgvector's physical AM storage.  Hide these index AMs
+	 * from planner/executor index lists so skipped-build definitions remain
+	 * catalog-compatible without becoming unsafe write targets.
+	 */
+	ivfflat_am_oid = get_index_am_oid("ivfflat", true);
+	hnsw_am_oid = get_index_am_oid("hnsw", true);
+
+	return (OidIsValid(ivfflat_am_oid) && relam == ivfflat_am_oid) ||
+		(OidIsValid(hnsw_am_oid) && relam == hnsw_am_oid);
+}
+#endif
+
 /*
  * RelationGetIndexList -- get a list of OIDs of indexes on this relation
  *
@@ -6163,6 +6195,11 @@ RelationGetIndexList(Relation relation)
 		 */
 		if (!index->indislive)
 			continue;
+
+#ifdef USE_FASTPG
+		if (fastpg_should_hide_unmaintained_extension_index(index->indexrelid))
+			continue;
+#endif
 
 		/* add index's OID to result list */
 		result = lappend_oid(result, index->indexrelid);

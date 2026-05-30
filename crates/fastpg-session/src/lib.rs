@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 pub use fastpg_exec::{
-    CopyOutput, CopyTarget, QueryDescription, QueryExecution, QueryNotice, QueryResult,
+    CopyOutput, CopyTarget, QueryDescription, QueryExecution, QueryListenAction, QueryNotice,
+    QueryNotification, QueryResult, StartupValidationError,
 };
 pub use fastpg_types::{Column, ParameterFormat, PgType, QueryParameter, Value};
 
@@ -70,6 +71,12 @@ impl From<BTreeMap<String, String>> for StartupParameters {
     fn from(parameters: BTreeMap<String, String>) -> Self {
         Self::new(parameters)
     }
+}
+
+pub fn validate_startup_parameters(
+    startup: &StartupParameters,
+) -> Result<(), StartupValidationError> {
+    fastpg_exec::validate_startup(startup.database(), startup.user())
 }
 
 #[derive(Debug)]
@@ -165,6 +172,16 @@ impl SessionBackendExecutor {
             .send(SessionBackendMessage::Run(Box::new(operation)))
             .expect("fastpg session backend thread exited");
     }
+
+    fn enqueue_shutdown_detached(&mut self, operation: SessionBackendJob) {
+        let _ = self.sender.send(SessionBackendMessage::Run(operation));
+        let _ = self.sender.send(SessionBackendMessage::Shutdown);
+        let _ = self
+            .handle
+            .lock()
+            .expect("fastpg session backend handle mutex poisoned")
+            .take();
+    }
 }
 
 impl fmt::Debug for SessionBackendExecutor {
@@ -216,8 +233,11 @@ impl SessionState {
         inline_execution: bool,
     ) -> Self {
         let id = server.allocate_session_id();
-        let executor =
-            QueryExecutor::with_shared_for_database(server.executor.clone(), startup.database());
+        let executor = QueryExecutor::with_shared_for_database_and_user(
+            server.executor.clone(),
+            startup.database(),
+            startup.user(),
+        );
         Self {
             id,
             server,
@@ -307,6 +327,14 @@ impl SessionState {
 
     pub fn take_notices(&self) -> Vec<QueryNotice> {
         self.executor.take_notices()
+    }
+
+    pub fn take_notifications(&self) -> Vec<QueryNotification> {
+        self.executor.take_notifications()
+    }
+
+    pub fn take_listen_actions(&self) -> Vec<QueryListenAction> {
+        self.executor.take_listen_actions()
     }
 
     pub fn copy_text_line(&self, table: &str, line: &str) -> Result<bool, String> {
@@ -414,8 +442,8 @@ impl Drop for SessionState {
             if let Some(close_work) = self.executor.close_work(active_copy_owned_transaction) {
                 if self.inline_execution {
                     close_work.run();
-                } else if let Some(backend) = &self.backend {
-                    backend.run(move || close_work.run());
+                } else if let Some(mut backend) = self.backend.take() {
+                    backend.enqueue_shutdown_detached(Box::new(move || close_work.run()));
                 }
             }
         }

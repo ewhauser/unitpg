@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use fastpg_catalog::relation_by_name;
 #[cfg(feature = "postgres-execution")]
 use fastpg_pgcore::{
-    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreNotice,
-    PgCoreParam, PgCoreParamFormat, PgCoreSession, PgCoreTransactionCommand, PgCoreValue,
-    PreparedStatement, SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
+    ExecutionResult as PgCoreExecutionResult, INT2_OID, INT4_OID, INT8_OID, PgCoreListenAction,
+    PgCoreNotice, PgCoreNotification, PgCoreParam, PgCoreParamFormat, PgCoreSession,
+    PgCoreTransactionCommand, PgCoreValue, PreparedStatement,
+    SimpleExecutionResult as PgCoreSimpleExecutionResult, TEXT_OID, VARCHAR_OID,
 };
 #[cfg(feature = "postgres-execution")]
 use fastpg_types::ParameterFormat;
@@ -214,6 +215,60 @@ pub struct QueryNotice {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StartupValidationError {
+    pub sqlstate: String,
+    pub message: String,
+    pub detail: Option<String>,
+    pub hint: Option<String>,
+    pub context: Option<String>,
+    pub cursorpos: i32,
+    pub internal_query: Option<String>,
+    pub internalpos: i32,
+}
+
+impl StartupValidationError {
+    #[cfg(feature = "postgres-execution")]
+    fn from_pgcore(error: fastpg_pgcore::PgCoreError) -> Self {
+        let error = error.into_fields();
+        Self {
+            sqlstate: error.sqlstate,
+            message: error.message,
+            detail: error.detail,
+            hint: error.hint,
+            context: error.context,
+            cursorpos: error.cursorpos,
+            internal_query: error.internal_query,
+            internalpos: error.internalpos,
+        }
+    }
+}
+
+pub fn validate_startup(database: &str, user: &str) -> Result<(), StartupValidationError> {
+    #[cfg(feature = "postgres-execution")]
+    {
+        fastpg_pgcore::validate_client_startup(database, user)
+            .map_err(StartupValidationError::from_pgcore)
+    }
+    #[cfg(not(feature = "postgres-execution"))]
+    {
+        let _ = (database, user);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueryNotification {
+    pub channel: String,
+    pub payload: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum QueryListenAction {
+    Listen(String),
+    Unlisten(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum QueryExecution {
     WithNotices {
         notices: Vec<QueryNotice>,
@@ -282,6 +337,12 @@ pub struct QueryExecutor {
     #[cfg(feature = "postgres-execution")]
     notice_count: AtomicUsize,
     notices: Mutex<Vec<QueryNotice>>,
+    #[cfg(feature = "postgres-execution")]
+    notification_count: AtomicUsize,
+    notifications: Mutex<Vec<QueryNotification>>,
+    #[cfg(feature = "postgres-execution")]
+    listen_action_count: AtomicUsize,
+    listen_actions: Mutex<Vec<QueryListenAction>>,
 }
 
 #[cfg(feature = "postgres-execution")]
@@ -336,14 +397,23 @@ impl QueryExecutor {
         shared: Arc<QueryExecutorShared>,
         database: impl Into<String>,
     ) -> Self {
+        Self::with_shared_for_database_and_user(shared, database, "postgres")
+    }
+
+    pub fn with_shared_for_database_and_user(
+        shared: Arc<QueryExecutorShared>,
+        database: impl Into<String>,
+        user: impl Into<String>,
+    ) -> Self {
         #[cfg(feature = "postgres-execution")]
         {
             let storage_session = fastpg_storage::new_session_storage();
             let storage2_session = fastpg_storage2::new_session_storage();
-            let pgcore_session = PgCoreSession::with_storage_sessions_and_database(
+            let pgcore_session = PgCoreSession::with_storage_sessions_database_and_user(
                 storage_session.clone(),
                 storage2_session.clone(),
                 database,
+                user,
             );
             Self {
                 shared,
@@ -354,14 +424,21 @@ impl QueryExecutor {
                 pgcore_start_lock: Mutex::new(()),
                 notice_count: AtomicUsize::new(0),
                 notices: Mutex::new(Vec::new()),
+                notification_count: AtomicUsize::new(0),
+                notifications: Mutex::new(Vec::new()),
+                listen_action_count: AtomicUsize::new(0),
+                listen_actions: Mutex::new(Vec::new()),
             }
         }
         #[cfg(not(feature = "postgres-execution"))]
         {
             let _ = database.into();
+            let _ = user.into();
             Self {
                 shared,
                 notices: Mutex::new(Vec::new()),
+                notifications: Mutex::new(Vec::new()),
+                listen_actions: Mutex::new(Vec::new()),
             }
         }
     }
@@ -445,16 +522,11 @@ impl QueryExecutor {
                 Ok(result) => {
                     let PgCoreExecutionResult {
                         notices,
+                        notifications,
+                        listen_actions,
                         statements,
                     } = result;
-                    if !notices.is_empty() {
-                        self.replace_notices(
-                            notices
-                                .into_iter()
-                                .map(pgcore_notice_to_query_notice)
-                                .collect(),
-                        );
-                    }
+                    self.store_pgcore_events(notices, notifications, listen_actions);
                     pgcore_statements_to_query_execution(
                         statements,
                         PgCoreRowConversion::PreserveText,
@@ -464,30 +536,24 @@ impl QueryExecutor {
             };
         }
         match self.pgcore_session.execute_simple_cstr_fast(sql) {
-            Ok(PgCoreSimpleExecutionResult::Command { notices, tag, rows }) => {
-                if !notices.is_empty() {
-                    self.replace_notices(
-                        notices
-                            .into_iter()
-                            .map(pgcore_notice_to_query_notice)
-                            .collect(),
-                    );
-                }
+            Ok(PgCoreSimpleExecutionResult::Command {
+                notices,
+                notifications,
+                listen_actions,
+                tag,
+                rows,
+            }) => {
+                self.store_pgcore_events(notices, notifications, listen_actions);
                 QueryExecution::Command { tag, rows }
             }
             Ok(PgCoreSimpleExecutionResult::Full(result)) => {
                 let PgCoreExecutionResult {
                     notices,
+                    notifications,
+                    listen_actions,
                     statements,
                 } = result;
-                if !notices.is_empty() {
-                    self.replace_notices(
-                        notices
-                            .into_iter()
-                            .map(pgcore_notice_to_query_notice)
-                            .collect(),
-                    );
-                }
+                self.store_pgcore_events(notices, notifications, listen_actions);
                 pgcore_statements_to_query_execution(statements, PgCoreRowConversion::PreserveText)
             }
             Err(error) => {
@@ -523,6 +589,40 @@ impl QueryExecutor {
         notices
     }
 
+    pub fn take_notifications(&self) -> Vec<QueryNotification> {
+        #[cfg(feature = "postgres-execution")]
+        if self.notification_count.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+
+        let notifications = std::mem::take(
+            &mut *self
+                .notifications
+                .lock()
+                .expect("fastpg executor notification mutex poisoned"),
+        );
+        #[cfg(feature = "postgres-execution")]
+        self.notification_count.store(0, Ordering::Relaxed);
+        notifications
+    }
+
+    pub fn take_listen_actions(&self) -> Vec<QueryListenAction> {
+        #[cfg(feature = "postgres-execution")]
+        if self.listen_action_count.load(Ordering::Relaxed) == 0 {
+            return Vec::new();
+        }
+
+        let listen_actions = std::mem::take(
+            &mut *self
+                .listen_actions
+                .lock()
+                .expect("fastpg executor listen-action mutex poisoned"),
+        );
+        #[cfg(feature = "postgres-execution")]
+        self.listen_action_count.store(0, Ordering::Relaxed);
+        listen_actions
+    }
+
     #[cfg(feature = "postgres-execution")]
     fn replace_notices(&self, notices: Vec<QueryNotice>) {
         if notices.is_empty() {
@@ -540,6 +640,71 @@ impl QueryExecutor {
         }
         self.notice_count
             .store(stored_notices.len(), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn replace_notifications(&self, notifications: Vec<QueryNotification>) {
+        if notifications.is_empty() {
+            return;
+        }
+
+        let mut stored_notifications = self
+            .notifications
+            .lock()
+            .expect("fastpg executor notification mutex poisoned");
+        if stored_notifications.is_empty() {
+            *stored_notifications = notifications;
+        } else {
+            stored_notifications.extend(notifications);
+        }
+        self.notification_count
+            .store(stored_notifications.len(), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn replace_listen_actions(&self, listen_actions: Vec<QueryListenAction>) {
+        if listen_actions.is_empty() {
+            return;
+        }
+
+        let mut stored_listen_actions = self
+            .listen_actions
+            .lock()
+            .expect("fastpg executor listen-action mutex poisoned");
+        if stored_listen_actions.is_empty() {
+            *stored_listen_actions = listen_actions;
+        } else {
+            stored_listen_actions.extend(listen_actions);
+        }
+        self.listen_action_count
+            .store(stored_listen_actions.len(), Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "postgres-execution")]
+    fn store_pgcore_events(
+        &self,
+        notices: Vec<PgCoreNotice>,
+        notifications: Vec<PgCoreNotification>,
+        listen_actions: Vec<PgCoreListenAction>,
+    ) {
+        self.replace_notices(
+            notices
+                .into_iter()
+                .map(pgcore_notice_to_query_notice)
+                .collect(),
+        );
+        self.replace_notifications(
+            notifications
+                .into_iter()
+                .map(pgcore_notification_to_query_notification)
+                .collect(),
+        );
+        self.replace_listen_actions(
+            listen_actions
+                .into_iter()
+                .map(pgcore_listen_action_to_query_listen_action)
+                .collect(),
+        );
     }
 
     #[cfg(feature = "postgres-execution")]
@@ -768,15 +933,14 @@ impl QueryExecutor {
                     return Err(pgcore_copy_error(error));
                 }
             };
-            self.replace_notices(
-                result
-                    .notices
-                    .iter()
-                    .cloned()
-                    .map(pgcore_notice_to_query_notice)
-                    .collect(),
-            );
-            let Some(statement) = result.statements.into_iter().next() else {
+            let PgCoreExecutionResult {
+                notices,
+                notifications,
+                listen_actions,
+                statements,
+            } = result;
+            self.store_pgcore_events(notices, notifications, listen_actions);
+            let Some(statement) = statements.into_iter().next() else {
                 return Ok(lines
                     .len()
                     .saturating_sub(target.header_lines_to_skip().min(lines.len())));
@@ -836,15 +1000,14 @@ impl QueryExecutor {
                 return Err(pgcore_copy_error(error));
             }
         };
-        self.replace_notices(
-            result
-                .notices
-                .iter()
-                .cloned()
-                .map(pgcore_notice_to_query_notice)
-                .collect(),
-        );
-        let Some(statement) = result.statements.into_iter().next() else {
+        let PgCoreExecutionResult {
+            notices,
+            notifications,
+            listen_actions,
+            statements,
+        } = result;
+        self.store_pgcore_events(notices, notifications, listen_actions);
+        let Some(statement) = statements.into_iter().next() else {
             return Ok(0);
         };
         Ok(statement.command_rows.unwrap_or(0))
@@ -1001,16 +1164,11 @@ impl QueryExecutor {
                 Ok(result) => {
                     let PgCoreExecutionResult {
                         notices,
+                        notifications,
+                        listen_actions,
                         statements,
                     } = result;
-                    if !notices.is_empty() {
-                        self.replace_notices(
-                            notices
-                                .into_iter()
-                                .map(pgcore_notice_to_query_notice)
-                                .collect(),
-                        );
-                    }
+                    self.store_pgcore_events(notices, notifications, listen_actions);
                     pgcore_statements_to_query_execution(statements, row_conversion)
                 }
                 Err(error) => pgcore_error_execution(error),
@@ -1033,16 +1191,11 @@ impl QueryExecutor {
             Ok(result) => {
                 let PgCoreExecutionResult {
                     notices,
+                    notifications,
+                    listen_actions,
                     statements,
                 } = result;
-                if !notices.is_empty() {
-                    self.replace_notices(
-                        notices
-                            .into_iter()
-                            .map(pgcore_notice_to_query_notice)
-                            .collect(),
-                    );
-                }
+                self.store_pgcore_events(notices, notifications, listen_actions);
                 pgcore_statements_to_query_execution(statements, row_conversion)
             }
             Err(error) => {
@@ -1157,6 +1310,24 @@ fn pgcore_notice_to_query_notice(notice: PgCoreNotice) -> QueryNotice {
         hint: notice.hint,
         context: notice.context,
         cursorpos: notice.cursorpos,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_notification_to_query_notification(
+    notification: PgCoreNotification,
+) -> QueryNotification {
+    QueryNotification {
+        channel: notification.channel,
+        payload: notification.payload,
+    }
+}
+
+#[cfg(feature = "postgres-execution")]
+fn pgcore_listen_action_to_query_listen_action(action: PgCoreListenAction) -> QueryListenAction {
+    match action {
+        PgCoreListenAction::Listen(channel) => QueryListenAction::Listen(channel),
+        PgCoreListenAction::Unlisten(channel) => QueryListenAction::Unlisten(channel),
     }
 }
 

@@ -17,4 +17,5 @@ tokio.workspace = true
 
 [dev-dependencies]
 futures.workspace = true
+postgres-types.workspace = true
 tokio-postgres.workspace = true

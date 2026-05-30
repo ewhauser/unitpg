@@ -44,7 +44,7 @@ impl TestServer {
     }
 
     pub fn connection_string(&self) -> String {
-        format!("postgres://{}/postgres", self.addr)
+        format!("postgres://postgres@{}/postgres", self.addr)
     }
 }
 
@@ -224,7 +224,7 @@ fn pgcore_extension_libdir(build_dir: &Path) -> Result<Option<PathBuf>, String> 
     }
 
     let libdir = build_dir.join("tmp_install/usr/local/pgsql/lib");
-    if installed_pgvector_libraries(&libdir)?.is_empty() {
+    if installed_extension_libraries(&libdir)?.is_empty() {
         Ok(None)
     } else {
         Ok(Some(libdir))
@@ -276,9 +276,9 @@ fn prepare_pgcore_libdir(
         copy_pgcore_library(&source, &libdir)?;
     }
 
-    remove_pgcore_pgvector_libraries(&libdir)?;
+    remove_pgcore_extension_libraries(&libdir)?;
     if let Some(extension_libdir) = extension_libdir {
-        for source in installed_pgvector_libraries(extension_libdir)? {
+        for source in installed_extension_libraries(extension_libdir)? {
             copy_pgcore_library(&source, &libdir)?;
         }
     }
@@ -287,11 +287,11 @@ fn prepare_pgcore_libdir(
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
-fn remove_pgcore_pgvector_libraries(libdir: &Path) -> Result<(), String> {
-    for path in installed_pgvector_libraries(libdir)? {
+fn remove_pgcore_extension_libraries(libdir: &Path) -> Result<(), String> {
+    for path in installed_extension_libraries(libdir)? {
         fs::remove_file(&path).map_err(|error| {
             format!(
-                "could not remove stale pgvector library {}: {error}",
+                "could not remove stale PostgreSQL extension library {}: {error}",
                 path.display()
             )
         })?;
@@ -321,15 +321,15 @@ fn copy_pgcore_library(source: &Path, libdir: &Path) -> Result<(), String> {
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
-fn installed_pgvector_libraries(libdir: &Path) -> Result<Vec<PathBuf>, String> {
+fn installed_extension_libraries(libdir: &Path) -> Result<Vec<PathBuf>, String> {
     let mut libraries = Vec::new();
-    collect_installed_pgvector_libraries(libdir, &mut libraries)?;
+    collect_installed_extension_libraries(libdir, &mut libraries)?;
     libraries.sort();
     Ok(libraries)
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
-fn collect_installed_pgvector_libraries(
+fn collect_installed_extension_libraries(
     dir: &Path,
     libraries: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
@@ -343,11 +343,11 @@ fn collect_installed_pgvector_libraries(
             .map_err(|error| format!("could not read entry in {}: {error}", dir.display()))?
             .path();
         if path.is_dir() {
-            collect_installed_pgvector_libraries(&path, libraries)?;
+            collect_installed_extension_libraries(&path, libraries)?;
         } else if path
             .file_name()
             .and_then(|name| name.to_str())
-            .is_some_and(is_pgvector_library)
+            .is_some_and(is_postgres_extension_library)
         {
             libraries.push(path);
         }
@@ -356,8 +356,8 @@ fn collect_installed_pgvector_libraries(
 }
 
 #[cfg(all(feature = "postgres-execution", not(feature = "rust-catalog")))]
-fn is_pgvector_library(name: &str) -> bool {
-    name.starts_with("vector")
+fn is_postgres_extension_library(name: &str) -> bool {
+    !name.starts_with("lib")
         && (name.ends_with(".so") || name.contains(".so.") || name.ends_with(".dylib"))
 }
 

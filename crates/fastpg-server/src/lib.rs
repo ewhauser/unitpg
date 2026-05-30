@@ -10,7 +10,10 @@ use std::thread;
 
 use fastpg_wire::FastPgServerHandlers;
 #[cfg(unix)]
+use fastpg_wire::process_socket;
+#[cfg(unix)]
 use fastpg_wire::process_socket_unix;
+#[cfg(not(unix))]
 use pgwire::tokio::process_socket;
 use tokio::net::TcpListener;
 #[cfg(unix)]

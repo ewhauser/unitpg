@@ -264,10 +264,115 @@ static SubTransactionId myTempNamespaceSubID = InvalidSubTransactionId;
 #ifdef USE_FASTPG
 static _Thread_local bool fastpgTempNamespaceExitCallbackRegistered = false;
 
+Oid FastPgSchemaDatabaseId(void);
+Oid FastPgLogicalDatabaseId(void);
+
+Oid
+__attribute__((weak))
+FastPgSchemaDatabaseId(void)
+{
+	return InvalidOid;
+}
+
+Oid
+__attribute__((weak))
+FastPgLogicalDatabaseId(void)
+{
+	return MyDatabaseId;
+}
+
 bool
 FastPgTempNamespaceCreatedInCurrentTransaction(void)
 {
 	return myTempNamespaceSubID != InvalidSubTransactionId;
+}
+
+static bool
+FastPgShouldMapPublicNamespace(void)
+{
+	return fastpg_catalog_mode_uses_postgres() &&
+		OidIsValid(FastPgSchemaDatabaseId());
+}
+
+static bool
+FastPgCatalogNameMatchesCurrentDatabase(const char *catalogname)
+{
+	char	   *database_name;
+	Oid			database_id = MyDatabaseId;
+
+	if (catalogname == NULL)
+		return true;
+
+	if (fastpg_catalog_mode_uses_postgres() &&
+		OidIsValid(FastPgLogicalDatabaseId()))
+		database_id = FastPgLogicalDatabaseId();
+
+	database_name = get_database_name(database_id);
+	return database_name != NULL && strcmp(catalogname, database_name) == 0;
+}
+
+static char *
+FastPgMappedPublicNamespaceName(void)
+{
+	return psprintf("fastpg_db_%u", FastPgSchemaDatabaseId());
+}
+
+static Oid
+FastPgMappedPublicNamespaceOid(bool missing_ok, bool create)
+{
+	char	   *namespace_name;
+	Oid			namespace_id;
+
+	if (!FastPgShouldMapPublicNamespace())
+		return InvalidOid;
+
+	namespace_name = FastPgMappedPublicNamespaceName();
+	namespace_id = get_namespace_oid(namespace_name, true);
+	if (!OidIsValid(namespace_id) && create)
+	{
+		namespace_id = NamespaceCreate(namespace_name, GetUserId(), false);
+		CommandCounterIncrement();
+	}
+	if (!OidIsValid(namespace_id) && !missing_ok)
+		ereport(ERROR,
+				(errcode(ERRCODE_UNDEFINED_SCHEMA),
+				 errmsg("schema \"%s\" does not exist", namespace_name)));
+	pfree(namespace_name);
+	return namespace_id;
+}
+
+static bool
+FastPgSchemaIsPublic(const char *schemaname)
+{
+	return schemaname != NULL && strcmp(schemaname, "public") == 0 &&
+		FastPgShouldMapPublicNamespace();
+}
+
+static Oid
+FastPgMaybeMapPublicNamespaceOid(Oid namespace_id, bool missing_ok, bool create)
+{
+	Oid			mapped_namespace_id;
+
+	if (namespace_id != PG_PUBLIC_NAMESPACE ||
+		!FastPgShouldMapPublicNamespace())
+		return namespace_id;
+
+	mapped_namespace_id = FastPgMappedPublicNamespaceOid(missing_ok, create);
+	if (OidIsValid(mapped_namespace_id))
+		return mapped_namespace_id;
+	return namespace_id;
+}
+#else
+static bool
+FastPgCatalogNameMatchesCurrentDatabase(const char *catalogname)
+{
+	char	   *database_name;
+
+	if (catalogname == NULL)
+		return true;
+
+	database_name = get_database_name(MyDatabaseId);
+	return database_name != NULL && strcmp(catalogname, database_name) == 0;
 }
 #endif
 
@@ -576,7 +681,7 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	 */
 	if (relation->catalogname)
 	{
-		if (strcmp(relation->catalogname, get_database_name(MyDatabaseId)) != 0)
+		if (!FastPgCatalogNameMatchesCurrentDatabase(relation->catalogname))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
@@ -602,6 +707,14 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 	 */
 	for (;;)
 	{
+#ifdef USE_FASTPG
+		if (fastpg_catalog_mode_uses_postgres())
+		{
+			AcceptInvalidationMessages();
+			InvalidateSystemCaches();
+		}
+#endif
+
 		/*
 		 * Remember this value, so that, after looking up the relation name
 		 * and locking its OID, we can check whether any invalidation messages
@@ -647,6 +760,11 @@ RangeVarGetRelidExtended(const RangeVar *relation, LOCKMODE lockmode,
 			Oid			namespaceId;
 
 			/* use exact schema given */
+#ifdef USE_FASTPG
+			if (FastPgSchemaIsPublic(relation->schemaname))
+				namespaceId = FastPgMappedPublicNamespaceOid(missing_ok, false);
+			else
+#endif
 			namespaceId = LookupExplicitNamespace(relation->schemaname, missing_ok);
 			if (missing_ok && !OidIsValid(namespaceId))
 				relId = InvalidOid;
@@ -788,7 +906,7 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
 	 */
 	if (newRelation->catalogname)
 	{
-		if (strcmp(newRelation->catalogname, get_database_name(MyDatabaseId)) != 0)
+		if (!FastPgCatalogNameMatchesCurrentDatabase(newRelation->catalogname))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
@@ -806,6 +924,10 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
 			return myTempNamespace;
 		}
 		/* use exact schema given */
+#ifdef USE_FASTPG
+		if (FastPgSchemaIsPublic(newRelation->schemaname))
+			return FastPgMappedPublicNamespaceOid(false, true);
+#endif
 		namespaceId = get_namespace_oid(newRelation->schemaname, false);
 		/* we do not check for USAGE rights here! */
 	}
@@ -830,6 +952,9 @@ RangeVarGetCreationNamespace(const RangeVar *newRelation)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_SCHEMA),
 					 errmsg("no schema has been selected to create in")));
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, false, true);
+#endif
 	}
 
 	/* Note: callers will check for CREATE rights when appropriate */
@@ -880,7 +1005,7 @@ RangeVarGetAndCheckCreationNamespace(RangeVar *relation,
 	 */
 	if (relation->catalogname)
 	{
-		if (strcmp(relation->catalogname, get_database_name(MyDatabaseId)) != 0)
+		if (!FastPgCatalogNameMatchesCurrentDatabase(relation->catalogname))
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("cross-database references are not implemented: \"%s.%s.%s\"",
@@ -1021,6 +1146,9 @@ RelnameGetRelid(const char *relname)
 	{
 		Oid			namespaceId = lfirst_oid(l);
 
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, true, false);
+#endif
 		relid = get_relname_relid(relname, namespaceId);
 		if (OidIsValid(relid))
 			return relid;
@@ -1147,6 +1275,9 @@ TypenameGetTypidExtended(const char *typname, bool temp_ok)
 		if (!temp_ok && namespaceId == myTempNamespace)
 			continue;			/* do not look in temp namespace */
 
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, true, false);
+#endif
 		typid = GetSysCacheOid2(TYPENAMENSP, Anum_pg_type_oid,
 								PointerGetDatum(typname),
 								ObjectIdGetDatum(namespaceId));
@@ -1396,7 +1527,12 @@ FuncnameGetCandidates(List *names, int nargs, List *argnames,
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (procform->pronamespace == lfirst_oid(nsp) &&
+				Oid			pathNamespaceId = lfirst_oid(nsp);
+
+#ifdef USE_FASTPG
+				pathNamespaceId = FastPgMaybeMapPublicNamespaceOid(pathNamespaceId, true, false);
+#endif
+				if (procform->pronamespace == pathNamespaceId &&
 					procform->pronamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -2060,6 +2196,9 @@ OpernameGetOprid(List *names, Oid oprleft, Oid oprright)
 		if (namespaceId == myTempNamespace)
 			continue;			/* do not look in temp namespace */
 
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, true, false);
+#endif
 		for (i = 0; i < catlist->n_members; i++)
 		{
 			HeapTuple	opertup = &catlist->members[i]->tuple;
@@ -2261,7 +2400,12 @@ OpernameGetCandidates(List *names, char oprkind, bool missing_schema_ok,
 
 			foreach(nsp, activeSearchPath)
 			{
-				if (operform->oprnamespace == lfirst_oid(nsp) &&
+				Oid			pathNamespaceId = lfirst_oid(nsp);
+
+#ifdef USE_FASTPG
+				pathNamespaceId = FastPgMaybeMapPublicNamespaceOid(pathNamespaceId, true, false);
+#endif
+				if (operform->oprnamespace == pathNamespaceId &&
 					operform->oprnamespace != myTempNamespace)
 					break;
 				pathpos++;
@@ -2389,6 +2533,18 @@ OperatorIsVisibleExt(Oid oprid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	oprnamespace = oprform->oprnamespace;
+#ifdef USE_FASTPG
+	if (oprnamespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, oprnamespace))
+	{
+		Oid			mapped_namespace = FastPgMappedPublicNamespaceOid(true, false);
+
+		if (OidIsValid(mapped_namespace) &&
+			oprnamespace == mapped_namespace &&
+			list_member_oid(activeSearchPath, PG_PUBLIC_NAMESPACE))
+			oprnamespace = PG_PUBLIC_NAMESPACE;
+	}
+#endif
 	if (oprnamespace != PG_CATALOG_NAMESPACE &&
 		!list_member_oid(activeSearchPath, oprnamespace))
 		visible = false;
@@ -2436,6 +2592,9 @@ OpclassnameGetOpcid(Oid amid, const char *opcname)
 		if (namespaceId == myTempNamespace)
 			continue;			/* do not look in temp namespace */
 
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, true, false);
+#endif
 		opcid = GetSysCacheOid3(CLAAMNAMENSP, Anum_pg_opclass_oid,
 								ObjectIdGetDatum(amid),
 								PointerGetDatum(opcname),
@@ -2494,6 +2653,18 @@ OpclassIsVisibleExt(Oid opcid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	opcnamespace = opcform->opcnamespace;
+#ifdef USE_FASTPG
+	if (opcnamespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, opcnamespace))
+	{
+		Oid			mapped_namespace = FastPgMappedPublicNamespaceOid(true, false);
+
+		if (OidIsValid(mapped_namespace) &&
+			opcnamespace == mapped_namespace &&
+			list_member_oid(activeSearchPath, PG_PUBLIC_NAMESPACE))
+			opcnamespace = PG_PUBLIC_NAMESPACE;
+	}
+#endif
 	if (opcnamespace != PG_CATALOG_NAMESPACE &&
 		!list_member_oid(activeSearchPath, opcnamespace))
 		visible = false;
@@ -2538,6 +2709,9 @@ OpfamilynameGetOpfid(Oid amid, const char *opfname)
 		if (namespaceId == myTempNamespace)
 			continue;			/* do not look in temp namespace */
 
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, true, false);
+#endif
 		opfid = GetSysCacheOid3(OPFAMILYAMNAMENSP, Anum_pg_opfamily_oid,
 								ObjectIdGetDatum(amid),
 								PointerGetDatum(opfname),
@@ -2596,6 +2770,18 @@ OpfamilyIsVisibleExt(Oid opfid, bool *is_missing)
 	 * list_member_oid() for them.
 	 */
 	opfnamespace = opfform->opfnamespace;
+#ifdef USE_FASTPG
+	if (opfnamespace != PG_CATALOG_NAMESPACE &&
+		!list_member_oid(activeSearchPath, opfnamespace))
+	{
+		Oid			mapped_namespace = FastPgMappedPublicNamespaceOid(true, false);
+
+		if (OidIsValid(mapped_namespace) &&
+			opfnamespace == mapped_namespace &&
+			list_member_oid(activeSearchPath, PG_PUBLIC_NAMESPACE))
+			opfnamespace = PG_PUBLIC_NAMESPACE;
+	}
+#endif
 	if (opfnamespace != PG_CATALOG_NAMESPACE &&
 		!list_member_oid(activeSearchPath, opfnamespace))
 		visible = false;
@@ -3624,8 +3810,6 @@ DeconstructQualifiedName(const List *names,
 			break;
 		case 3:
 		{
-			char	   *databasename = get_database_name(MyDatabaseId);
-
 			catalogname = strVal(linitial(names));
 			schemaname = strVal(lsecond(names));
 			objname = strVal(lthird(names));
@@ -3633,8 +3817,7 @@ DeconstructQualifiedName(const List *names,
 			/*
 			 * We check the catalog name and then ignore it.
 			 */
-			if (databasename == NULL ||
-				strcmp(catalogname, databasename) != 0)
+			if (!FastPgCatalogNameMatchesCurrentDatabase(catalogname))
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						 errmsg("cross-database references are not implemented: %s",
@@ -3666,6 +3849,10 @@ DeconstructQualifiedName(const List *names,
 Oid
 LookupNamespaceNoError(const char *nspname)
 {
+#ifdef USE_FASTPG
+	Oid			namespaceId;
+#endif
+
 	/* check for pg_temp alias */
 	if (strcmp(nspname, "pg_temp") == 0)
 	{
@@ -3682,6 +3869,16 @@ LookupNamespaceNoError(const char *nspname)
 		 */
 		return InvalidOid;
 	}
+
+#ifdef USE_FASTPG
+	if (FastPgSchemaIsPublic(nspname))
+	{
+		namespaceId = FastPgMappedPublicNamespaceOid(true, false);
+		if (OidIsValid(namespaceId))
+			return namespaceId;
+		return InvalidOid;
+	}
+#endif
 
 	return get_namespace_oid(nspname, true);
 }
@@ -3712,6 +3909,15 @@ LookupExplicitNamespace(const char *nspname, bool missing_ok)
 		 */
 	}
 
+#ifdef USE_FASTPG
+	if (FastPgSchemaIsPublic(nspname))
+	{
+		namespaceId = FastPgMappedPublicNamespaceOid(missing_ok, false);
+		if (missing_ok && !OidIsValid(namespaceId))
+			return InvalidOid;
+	}
+	else
+#endif
 	namespaceId = get_namespace_oid(nspname, missing_ok);
 	if (missing_ok && !OidIsValid(namespaceId))
 		return InvalidOid;
@@ -3750,6 +3956,11 @@ LookupCreationNamespace(const char *nspname)
 		return myTempNamespace;
 	}
 
+#ifdef USE_FASTPG
+	if (FastPgSchemaIsPublic(nspname))
+		namespaceId = FastPgMappedPublicNamespaceOid(false, true);
+	else
+#endif
 	namespaceId = get_namespace_oid(nspname, false);
 
 	aclresult = object_aclcheck(NamespaceRelationId, namespaceId, GetUserId(), ACL_CREATE);
@@ -3814,6 +4025,10 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
 			return myTempNamespace;
 		}
 		/* use exact schema given */
+#ifdef USE_FASTPG
+		if (FastPgSchemaIsPublic(schemaname))
+			return FastPgMappedPublicNamespaceOid(false, true);
+#endif
 		namespaceId = get_namespace_oid(schemaname, false);
 		/* we do not check for USAGE rights here! */
 	}
@@ -3832,6 +4047,9 @@ QualifiedNameGetCreationNamespace(const List *names, char **objname_p)
 			ereport(ERROR,
 					(errcode(ERRCODE_UNDEFINED_SCHEMA),
 					 errmsg("no schema has been selected to create in")));
+#ifdef USE_FASTPG
+		namespaceId = FastPgMaybeMapPublicNamespaceOid(namespaceId, false, true);
+#endif
 	}
 
 	return namespaceId;
