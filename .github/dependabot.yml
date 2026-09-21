@@ -17,6 +17,7 @@ updates:
         update-types:
           - minor
           - patch
+    open-pull-requests-limit: 0
 
   - package-ecosystem: github-actions
     directory: /
@@ -35,3 +36,4 @@ updates:
         update-types:
           - minor
           - patch
+    open-pull-requests-limit: 0
